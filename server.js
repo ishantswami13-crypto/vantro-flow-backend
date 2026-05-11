@@ -7,7 +7,6 @@ const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const { createClient } = require('@supabase/supabase-js');
-const Anthropic = require('@anthropic-ai/sdk');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -17,11 +16,6 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
 );
-
-// Initialize Anthropic
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY
-});
 
 // Middleware
 app.use(cors({
@@ -252,7 +246,6 @@ app.post('/api/calculate-priority/:userId', async (req, res) => {
 // MESSAGE GENERATION - CLAUDE API INTEGRATION
 // ============================================
 
-// System prompt is stable — defined once so prompt caching can kick in.
 const MESSAGE_SYSTEM_PROMPT = `You are a collection message generator for small Indian business owners.
 
 Generate a WhatsApp message in Hinglish (Hindi + English mix) to collect payment.
@@ -280,27 +273,29 @@ app.post('/api/generate-message', async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    const message = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 200,
-      // Cache the stable system prompt — saves ~90% cost on repeated calls
-      system: [
-        {
-          type: 'text',
-          text: MESSAGE_SYSTEM_PROMPT,
-          cache_control: { type: 'ephemeral' }
-        }
-      ],
-      messages: [
-        {
-          role: 'user',
-          content: `Customer name: ${customer_name}\nAmount owed: ₹${amount}\nDays overdue: ${days_overdue} days`
-        }
-      ]
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        max_tokens: 200,
+        messages: [
+          { role: 'system', content: MESSAGE_SYSTEM_PROMPT },
+          { role: 'user', content: `Customer name: ${customer_name}\nAmount owed: ₹${amount}\nDays overdue: ${days_overdue} days` }
+        ]
+      })
     });
 
-    const generatedText =
-      message.content[0].type === 'text' ? message.content[0].text : '';
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data.error?.message || 'Groq API error');
+    }
+
+    const generatedText = data.choices[0]?.message?.content || '';
 
     res.json({
       success: true,
