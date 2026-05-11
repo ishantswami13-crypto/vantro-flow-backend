@@ -312,11 +312,18 @@ app.post('/api/generate-message', async (req, res) => {
 
 app.post('/api/mark-paid', async (req, res) => {
   try {
-    const { invoice_id } = req.body;
+    const { invoice_id, payment_date, payment_amount, payment_method, payment_notes } = req.body;
 
     const { data, error } = await supabase
       .from('invoices')
-      .update({ payment_status: 'Paid', updated_at: new Date() })
+      .update({
+        payment_status: 'Paid',
+        updated_at: new Date(),
+        payment_date: payment_date || new Date().toISOString().split('T')[0],
+        payment_amount: payment_amount || null,
+        payment_method: payment_method || null,
+        payment_notes: payment_notes || null
+      })
       .eq('id', invoice_id)
       .select();
 
@@ -329,12 +336,16 @@ app.post('/api/mark-paid', async (req, res) => {
 });
 
 // ============================================
-// CALL TRACKING (Optional)
+// CALL TRACKING
 // ============================================
 
 app.post('/api/log-call', async (req, res) => {
   try {
-    const { user_id, customer_name, amount, notes } = req.body;
+    const {
+      user_id, customer_name, amount, notes,
+      invoice_id, customer_phone, call_duration_minutes,
+      did_pick_up, promised_payment_date, promised_amount
+    } = req.body;
 
     const { data, error } = await supabase
       .from('call_logs')
@@ -343,8 +354,51 @@ app.post('/api/log-call', async (req, res) => {
         customer_name,
         amount,
         notes,
+        invoice_id: invoice_id || null,
+        customer_phone: customer_phone || null,
+        call_duration_minutes: call_duration_minutes || null,
+        did_pick_up: did_pick_up !== undefined ? did_pick_up : null,
+        promised_payment_date: promised_payment_date || null,
+        promised_amount: promised_amount || null,
         called_at: new Date()
       }])
+      .select();
+
+    if (error) throw error;
+
+    res.json({ success: true, log: data[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/calls/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const { data, error } = await supabase
+      .from('call_logs')
+      .select('*')
+      .eq('user_id', userId)
+      .order('called_at', { ascending: false });
+
+    if (error) throw error;
+
+    res.json({ success: true, calls: data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/call/:callId/update', async (req, res) => {
+  try {
+    const { callId } = req.params;
+    const { notes, did_pick_up, promised_payment_date, promised_amount, call_duration_minutes } = req.body;
+
+    const { data, error } = await supabase
+      .from('call_logs')
+      .update({ notes, did_pick_up, promised_payment_date, promised_amount, call_duration_minutes })
+      .eq('id', callId)
       .select();
 
     if (error) throw error;
@@ -394,6 +448,79 @@ app.get('/api/metrics/:userId', async (req, res) => {
     };
 
     res.json({ success: true, metrics });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// ANALYTICS
+// ============================================
+
+app.get('/api/analytics/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const [{ data: invoices }, { data: callLogs }] = await Promise.all([
+      supabase.from('invoices').select('*').eq('user_id', userId),
+      supabase.from('call_logs').select('*').eq('user_id', userId)
+    ]);
+
+    const safeInvoices = invoices || [];
+    const safeCallLogs = callLogs || [];
+
+    const paidInvoices = safeInvoices.filter(inv => inv.payment_status === 'Paid');
+    const pendingInvoices = safeInvoices.filter(inv => inv.payment_status === 'Pending');
+
+    // Monthly recovery for last 6 months
+    const monthly = {};
+    const now = new Date();
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      monthly[key] = { month: key, recovered: 0, invoices_paid: 0 };
+    }
+    paidInvoices.forEach(inv => {
+      const date = inv.payment_date || inv.updated_at;
+      if (!date) return;
+      const key = date.substring(0, 7);
+      if (monthly[key]) {
+        monthly[key].recovered += Number(inv.payment_amount || inv.invoice_amount);
+        monthly[key].invoices_paid += 1;
+      }
+    });
+
+    // Top customers by outstanding amount
+    const customerMap = {};
+    pendingInvoices.forEach(inv => {
+      if (!customerMap[inv.customer_name]) customerMap[inv.customer_name] = 0;
+      customerMap[inv.customer_name] += Number(inv.invoice_amount);
+    });
+    const topCustomers = Object.entries(customerMap)
+      .map(([name, amount]) => ({ name, amount }))
+      .sort((a, b) => b.amount - a.amount)
+      .slice(0, 5);
+
+    const totalOutstanding = pendingInvoices.reduce((s, i) => s + Number(i.invoice_amount), 0);
+    const totalRecovered = paidInvoices.reduce((s, i) => s + Number(i.payment_amount || i.invoice_amount), 0);
+    const recoveryRate = safeInvoices.length > 0
+      ? ((paidInvoices.length / safeInvoices.length) * 100).toFixed(1)
+      : 0;
+
+    res.json({
+      success: true,
+      analytics: {
+        total_outstanding: totalOutstanding,
+        total_recovered: totalRecovered,
+        recovery_rate: recoveryRate,
+        total_invoices: safeInvoices.length,
+        paid_invoices: paidInvoices.length,
+        pending_invoices: pendingInvoices.length,
+        calls_made: safeCallLogs.length,
+        monthly_trend: Object.values(monthly),
+        top_customers: topCustomers
+      }
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
