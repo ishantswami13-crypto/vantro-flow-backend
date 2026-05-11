@@ -825,7 +825,7 @@ Calls made: ${totalCalls}, Pick-up rate: ${totalCalls ? Math.round(pickedUp/tota
 });
 
 // ============================================
-// DEEP AI ANALYSIS (Claude Opus 4.7)
+// DEEP AI ANALYSIS (Groq llama-3.3-70b — free)
 // ============================================
 
 app.get('/api/ai-deep-analysis/:userId', async (req, res) => {
@@ -937,25 +937,27 @@ Return a JSON object with this exact structure (no markdown, pure JSON):
   ]
 }`;
 
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
+        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`
       },
       body: JSON.stringify({
-        model: 'claude-opus-4-7',
-        max_tokens: 2000,
-        thinking: { type: 'adaptive' },
-        messages: [{ role: 'user', content: prompt }]
+        model: 'llama-3.3-70b-versatile',
+        max_tokens: 3000,
+        temperature: 0.3,
+        messages: [
+          { role: 'system', content: 'You are a senior business analyst for Indian MSMEs. Always respond with valid JSON only — no markdown, no explanation, just the JSON object.' },
+          { role: 'user', content: prompt }
+        ]
       })
     });
 
     const data = await response.json();
-    if (!response.ok) throw new Error(data.error?.message || 'Claude API error');
+    if (!response.ok) throw new Error(data.error?.message || 'Groq API error');
 
-    const text = data.content?.find(b => b.type === 'text')?.text || '{}';
+    const text = data.choices?.[0]?.message?.content || '{}';
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     const analysis = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
 
