@@ -536,6 +536,196 @@ app.get('/api/analytics/:userId', async (req, res) => {
 });
 
 // ============================================
+// INVENTORY MANAGEMENT
+// ============================================
+
+// --- Products ---
+
+app.get('/api/inventory/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const [{ data: products }, { data: movements }] = await Promise.all([
+      supabase.from('products').select('*').eq('user_id', userId).order('name'),
+      supabase.from('stock_movements').select('*').eq('user_id', userId).order('moved_at', { ascending: false }).limit(50)
+    ]);
+
+    const safeProducts = products || [];
+    const totalValue = safeProducts.reduce((s, p) => s + Number(p.current_stock) * Number(p.unit_price), 0);
+    const lowStock = safeProducts.filter(p => p.current_stock > 0 && p.current_stock <= p.low_stock_alert);
+    const outOfStock = safeProducts.filter(p => p.current_stock === 0);
+
+    res.json({
+      success: true,
+      products: safeProducts,
+      movements: movements || [],
+      summary: {
+        total_products: safeProducts.length,
+        total_value: totalValue,
+        low_stock_count: lowStock.length,
+        out_of_stock_count: outOfStock.length,
+        low_stock_items: lowStock,
+        out_of_stock_items: outOfStock
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/products', async (req, res) => {
+  try {
+    const { user_id, name, sku, description, unit_price, unit, current_stock, low_stock_alert, category } = req.body;
+    if (!user_id || !name) return res.status(400).json({ error: 'user_id and name required' });
+
+    const { data, error } = await supabase
+      .from('products')
+      .insert([{ user_id, name, sku: sku || null, description: description || null, unit_price: unit_price || 0, unit: unit || 'unit', current_stock: current_stock || 0, low_stock_alert: low_stock_alert || 10, category: category || null }])
+      .select();
+
+    if (error) throw error;
+    res.json({ success: true, product: data[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/products/:productId', async (req, res) => {
+  try {
+    const { productId } = req.params;
+    const { name, sku, description, unit_price, unit, low_stock_alert, category } = req.body;
+
+    const { data, error } = await supabase
+      .from('products')
+      .update({ name, sku, description, unit_price, unit, low_stock_alert, category, updated_at: new Date() })
+      .eq('id', productId)
+      .select();
+
+    if (error) throw error;
+    res.json({ success: true, product: data[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/products/:productId/delete', async (req, res) => {
+  try {
+    const { productId } = req.params;
+    const { error } = await supabase.from('products').delete().eq('id', productId);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- Stock Movements ---
+
+app.post('/api/stock/move', async (req, res) => {
+  try {
+    const { user_id, product_id, movement_type, quantity, unit_cost, reference, notes } = req.body;
+    if (!user_id || !product_id || !movement_type || !quantity) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const qty = parseInt(quantity);
+    const delta = movement_type === 'in' ? qty : -qty;
+
+    const { data: product, error: fetchErr } = await supabase
+      .from('products').select('current_stock').eq('id', product_id).single();
+    if (fetchErr) throw fetchErr;
+
+    const newStock = Math.max(0, (product.current_stock || 0) + delta);
+
+    const [{ data: movement, error: movErr }, { error: updateErr }] = await Promise.all([
+      supabase.from('stock_movements').insert([{
+        user_id, product_id, movement_type, quantity: qty,
+        unit_cost: unit_cost || null, reference: reference || null, notes: notes || null
+      }]).select(),
+      supabase.from('products').update({ current_stock: newStock, updated_at: new Date() }).eq('id', product_id)
+    ]);
+
+    if (movErr) throw movErr;
+    if (updateErr) throw updateErr;
+
+    res.json({ success: true, movement: movement[0], new_stock: newStock });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/stock/movements/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { data, error } = await supabase
+      .from('stock_movements')
+      .select('*, products(name, unit)')
+      .eq('user_id', userId)
+      .order('moved_at', { ascending: false });
+
+    if (error) throw error;
+    res.json({ success: true, movements: data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- Suppliers ---
+
+app.get('/api/suppliers/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { data, error } = await supabase
+      .from('suppliers').select('*').eq('user_id', userId).order('name');
+    if (error) throw error;
+    res.json({ success: true, suppliers: data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/suppliers', async (req, res) => {
+  try {
+    const { user_id, name, phone, email, address, payment_terms } = req.body;
+    if (!user_id || !name) return res.status(400).json({ error: 'user_id and name required' });
+
+    const { data, error } = await supabase
+      .from('suppliers')
+      .insert([{ user_id, name, phone: phone || null, email: email || null, address: address || null, payment_terms: payment_terms || 30 }])
+      .select();
+
+    if (error) throw error;
+    res.json({ success: true, supplier: data[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/suppliers/:supplierId', async (req, res) => {
+  try {
+    const { supplierId } = req.params;
+    const { name, phone, email, address, payment_terms } = req.body;
+
+    const { data, error } = await supabase
+      .from('suppliers').update({ name, phone, email, address, payment_terms }).eq('id', supplierId).select();
+    if (error) throw error;
+    res.json({ success: true, supplier: data[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/suppliers/:supplierId/delete', async (req, res) => {
+  try {
+    const { supplierId } = req.params;
+    const { error } = await supabase.from('suppliers').delete().eq('id', supplierId);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
 // HEALTH CHECK
 // ============================================
 
