@@ -729,6 +729,141 @@ app.post('/api/suppliers/:supplierId/delete', async (req, res) => {
 // HEALTH CHECK
 // ============================================
 
+// ============================================
+// AI INSIGHTS
+// ============================================
+
+app.get('/api/ai-insights/:userId', async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const [{ data: invoices }, { data: calls }, { data: movements }, { data: products }] = await Promise.all([
+      supabase.from('invoices').select('*').eq('user_id', userId),
+      supabase.from('call_logs').select('*').eq('user_id', userId),
+      supabase.from('stock_movements').select('*, products(name)').eq('user_id', userId),
+      supabase.from('products').select('*').eq('user_id', userId),
+    ]);
+
+    const safeInv = invoices || [];
+    const safeCalls = calls || [];
+    const safeMov = movements || [];
+    const safeProd = products || [];
+
+    // Customer stats
+    const custMap = {};
+    safeInv.forEach(inv => {
+      if (!custMap[inv.customer_name]) custMap[inv.customer_name] = { name: inv.customer_name, total: 0, paid: 0, pending: 0, invoices: 0 };
+      custMap[inv.customer_name].total += Number(inv.invoice_amount);
+      custMap[inv.customer_name].invoices += 1;
+      if (inv.payment_status === 'Paid') custMap[inv.customer_name].paid += Number(inv.payment_amount || inv.invoice_amount);
+      else custMap[inv.customer_name].pending += Number(inv.invoice_amount);
+    });
+    const customers = Object.values(custMap).sort((a, b) => b.total - a.total);
+
+    // Product sales from stock_movements out
+    const prodMap = {};
+    safeMov.filter(m => m.movement_type === 'out').forEach(m => {
+      const name = m.products?.name || m.product_id;
+      if (!prodMap[name]) prodMap[name] = { name, units_sold: 0 };
+      prodMap[name].units_sold += m.quantity;
+    });
+    const productSales = Object.values(prodMap).sort((a, b) => b.units_sold - a.units_sold);
+
+    // Call effectiveness
+    const totalCalls = safeCalls.length;
+    const pickedUp = safeCalls.filter(c => c.did_pick_up).length;
+    const promised = safeCalls.filter(c => c.promised_payment_date).length;
+
+    // Build context for Groq
+    const context = `
+Business Data Summary:
+- Total invoices: ${safeInv.length}, Paid: ${safeInv.filter(i=>i.payment_status==='Paid').length}, Pending: ${safeInv.filter(i=>i.payment_status!=='Paid').length}
+- Total outstanding: ₹${safeInv.filter(i=>i.payment_status!=='Paid').reduce((s,i)=>s+Number(i.invoice_amount),0).toLocaleString('en-IN')}
+- Total collected: ₹${safeInv.filter(i=>i.payment_status==='Paid').reduce((s,i)=>s+Number(i.payment_amount||i.invoice_amount),0).toLocaleString('en-IN')}
+
+Top customers by purchase value:
+${customers.slice(0,5).map((c,i)=>`${i+1}. ${c.name}: ₹${c.total.toLocaleString('en-IN')} total, ₹${c.paid.toLocaleString('en-IN')} paid, ₹${c.pending.toLocaleString('en-IN')} pending`).join('\n')}
+
+Lowest buying customers:
+${customers.slice(-3).map((c,i)=>`${i+1}. ${c.name}: ₹${c.total.toLocaleString('en-IN')} total`).join('\n')}
+
+Product sales (stock out movements):
+${productSales.length ? productSales.map((p,i)=>`${i+1}. ${p.name}: ${p.units_sold} units sold`).join('\n') : 'No sales data yet'}
+
+Products in inventory: ${safeProd.length}, Low stock: ${safeProd.filter(p=>p.current_stock>0&&p.current_stock<=p.low_stock_alert).length}, Out of stock: ${safeProd.filter(p=>p.current_stock===0).length}
+
+Calls made: ${totalCalls}, Pick-up rate: ${totalCalls ? Math.round(pickedUp/totalCalls*100) : 0}%, Promises secured: ${promised}
+`;
+
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        max_tokens: 600,
+        messages: [
+          { role: 'system', content: 'You are a sharp business analyst for Indian MSMEs. Given data, provide 4-5 specific, actionable insights in plain English. Be direct and data-driven. Format as a JSON array of objects: [{title, insight, action, type}] where type is "success"|"warning"|"danger"|"info". No markdown, pure JSON only.' },
+          { role: 'user', content: context }
+        ]
+      })
+    });
+    const groqData = await response.json();
+    let insights = [];
+    try {
+      const text = groqData.choices[0]?.message?.content || '[]';
+      const jsonMatch = text.match(/\[[\s\S]*\]/);
+      insights = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+    } catch(e) { insights = []; }
+
+    res.json({
+      success: true,
+      stats: { customers: customers.slice(0,5), bottomCustomers: customers.slice(-3), productSales, totalCalls, pickedUp, promised },
+      insights
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// CAMERA / OCR SCAN
+// ============================================
+
+app.post('/api/scan-document', async (req, res) => {
+  const { image_base64, scan_type } = req.body; // scan_type: 'invoice' | 'supplier'
+  if (!image_base64) return res.status(400).json({ error: 'No image provided' });
+
+  const invoicePrompt = `Extract invoice/bill details from this image. Return ONLY a JSON object with these fields (use null if not found):
+{"customer_name": "", "customer_phone": "", "invoice_amount": null, "invoice_date": "YYYY-MM-DD", "items": "brief description of items"}`;
+
+  const supplierPrompt = `Extract supplier/vendor details from this document image. Return ONLY a JSON object with these fields (use null if not found):
+{"name": "", "phone": "", "email": "", "address": "", "payment_terms": null}`;
+
+  try {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+      body: JSON.stringify({
+        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        max_tokens: 400,
+        messages: [
+          { role: 'user', content: [
+            { type: 'text', text: scan_type === 'supplier' ? supplierPrompt : invoicePrompt },
+            { type: 'image_url', image_url: { url: image_base64 } }
+          ]}
+        ]
+      })
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error?.message || 'Vision API error');
+    const text = data.choices[0]?.message?.content || '{}';
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    const extracted = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
+    res.json({ success: true, extracted });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/health', (req, res) => {
   res.json({ status: 'Backend is running', timestamp: new Date() });
 });
