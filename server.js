@@ -1120,6 +1120,206 @@ app.post('/api/seed/:userId', async (req, res) => {
 });
 
 // ============================================
+// PROSPECTS / CRM LITE
+// ============================================
+
+app.get('/api/prospects/:userId', async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const { data, error } = await supabase
+      .from('prospects')
+      .select('*, prospect_notes(*)')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json({ success: true, prospects: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/prospects', async (req, res) => {
+  try {
+    const { user_id, name, phone, email, business_type, location, amount_stuck, status } = req.body;
+    const { data, error } = await supabase
+      .from('prospects')
+      .insert([{ user_id, name, phone, email, business_type, location, amount_stuck: amount_stuck || null, status: status || 'cold' }])
+      .select();
+    if (error) throw error;
+    res.json({ success: true, prospect: data[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/prospects/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const updates = req.body;
+    updates.updated_at = new Date();
+    if (updates.status === 'trial' && !updates.trial_start_date) {
+      updates.trial_start_date = new Date().toISOString().split('T')[0];
+      const end = new Date(); end.setDate(end.getDate() + 14);
+      updates.trial_end_date = end.toISOString().split('T')[0];
+    }
+    const { data, error } = await supabase.from('prospects').update(updates).eq('id', id).select();
+    if (error) throw error;
+    res.json({ success: true, prospect: data[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/prospects/:id/delete', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const { error } = await supabase.from('prospects').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/prospects/:id/notes', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const { text } = req.body;
+    const { data, error } = await supabase
+      .from('prospect_notes')
+      .insert([{ prospect_id: id, text }])
+      .select();
+    if (error) throw error;
+    res.json({ success: true, note: data[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================
+// CASH FLOW FORECAST
+// ============================================
+
+app.get('/api/cash-forecast/:userId', async (req, res) => {
+  const { userId } = req.params;
+  const { current_cash = 0, daily_expenses = 13000, days = 30 } = req.query;
+
+  try {
+    const { data: invoices } = await supabase
+      .from('invoices')
+      .select('invoice_amount, payment_amount, payment_status, payment_date, days_overdue, customer_name')
+      .eq('user_id', userId);
+
+    const safe = invoices || [];
+    const paid = safe.filter(i => i.payment_status === 'Paid' && i.payment_date);
+    const totalRecovered = paid.reduce((s, i) => s + Number(i.payment_amount || i.invoice_amount), 0);
+    const pending = safe.filter(i => i.payment_status !== 'Paid');
+    const totalOutstanding = pending.reduce((s, i) => s + Number(i.invoice_amount), 0);
+    const totalOverdue30 = pending.filter(i => Number(i.days_overdue) >= 30)
+      .reduce((s, i) => s + Number(i.invoice_amount), 0);
+
+    // Average daily collections over last 90 days (or estimate from outstanding if not enough data)
+    const avgDailyCollections = paid.length > 0 ? Math.round(totalRecovered / 90) : Math.round(totalOutstanding * 0.03);
+
+    const cashStart = Number(current_cash);
+    const burnRate = Number(daily_expenses);
+    const n = Number(days);
+
+    const buildCurve = (inflow) => {
+      const curve = [];
+      let cash = cashStart;
+      for (let d = 0; d <= n; d++) {
+        curve.push({ day: d, cash: Math.max(0, Math.round(cash)) });
+        cash += inflow - burnRate;
+      }
+      return curve;
+    };
+
+    const scenarios = {
+      pessimistic: { dailyInflow: Math.round(avgDailyCollections * 0.5) },
+      expected:    { dailyInflow: Math.round(avgDailyCollections * 0.8) },
+      optimistic:  { dailyInflow: Math.round(avgDailyCollections * 0.95) },
+    };
+
+    Object.keys(scenarios).forEach(k => {
+      const { dailyInflow } = scenarios[k];
+      const netDaily = dailyInflow - burnRate;
+      scenarios[k].curve = buildCurve(dailyInflow);
+      scenarios[k].endCash = Math.max(0, Math.round(cashStart + netDaily * n));
+      scenarios[k].runwayDays = netDaily >= 0 ? 999 : Math.floor(cashStart / Math.abs(netDaily));
+    });
+
+    res.json({
+      success: true,
+      cashStart,
+      burnRate,
+      avgDailyCollections,
+      totalOutstanding,
+      totalOverdue30,
+      scenarios,
+      days: n
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================
+// DB MIGRATION (safe to call multiple times)
+// ============================================
+
+app.post('/api/migrate', async (req, res) => {
+  try {
+    // prospects table
+    await supabase.rpc('exec_sql', { sql: `
+      CREATE TABLE IF NOT EXISTS prospects (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL,
+        name TEXT NOT NULL,
+        phone TEXT,
+        email TEXT,
+        business_type TEXT DEFAULT 'Distributor',
+        location TEXT,
+        amount_stuck NUMERIC,
+        status TEXT DEFAULT 'cold',
+        trial_start_date DATE,
+        trial_end_date DATE,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `}).catch(() => null);
+
+    await supabase.rpc('exec_sql', { sql: `
+      CREATE TABLE IF NOT EXISTS prospect_notes (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        prospect_id UUID NOT NULL REFERENCES prospects(id) ON DELETE CASCADE,
+        text TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `}).catch(() => null);
+
+    // Try direct insert to test table existence
+    const { error: testErr } = await supabase.from('prospects').select('id').limit(1);
+    if (testErr && testErr.code === '42P01') {
+      return res.status(500).json({ error: 'Tables not created — please create them manually in Supabase dashboard', sql: `
+CREATE TABLE IF NOT EXISTS prospects (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL,
+  name TEXT NOT NULL,
+  phone TEXT,
+  email TEXT,
+  business_type TEXT DEFAULT 'Distributor',
+  location TEXT,
+  amount_stuck NUMERIC,
+  status TEXT DEFAULT 'cold',
+  trial_start_date DATE,
+  trial_end_date DATE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS prospect_notes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  prospect_id UUID NOT NULL REFERENCES prospects(id) ON DELETE CASCADE,
+  text TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);`});
+    }
+
+    res.json({ success: true, message: 'Migration complete — prospects & prospect_notes tables ready' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
 // START SERVER
 // ============================================
 
