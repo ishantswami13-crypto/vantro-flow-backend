@@ -825,6 +825,148 @@ Calls made: ${totalCalls}, Pick-up rate: ${totalCalls ? Math.round(pickedUp/tota
 });
 
 // ============================================
+// DEEP AI ANALYSIS (Claude Opus 4.7)
+// ============================================
+
+app.get('/api/ai-deep-analysis/:userId', async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const [{ data: invoices }, { data: calls }, { data: movements }, { data: products }, { data: suppliers }] = await Promise.all([
+      supabase.from('invoices').select('*').eq('user_id', userId),
+      supabase.from('call_logs').select('*').eq('user_id', userId),
+      supabase.from('stock_movements').select('*, products(name)').eq('user_id', userId),
+      supabase.from('products').select('*').eq('user_id', userId),
+      supabase.from('suppliers').select('*').eq('user_id', userId),
+    ]);
+
+    const inv = invoices || [];
+    const cls = calls || [];
+    const mov = movements || [];
+    const prd = products || [];
+    const sup = suppliers || [];
+
+    const paid = inv.filter(i => i.payment_status === 'Paid');
+    const pending = inv.filter(i => i.payment_status !== 'Paid');
+    const totalOutstanding = pending.reduce((s, i) => s + Number(i.invoice_amount), 0);
+    const totalRecovered = paid.reduce((s, i) => s + Number(i.payment_amount || i.invoice_amount), 0);
+    const recoveryRate = inv.length ? Math.round(paid.length / inv.length * 100) : 0;
+
+    // Customer breakdown
+    const custMap = {};
+    inv.forEach(i => {
+      if (!custMap[i.customer_name]) custMap[i.customer_name] = { name: i.customer_name, phone: i.customer_phone, total: 0, paid: 0, pending: 0, overdue: 0, invoices: 0 };
+      custMap[i.customer_name].total += Number(i.invoice_amount);
+      custMap[i.customer_name].invoices++;
+      if (i.payment_status === 'Paid') custMap[i.customer_name].paid += Number(i.payment_amount || i.invoice_amount);
+      else { custMap[i.customer_name].pending += Number(i.invoice_amount); custMap[i.customer_name].overdue = Math.max(custMap[i.customer_name].overdue, i.days_overdue); }
+    });
+    const customers = Object.values(custMap).sort((a, b) => b.pending - a.pending);
+
+    const callsByCustomer = {};
+    cls.forEach(c => {
+      if (!callsByCustomer[c.customer_name]) callsByCustomer[c.customer_name] = { calls: 0, pickup: 0 };
+      callsByCustomer[c.customer_name].calls++;
+      if (c.did_pick_up) callsByCustomer[c.customer_name].pickup++;
+    });
+
+    const lowStock = prd.filter(p => p.current_stock > 0 && p.current_stock <= p.low_stock_alert);
+    const outOfStock = prd.filter(p => p.current_stock === 0);
+    const stockValue = prd.reduce((s, p) => s + (Number(p.unit_price) * Number(p.current_stock)), 0);
+
+    const prompt = `You are a senior business analyst for Indian MSMEs. Analyze this business data and produce a comprehensive, honest, and actionable report.
+
+BUSINESS DATA:
+Business: Collections & Inventory Management
+
+INVOICES:
+- Total: ${inv.length} | Paid: ${paid.length} | Pending: ${pending.length}
+- Outstanding: ₹${totalOutstanding.toLocaleString('en-IN')} | Recovered: ₹${totalRecovered.toLocaleString('en-IN')}
+- Recovery Rate: ${recoveryRate}% (Industry avg: 40%)
+
+CUSTOMERS (sorted by pending amount):
+${customers.slice(0, 8).map(c => `- ${c.name}: ₹${c.pending.toLocaleString('en-IN')} pending, ₹${c.paid.toLocaleString('en-IN')} paid, overdue ${c.overdue} days, calls: ${callsByCustomer[c.name]?.calls || 0} (pickup: ${callsByCustomer[c.name]?.pickup || 0})`).join('\n')}
+
+CALLS: ${cls.length} total, ${cls.filter(c => c.did_pick_up).length} picked up, ${cls.filter(c => c.promised_payment_date).length} payment promises secured
+
+INVENTORY:
+- Products: ${prd.length} | Stock Value: ₹${stockValue.toLocaleString('en-IN')}
+- Low stock: ${lowStock.map(p => `${p.name} (${p.current_stock} left)`).join(', ') || 'none'}
+- Out of stock: ${outOfStock.map(p => p.name).join(', ') || 'none'}
+- Stock movements (out): ${mov.filter(m => m.movement_type === 'out').length} dispatches
+
+SUPPLIERS: ${sup.length} suppliers on record
+
+Return a JSON object with this exact structure (no markdown, pure JSON):
+{
+  "health_score": <number 0-100>,
+  "health_label": <"Excellent"|"Good"|"Average"|"Needs Work"|"Critical">,
+  "health_color": <"#16a34a"|"#65a30d"|"#d97706"|"#ea580c"|"#dc2626">,
+  "executive_summary": "<2-3 sentences honest overview>",
+  "top_actions": [
+    {"priority": 1, "action": "<specific action>", "impact": "<expected result>", "urgency": "TODAY"|"THIS WEEK"|"THIS MONTH"}
+  ],
+  "sections": [
+    {
+      "id": "collections",
+      "title": "💰 Collections Analysis",
+      "insights": ["<specific insight with numbers>"],
+      "customers": [{"name": "", "status": "CHASE NOW"|"FOLLOW UP"|"RELIABLE"|"RISKY", "reason": "", "suggested_action": ""}]
+    },
+    {
+      "id": "cashflow",
+      "title": "📊 Cash Flow Health",
+      "insights": ["<specific insight>"],
+      "metrics": [{"label": "", "value": "", "trend": "up"|"down"|"neutral"}]
+    },
+    {
+      "id": "inventory",
+      "title": "📦 Inventory Intelligence",
+      "insights": ["<specific insight>"],
+      "alerts": [{"product": "", "issue": "", "action": ""}]
+    },
+    {
+      "id": "strategy",
+      "title": "🎯 This Week's Strategy",
+      "insights": ["<specific actionable step with expected outcome>"]
+    },
+    {
+      "id": "risks",
+      "title": "⚠️ Risks & Warnings",
+      "insights": ["<specific risk>"]
+    }
+  ]
+}`;
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-opus-4-7',
+        max_tokens: 2000,
+        thinking: { type: 'adaptive' },
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
+
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error?.message || 'Claude API error');
+
+    const text = data.content?.find(b => b.type === 'text')?.text || '{}';
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    const analysis = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
+
+    res.json({ success: true, analysis });
+  } catch (err) {
+    console.error('Deep analysis error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
 // CAMERA / OCR SCAN
 // ============================================
 
