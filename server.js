@@ -18,10 +18,19 @@ const supabase = createClient(
 );
 
 // Middleware
+const allowedOrigins = [
+  'http://localhost:3000',
+  'https://vantro-flow.vercel.app',
+  'https://vantro-flow-frontend.vercel.app'
+];
+if (process.env.ALLOWED_ORIGINS) {
+  process.env.ALLOWED_ORIGINS.split(',').forEach(o => {
+    const trimmed = o.trim();
+    if (trimmed && !allowedOrigins.includes(trimmed)) allowedOrigins.push(trimmed);
+  });
+}
 app.use(cors({
-  origin: process.env.ALLOWED_ORIGINS
-    ? process.env.ALLOWED_ORIGINS.split(',')
-    : ['http://localhost:3000', 'https://vantro-flow.vercel.app', 'https://vantro-flow-frontend.vercel.app'],
+  origin: allowedOrigins,
   methods: ['GET', 'POST'],
   allowedHeaders: ['Content-Type']
 }));
