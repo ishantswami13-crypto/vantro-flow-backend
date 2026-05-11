@@ -21,7 +21,7 @@ const supabase = createClient(
 app.use(cors({
   origin: process.env.ALLOWED_ORIGINS
     ? process.env.ALLOWED_ORIGINS.split(',')
-    : ['http://localhost:3000', 'https://vantro-flow.vercel.app'],
+    : ['http://localhost:3000', 'https://vantro-flow.vercel.app', 'https://vantro-flow-frontend.vercel.app'],
   methods: ['GET', 'POST'],
   allowedHeaders: ['Content-Type']
 }));
