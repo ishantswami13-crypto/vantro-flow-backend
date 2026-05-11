@@ -1350,6 +1350,11 @@ const AI_TOOLS = [
   { type:'function', function:{ name:'get_cash_forecast', description:'Get 3-scenario cash flow forecast for the next N days', parameters:{ type:'object', properties:{ days:{ type:'number', description:'Forecast horizon in days (14/30/60/90)' } } } } },
   { type:'function', function:{ name:'get_overdue', description:'Get customers with overdue invoices sorted by days overdue or amount', parameters:{ type:'object', properties:{ min_days:{ type:'number', description:'Minimum days overdue (e.g. 30)' } } } } },
   { type:'function', function:{ name:'navigate_to', description:'Navigate the user to a specific page in the app', parameters:{ type:'object', properties:{ page:{ type:'string', enum:['dashboard','payments','calls','priority','message','analytics','inventory','metrics','prospects','forecast','pricing'] }, reason:{ type:'string', description:'Why you are navigating there' } }, required:['page'] } } },
+  { type:'function', function:{ name:'get_suppliers', description:'Get all suppliers with name, phone, email, payment terms', parameters:{ type:'object', properties:{} } } },
+  { type:'function', function:{ name:'send_whatsapp', description:'Compose and prepare a WhatsApp message to any contact (customer or supplier). The message will be opened ready-to-send in WhatsApp.', parameters:{ type:'object', properties:{ to:{ type:'string', description:'Recipient name' }, phone:{ type:'string', description:'Phone number (digits only or with spaces)' }, message:{ type:'string', description:'The full message text — write it naturally in Hindi/English mix if appropriate' } }, required:['to','phone','message'] } } },
+  { type:'function', function:{ name:'send_collection_reminder', description:'Compose a tailored payment reminder WhatsApp message for an overdue customer', parameters:{ type:'object', properties:{ customer_name:{ type:'string' }, tone:{ type:'string', enum:['friendly','firm','urgent'], description:'Tone of the message' } }, required:['customer_name'] } } },
+  { type:'function', function:{ name:'send_bulk_reminders', description:'Prepare WhatsApp payment reminders for ALL overdue customers at once (or filtered by min days overdue)', parameters:{ type:'object', properties:{ min_days:{ type:'number', description:'Only customers overdue by at least this many days (default 1)' }, tone:{ type:'string', enum:['friendly','firm','urgent'] } } } } },
+  { type:'function', function:{ name:'place_order_with_supplier', description:'Create a purchase order for a supplier and compose a WhatsApp order message to them', parameters:{ type:'object', properties:{ supplier_name:{ type:'string', description:'Name of the supplier' }, items:{ type:'array', items:{ type:'object', properties:{ name:{type:'string'}, quantity:{type:'number'}, unit:{type:'string',description:'e.g. boxes, kg, units'} } }, description:'Items to order' }, notes:{ type:'string', description:'Any special instructions' } }, required:['supplier_name','items'] } } },
 ];
 
 async function groqChat(messages, tools, toolChoice = 'auto') {
@@ -1381,6 +1386,7 @@ After performing actions, summarise what you did clearly. Keep responses concise
   ];
 
   const actions = [];
+  const waLinks = [];
   let navigateTo = null;
 
   const executeTool = async (name, args) => {
@@ -1476,6 +1482,93 @@ After performing actions, summarise what you did clearly. Keep responses concise
           actions.push(`🧭 Navigating to ${args.page}`);
           return { success:true, navigating_to:args.page, reason:args.reason };
         }
+        case 'get_suppliers': {
+          const { data } = await supabase.from('suppliers').select('*').eq('user_id', user_id);
+          return data || [];
+        }
+        case 'send_whatsapp': {
+          const phone = String(args.phone||'').replace(/\D/g,'');
+          if (!phone) return { error: 'No phone number provided' };
+          const url = `https://wa.me/91${phone}?text=${encodeURIComponent(args.message)}`;
+          waLinks.push({ to: args.to, phone, message: args.message, url });
+          actions.push(`💬 WhatsApp ready for ${args.to}`);
+          return { success:true, whatsapp_url: url, to: args.to, message_preview: args.message.substring(0,80) };
+        }
+        case 'send_collection_reminder': {
+          // Fetch customer invoice data
+          const { data: inv } = await supabase.from('invoices').select('customer_name,customer_phone,invoice_amount,days_overdue').eq('user_id', user_id).ilike('customer_name', `%${args.customer_name}%`).eq('payment_status','Pending').order('days_overdue',{ascending:false}).limit(5);
+          if (!inv?.length) return { error: `No pending invoices found for ${args.customer_name}` };
+          const total = inv.reduce((s,i)=>s+Number(i.invoice_amount),0);
+          const maxOverdue = Math.max(...inv.map(i=>Number(i.days_overdue)));
+          const phone = String(inv[0].customer_phone||'').replace(/\D/g,'');
+          const name = inv[0].customer_name;
+          const tone = args.tone || 'friendly';
+          let msg;
+          if (tone === 'friendly') {
+            msg = `Namaste ${name} ji 🙏\n\nAapke account mein ₹${total.toLocaleString('en-IN')} outstanding hai (${maxOverdue} din se).\n\nKripya jaldi payment karlein. Koi problem ho toh batayein, hum help karenge.\n\nDhanyawaad 🙏\n— ${business_name || 'Vantro Flow'}`;
+          } else if (tone === 'firm') {
+            msg = `Dear ${name},\n\nYe aapko yaad dilaana hai ki ₹${total.toLocaleString('en-IN')} ki payment ${maxOverdue} din se pending hai.\n\nKripya aaj hi payment karein ya 2 din mein confirm karein.\n\n— ${business_name || 'Vantro Flow'}`;
+          } else {
+            msg = `URGENT: ${name} ji, ₹${total.toLocaleString('en-IN')} ki payment ${maxOverdue} din overdue hai. Aaj payment nahi hui toh delivery ruk sakti hai. Turant sampark karein.\n— ${business_name || 'Vantro Flow'}`;
+          }
+          const url = phone ? `https://wa.me/91${phone}?text=${encodeURIComponent(msg)}` : null;
+          if (url) { waLinks.push({ to: name, phone, message: msg, url }); actions.push(`💬 Reminder ready for ${name}`); }
+          return { success:true, customer: name, amount: `₹${total.toLocaleString('en-IN')}`, days_overdue: maxOverdue, message_preview: msg.substring(0,100), whatsapp_url: url, note: url ? 'WhatsApp link ready' : 'No phone number on file' };
+        }
+        case 'send_bulk_reminders': {
+          const minDays = args.min_days || 1;
+          const tone = args.tone || 'friendly';
+          const { data: inv } = await supabase.from('invoices').select('customer_name,customer_phone,invoice_amount,days_overdue').eq('user_id', user_id).eq('payment_status','Pending').gte('days_overdue', minDays).order('days_overdue',{ascending:false});
+          if (!inv?.length) return { message: 'No overdue invoices found matching criteria' };
+          // Group by customer
+          const custMap = {};
+          inv.forEach(i => {
+            if (!custMap[i.customer_name]) custMap[i.customer_name] = { name:i.customer_name, phone:i.customer_phone, total:0, maxOverdue:0 };
+            custMap[i.customer_name].total += Number(i.invoice_amount);
+            custMap[i.customer_name].maxOverdue = Math.max(custMap[i.customer_name].maxOverdue, Number(i.days_overdue));
+          });
+          const customers = Object.values(custMap);
+          let added = 0;
+          customers.forEach(c => {
+            const phone = String(c.phone||'').replace(/\D/g,'');
+            if (!phone) return;
+            let msg;
+            if (tone === 'urgent') {
+              msg = `URGENT: ${c.name} ji, ₹${c.total.toLocaleString('en-IN')} ki payment ${c.maxOverdue} din se overdue hai. Aaj payment karein.\n— ${business_name||''}`;
+            } else if (tone === 'firm') {
+              msg = `Dear ${c.name}, ₹${c.total.toLocaleString('en-IN')} ki payment ${c.maxOverdue} din se pending hai. Kripya jaldi karein.\n— ${business_name||''}`;
+            } else {
+              msg = `Namaste ${c.name} ji 🙏 ₹${c.total.toLocaleString('en-IN')} outstanding hai (${c.maxOverdue} din). Kripya payment karein. Dhanyawaad!\n— ${business_name||''}`;
+            }
+            waLinks.push({ to: c.name, phone, message: msg, url: `https://wa.me/91${phone}?text=${encodeURIComponent(msg)}` });
+            added++;
+          });
+          actions.push(`💬 ${added} WhatsApp reminders ready`);
+          return { success:true, total_customers: customers.length, reminders_prepared: added, no_phone: customers.length - added };
+        }
+        case 'place_order_with_supplier': {
+          // Find supplier
+          const { data: suppliers } = await supabase.from('suppliers').select('*').eq('user_id', user_id).ilike('name', `%${args.supplier_name}%`).limit(1);
+          const supplier = suppliers?.[0];
+          const phone = supplier?.phone ? String(supplier.phone).replace(/\D/g,'') : null;
+          // Compose order message
+          const itemLines = (args.items||[]).map(it=>`  • ${it.name} — ${it.quantity} ${it.unit||'units'}`).join('\n');
+          const totalItems = (args.items||[]).length;
+          const msg = `Namaste ${args.supplier_name} ji 🙏\n\nHumein aapki taraf se yeh order chahiye:\n\n${itemLines}\n\n${args.notes ? `Note: ${args.notes}\n\n` : ''}Kripya availability aur delivery time confirm karein.\n\nDhanyawaad!\n— ${business_name||'Vantro Flow'}`;
+          // Log as stock movement "ordered"
+          if (supplier) {
+            for (const item of (args.items||[])) {
+              const { data: prod } = await supabase.from('products').select('id,name').eq('user_id',user_id).ilike('name',`%${item.name}%`).limit(1);
+              if (prod?.[0]) {
+                await supabase.from('stock_movements').insert([{ user_id, product_id:prod[0].id, movement_type:'order', quantity:item.quantity, notes:`Order placed with ${args.supplier_name}${args.notes?'. '+args.notes:''}`, created_at:new Date() }]).catch(()=>{});
+              }
+            }
+          }
+          const url = phone ? `https://wa.me/91${phone}?text=${encodeURIComponent(msg)}` : null;
+          if (url) { waLinks.push({ to: args.supplier_name, phone, message: msg, url }); actions.push(`📦 Order WhatsApp ready for ${args.supplier_name}`); }
+          else { actions.push(`📦 Order composed for ${args.supplier_name} (no phone on file)`); }
+          return { success:true, supplier: args.supplier_name, items_ordered: totalItems, message_preview: msg.substring(0,120), whatsapp_url: url || 'No phone number on file for this supplier', order_logged: !!supplier };
+        }
         default: return { error:`Unknown tool: ${name}` };
       }
     } catch(err) { return { error: err.message }; }
@@ -1501,11 +1594,11 @@ After performing actions, summarise what you did clearly. Keep responses concise
         }
         chatMessages.push(...toolResults);
       } else {
-        return res.json({ success:true, message:msg.content, actions, navigate:navigateTo });
+        return res.json({ success:true, message:msg.content, actions, navigate:navigateTo, waLinks });
       }
     }
 
-    return res.json({ success:true, message:'Done! Let me know if you need anything else.', actions, navigate:navigateTo });
+    return res.json({ success:true, message:'Done! Let me know if you need anything else.', actions, navigate:navigateTo, waLinks });
   } catch(err) {
     console.error('AI chat error:', err);
     res.status(500).json({ error: err.message });
