@@ -1257,40 +1257,12 @@ app.get('/api/cash-forecast/:userId', async (req, res) => {
 // ============================================
 
 app.post('/api/migrate', async (req, res) => {
-  try {
-    // prospects table
-    await supabase.rpc('exec_sql', { sql: `
-      CREATE TABLE IF NOT EXISTS prospects (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        user_id UUID NOT NULL,
-        name TEXT NOT NULL,
-        phone TEXT,
-        email TEXT,
-        business_type TEXT DEFAULT 'Distributor',
-        location TEXT,
-        amount_stuck NUMERIC,
-        status TEXT DEFAULT 'cold',
-        trial_start_date DATE,
-        trial_end_date DATE,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      );
-    `}).catch(() => null);
-
-    await supabase.rpc('exec_sql', { sql: `
-      CREATE TABLE IF NOT EXISTS prospect_notes (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        prospect_id UUID NOT NULL REFERENCES prospects(id) ON DELETE CASCADE,
-        text TEXT NOT NULL,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
-    `}).catch(() => null);
-
-    // Try direct insert to test table existence
-    const { error: testErr } = await supabase.from('prospects').select('id').limit(1);
-    if (testErr && testErr.code === '42P01') {
-      return res.status(500).json({ error: 'Tables not created — please create them manually in Supabase dashboard', sql: `
-CREATE TABLE IF NOT EXISTS prospects (
+  const dbUrl = process.env.DATABASE_URL;
+  if (!dbUrl) {
+    return res.status(400).json({
+      error: 'DATABASE_URL not set',
+      instructions: 'Set DATABASE_URL in Railway environment variables to your Supabase PostgreSQL connection string (find it at: Supabase dashboard → Settings → Database → Connection string → URI mode)',
+      sql: `CREATE TABLE IF NOT EXISTS prospects (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL,
   name TEXT NOT NULL,
@@ -1310,11 +1282,52 @@ CREATE TABLE IF NOT EXISTS prospect_notes (
   prospect_id UUID NOT NULL REFERENCES prospects(id) ON DELETE CASCADE,
   text TEXT NOT NULL,
   created_at TIMESTAMPTZ DEFAULT NOW()
-);`});
-    }
+);
+CREATE INDEX IF NOT EXISTS idx_prospects_user_id ON prospects(user_id);
+CREATE INDEX IF NOT EXISTS idx_prospect_notes_prospect_id ON prospect_notes(prospect_id);`
+    });
+  }
 
-    res.json({ success: true, message: 'Migration complete — prospects & prospect_notes tables ready' });
+  let client;
+  try {
+    const { Client } = require('pg');
+    client = new Client({ connectionString: dbUrl, ssl: { rejectUnauthorized: false } });
+    await client.connect();
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS prospects (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL,
+        name TEXT NOT NULL,
+        phone TEXT,
+        email TEXT,
+        business_type TEXT DEFAULT 'Distributor',
+        location TEXT,
+        amount_stuck NUMERIC,
+        status TEXT DEFAULT 'cold',
+        trial_start_date DATE,
+        trial_end_date DATE,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS prospect_notes (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        prospect_id UUID NOT NULL REFERENCES prospects(id) ON DELETE CASCADE,
+        text TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_prospects_user_id ON prospects(user_id)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_prospect_notes_prospect_id ON prospect_notes(prospect_id)`);
+
+    await client.end();
+    res.json({ success: true, message: '✅ Migration complete — prospects & prospect_notes tables created' });
   } catch (err) {
+    if (client) await client.end().catch(() => {});
     res.status(500).json({ error: err.message });
   }
 });
