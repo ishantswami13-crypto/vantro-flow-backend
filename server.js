@@ -1335,6 +1335,184 @@ CREATE INDEX IF NOT EXISTS idx_prospect_notes_prospect_id ON prospect_notes(pros
 });
 
 // ============================================
+// AI CHAT ASSISTANT (Groq tool-calling — free)
+// ============================================
+
+const AI_TOOLS = [
+  { type:'function', function:{ name:'get_summary', description:'Get business overview: total invoices, outstanding amount, recovery rate, total customers', parameters:{ type:'object', properties:{} } } },
+  { type:'function', function:{ name:'get_invoices', description:'Get invoices list, optionally filtered by status or customer name', parameters:{ type:'object', properties:{ status:{ type:'string', description:'Pending, Paid, or all' }, customer_name:{ type:'string', description:'Filter by customer (partial match)' }, limit:{ type:'number', description:'Max records to return' } } } } },
+  { type:'function', function:{ name:'mark_invoice_paid', description:'Mark a specific invoice as paid using invoice_id or customer_name (marks the most overdue one)', parameters:{ type:'object', properties:{ invoice_id:{ type:'string' }, customer_name:{ type:'string' } } } } },
+  { type:'function', function:{ name:'get_prospects', description:'Get CRM prospects, optionally filtered by stage', parameters:{ type:'object', properties:{ status:{ type:'string', description:'cold, contacted, trial, engaged, paid, churned, or all' } } } } },
+  { type:'function', function:{ name:'add_prospect', description:'Add a new prospect to the CRM pipeline', parameters:{ type:'object', properties:{ name:{ type:'string' }, phone:{ type:'string' }, business_type:{ type:'string' }, location:{ type:'string' }, amount_stuck:{ type:'number' } }, required:['name'] } } },
+  { type:'function', function:{ name:'update_prospect_status', description:'Move a prospect to a different CRM stage', parameters:{ type:'object', properties:{ prospect_name:{ type:'string', description:'Name of the prospect to update' }, status:{ type:'string', enum:['cold','contacted','trial','engaged','paid','churned'] } }, required:['prospect_name','status'] } } },
+  { type:'function', function:{ name:'get_inventory', description:'Get product inventory levels, low stock alerts, and stock value', parameters:{ type:'object', properties:{} } } },
+  { type:'function', function:{ name:'get_calls', description:'Get recent call history and performance stats', parameters:{ type:'object', properties:{ limit:{ type:'number' } } } } },
+  { type:'function', function:{ name:'get_cash_forecast', description:'Get 3-scenario cash flow forecast for the next N days', parameters:{ type:'object', properties:{ days:{ type:'number', description:'Forecast horizon in days (14/30/60/90)' } } } } },
+  { type:'function', function:{ name:'get_overdue', description:'Get customers with overdue invoices sorted by days overdue or amount', parameters:{ type:'object', properties:{ min_days:{ type:'number', description:'Minimum days overdue (e.g. 30)' } } } } },
+  { type:'function', function:{ name:'navigate_to', description:'Navigate the user to a specific page in the app', parameters:{ type:'object', properties:{ page:{ type:'string', enum:['dashboard','payments','calls','priority','message','analytics','inventory','metrics','prospects','forecast','pricing'] }, reason:{ type:'string', description:'Why you are navigating there' } }, required:['page'] } } },
+];
+
+async function groqChat(messages, tools, toolChoice = 'auto') {
+  const body = { model:'llama-3.3-70b-versatile', max_tokens:1500, temperature:0.2, messages };
+  if (tools?.length) { body.tools = tools; body.tool_choice = toolChoice; }
+  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method:'POST',
+    headers:{ 'Content-Type':'application/json', 'Authorization':`Bearer ${process.env.GROQ_API_KEY}` },
+    body: JSON.stringify(body)
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error?.message || 'Groq error');
+  return data.choices[0];
+}
+
+app.post('/api/ai-chat', async (req, res) => {
+  const { user_id, messages, business_name } = req.body;
+  if (!user_id || !messages) return res.status(400).json({ error: 'Missing user_id or messages' });
+
+  const system = `You are Vantro AI, an intelligent business assistant built into the Vantro Flow app for ${business_name || 'this business'}. You help Indian MSME distributors manage collections, invoices, CRM prospects, inventory, and cash flow.
+
+You have tools to: fetch data, mark invoices as paid, add/update prospects, get forecasts, and navigate pages.
+Always be helpful, specific, and use rupee (₹) formatting. When asked to do something, use tools to actually do it — don't just explain.
+After performing actions, summarise what you did clearly. Keep responses concise and friendly.`;
+
+  const chatMessages = [
+    { role:'system', content: system },
+    ...messages
+  ];
+
+  const actions = [];
+  let navigateTo = null;
+
+  const executeTool = async (name, args) => {
+    try {
+      switch(name) {
+        case 'get_summary': {
+          const { data:inv } = await supabase.from('invoices').select('invoice_amount,payment_status,days_overdue').eq('user_id', user_id);
+          const safe = inv || [];
+          const paid = safe.filter(i=>i.payment_status==='Paid');
+          const pending = safe.filter(i=>i.payment_status!=='Paid');
+          const outstanding = pending.reduce((s,i)=>s+Number(i.invoice_amount),0);
+          const recovered = paid.reduce((s,i)=>s+Number(i.invoice_amount),0);
+          const { data:cust } = await supabase.from('invoices').select('customer_name').eq('user_id',user_id);
+          const uniqueCustomers = new Set((cust||[]).map(c=>c.customer_name)).size;
+          return { total_invoices:safe.length, paid:paid.length, pending:pending.length, outstanding:`₹${outstanding.toLocaleString('en-IN')}`, recovered:`₹${recovered.toLocaleString('en-IN')}`, recovery_rate:`${safe.length?Math.round(paid.length/safe.length*100):0}%`, total_customers:uniqueCustomers };
+        }
+        case 'get_invoices': {
+          let q = supabase.from('invoices').select('id,customer_name,customer_phone,invoice_amount,payment_status,days_overdue,invoice_date').eq('user_id',user_id);
+          if (args.status && args.status!=='all') q = q.eq('payment_status', args.status);
+          if (args.customer_name) q = q.ilike('customer_name', `%${args.customer_name}%`);
+          q = q.order('days_overdue',{ascending:false}).limit(args.limit||20);
+          const { data } = await q;
+          return data || [];
+        }
+        case 'mark_invoice_paid': {
+          let inv;
+          if (args.invoice_id) {
+            const { data } = await supabase.from('invoices').select('id,customer_name,invoice_amount').eq('id',args.invoice_id).single();
+            inv = data;
+          } else if (args.customer_name) {
+            const { data } = await supabase.from('invoices').select('id,customer_name,invoice_amount').eq('user_id',user_id).ilike('customer_name',`%${args.customer_name}%`).eq('payment_status','Pending').order('days_overdue',{ascending:false}).limit(1);
+            inv = data?.[0];
+          }
+          if (!inv) return { error: 'Invoice not found' };
+          await supabase.from('invoices').update({ payment_status:'Paid', payment_date:new Date().toISOString().split('T')[0], payment_amount:inv.invoice_amount }).eq('id',inv.id);
+          actions.push(`✅ Marked ${inv.customer_name} invoice (₹${Number(inv.invoice_amount).toLocaleString('en-IN')}) as paid`);
+          return { success:true, message:`Marked ${inv.customer_name} as paid`, amount:inv.invoice_amount };
+        }
+        case 'get_prospects': {
+          let q = supabase.from('prospects').select('id,name,phone,status,business_type,location,amount_stuck,created_at').eq('user_id',user_id);
+          if (args.status && args.status!=='all') q = q.eq('status',args.status);
+          const { data } = await q.order('created_at',{ascending:false});
+          return data || [];
+        }
+        case 'add_prospect': {
+          const { data, error } = await supabase.from('prospects').insert([{ user_id, name:args.name, phone:args.phone||null, business_type:args.business_type||'Distributor', location:args.location||null, amount_stuck:args.amount_stuck||null, status:'cold' }]).select();
+          if (error) return { error: error.message };
+          actions.push(`➕ Added prospect: ${args.name} to CRM`);
+          return { success:true, prospect: data[0] };
+        }
+        case 'update_prospect_status': {
+          const { data:prospects } = await supabase.from('prospects').select('id,name,status').eq('user_id',user_id).ilike('name',`%${args.prospect_name}%`).limit(1);
+          const p = prospects?.[0];
+          if (!p) return { error: `Prospect "${args.prospect_name}" not found` };
+          const updates = { status:args.status, updated_at:new Date() };
+          if (args.status==='trial') { updates.trial_start_date=new Date().toISOString().split('T')[0]; const e=new Date(); e.setDate(e.getDate()+14); updates.trial_end_date=e.toISOString().split('T')[0]; }
+          await supabase.from('prospects').update(updates).eq('id',p.id);
+          actions.push(`🔄 Moved ${p.name} → ${args.status}`);
+          return { success:true, message:`${p.name} moved to ${args.status}` };
+        }
+        case 'get_inventory': {
+          const { data:products } = await supabase.from('products').select('*').eq('user_id',user_id);
+          const prd = products||[];
+          const lowStock = prd.filter(p=>p.current_stock>0&&p.current_stock<=p.low_stock_alert);
+          const outOfStock = prd.filter(p=>p.current_stock===0);
+          const stockValue = prd.reduce((s,p)=>s+(Number(p.unit_price)*Number(p.current_stock)),0);
+          return { total_products:prd.length, stock_value:`₹${stockValue.toLocaleString('en-IN')}`, low_stock:lowStock.map(p=>({name:p.name,stock:p.current_stock,alert:p.low_stock_alert})), out_of_stock:outOfStock.map(p=>p.name), products:prd.map(p=>({name:p.name,stock:p.current_stock,unit_price:`₹${p.unit_price}`})) };
+        }
+        case 'get_calls': {
+          const { data } = await supabase.from('call_logs').select('customer_name,did_pick_up,notes,promised_payment_date,created_at').eq('user_id',user_id).order('created_at',{ascending:false}).limit(args.limit||15);
+          const cls = data||[];
+          const pickupRate = cls.length ? Math.round(cls.filter(c=>c.did_pick_up).length/cls.length*100) : 0;
+          return { total:cls.length, pickup_rate:`${pickupRate}%`, promises:cls.filter(c=>c.promised_payment_date).length, recent:cls.slice(0,10) };
+        }
+        case 'get_cash_forecast': {
+          const days = args.days||30;
+          const { data:invoices } = await supabase.from('invoices').select('invoice_amount,payment_status,payment_date').eq('user_id',user_id);
+          const safe = invoices||[];
+          const paid = safe.filter(i=>i.payment_status==='Paid'&&i.payment_date);
+          const totalRecovered = paid.reduce((s,i)=>s+Number(i.invoice_amount),0);
+          const outstanding = safe.filter(i=>i.payment_status!=='Paid').reduce((s,i)=>s+Number(i.invoice_amount),0);
+          const avgDaily = paid.length>0?Math.round(totalRecovered/90):Math.round(outstanding*0.03);
+          return { forecast_days:days, avg_daily_collections:`₹${avgDaily.toLocaleString('en-IN')}`, total_outstanding:`₹${outstanding.toLocaleString('en-IN')}`, pessimistic_day_n:`₹${Math.round(avgDaily*0.5*days).toLocaleString('en-IN')}`, expected_day_n:`₹${Math.round(avgDaily*0.8*days).toLocaleString('en-IN')}`, optimistic_day_n:`₹${Math.round(avgDaily*0.95*days).toLocaleString('en-IN')}` };
+        }
+        case 'get_overdue': {
+          let q = supabase.from('invoices').select('customer_name,customer_phone,invoice_amount,days_overdue').eq('user_id',user_id).eq('payment_status','Pending').order('days_overdue',{ascending:false});
+          if (args.min_days) q = q.gte('days_overdue',args.min_days);
+          const { data } = await q.limit(20);
+          return data||[];
+        }
+        case 'navigate_to': {
+          navigateTo = args.page;
+          actions.push(`🧭 Navigating to ${args.page}`);
+          return { success:true, navigating_to:args.page, reason:args.reason };
+        }
+        default: return { error:`Unknown tool: ${name}` };
+      }
+    } catch(err) { return { error: err.message }; }
+  };
+
+  try {
+    let iteration = 0;
+    const maxIter = 5;
+
+    while (iteration < maxIter) {
+      iteration++;
+      const choice = await groqChat(chatMessages, AI_TOOLS);
+      const msg = choice.message;
+      chatMessages.push(msg);
+
+      if (choice.finish_reason === 'tool_calls' && msg.tool_calls?.length) {
+        const toolResults = [];
+        for (const tc of msg.tool_calls) {
+          let args = {};
+          try { args = JSON.parse(tc.function.arguments||'{}'); } catch(e) {}
+          const result = await executeTool(tc.function.name, args);
+          toolResults.push({ role:'tool', tool_call_id:tc.id, content:JSON.stringify(result) });
+        }
+        chatMessages.push(...toolResults);
+      } else {
+        return res.json({ success:true, message:msg.content, actions, navigate:navigateTo });
+      }
+    }
+
+    return res.json({ success:true, message:'Done! Let me know if you need anything else.', actions, navigate:navigateTo });
+  } catch(err) {
+    console.error('AI chat error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
 // START SERVER
 // ============================================
 
