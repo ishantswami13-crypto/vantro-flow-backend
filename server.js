@@ -26,19 +26,22 @@ const supabase = createClient(
 );
 
 // Middleware
-const allowedOrigins = [
-  'http://localhost:3000',
-  'https://vantro-flow.vercel.app',
-  'https://vantro-flow-frontend.vercel.app'
-];
-if (process.env.ALLOWED_ORIGINS) {
-  process.env.ALLOWED_ORIGINS.split(',').forEach(o => {
-    const trimmed = o.trim();
-    if (trimmed && !allowedOrigins.includes(trimmed)) allowedOrigins.push(trimmed);
-  });
-}
+const extraOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim()).filter(Boolean)
+  : [];
+
 app.use(cors({
-  origin: allowedOrigins,
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, Postman, server-to-server)
+    if (!origin) return callback(null, true);
+    // Allow localhost dev
+    if (origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1')) return callback(null, true);
+    // Allow all Vercel preview and production URLs
+    if (origin.endsWith('.vercel.app')) return callback(null, true);
+    // Allow any explicitly listed extra origins
+    if (extraOrigins.includes(origin)) return callback(null, true);
+    callback(new Error(`CORS: origin ${origin} not allowed`));
+  },
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
