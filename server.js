@@ -6,7 +6,15 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const cron = require('node-cron');
+const rateLimit = require('express-rate-limit');
+const Razorpay = require('razorpay');
+const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
+
+const JWT_SECRET = process.env.JWT_SECRET || 'vantro-dev-secret-change-in-prod';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -31,10 +39,36 @@ if (process.env.ALLOWED_ORIGINS) {
 }
 app.use(cors({
   origin: allowedOrigins,
-  methods: ['GET', 'POST'],
-  allowedHeaders: ['Content-Type']
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
 }));
-app.use(express.json());
+app.options('*', cors());
+app.use(express.json({ limit: '10mb' }));
+
+// Rate limiting
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Too many attempts, try again later' } });
+const apiLimiter  = rateLimit({ windowMs: 60 * 1000, max: 120, message: { error: 'Rate limit exceeded' } });
+app.use('/api/auth', authLimiter);
+app.use('/api', apiLimiter);
+
+// JWT middleware — attach user to req if token valid
+function authMiddleware(req, res, next) {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing token' });
+  try {
+    req.user = jwt.verify(header.slice(7), JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
+
+// Razorpay instance (initialised lazily so missing keys don't crash startup)
+let razorpay = null;
+if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
+  razorpay = new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET });
+}
 
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -44,20 +78,25 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 app.post('/api/auth/signup', async (req, res) => {
   try {
-    const { email, phone, business_name } = req.body;
-
-    if (!email || !phone || !business_name) {
-      return res.status(400).json({ error: 'Missing required fields' });
+    const { email, phone, business_name, password } = req.body;
+    if (!email || !phone || !business_name || !password) {
+      return res.status(400).json({ error: 'All fields are required' });
     }
+    if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
 
+    const { data: existing } = await supabase.from('users').select('id').eq('email', email).maybeSingle();
+    if (existing) return res.status(409).json({ error: 'Email already registered' });
+
+    const password_hash = await bcrypt.hash(password, 10);
     const { data, error } = await supabase
       .from('users')
-      .insert([{ email, phone, business_name, created_at: new Date() }])
-      .select();
-
+      .insert([{ email, phone, business_name, password_hash, plan: 'free', created_at: new Date() }])
+      .select('id, email, phone, business_name, plan, created_at');
     if (error) throw error;
 
-    res.json({ success: true, user: data[0] });
+    const user = data[0];
+    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ success: true, token, user });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -65,18 +104,36 @@ app.post('/api/auth/signup', async (req, res) => {
 
 app.post('/api/auth/login', async (req, res) => {
   try {
-    const { email } = req.body;
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
     const { data, error } = await supabase
       .from('users')
-      .select('*')
+      .select('id, email, phone, business_name, plan, password_hash, created_at')
       .eq('email', email)
+      .maybeSingle();
+
+    if (error || !data) return res.status(401).json({ error: 'Invalid email or password' });
+
+    const valid = await bcrypt.compare(password, data.password_hash || '');
+    if (!valid) return res.status(401).json({ error: 'Invalid email or password' });
+
+    const { password_hash, ...user } = data;
+    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ success: true, token, user });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/auth/me', authMiddleware, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .select('id, email, phone, business_name, plan, gstin, created_at')
+      .eq('id', req.user.userId)
       .single();
-
-    if (error || !data) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
+    if (error || !data) return res.status(404).json({ error: 'User not found' });
     res.json({ success: true, user: data });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1604,6 +1661,205 @@ After performing actions, summarise what you did clearly. Keep responses concise
     res.status(500).json({ error: err.message });
   }
 });
+
+// ============================================
+// RAZORPAY BILLING
+// ============================================
+
+const PLANS = {
+  starter: { name: 'Vantro Starter', amount_monthly: 99900,  amount_annual: 95904  },
+  growth:  { name: 'Vantro Growth',  amount_monthly: 249900, amount_annual: 239904 },
+  pro:     { name: 'Vantro Pro',     amount_monthly: 499900, amount_annual: 479904 },
+};
+
+app.post('/api/billing/create-order', authMiddleware, async (req, res) => {
+  try {
+    if (!razorpay) return res.status(503).json({ error: 'Payment gateway not configured' });
+    const { plan, period } = req.body;
+    if (!PLANS[plan]) return res.status(400).json({ error: 'Invalid plan' });
+
+    const amount = period === 'annual' ? PLANS[plan].amount_annual : PLANS[plan].amount_monthly;
+    const order = await razorpay.orders.create({
+      amount,
+      currency: 'INR',
+      receipt: `vantro_${req.user.userId}_${Date.now()}`,
+      notes: { userId: req.user.userId, plan, period },
+    });
+    res.json({ success: true, order, key: process.env.RAZORPAY_KEY_ID });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/billing/verify', authMiddleware, async (req, res) => {
+  try {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, plan } = req.body;
+    const body = razorpay_order_id + '|' + razorpay_payment_id;
+    const expectedSig = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET || '').update(body).digest('hex');
+
+    if (expectedSig !== razorpay_signature) return res.status(400).json({ error: 'Payment verification failed' });
+
+    await supabase.from('users').update({ plan, plan_updated_at: new Date() }).eq('id', req.user.userId);
+    await supabase.from('billing_history').insert([{
+      user_id: req.user.userId, plan, payment_id: razorpay_payment_id,
+      order_id: razorpay_order_id, status: 'paid', created_at: new Date(),
+    }]);
+    res.json({ success: true, message: 'Payment verified, plan upgraded' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/billing/history', authMiddleware, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('billing_history')
+      .select('*').eq('user_id', req.user.userId).order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json({ success: true, history: data || [] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// SETTINGS
+// ============================================
+
+app.get('/api/settings', authMiddleware, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('users')
+      .select('id, email, phone, business_name, gstin, plan, whatsapp_phone, whatsapp_token, logo_url, address, created_at')
+      .eq('id', req.user.userId).single();
+    if (error) throw error;
+    res.json({ success: true, settings: data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.patch('/api/settings', authMiddleware, async (req, res) => {
+  try {
+    const allowed = ['business_name', 'phone', 'gstin', 'address', 'logo_url', 'whatsapp_phone', 'whatsapp_token'];
+    const updates = {};
+    allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
+    updates.updated_at = new Date();
+    const { data, error } = await supabase.from('users').update(updates).eq('id', req.user.userId).select('id, email, phone, business_name, gstin, plan');
+    if (error) throw error;
+    res.json({ success: true, settings: data[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// DUNNING RULES
+// ============================================
+
+app.get('/api/dunning/:userId', async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('dunning_rules')
+      .select('*').eq('user_id', req.params.userId).order('trigger_day');
+    if (error) throw error;
+    res.json({ success: true, rules: data || [] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/dunning', async (req, res) => {
+  try {
+    const { user_id, name, trigger_day, action, tone, enabled } = req.body;
+    if (!user_id || !trigger_day || !action) return res.status(400).json({ error: 'Missing required fields' });
+    const { data, error } = await supabase.from('dunning_rules')
+      .insert([{ user_id, name: name || `Day ${trigger_day} Follow-Up`, trigger_day, action, tone: tone || 'gentle', enabled: enabled !== false }])
+      .select();
+    if (error) throw error;
+    res.json({ success: true, rule: data[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.patch('/api/dunning/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updates = { ...req.body, updated_at: new Date() };
+    const { data, error } = await supabase.from('dunning_rules').update(updates).eq('id', id).select();
+    if (error) throw error;
+    res.json({ success: true, rule: data[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/dunning/:id', async (req, res) => {
+  try {
+    const { error } = await supabase.from('dunning_rules').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// DUNNING CRON — runs every day at 9:00 AM IST
+// ============================================
+
+async function runDunningCycle() {
+  console.log('🔔 Dunning cron started:', new Date().toISOString());
+  try {
+    // Get all active dunning rules
+    const { data: allRules } = await supabase.from('dunning_rules').select('*').eq('enabled', true);
+    if (!allRules?.length) return;
+
+    // Get all pending invoices
+    const { data: invoices } = await supabase
+      .from('invoices').select('id, user_id, customer_name, customer_phone, invoice_amount, days_overdue')
+      .eq('payment_status', 'Pending').gt('days_overdue', 0);
+    if (!invoices?.length) return;
+
+    // Get user business names
+    const userIds = [...new Set(invoices.map(i => i.user_id))];
+    const { data: users } = await supabase.from('users').select('id, business_name').in('id', userIds);
+    const userMap = {};
+    (users || []).forEach(u => { userMap[u.id] = u; });
+
+    let sent = 0;
+    for (const invoice of invoices) {
+      const rules = allRules.filter(r => r.user_id === invoice.user_id && r.trigger_day === invoice.days_overdue);
+      for (const rule of rules) {
+        if (!invoice.customer_phone) continue;
+        const biz = userMap[invoice.user_id]?.business_name || 'Collections Team';
+        const phone = String(invoice.customer_phone).replace(/\D/g, '');
+        let msg = '';
+        if (rule.tone === 'gentle') {
+          msg = `Namaste ${invoice.customer_name} ji 🙏\n\n₹${Number(invoice.invoice_amount).toLocaleString('en-IN')} ka payment ${invoice.days_overdue} din se pending hai.\n\nKripya is hafte payment karein.\n— ${biz}`;
+        } else if (rule.tone === 'firm') {
+          msg = `Dear ${invoice.customer_name},\n\n₹${Number(invoice.invoice_amount).toLocaleString('en-IN')} payment is ${invoice.days_overdue} days overdue. Please pay within 3 days.\n— ${biz}`;
+        } else {
+          msg = `URGENT: ${invoice.customer_name} — ₹${Number(invoice.invoice_amount).toLocaleString('en-IN')} overdue ${invoice.days_overdue} days. Immediate action required.\n— ${biz}`;
+        }
+
+        // Log the dunning action
+        await supabase.from('dunning_logs').insert([{
+          user_id: invoice.user_id, rule_id: rule.id, invoice_id: invoice.id,
+          customer_name: invoice.customer_name, action: rule.action,
+          message: msg, whatsapp_url: `https://wa.me/91${phone}?text=${encodeURIComponent(msg)}`,
+          sent_at: new Date(),
+        }]).catch(() => {});
+
+        sent++;
+      }
+    }
+    console.log(`✅ Dunning cycle done — ${sent} actions logged`);
+  } catch (err) {
+    console.error('Dunning cron error:', err.message);
+  }
+}
+
+// Run daily at 9 AM IST (UTC+5:30 = 3:30 AM UTC)
+cron.schedule('30 3 * * *', runDunningCycle, { timezone: 'UTC' });
 
 // ============================================
 // START SERVER
