@@ -144,6 +144,80 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
 });
 
 // ============================================
+// FORGOT PASSWORD
+// ============================================
+
+app.post('/api/auth/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+
+    const { data: user } = await supabase.from('users').select('id, email, business_name').eq('email', email).maybeSingle();
+    // Always respond success to prevent email enumeration
+    if (!user) return res.json({ success: true, message: 'If that email exists, an OTP has been sent.' });
+
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    const expires_at = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+    // Invalidate previous tokens for this email
+    await supabase.from('password_reset_tokens').update({ used: true }).eq('email', email).eq('used', false);
+    await supabase.from('password_reset_tokens').insert([{ email, otp, expires_at }]);
+
+    // Send via Resend if configured, else log to console (dev mode)
+    const RESEND_API_KEY = process.env.RESEND_API_KEY;
+    if (RESEND_API_KEY) {
+      await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_API_KEY}` },
+        body: JSON.stringify({
+          from: 'Vantro Flow <noreply@vantroflow.com>',
+          to: email,
+          subject: `Your Vantro OTP: ${otp}`,
+          html: `<p>Hi ${user.business_name},</p><p>Your OTP to reset your Vantro Flow password is: <strong style="font-size:24px">${otp}</strong></p><p>Valid for 15 minutes. Do not share this with anyone.</p>`
+        })
+      });
+    } else {
+      console.log(`[DEV] Password reset OTP for ${email}: ${otp}`);
+    }
+
+    res.json({ success: true, message: 'If that email exists, an OTP has been sent.' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { email, otp, new_password } = req.body;
+    if (!email || !otp || !new_password) return res.status(400).json({ error: 'Email, OTP, and new password required' });
+    if (new_password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+
+    const { data: token } = await supabase
+      .from('password_reset_tokens')
+      .select('*')
+      .eq('email', email)
+      .eq('otp', otp)
+      .eq('used', false)
+      .gte('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!token) return res.status(400).json({ error: 'Invalid or expired OTP' });
+
+    const password_hash = await bcrypt.hash(new_password, 10);
+    await Promise.all([
+      supabase.from('users').update({ password_hash }).eq('email', email),
+      supabase.from('password_reset_tokens').update({ used: true }).eq('id', token.id)
+    ]);
+
+    res.json({ success: true, message: 'Password reset successfully. Please log in.' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
 // CSV UPLOAD & INVOICE PROCESSING
 // ============================================
 
@@ -1434,11 +1508,29 @@ app.post('/api/ai-chat', async (req, res) => {
   const { user_id, messages, business_name } = req.body;
   if (!user_id || !messages) return res.status(400).json({ error: 'Missing user_id or messages' });
 
+  // Pre-fetch top 5 overdue invoices so first response is instant and data-aware
+  let overdueContext = '';
+  try {
+    const { data: topInvoices } = await supabase
+      .from('invoices')
+      .select('customer_name, invoice_amount, days_overdue, customer_phone')
+      .eq('user_id', user_id)
+      .eq('payment_status', 'Pending')
+      .order('days_overdue', { ascending: false })
+      .limit(5);
+
+    if (topInvoices && topInvoices.length > 0) {
+      overdueContext = `\n\nTop overdue customers right now:\n${topInvoices.map(i =>
+        `- ${i.customer_name}: ₹${Number(i.invoice_amount).toLocaleString('en-IN')} (${i.days_overdue} days overdue${i.customer_phone ? ', phone: ' + i.customer_phone : ''})`
+      ).join('\n')}`;
+    }
+  } catch (_) {}
+
   const system = `You are Vantro AI, an intelligent business assistant built into the Vantro Flow app for ${business_name || 'this business'}. You help Indian MSME distributors manage collections, invoices, CRM prospects, inventory, and cash flow.
 
 You have tools to: fetch data, mark invoices as paid, add/update prospects, get forecasts, and navigate pages.
 Always be helpful, specific, and use rupee (₹) formatting. When asked to do something, use tools to actually do it — don't just explain.
-After performing actions, summarise what you did clearly. Keep responses concise and friendly.`;
+After performing actions, summarise what you did clearly. Keep responses concise and friendly. Speak in Hinglish when appropriate.${overdueContext}`;
 
   const chatMessages = [
     { role:'system', content: system },
@@ -1742,7 +1834,7 @@ app.get('/api/settings', authMiddleware, async (req, res) => {
 
 app.patch('/api/settings', authMiddleware, async (req, res) => {
   try {
-    const allowed = ['business_name', 'phone', 'gstin', 'address', 'logo_url', 'whatsapp_phone', 'whatsapp_token'];
+    const allowed = ['business_name', 'phone', 'gstin', 'address', 'logo_url', 'whatsapp_phone', 'whatsapp_token', 'industry', 'language', 'contact_time'];
     const updates = {};
     allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
     updates.updated_at = new Date();
@@ -1863,6 +1955,70 @@ async function runDunningCycle() {
 
 // Run daily at 9 AM IST (UTC+5:30 = 3:30 AM UTC)
 cron.schedule('30 3 * * *', runDunningCycle, { timezone: 'UTC' });
+
+// ============================================
+// ADMIN ANALYTICS (founder-only)
+// ============================================
+
+function adminOnly(req, res, next) {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing token' });
+  try {
+    const decoded = jwt.verify(header.slice(7), JWT_SECRET);
+    const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim());
+    if (!ADMIN_EMAILS.includes(decoded.email)) return res.status(403).json({ error: 'Forbidden' });
+    req.user = decoded;
+    next();
+  } catch {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+app.get('/api/admin/stats', adminOnly, async (req, res) => {
+  try {
+    const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
+    const oneDayAgo    = new Date(Date.now() - 86400000).toISOString();
+
+    const [
+      { data: allUsers },
+      { data: recentSignups },
+      { data: todaySignups },
+      { data: allInvoices },
+      { data: paidBilling },
+    ] = await Promise.all([
+      supabase.from('users').select('id, email, business_name, plan, created_at'),
+      supabase.from('users').select('id').gte('created_at', sevenDaysAgo),
+      supabase.from('users').select('id').gte('created_at', oneDayAgo),
+      supabase.from('invoices').select('id, user_id, created_at'),
+      supabase.from('billing_records').select('amount').eq('status', 'paid'),
+    ]);
+
+    const safe = (d) => d || [];
+    const mrr = safe(paidBilling).reduce((s, b) => s + Number(b.amount || 0), 0) / 100;
+    const paidUsers = safe(allUsers).filter(u => u.plan && u.plan !== 'free').length;
+    const usersWithInvoices = new Set(safe(allInvoices).map(i => i.user_id)).size;
+
+    res.json({
+      success: true,
+      stats: {
+        total_users: safe(allUsers).length,
+        signups_last_7d: safe(recentSignups).length,
+        signups_today: safe(todaySignups).length,
+        paid_users: paidUsers,
+        free_users: safe(allUsers).length - paidUsers,
+        users_with_data: usersWithInvoices,
+        total_invoices: safe(allInvoices).length,
+        mrr_inr: mrr,
+        recent_signups: safe(allUsers)
+          .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+          .slice(0, 10)
+          .map(u => ({ email: u.email, business: u.business_name, plan: u.plan, joined: u.created_at })),
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // ============================================
 // START SERVER
