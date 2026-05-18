@@ -2021,6 +2021,69 @@ app.get('/api/admin/stats', adminOnly, async (req, res) => {
 });
 
 // ============================================
+// PUBLIC BUSINESS PROFILE — no auth required
+// ============================================
+
+app.get('/api/public/profile/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const [{ data: user }, { data: invoices }, { data: callLogs }] = await Promise.all([
+      supabase.from('users').select('id, business_name, plan, created_at, gstin').eq('id', userId).single(),
+      supabase.from('invoices').select('invoice_amount, payment_status, days_overdue, customer_name').eq('user_id', userId),
+      supabase.from('call_logs').select('id').eq('user_id', userId),
+    ]);
+
+    if (!user) return res.status(404).json({ error: 'Business not found' });
+
+    const safe = invoices || [];
+    const totalInvoices   = safe.length;
+    const paidInvoices    = safe.filter(i => i.payment_status === 'Paid').length;
+    const totalManaged    = safe.reduce((s, i) => s + i.invoice_amount, 0);
+    const recoveryRate    = totalInvoices > 0 ? Math.round((paidInvoices / totalInvoices) * 100) : 0;
+    const totalCustomers  = new Set(safe.map(i => i.customer_name)).size;
+    const memberDays      = Math.floor((Date.now() - new Date(user.created_at)) / 86400000);
+
+    // Trust Score: weighted formula (max 100)
+    const recScore   = recoveryRate * 0.40;
+    const volScore   = Math.min(totalInvoices, 100) / 100 * 100 * 0.20;
+    const ageScore   = Math.min(memberDays, 365) / 365 * 100 * 0.20;
+    const callScore  = Math.min((callLogs || []).length, 50) / 50 * 100 * 0.20;
+    const trustScore = Math.round(recScore + volScore + ageScore + callScore);
+
+    // Vantro ID: VAN- + first 8 chars of userId
+    const vantroId = 'VAN-' + userId.replace(/-/g, '').slice(0, 8).toUpperCase();
+
+    // Badges
+    const badges = [];
+    if (totalInvoices >= 10) badges.push('Active Business');
+    if (recoveryRate >= 60)  badges.push('Strong Collector');
+    if (memberDays  >= 30)   badges.push('Verified Member');
+    if (user.gstin)          badges.push('GST Registered');
+    if (trustScore  >= 70)   badges.push('Trusted Partner');
+
+    res.json({
+      success: true,
+      profile: {
+        vantro_id:       vantroId,
+        business_name:   user.business_name,
+        member_since:    user.created_at,
+        plan:            user.plan,
+        trust_score:     trustScore,
+        recovery_rate:   recoveryRate,
+        total_customers: totalCustomers,
+        total_managed:   totalManaged,
+        total_invoices:  totalInvoices,
+        member_days:     memberDays,
+        badges,
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
 // START SERVER
 // ============================================
 
