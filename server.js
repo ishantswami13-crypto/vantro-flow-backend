@@ -81,7 +81,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 app.post('/api/auth/signup', async (req, res) => {
   try {
-    const { email, phone, business_name, password } = req.body;
+    const { email, phone, business_name, password, referred_by } = req.body;
     if (!email || !phone || !business_name || !password) {
       return res.status(400).json({ error: 'All fields are required' });
     }
@@ -91,9 +91,12 @@ app.post('/api/auth/signup', async (req, res) => {
     if (existing) return res.status(409).json({ error: 'Email already registered' });
 
     const password_hash = await bcrypt.hash(password, 10);
+    const insertPayload = { email, phone, business_name, password_hash, plan: 'free', created_at: new Date() };
+    if (referred_by) insertPayload.referred_by = referred_by;
+
     const { data, error } = await supabase
       .from('users')
-      .insert([{ email, phone, business_name, password_hash, plan: 'free', created_at: new Date() }])
+      .insert([insertPayload])
       .select('id, email, phone, business_name, plan, created_at');
     if (error) throw error;
 
@@ -102,6 +105,20 @@ app.post('/api/auth/signup', async (req, res) => {
     res.json({ success: true, token, user });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Referral count (public — used on /my-id page)
+app.get('/api/public/referrals/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { count } = await supabase
+      .from('users')
+      .select('*', { count: 'exact', head: true })
+      .eq('referred_by', userId);
+    res.json({ success: true, referral_count: count || 0 });
+  } catch (error) {
+    res.json({ success: true, referral_count: 0 });
   }
 });
 
