@@ -1974,6 +1974,79 @@ async function runDunningCycle() {
 cron.schedule('30 3 * * *', runDunningCycle, { timezone: 'UTC' });
 
 // ============================================
+// VANTRO NETWORK — Business Discovery
+// ============================================
+
+app.get('/api/network/search', async (req, res) => {
+  try {
+    const { q = '', type = 'all', limit = 20 } = req.query;
+
+    let query = supabase
+      .from('users')
+      .select('id, business_name, plan, created_at, gstin')
+      .limit(Number(limit));
+
+    if (q) query = query.ilike('business_name', `%${q}%`);
+
+    const { data: users, error } = await query.order('created_at', { ascending: false });
+    if (error) throw error;
+
+    if (!users || users.length === 0) return res.json({ success: true, businesses: [] });
+
+    // Enrich each user with their profile data
+    const enriched = await Promise.all(users.map(async (user) => {
+      const [{ data: invoices }, { data: callLogs }] = await Promise.all([
+        supabase.from('invoices').select('invoice_amount, payment_status').eq('user_id', user.id),
+        supabase.from('call_logs').select('id').eq('user_id', user.id),
+      ]);
+
+      const inv = invoices || [];
+      const paid = inv.filter(i => i.payment_status === 'Paid');
+      const totalManaged = inv.reduce((s, i) => s + Number(i.invoice_amount), 0);
+      const recoveryRate = inv.length ? Math.round((paid.length / inv.length) * 100) : 0;
+      const memberDays = Math.floor((Date.now() - new Date(user.created_at).getTime()) / 86400000);
+      const uniqueCustomers = new Set(inv.map(i => i.customer_name)).size;
+
+      // Trust score
+      const recScore = recoveryRate * 0.40;
+      const volScore = Math.min(20, inv.length * 0.5) * 0.20;
+      const ageScore = Math.min(20, memberDays * 0.1) * 0.20;
+      const callScore = Math.min(20, (callLogs || []).length * 0.5) * 0.20;
+      const trustScore = Math.min(100, Math.round(recScore + volScore + ageScore + callScore));
+
+      const badges = [];
+      if (inv.length >= 5) badges.push('Active Business');
+      if (recoveryRate >= 70) badges.push('Strong Collector');
+      if (memberDays >= 30) badges.push('Verified Member');
+      if (user.gstin) badges.push('GST Registered');
+
+      const vantroId = 'VAN-' + user.id.replace(/-/g, '').slice(0, 8).toUpperCase();
+
+      return {
+        user_id: user.id,
+        vantro_id: vantroId,
+        business_name: user.business_name,
+        plan: user.plan,
+        trust_score: trustScore,
+        recovery_rate: recoveryRate,
+        total_customers: uniqueCustomers,
+        total_managed: totalManaged,
+        total_invoices: inv.length,
+        member_days: memberDays,
+        badges,
+      };
+    }));
+
+    // Filter out users with no activity if not searching
+    const result = q ? enriched : enriched.filter(b => b.total_invoices > 0 || b.member_days > 1);
+    res.json({ success: true, businesses: result });
+  } catch (error) {
+    console.error('Network search error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
 // ML SCORING ENGINE + AI FOUNDER BRIEFING
 // ============================================
 
