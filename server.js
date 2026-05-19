@@ -12,6 +12,7 @@ const cron = require('node-cron');
 const rateLimit = require('express-rate-limit');
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
+const webpush = require('web-push');
 const { createClient } = require('@supabase/supabase-js');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'vantro-dev-secret-change-in-prod';
@@ -47,6 +48,19 @@ app.use(cors({
   credentials: true,
 }));
 app.options('*', cors());
+
+// Raw body preservation for Razorpay webhook (must come BEFORE express.json)
+app.use((req, res, next) => {
+  if (req.path === '/api/payments/webhook') {
+    let data = '';
+    req.setEncoding('utf8');
+    req.on('data', chunk => { data += chunk; });
+    req.on('end', () => { req.rawBody = data; next(); });
+  } else {
+    next();
+  }
+});
+
 app.use(express.json({ limit: '10mb' }));
 
 // Rate limiting
@@ -74,6 +88,15 @@ if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
 }
 
 const upload = multer({ storage: multer.memoryStorage() });
+
+// Web Push — VAPID
+if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
+  webpush.setVapidDetails(
+    `mailto:${process.env.VAPID_EMAIL || 'hello@vantroflow.com'}`,
+    process.env.VAPID_PUBLIC_KEY,
+    process.env.VAPID_PRIVATE_KEY
+  );
+}
 
 // ============================================
 // AUTHENTICATION ENDPOINTS
@@ -1986,9 +2009,13 @@ app.post('/api/payments/create-link', authMiddleware, async (req, res) => {
       callback_method: 'get',
     });
 
-    // Mark invoice as payment link sent
+    // Mark invoice as payment link sent — save link_id for webhook matching
     if (invoice_id) {
-      await supabase.from('invoices').update({ payment_link: paymentLink.short_url, payment_link_sent_at: new Date() }).eq('id', invoice_id);
+      await supabase.from('invoices').update({
+        payment_link: paymentLink.short_url,
+        payment_link_id: paymentLink.id,
+        payment_link_sent_at: new Date()
+      }).eq('id', invoice_id);
     }
 
     res.json({
@@ -2897,6 +2924,180 @@ app.post('/api/voice/status', async (req, res) => {
   } catch (_) {}
   res.sendStatus(200);
 });
+
+// ============================================
+// PUSH NOTIFICATIONS
+// ============================================
+
+// Get VAPID public key (needed by frontend to subscribe)
+app.get('/api/notifications/vapid-key', (req, res) => {
+  const key = process.env.VAPID_PUBLIC_KEY;
+  if (!key) return res.json({ success: false, message: 'Push notifications not configured' });
+  res.json({ success: true, publicKey: key });
+});
+
+// Save push subscription to user's row
+app.post('/api/notifications/subscribe', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { subscription } = req.body; // PushSubscription object from browser
+    if (!subscription || !subscription.endpoint) {
+      return res.status(400).json({ error: 'Invalid subscription object' });
+    }
+    await supabase.from('users')
+      .update({ push_subscription: subscription })
+      .eq('id', userId);
+    res.json({ success: true, message: 'Push subscription saved' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Internal helper: send push to a user
+async function sendPushToUser(userId, title, body, data = {}) {
+  if (!process.env.VAPID_PUBLIC_KEY) return; // not configured
+  try {
+    const { data: user } = await supabase
+      .from('users').select('push_subscription').eq('id', userId).single();
+    if (!user?.push_subscription) return;
+
+    const payload = JSON.stringify({ title, body, data, icon: '/icon-192.png', badge: '/icon-192.png' });
+    await webpush.sendNotification(user.push_subscription, payload);
+  } catch (err) {
+    // Subscription expired or invalid — clear it
+    if (err.statusCode === 410 || err.statusCode === 404) {
+      await supabase.from('users').update({ push_subscription: null }).eq('id', userId);
+    }
+    console.error('Push notification error:', err.message);
+  }
+}
+
+// ============================================
+// RAZORPAY WEBHOOK — auto-mark invoice paid
+// ============================================
+
+// IMPORTANT: Raw body captured by middleware above for HMAC verification
+app.post('/api/payments/webhook', async (req, res) => {
+    try {
+      const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
+      if (!secret) return res.sendStatus(200); // not configured, ignore
+
+      // Verify signature using raw body
+      const rawBody = req.rawBody || JSON.stringify(req.body);
+      const signature = req.headers['x-razorpay-signature'];
+      const expectedSig = crypto
+        .createHmac('sha256', secret)
+        .update(rawBody)
+        .digest('hex');
+
+      if (signature !== expectedSig) {
+        console.warn('Razorpay webhook: invalid signature');
+        return res.status(400).json({ error: 'Invalid signature' });
+      }
+
+      const event = typeof req.body === 'object' ? req.body : JSON.parse(rawBody);
+
+      // We care about payment_link.paid (payment link fully paid)
+      if (event.event === 'payment_link.paid') {
+        const pl = event.payload?.payment_link?.entity;
+        const payment = event.payload?.payment?.entity;
+
+        if (!pl) return res.sendStatus(200);
+
+        const paymentLinkId = pl.id;
+        const amountPaid = (payment?.amount || pl.amount_paid || 0) / 100; // paise → ₹
+        const payerName = payment?.notes?.contact || pl.customer?.name || '';
+        const paymentId  = payment?.id || '';
+
+        // Find the invoice that has this payment_link_id stored in notes or match by amount+customer
+        const { data: invoices } = await supabase
+          .from('invoices')
+          .select('id, user_id, customer_name, invoice_amount, status')
+          .eq('status', 'unpaid')
+          .eq('payment_link_id', paymentLinkId)
+          .limit(1);
+
+        if (invoices && invoices.length > 0) {
+          const inv = invoices[0];
+
+          // Mark as paid
+          await supabase.from('invoices')
+            .update({
+              status: 'paid',
+              paid_at: new Date().toISOString(),
+              payment_id: paymentId,
+            })
+            .eq('id', inv.id);
+
+          // Send push notification to the business owner
+          await sendPushToUser(
+            inv.user_id,
+            `💰 Payment Received!`,
+            `${inv.customer_name} ne ₹${Number(inv.invoice_amount).toLocaleString('en-IN')} bheja! Invoice auto-closed. 🎉`,
+            { type: 'payment_received', invoice_id: inv.id, amount: inv.invoice_amount }
+          );
+
+          console.log(`✅ Webhook: Invoice ${inv.id} marked paid via Razorpay (${paymentLinkId})`);
+        } else {
+          // Fallback: try matching by amount if no payment_link_id stored
+          console.log(`Webhook: No invoice found for payment_link ${paymentLinkId}`);
+        }
+      }
+
+      res.sendStatus(200);
+    } catch (err) {
+      console.error('Razorpay webhook error:', err.message);
+      res.sendStatus(500);
+    }
+});
+
+// ============================================
+// MORNING BRIEFING CRON — 8:00 AM IST daily
+// ============================================
+// IST = UTC+5:30 → 8am IST = 2:30 UTC
+cron.schedule('30 2 * * *', async () => {
+  console.log('⏰ Morning briefing cron running — 8am IST');
+  try {
+    // Get all users who have push subscriptions
+    const { data: users } = await supabase
+      .from('users')
+      .select('id, business_name, push_subscription')
+      .not('push_subscription', 'is', null);
+
+    if (!users || users.length === 0) return;
+
+    for (const user of users) {
+      try {
+        // Get their overdue invoices
+        const { data: overdue } = await supabase
+          .from('invoices')
+          .select('id, customer_name, invoice_amount, due_date')
+          .eq('user_id', user.id)
+          .eq('status', 'unpaid')
+          .lte('due_date', new Date().toISOString().split('T')[0])
+          .order('invoice_amount', { ascending: false })
+          .limit(3);
+
+        if (!overdue || overdue.length === 0) continue;
+
+        const topDebtor = overdue[0];
+        const totalOverdue = overdue.reduce((s, i) => s + Number(i.invoice_amount), 0);
+
+        await sendPushToUser(
+          user.id,
+          `☀️ Subah ka briefing — Vantro Flow`,
+          `${overdue.length} overdue invoices. Top: ${topDebtor.customer_name} (₹${Number(topDebtor.invoice_amount).toLocaleString('en-IN')}). Total pending: ₹${totalOverdue.toLocaleString('en-IN')}`,
+          { type: 'morning_briefing', count: overdue.length, total: totalOverdue }
+        );
+      } catch (userErr) {
+        console.error(`Morning briefing error for user ${user.id}:`, userErr.message);
+      }
+    }
+    console.log(`✅ Morning briefing sent to ${users.length} users`);
+  } catch (err) {
+    console.error('Morning briefing cron error:', err.message);
+  }
+}, { timezone: 'UTC' });
 
 // ============================================
 // START SERVER
