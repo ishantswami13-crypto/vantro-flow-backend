@@ -3100,6 +3100,167 @@ cron.schedule('30 2 * * *', async () => {
 }, { timezone: 'UTC' });
 
 // ============================================
+// BANK LEDGER — TRANSACTIONS
+// ============================================
+
+// Create transactions table
+app.post('/api/transactions/migrate', async (req, res) => {
+  try {
+    const { Pool } = require('pg');
+    const pool2 = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+    await pool2.query(`
+      CREATE TABLE IF NOT EXISTS transactions (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID,
+        type VARCHAR(10) NOT NULL CHECK (type IN ('in','out')),
+        category VARCHAR(60) NOT NULL,
+        amount DECIMAL(14,2) NOT NULL,
+        description TEXT,
+        party_name VARCHAR(200),
+        transaction_date DATE NOT NULL DEFAULT CURRENT_DATE,
+        payment_method VARCHAR(50) DEFAULT 'UPI',
+        reference VARCHAR(200),
+        notes TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_txn_user ON transactions(user_id);
+      CREATE INDEX IF NOT EXISTS idx_txn_date ON transactions(transaction_date DESC);
+    `);
+    await pool2.end();
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
+
+// GET all transactions for a user
+app.get('/api/transactions/:userId', async (req, res) => {
+  const { userId } = req.params;
+  const { type, category, limit = 200 } = req.query;
+  try {
+    let q = `SELECT * FROM transactions WHERE user_id = $1`;
+    const params = [userId];
+    if (type && type !== 'all') { q += ` AND type = $${params.length + 1}`; params.push(type); }
+    if (category && category !== 'all') { q += ` AND category = $${params.length + 1}`; params.push(category); }
+    q += ` ORDER BY transaction_date DESC, created_at DESC LIMIT $${params.length + 1}`;
+    params.push(parseInt(limit));
+
+    const { data: rows, error } = await supabase.rpc ? await (async () => {
+      const r = await supabase.from('transactions').select('*').eq('user_id', userId).order('transaction_date', { ascending: false }).limit(parseInt(limit));
+      return r;
+    })() : { data: [], error: null };
+
+    // Use raw pg if supabase doesn't have table yet
+    const { Pool } = require('pg');
+    const pool2 = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+    const result = await pool2.query(q, params);
+
+    // Summary
+    const sumRes = await pool2.query(
+      `SELECT type, SUM(amount) as total FROM transactions WHERE user_id = $1 GROUP BY type`,
+      [userId]
+    );
+    const monthRes = await pool2.query(
+      `SELECT type, SUM(amount) as total FROM transactions WHERE user_id = $1 AND DATE_TRUNC('month', transaction_date) = DATE_TRUNC('month', CURRENT_DATE) GROUP BY type`,
+      [userId]
+    );
+    await pool2.end();
+
+    const totalIn  = parseFloat(sumRes.rows.find(r => r.type === 'in')?.total  || 0);
+    const totalOut = parseFloat(sumRes.rows.find(r => r.type === 'out')?.total || 0);
+    const monthIn  = parseFloat(monthRes.rows.find(r => r.type === 'in')?.total  || 0);
+    const monthOut = parseFloat(monthRes.rows.find(r => r.type === 'out')?.total || 0);
+
+    res.json({
+      transactions: result.rows,
+      summary: { totalIn, totalOut, balance: totalIn - totalOut, monthIn, monthOut, monthBalance: monthIn - monthOut }
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST add a transaction
+app.post('/api/transactions', async (req, res) => {
+  const { user_id, type, category, amount, description, party_name, transaction_date, payment_method, reference, notes } = req.body;
+  try {
+    const { Pool } = require('pg');
+    const pool2 = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+    const result = await pool2.query(
+      `INSERT INTO transactions (user_id,type,category,amount,description,party_name,transaction_date,payment_method,reference,notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+      [user_id, type, category, parseFloat(amount), description, party_name,
+       transaction_date || new Date().toISOString().split('T')[0], payment_method || 'UPI', reference, notes]
+    );
+    await pool2.end();
+    res.json({ success: true, transaction: result.rows[0] });
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
+
+// GET financial summary with category breakdown
+app.get('/api/financial-summary/:userId', async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const { Pool } = require('pg');
+    const pool2 = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+    const [totals, monthly, catBreakdown, recent] = await Promise.all([
+      pool2.query(`SELECT type, SUM(amount) as total, COUNT(*) as count FROM transactions WHERE user_id=$1 GROUP BY type`, [userId]),
+      pool2.query(`SELECT TO_CHAR(transaction_date,'YYYY-MM') as month, type, SUM(amount) as total FROM transactions WHERE user_id=$1 AND transaction_date >= NOW()-INTERVAL '6 months' GROUP BY month,type ORDER BY month DESC`, [userId]),
+      pool2.query(`SELECT category, type, SUM(amount) as total, COUNT(*) as count FROM transactions WHERE user_id=$1 GROUP BY category,type ORDER BY total DESC`, [userId]),
+      pool2.query(`SELECT * FROM transactions WHERE user_id=$1 ORDER BY transaction_date DESC, created_at DESC LIMIT 5`, [userId]),
+    ]);
+    await pool2.end();
+
+    const totalIn  = parseFloat(totals.rows.find(r => r.type === 'in')?.total  || 0);
+    const totalOut = parseFloat(totals.rows.find(r => r.type === 'out')?.total || 0);
+    res.json({
+      summary: { totalIn, totalOut, balance: totalIn - totalOut },
+      monthly: monthly.rows,
+      categories: catBreakdown.rows,
+      recentTransactions: recent.rows,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// AI Financial Monitor
+app.get('/api/ai-financial-monitor/:userId', async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const { Pool } = require('pg');
+    const pool2 = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+    const [totals, last30, invoiceSummary] = await Promise.all([
+      pool2.query(`SELECT type, SUM(amount) as total FROM transactions WHERE user_id=$1 GROUP BY type`, [userId]),
+      pool2.query(`SELECT category, type, SUM(amount) as total FROM transactions WHERE user_id=$1 AND transaction_date >= NOW()-INTERVAL '30 days' GROUP BY category,type ORDER BY total DESC`, [userId]),
+      pool2.query(`SELECT payment_status, SUM(invoice_amount) as total, COUNT(*) as cnt FROM invoices WHERE user_id=$1 GROUP BY payment_status`, [userId]),
+    ]);
+    await pool2.end();
+
+    const totalIn  = parseFloat(totals.rows.find(r => r.type === 'in')?.total  || 0);
+    const totalOut = parseFloat(totals.rows.find(r => r.type === 'out')?.total || 0);
+    const outstanding = parseFloat(invoiceSummary.rows.find(r => r.payment_status === 'Pending')?.total || 0);
+
+    const expenseLines = last30.rows.filter(r => r.type === 'out').map(r => `  - ${r.category}: ₹${parseFloat(r.total).toLocaleString('en-IN')}`).join('\n');
+    const incomeLines  = last30.rows.filter(r => r.type === 'in').map(r => `  - ${r.category}: ₹${parseFloat(r.total).toLocaleString('en-IN')}`).join('\n');
+
+    const prompt = `You are a financial AI for an Indian MSME. Analyze this data:
+TOTAL: In ₹${totalIn.toLocaleString('en-IN')}, Out ₹${totalOut.toLocaleString('en-IN')}, Balance ₹${(totalIn-totalOut).toLocaleString('en-IN')}
+OUTSTANDING INVOICES: ₹${outstanding.toLocaleString('en-IN')}
+LAST 30 DAYS EXPENSES:\n${expenseLines || '  (none)'}
+LAST 30 DAYS INCOME:\n${incomeLines || '  (none)'}
+
+Return JSON only:
+{"health_score":0-100,"status":"healthy|warning|critical","summary":"2-3 sentences","alerts":[{"type":"warning|danger|info","message":"..."}],"insights":[{"title":"...","description":"...","action":"..."}],"top_expenses":[{"category":"...","amount":0,"pct":0}]}`;
+
+    const aiRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+      body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'user', content: prompt }], temperature: 0.2, max_tokens: 1200 })
+    });
+    const aiData = await aiRes.json();
+    const text = aiData.choices?.[0]?.message?.content || '{}';
+    const match = text.match(/\{[\s\S]*\}/);
+    const analysis = match ? JSON.parse(match[0]) : { health_score: 50, status: 'warning', summary: 'Insufficient data.', alerts: [], insights: [], top_expenses: [] };
+    res.json({ success: true, analysis });
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
+
+// ============================================
 // START SERVER
 // ============================================
 
