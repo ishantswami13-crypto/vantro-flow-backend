@@ -2349,6 +2349,145 @@ app.get('/api/public/profile/:userId', async (req, res) => {
 });
 
 // ============================================
+// AI CALL SCRIPT GENERATOR
+// ============================================
+
+app.post('/api/ai/call-script', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { customer_name, invoice_amount, days_overdue, call_count = 0, has_promise = false, tone = 'soft' } = req.body;
+
+    if (!customer_name || !invoice_amount) {
+      return res.status(400).json({ error: 'customer_name and invoice_amount required' });
+    }
+
+    const toneGuide = {
+      soft: 'polite aur friendly — pehli baar call kar rahe hain',
+      firm: 'professional aur direct — 2-3 baar try kar chuke hain',
+      urgent: 'serious aur urgent — bahut zyada overdue hai, strong follow-up chahiye',
+    };
+
+    const prompt = `You are Vantro AI, an expert Hinglish debt collection assistant for Indian MSMEs.
+
+Generate a COMPLETE phone call script for collecting payment. The script must be in Hinglish (natural mix of Hindi and English as spoken in India).
+
+Debtor: ${customer_name}
+Amount: ₹${invoice_amount.toLocaleString('en-IN')}
+Days overdue: ${days_overdue || 0} days
+Previous call attempts: ${call_count}
+Has made a payment promise before: ${has_promise ? 'Yes' : 'No'}
+Tone required: ${toneGuide[tone] || toneGuide.soft}
+
+Generate a JSON response with this exact structure:
+{
+  "opening": "The first 2-3 sentences to say when they pick up. Max 30 words. Include greeting and reason for call.",
+  "main_ask": "The core ask — what you want them to do. 1 clear sentence.",
+  "objection_handler": "What to say if they say 'baad mein karenge' or 'paise nahi hain'. 2-3 sentences.",
+  "closing": "How to end the call politely regardless of outcome. 1-2 sentences.",
+  "whatsapp_followup": "A WhatsApp message to send after the call. Max 40 words. Include payment reminder.",
+  "key_phrases": ["3-4 short Hinglish phrases to use naturally during the call"],
+  "tone_rating": "${tone}"
+}
+
+Use natural Hinglish like "bhai", "aap", "theek hai", "koi baat nahi", "kal tak", etc. Sound human, not robotic.`;
+
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.4,
+        response_format: { type: 'json_object' },
+      }),
+    });
+
+    const groqData = await response.json();
+    const scriptRaw = groqData.choices?.[0]?.message?.content;
+
+    if (!scriptRaw) throw new Error('Groq returned no content');
+    const script = JSON.parse(scriptRaw);
+
+    res.json({ success: true, script, debtor: customer_name, amount: invoice_amount });
+  } catch (err) {
+    console.error('Call script error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// AI BULK WHATSAPP GENERATOR
+// ============================================
+
+app.post('/api/ai/bulk-whatsapp', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // Get all high-priority overdue invoices
+    const { data: invoices } = await supabase
+      .from('invoices')
+      .select('customer_name, customer_phone, invoice_amount, days_overdue')
+      .eq('user_id', userId)
+      .neq('payment_status', 'Paid')
+      .gt('days_overdue', 0)
+      .order('days_overdue', { ascending: false })
+      .limit(20);
+
+    if (!invoices?.length) return res.json({ success: true, messages: [] });
+
+    // Generate messages for top 10 overdue
+    const top = invoices.slice(0, 10);
+
+    const prompt = `You are Vantro AI. Generate WhatsApp payment reminder messages in Hinglish for multiple debtors.
+
+Debtors list:
+${top.map((d, i) => `${i + 1}. ${d.customer_name} — ₹${d.invoice_amount?.toLocaleString('en-IN')} — ${d.days_overdue} days overdue`).join('\n')}
+
+For each debtor, generate a short WhatsApp message (max 35 words) that is:
+- Personal (uses their name)
+- States the amount clearly
+- Has a clear ask (pay today / share timeline)
+- Ends with a question or CTA
+
+Return JSON array: [{"name": "customer name", "message": "the message", "urgency": "high|medium|low"}]
+Sort by urgency (most overdue first). Use natural Hinglish.`;
+
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.3,
+        response_format: { type: 'json_object' },
+      }),
+    });
+
+    const groqData = await response.json();
+    const raw = groqData.choices?.[0]?.message?.content;
+    let messages = [];
+
+    try {
+      const parsed = JSON.parse(raw);
+      messages = Array.isArray(parsed) ? parsed : parsed.messages || parsed.data || [];
+    } catch {
+      messages = [];
+    }
+
+    // Merge phone numbers
+    const result = messages.map(m => {
+      const inv = top.find(i => i.customer_name === m.name);
+      return { ...m, phone: inv?.customer_phone || null };
+    });
+
+    res.json({ success: true, messages: result, count: result.length });
+  } catch (err) {
+    console.error('Bulk WhatsApp error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
 // START SERVER
 // ============================================
 
