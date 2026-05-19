@@ -326,6 +326,155 @@ app.post('/api/upload-csv', upload.single('file'), async (req, res) => {
 });
 
 // ============================================
+// EXCEL / XLSX SMART IMPORT
+// ============================================
+
+app.post('/api/import/excel', authMiddleware, upload.single('file'), async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+    const ext = (req.file.originalname || '').toLowerCase();
+    let rows = [];
+
+    if (ext.endsWith('.xlsx') || ext.endsWith('.xls') || req.file.mimetype.includes('spreadsheet') || req.file.mimetype.includes('excel')) {
+      // Parse Excel
+      try {
+        const XLSX = require('xlsx');
+        const wb = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+      } catch (e) {
+        return res.status(400).json({ error: 'Could not parse Excel file. Please use .xlsx format.' });
+      }
+    } else {
+      // Parse CSV
+      const text = req.file.buffer.toString('utf-8');
+      const lines = text.split('\n').filter(l => l.trim());
+      if (lines.length < 2) return res.status(400).json({ error: 'CSV must have a header row and at least one data row' });
+      const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, '').toLowerCase());
+      rows = lines.slice(1).map(line => {
+        const vals = line.split(',').map(v => v.trim().replace(/"/g, ''));
+        const obj = {};
+        headers.forEach((h, i) => { obj[h] = vals[i] || ''; });
+        return obj;
+      });
+    }
+
+    // Smart column detection — try many possible header names
+    const findCol = (obj, candidates) => {
+      const keys = Object.keys(obj).map(k => k.toLowerCase().trim());
+      for (const c of candidates) {
+        const match = keys.find(k => k.includes(c));
+        if (match) return obj[Object.keys(obj).find(k => k.toLowerCase().trim() === match)];
+      }
+      return null;
+    };
+
+    const invoices = [];
+    const skipped = [];
+
+    for (const row of rows) {
+      const name = findCol(row, ['customer', 'party', 'client', 'debtor', 'buyer', 'name', 'company']);
+      const amountRaw = findCol(row, ['amount', 'outstanding', 'due', 'balance', 'pending', 'invoice_amount', 'receivable']);
+      const dateRaw = findCol(row, ['date', 'invoice_date', 'bill_date', 'due_date', 'created']);
+      const phone = findCol(row, ['phone', 'mobile', 'contact', 'number', 'whatsapp']);
+      const statusRaw = findCol(row, ['status', 'payment_status', 'paid', 'cleared']);
+
+      if (!name || !amountRaw) { skipped.push(row); continue; }
+
+      const amount = parseFloat(String(amountRaw).replace(/[₹,\s]/g, ''));
+      if (isNaN(amount) || amount <= 0) { skipped.push(row); continue; }
+
+      // Date parsing — handle DD/MM/YYYY, MM/DD/YYYY, YYYY-MM-DD, serial numbers
+      let invoiceDate = new Date();
+      if (dateRaw) {
+        if (dateRaw instanceof Date) {
+          invoiceDate = dateRaw;
+        } else if (typeof dateRaw === 'number') {
+          // Excel serial date
+          invoiceDate = new Date(Math.round((dateRaw - 25569) * 86400 * 1000));
+        } else {
+          const str = String(dateRaw).trim();
+          // Try DD/MM/YYYY
+          const ddmm = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+          if (ddmm) invoiceDate = new Date(`${ddmm[3]}-${ddmm[2].padStart(2,'0')}-${ddmm[1].padStart(2,'0')}`);
+          else invoiceDate = new Date(str);
+          if (isNaN(invoiceDate.getTime())) invoiceDate = new Date();
+        }
+      }
+
+      const daysOverdue = Math.max(0, Math.floor((Date.now() - invoiceDate.getTime()) / 86400000));
+      const statusLower = String(statusRaw || '').toLowerCase();
+      const paymentStatus = statusLower.includes('paid') || statusLower.includes('clear') ? 'Paid' : 'Pending';
+
+      invoices.push({
+        user_id: userId,
+        customer_name: String(name).trim(),
+        customer_phone: phone ? String(phone).replace(/\D/g, '').slice(-10) : null,
+        invoice_amount: amount,
+        invoice_date: invoiceDate.toISOString().split('T')[0],
+        payment_status: paymentStatus,
+        days_overdue: paymentStatus === 'Paid' ? 0 : daysOverdue,
+        created_at: new Date(),
+      });
+    }
+
+    if (invoices.length === 0) {
+      return res.status(400).json({
+        error: 'No valid rows found. Make sure your file has columns: Customer Name, Amount, Date.',
+        skipped: skipped.length,
+        hint: 'Column names can be: customer_name, party, amount, outstanding, invoice_date, date, phone, mobile',
+      });
+    }
+
+    const { data, error } = await supabase.from('invoices').insert(invoices).select('id');
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      imported: invoices.length,
+      skipped: skipped.length,
+      message: `✅ ${invoices.length} invoices imported${skipped.length ? `, ${skipped.length} rows skipped (missing name/amount)` : ''}`,
+    });
+  } catch (err) {
+    console.error('Import error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Quick manual add — add a single customer/invoice
+app.post('/api/import/manual', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const entries = req.body.entries; // array of { customer_name, invoice_amount, days_overdue, customer_phone }
+    if (!Array.isArray(entries) || entries.length === 0) return res.status(400).json({ error: 'entries array required' });
+
+    const invoices = entries.map(e => {
+      const daysOverdue = parseInt(e.days_overdue) || 0;
+      const invoiceDate = new Date(Date.now() - daysOverdue * 86400000);
+      return {
+        user_id: userId,
+        customer_name: e.customer_name,
+        customer_phone: e.customer_phone || null,
+        invoice_amount: parseFloat(e.invoice_amount),
+        invoice_date: invoiceDate.toISOString().split('T')[0],
+        payment_status: 'Pending',
+        days_overdue: daysOverdue,
+        created_at: new Date(),
+      };
+    }).filter(i => i.customer_name && i.invoice_amount > 0);
+
+    if (invoices.length === 0) return res.status(400).json({ error: 'No valid entries' });
+    const { data, error } = await supabase.from('invoices').insert(invoices).select();
+    if (error) throw error;
+    res.json({ success: true, imported: invoices.length, invoices: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
 // DASHBOARD - GET ALL INVOICES
 // ============================================
 
@@ -1804,6 +1953,58 @@ Summarise actions clearly after doing them.${voiceContext}${overdueContext}`;
 });
 
 // ============================================
+// PAYMENT LINKS — Send UPI link to debtor
+// ============================================
+
+app.post('/api/payments/create-link', authMiddleware, async (req, res) => {
+  try {
+    const { invoice_id, customer_name, amount, description } = req.body;
+    if (!amount || !customer_name) return res.status(400).json({ error: 'amount and customer_name required' });
+
+    // If Razorpay not configured, return a UPI deep link fallback
+    if (!razorpay) {
+      const upiId = process.env.BUSINESS_UPI_ID || 'vantro@upi';
+      const upiLink = `upi://pay?pa=${upiId}&pn=${encodeURIComponent(customer_name)}&am=${amount}&tn=${encodeURIComponent(description || 'Invoice Payment')}&cu=INR`;
+      return res.json({
+        success: true,
+        type: 'upi_deeplink',
+        link: upiLink,
+        whatsapp_text: `${customer_name} ji, aapka ₹${Number(amount).toLocaleString('en-IN')} payment aap is link se kar sakte hain:\n${upiLink}\n\nUPI se direct pay karein. Koi bhi issue ho toh batayein.`,
+      });
+    }
+
+    // Create Razorpay Payment Link
+    const paymentLink = await razorpay.paymentLink.create({
+      amount: Math.round(parseFloat(amount) * 100), // in paise
+      currency: 'INR',
+      description: description || `Invoice payment from ${customer_name}`,
+      customer: { name: customer_name },
+      notify: { sms: false, email: false },
+      reminder_enable: false,
+      notes: { invoice_id: invoice_id || '', customer_name },
+      callback_url: `${process.env.FRONTEND_URL || 'https://vantro-flow.vercel.app'}/collections`,
+      callback_method: 'get',
+    });
+
+    // Mark invoice as payment link sent
+    if (invoice_id) {
+      await supabase.from('invoices').update({ payment_link: paymentLink.short_url, payment_link_sent_at: new Date() }).eq('id', invoice_id);
+    }
+
+    res.json({
+      success: true,
+      type: 'razorpay',
+      link: paymentLink.short_url,
+      link_id: paymentLink.id,
+      whatsapp_text: `${customer_name} ji, aapka ₹${Number(amount).toLocaleString('en-IN')} invoice pending hai. Is link pe click karke abhi pay karein:\n\n${paymentLink.short_url}\n\nUPI, card, netbanking — sab accept hota hai. Koi problem ho toh call karein.`,
+    });
+  } catch (err) {
+    console.error('Payment link error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
 // RAZORPAY BILLING
 // ============================================
 
@@ -2596,6 +2797,105 @@ Output JSON: { "style_description": "2-3 sentences describing exact style", "det
     console.error('Extract voice error:', err);
     res.status(500).json({ error: err.message });
   }
+});
+
+// ============================================
+// TWILIO VOICE CALLING — AI calls debtors
+// ============================================
+
+const getTwilio = () => {
+  if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) return null;
+  try { const twilio = require('twilio'); return twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN); }
+  catch { return null; }
+};
+
+// Check Twilio config
+app.get('/api/voice/config', authMiddleware, async (req, res) => {
+  const configured = !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_PHONE_NUMBER);
+  res.json({
+    configured,
+    missing: ['TWILIO_ACCOUNT_SID','TWILIO_AUTH_TOKEN','TWILIO_PHONE_NUMBER'].filter(k => !process.env[k]),
+    setup_url: 'https://console.twilio.com',
+    instructions: 'Sign up at twilio.com → buy a +91 Indian number → add 3 env vars to Railway → AI calling activates instantly',
+  });
+});
+
+// Initiate outbound AI call
+app.post('/api/voice/call', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { customer_name, customer_phone, invoice_amount, days_overdue, invoice_id, tone = 'soft' } = req.body;
+    if (!customer_phone) return res.status(400).json({ error: 'customer_phone required' });
+
+    const twilioClient = getTwilio();
+    if (!twilioClient) {
+      return res.status(503).json({
+        error: 'Twilio not configured yet',
+        action: 'Go to Railway → Variables → add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER',
+        setup_url: 'https://console.twilio.com',
+      });
+    }
+
+    // Fetch owner voice profile
+    const { data: profile } = await supabase.from('users')
+      .select('business_name, owner_name, ai_persona').eq('id', userId).single();
+
+    // Generate opening script via Groq
+    let openingScript = `Namaste ${customer_name} ji, main ${profile?.business_name || 'Vantro'} se bol raha hoon. Aapka rupaye ${invoice_amount} pending hai. Kya aaj payment ho sakti hai?`;
+    try {
+      const gr = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+        body: JSON.stringify({
+          model: 'llama-3.3-70b-versatile',
+          messages: [{ role: 'user', content: `Write a 20-word Hinglish phone call opening for collecting ₹${invoice_amount} from ${customer_name}, ${days_overdue} days overdue. Tone: ${tone}. Business: ${profile?.business_name}. ${profile?.ai_persona || ''}. Output only the script text.` }],
+          temperature: 0.3,
+        }),
+      });
+      const gd = await gr.json();
+      const s = gd.choices?.[0]?.message?.content?.trim();
+      if (s && s.length > 10) openingScript = s;
+    } catch (_) {}
+
+    // Log the call
+    await supabase.from('call_logs').insert([{
+      user_id: userId, invoice_id: invoice_id || null,
+      customer_name, customer_phone, amount: invoice_amount,
+      did_pick_up: false, notes: `AI call initiated. Script: "${openingScript}"`, created_at: new Date(),
+    }]);
+
+    const phone = String(customer_phone).replace(/\D/g, '');
+    const toPhone = phone.length === 10 ? `+91${phone}` : `+${phone}`;
+    const safeScript = openingScript.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+    const call = await twilioClient.calls.create({
+      to: toPhone,
+      from: process.env.TWILIO_PHONE_NUMBER,
+      twiml: `<Response><Say voice="Polly.Aditi" language="hi-IN">${safeScript}</Say><Pause length="2"/><Say voice="Polly.Aditi" language="hi-IN">Payment ke liye please call wapas karein ya WhatsApp karein. Dhanyavaad.</Say></Response>`,
+      statusCallback: `${process.env.RAILWAY_PUBLIC_URL || 'https://vantro-flow-backend-production.up.railway.app'}/api/voice/status`,
+      statusCallbackEvent: ['completed'],
+      timeout: 30,
+    });
+
+    res.json({ success: true, call_sid: call.sid, status: call.status, script: openingScript });
+  } catch (err) {
+    console.error('Twilio error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Twilio status webhook
+app.post('/api/voice/status', async (req, res) => {
+  try {
+    const { CallStatus, CallDuration, To } = req.body;
+    const phone = (To || '').replace(/^\+91/, '').replace(/\D/g, '');
+    if (phone) {
+      await supabase.from('call_logs')
+        .update({ did_pick_up: CallStatus === 'completed', call_duration_minutes: Math.ceil(parseInt(CallDuration || '0') / 60) })
+        .eq('customer_phone', phone).order('created_at', { ascending: false }).limit(1);
+    }
+  } catch (_) {}
+  res.sendStatus(200);
 });
 
 // ============================================
