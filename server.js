@@ -1543,11 +1543,40 @@ app.post('/api/ai-chat', async (req, res) => {
     }
   } catch (_) {}
 
-  const system = `You are Vantro AI, an intelligent business assistant built into the Vantro Flow app for ${business_name || 'this business'}. You help Indian MSME distributors manage collections, invoices, CRM prospects, inventory, and cash flow.
+  // Fetch owner voice profile
+  let ownerName = '';
+  let voiceContext = '';
+  try {
+    const { data: userProfile } = await supabase.from('users')
+      .select('owner_name, city, voice_style, ai_persona')
+      .eq('id', user_id).single();
+    if (userProfile) {
+      ownerName = userProfile.owner_name || '';
+      const styleMap = {
+        casual_hinglish: 'casual Hinglish — uses bhai/yaar, mixes Hindi-English naturally, short sentences',
+        formal_hindi: 'formal respectful Hindi — uses aap, complete sentences, professional tone',
+        direct_english: 'direct English — professional, concise, no-nonsense',
+        friendly_urdu: 'friendly Urdu-Hindi mix — warm, relationship-first tone',
+        regional_hindi: `regional ${userProfile.city || 'Indian'} Hinglish — local dialect and phrases`,
+      };
+      const styleDesc = styleMap[userProfile.voice_style] || 'natural Hinglish';
+      if (ownerName || userProfile.ai_persona) {
+        voiceContext = `\n\nOWNER VOICE PROFILE:
+- Owner name: ${ownerName || 'the business owner'}
+- Business city: ${userProfile.city || 'India'}
+- Communication style: ${styleDesc}
+${userProfile.ai_persona ? `- How they write/talk: ${userProfile.ai_persona}` : ''}
 
-You have tools to: fetch data, mark invoices as paid, add/update prospects, get forecasts, and navigate pages.
-Always be helpful, specific, and use rupee (₹) formatting. When asked to do something, use tools to actually do it — don't just explain.
-After performing actions, summarise what you did clearly. Keep responses concise and friendly. Speak in Hinglish when appropriate.${overdueContext}`;
+When generating WhatsApp messages, call scripts, or any communication: write EXACTLY as ${ownerName || 'the owner'} would — matching their exact style, tone, and language mix. Sound like a real person, not a bot.`;
+      }
+    }
+  } catch (_) {}
+
+  const system = `You are ${ownerName ? ownerName + "'s" : 'Vantro'} AI co-founder, built into Vantro Flow for ${business_name || 'this business'}. You help Indian MSME owners manage collections, invoices, CRM, inventory, and cash flow.
+
+You have tools: fetch data, mark invoices paid, add prospects, get forecasts, navigate pages.
+Be specific, use ₹ formatting, and when asked to do something — DO it with tools, don't just explain.
+Summarise actions clearly after doing them.${voiceContext}${overdueContext}`;
 
   const chatMessages = [
     { role:'system', content: system },
@@ -1840,7 +1869,7 @@ app.get('/api/billing/history', authMiddleware, async (req, res) => {
 app.get('/api/settings', authMiddleware, async (req, res) => {
   try {
     const { data, error } = await supabase.from('users')
-      .select('id, email, phone, business_name, gstin, plan, whatsapp_phone, whatsapp_token, logo_url, address, created_at')
+      .select('id, email, phone, business_name, gstin, plan, whatsapp_phone, whatsapp_token, logo_url, address, created_at, owner_name, city, voice_style, ai_persona')
       .eq('id', req.user.userId).single();
     if (error) throw error;
     res.json({ success: true, settings: data });
@@ -1851,7 +1880,7 @@ app.get('/api/settings', authMiddleware, async (req, res) => {
 
 app.patch('/api/settings', authMiddleware, async (req, res) => {
   try {
-    const allowed = ['business_name', 'phone', 'gstin', 'address', 'logo_url', 'whatsapp_phone', 'whatsapp_token', 'industry', 'language', 'contact_time'];
+    const allowed = ['business_name', 'phone', 'gstin', 'address', 'logo_url', 'whatsapp_phone', 'whatsapp_token', 'industry', 'language', 'contact_time', 'owner_name', 'city', 'voice_style', 'ai_persona'];
     const updates = {};
     allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
     updates.updated_at = new Date();
@@ -2367,8 +2396,25 @@ app.post('/api/ai/call-script', authMiddleware, async (req, res) => {
       urgent: 'serious aur urgent — bahut zyada overdue hai, strong follow-up chahiye',
     };
 
-    const prompt = `You are Vantro AI, an expert Hinglish debt collection assistant for Indian MSMEs.
+    // Fetch owner voice profile for personalization
+    let ownerVoiceContext = '';
+    try {
+      const { data: profile } = await supabase.from('users')
+        .select('owner_name, city, voice_style, ai_persona').eq('id', userId).single();
+      if (profile?.owner_name || profile?.ai_persona) {
+        const styleMap = {
+          casual_hinglish: 'casual Hinglish, uses bhai/yaar, short and direct',
+          formal_hindi: 'formal respectful Hindi, uses aap, full sentences',
+          direct_english: 'direct professional English, concise',
+          friendly_urdu: 'friendly Urdu-Hindi mix, warm tone',
+          regional_hindi: 'regional Hinglish dialect',
+        };
+        ownerVoiceContext = `\nThe script is being generated FOR ${profile.owner_name || 'the business owner'} from ${profile.city || 'India'}. Their communication style is: ${styleMap[profile.voice_style] || 'natural Hinglish'}. ${profile.ai_persona ? 'How they talk: ' + profile.ai_persona : ''} Make the script sound EXACTLY like them — not a generic bot.`;
+      }
+    } catch (_) {}
 
+    const prompt = `You are Vantro AI, an expert Hinglish debt collection assistant for Indian MSMEs.
+${ownerVoiceContext}
 Generate a COMPLETE phone call script for collecting payment. The script must be in Hinglish (natural mix of Hindi and English as spoken in India).
 
 Debtor: ${customer_name}
@@ -2438,7 +2484,17 @@ app.post('/api/ai/bulk-whatsapp', authMiddleware, async (req, res) => {
     // Generate messages for top 10 overdue
     const top = invoices.slice(0, 10);
 
-    const prompt = `You are Vantro AI. Generate WhatsApp payment reminder messages in Hinglish for multiple debtors.
+    // Fetch owner voice for personalized messages
+    let bulkVoiceCtx = '';
+    try {
+      const { data: profile } = await supabase.from('users')
+        .select('owner_name, city, voice_style, ai_persona').eq('id', userId).single();
+      if (profile?.owner_name || profile?.ai_persona) {
+        bulkVoiceCtx = `\nGenerate these messages as if written by ${profile.owner_name || 'the business owner'} personally. Style: ${profile.voice_style || 'casual_hinglish'}. ${profile.ai_persona ? profile.ai_persona : ''} Sound like a real person they know, not a robot.`;
+      }
+    } catch (_) {}
+
+    const prompt = `You are Vantro AI. Generate WhatsApp payment reminder messages in Hinglish for multiple debtors.${bulkVoiceCtx}
 
 Debtors list:
 ${top.map((d, i) => `${i + 1}. ${d.customer_name} — ₹${d.invoice_amount?.toLocaleString('en-IN')} — ${d.days_overdue} days overdue`).join('\n')}
@@ -2483,6 +2539,61 @@ Sort by urgency (most overdue first). Use natural Hinglish.`;
     res.json({ success: true, messages: result, count: result.length });
   } catch (err) {
     console.error('Bulk WhatsApp error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// AI VOICE EXTRACTOR — learn owner's writing style
+// ============================================
+
+app.post('/api/ai/extract-voice', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { samples } = req.body; // array of 2-5 sample messages the owner has written
+
+    if (!samples || !Array.isArray(samples) || samples.length < 1) {
+      return res.status(400).json({ error: 'Provide at least 1 sample message' });
+    }
+
+    const prompt = `Analyze these WhatsApp/text messages written by an Indian business owner and extract their writing style in 2-3 sentences.
+
+Messages:
+${samples.map((s, i) => `${i + 1}. "${s}"`).join('\n')}
+
+Write a style description that captures:
+- Language mix (Hindi/English/Hinglish ratio)
+- Tone (casual/formal/direct/friendly)
+- Typical phrases or words they use
+- Message length preference
+- How they address people
+
+Output JSON: { "style_description": "2-3 sentences describing exact style", "detected_style": "casual_hinglish|formal_hindi|direct_english|friendly_urdu|regional_hindi", "sample_phrase": "a short example phrase in their style" }`;
+
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.3,
+        response_format: { type: 'json_object' },
+      }),
+    });
+
+    const groqData = await response.json();
+    const result = JSON.parse(groqData.choices?.[0]?.message?.content || '{}');
+
+    // Auto-save the detected style to user profile
+    await supabase.from('users').update({
+      ai_persona: result.style_description,
+      voice_style: result.detected_style || 'casual_hinglish',
+      updated_at: new Date(),
+    }).eq('id', userId);
+
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('Extract voice error:', err);
     res.status(500).json({ error: err.message });
   }
 });
