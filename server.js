@@ -3600,6 +3600,454 @@ app.get('/api/voice/webhook-url', authMiddleware, (req, res) => {
 });
 
 // ============================================
+// EXPENSES — daily tracking
+// ============================================
+
+const EXPENSE_CATEGORIES = ['transport','fuel','salary','material','rent','electricity','maintenance','marketing','misc'];
+
+app.get('/api/expenses', authMiddleware, async (req, res) => {
+  try {
+    const { date, from, to } = req.query;
+    let q = supabase.from('expenses').select('*').eq('user_id', req.user.userId).order('created_at', { ascending: false });
+    if (from && to) q = q.gte('expense_date', from).lte('expense_date', to);
+    else q = q.eq('expense_date', date || new Date().toISOString().split('T')[0]);
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json({ success: true, expenses: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/expenses', authMiddleware, async (req, res) => {
+  try {
+    const { description, amount, category, notes } = req.body;
+    if (!description || !amount) return res.status(400).json({ error: 'description and amount required' });
+    const { data, error } = await supabase.from('expenses').insert([{
+      user_id: req.user.userId, description, amount: parseFloat(amount),
+      category: category || 'misc', notes: notes || null,
+      expense_date: new Date().toISOString().split('T')[0], created_at: new Date(),
+    }]).select().single();
+    if (error) throw error;
+    res.json({ success: true, expense: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/expenses/:id', authMiddleware, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('expenses')
+      .update(req.body).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
+    if (error) throw error;
+    res.json({ success: true, expense: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/expenses/:id', authMiddleware, async (req, res) => {
+  try {
+    await supabase.from('expenses').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================
+// TODAY SUMMARY — P&L aggregator
+// ============================================
+
+app.get('/api/today/summary', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const date = req.query.date || new Date().toISOString().split('T')[0];
+
+    const [
+      { data: orders },
+      { data: expenses },
+      { data: paidInvoices },
+      { data: callLogs },
+    ] = await Promise.all([
+      supabase.from('orders').select('*').eq('user_id', userId).eq('order_date', date),
+      supabase.from('expenses').select('*').eq('user_id', userId).eq('expense_date', date),
+      supabase.from('invoices').select('*').eq('user_id', userId).gte('paid_at', date + 'T00:00:00').lte('paid_at', date + 'T23:59:59'),
+      supabase.from('call_logs').select('*').eq('user_id', userId).gte('created_at', date + 'T00:00:00').lte('created_at', date + 'T23:59:59'),
+    ]);
+
+    const orderIncome = (orders || [])
+      .filter(o => !['cancelled'].includes(o.status))
+      .reduce((s, o) => s + (Number(o.total_amount) || 0), 0);
+
+    const invoiceIncome = (paidInvoices || [])
+      .reduce((s, i) => s + Number(i.invoice_amount || 0), 0);
+
+    const totalIncome = orderIncome + invoiceIncome;
+    const totalExpenses = (expenses || []).reduce((s, e) => s + Number(e.amount || 0), 0);
+    const netProfit = totalIncome - totalExpenses;
+
+    // Top selling items from orders
+    const itemMap: Record<string, number> = {};
+    (orders || []).forEach(o => {
+      (o.items || []).forEach((item: any) => {
+        const key = item.name || item.local_name || 'Unknown';
+        itemMap[key] = (itemMap[key] || 0) + (item.quantity || 0);
+      });
+    });
+    const topItems = Object.entries(itemMap)
+      .sort(([,a],[,b]) => b - a).slice(0, 5)
+      .map(([name, qty]) => ({ name, qty }));
+
+    // Expense breakdown by category
+    const expenseByCategory: Record<string, number> = {};
+    (expenses || []).forEach(e => {
+      expenseByCategory[e.category] = (expenseByCategory[e.category] || 0) + Number(e.amount || 0);
+    });
+
+    res.json({
+      success: true,
+      date,
+      summary: {
+        income: { orders: orderIncome, invoices: invoiceIncome, total: totalIncome },
+        expenses: { total: totalExpenses, by_category: expenseByCategory },
+        net_profit: netProfit,
+        order_count: (orders || []).length,
+        orders_by_status: {
+          new: (orders || []).filter(o => o.status === 'new').length,
+          confirmed: (orders || []).filter(o => o.status === 'confirmed').length,
+          dispatched: (orders || []).filter(o => o.status === 'dispatched').length,
+          delivered: (orders || []).filter(o => o.status === 'delivered').length,
+          cancelled: (orders || []).filter(o => o.status === 'cancelled').length,
+        },
+        invoices_collected: (paidInvoices || []).length,
+        calls_made: (callLogs || []).length,
+        top_items: topItems,
+      },
+      orders: orders || [],
+      expenses: expenses || [],
+      paid_invoices: paidInvoices || [],
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================
+// VANTRO BRAIN — Specialized Business AI
+// ============================================
+
+// Brain rules — business-specific knowledge owner teaches AI
+app.get('/api/ai/brain/rules', authMiddleware, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('brain_rules').select('*').eq('user_id', req.user.userId).order('created_at');
+    if (error) throw error;
+    res.json({ success: true, rules: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/ai/brain/rules', authMiddleware, async (req, res) => {
+  try {
+    const { rule, category } = req.body;
+    if (!rule) return res.status(400).json({ error: 'rule required' });
+    const { data, error } = await supabase.from('brain_rules').insert([{
+      user_id: req.user.userId, rule, category: category || 'general', created_at: new Date()
+    }]).select().single();
+    if (error) throw error;
+    res.json({ success: true, rule: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/ai/brain/rules/:id', authMiddleware, async (req, res) => {
+  try {
+    await supabase.from('brain_rules').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Main Vantro Brain endpoint — full context AI with live tool use
+app.post('/api/ai/brain', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { message, history = [] } = req.body;
+    if (!message) return res.status(400).json({ error: 'message required' });
+
+    // Load all business context in parallel
+    const today = new Date().toISOString().split('T')[0];
+    const [
+      { data: profile },
+      { data: vocab },
+      { data: rules },
+      { data: workers },
+      { data: topInvoices },
+      { data: todayOrders },
+      { data: todayExpenses },
+    ] = await Promise.all([
+      supabase.from('users').select('business_name,city,business_type,owner_name,voice_style,ai_persona').eq('id', userId).single(),
+      supabase.from('business_vocabulary').select('term,meaning,aliases').eq('user_id', userId).limit(50),
+      supabase.from('brain_rules').select('rule,category').eq('user_id', userId).limit(30),
+      supabase.from('workers').select('name,role,is_active').eq('user_id', userId),
+      supabase.from('invoices').select('customer_name,invoice_amount,due_date,status').eq('user_id', userId).eq('status','unpaid').order('invoice_amount', { ascending: false }).limit(10),
+      supabase.from('orders').select('customer_name,items,status,total_amount,delivery_time').eq('user_id', userId).eq('order_date', today),
+      supabase.from('expenses').select('description,amount,category').eq('user_id', userId).eq('expense_date', today),
+    ]);
+
+    // Build today's numbers for context
+    const todayIncome = (todayOrders || []).filter(o => o.status !== 'cancelled').reduce((s, o) => s + Number(o.total_amount || 0), 0);
+    const todaySpend = (todayExpenses || []).reduce((s, e) => s + Number(e.amount || 0), 0);
+    const pendingAmount = (topInvoices || []).reduce((s, i) => s + Number(i.invoice_amount || 0), 0);
+
+    // Vocabulary context
+    const vocabText = (vocab || []).length > 0
+      ? '\n\nBUSINESS VOCABULARY:\n' + (vocab || []).map(v => `• ${v.term} = ${v.meaning}${v.aliases?.length ? ` (also: ${v.aliases.join(', ')})` : ''}`).join('\n')
+      : '';
+
+    // Owner-taught business rules
+    const rulesText = (rules || []).length > 0
+      ? '\n\nOWNER\'S BUSINESS RULES (always follow these):\n' + (rules || []).map(r => `• [${r.category}] ${r.rule}`).join('\n')
+      : '';
+
+    // Live business snapshot
+    const snapshot = `
+LIVE BUSINESS SNAPSHOT (right now):
+• Business: ${profile?.business_name || 'Business'}, ${profile?.city || 'India'}
+• Today ${today}:
+  - Orders today: ${(todayOrders || []).length} (income: ₹${todayIncome.toLocaleString('en-IN')})
+  - Expenses today: ₹${todaySpend.toLocaleString('en-IN')}
+  - Net today: ₹${(todayIncome - todaySpend).toLocaleString('en-IN')}
+• Outstanding receivables: ₹${pendingAmount.toLocaleString('en-IN')} from ${(topInvoices || []).length} parties
+• Top pending: ${(topInvoices || []).slice(0, 3).map(i => `${i.customer_name} ₹${Number(i.invoice_amount).toLocaleString('en-IN')}`).join(', ') || 'none'}
+• Today's orders: ${(todayOrders || []).map(o => `${o.customer_name}(${o.status})`).join(', ') || 'none'}
+• Team: ${(workers || []).filter(w => w.is_active).map(w => w.name).join(', ') || 'no workers yet'}`;
+
+    // Voice/persona context
+    const styleDesc = { casual_hinglish:'Mix of Hindi + English (Hinglish)', formal_hindi:'Formal Hindi', direct_english:'Direct English', friendly_urdu:'Friendly Urdu-influenced', regional_hindi:'Regional Hindi dialect' }[profile?.voice_style || ''] || 'Hinglish';
+    const voiceCtx = profile?.owner_name ? `\nSPEAK TO OWNER AS: ${profile.owner_name} ji. Style: ${styleDesc}. ${profile?.ai_persona ? 'Their style: ' + profile.ai_persona : ''}` : '';
+
+    const systemPrompt = `You are Vantro Brain — a specialized AI built exclusively for this Indian MSME business.
+You are NOT a generic AI. You know this business inside-out: every customer, every product, every rule.
+You speak in Hinglish (mix of Hindi + English) naturally, like a knowledgeable business partner.
+${voiceCtx}
+${snapshot}
+${vocabText}
+${rulesText}
+
+WHAT YOU CAN DO:
+- Answer any business question using the live data above
+- Calculate P&L, outstanding, recovery rates on the fly
+- Suggest which customer to call first, what to do next
+- Track and reason about orders, expenses, invoices
+- Give brutally honest business advice
+
+RULES:
+- Always use ₹ for amounts, Indian number format (lakhs/crores)
+- Be direct and action-oriented — no fluff
+- If you don't know something specific, say so and suggest how to find it
+- Keep answers concise unless asked for detail
+- End responses with a clear next action when relevant`;
+
+    // Tool definitions for live DB queries
+    const tools = [
+      {
+        type: 'function',
+        function: {
+          name: 'get_invoices',
+          description: 'Fetch unpaid invoices with filtering',
+          parameters: {
+            type: 'object',
+            properties: {
+              sort_by: { type: 'string', enum: ['amount', 'days_overdue'], default: 'amount' },
+              limit: { type: 'integer', default: 10 },
+              min_amount: { type: 'number', description: 'Minimum invoice amount filter' },
+            }
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'get_orders_by_date',
+          description: 'Get orders for a specific date',
+          parameters: {
+            type: 'object',
+            properties: {
+              date: { type: 'string', description: 'YYYY-MM-DD, default today' },
+              status: { type: 'string', enum: ['new','confirmed','dispatched','delivered','cancelled'] },
+            }
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'get_expenses_summary',
+          description: 'Get expense breakdown for a date range',
+          parameters: {
+            type: 'object',
+            properties: {
+              from_date: { type: 'string', description: 'YYYY-MM-DD start' },
+              to_date: { type: 'string', description: 'YYYY-MM-DD end' },
+            }
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'search_customer',
+          description: 'Search for a specific customer across invoices and orders',
+          parameters: {
+            type: 'object',
+            properties: { name: { type: 'string' } },
+            required: ['name']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'add_expense',
+          description: 'Add a new expense entry for today',
+          parameters: {
+            type: 'object',
+            properties: {
+              description: { type: 'string' },
+              amount: { type: 'number' },
+              category: { type: 'string', enum: EXPENSE_CATEGORIES },
+            },
+            required: ['description', 'amount']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'get_top_customers',
+          description: 'Get customers ranked by outstanding amount or order history',
+          parameters: {
+            type: 'object',
+            properties: {
+              ranked_by: { type: 'string', enum: ['outstanding', 'orders'], default: 'outstanding' },
+              limit: { type: 'integer', default: 5 }
+            }
+          }
+        }
+      }
+    ];
+
+    // Tool execution handlers
+    const execTool = async (name: string, args: any): Promise<any> => {
+      switch (name) {
+        case 'get_invoices': {
+          const order = args.sort_by === 'days_overdue' ? 'due_date' : 'invoice_amount';
+          let q = supabase.from('invoices').select('customer_name,invoice_amount,due_date,status')
+            .eq('user_id', userId).eq('status', 'unpaid').order(order, { ascending: false }).limit(args.limit || 10);
+          if (args.min_amount) q = q.gte('invoice_amount', args.min_amount);
+          const { data } = await q;
+          return (data || []).map(i => ({
+            customer: i.customer_name,
+            amount: `₹${Number(i.invoice_amount).toLocaleString('en-IN')}`,
+            due: i.due_date,
+            overdue_days: i.due_date ? Math.max(0, Math.floor((Date.now() - new Date(i.due_date).getTime()) / 86400000)) : null
+          }));
+        }
+        case 'get_orders_by_date': {
+          const d = args.date || today;
+          let q = supabase.from('orders').select('customer_name,items,status,total_amount,delivery_time,created_at')
+            .eq('user_id', userId).eq('order_date', d);
+          if (args.status) q = q.eq('status', args.status);
+          const { data } = await q.order('created_at', { ascending: false });
+          return data || [];
+        }
+        case 'get_expenses_summary': {
+          const from = args.from_date || today;
+          const to = args.to_date || today;
+          const { data } = await supabase.from('expenses').select('description,amount,category,expense_date')
+            .eq('user_id', userId).gte('expense_date', from).lte('expense_date', to);
+          const total = (data || []).reduce((s, e) => s + Number(e.amount || 0), 0);
+          const byCategory: Record<string, number> = {};
+          (data || []).forEach(e => { byCategory[e.category] = (byCategory[e.category] || 0) + Number(e.amount); });
+          return { total: `₹${total.toLocaleString('en-IN')}`, by_category: byCategory, items: data || [] };
+        }
+        case 'search_customer': {
+          const term = `%${args.name}%`;
+          const [invRes, ordRes] = await Promise.all([
+            supabase.from('invoices').select('customer_name,invoice_amount,status,due_date').eq('user_id', userId).ilike('customer_name', term).limit(5),
+            supabase.from('orders').select('customer_name,items,status,total_amount,order_date').eq('user_id', userId).ilike('customer_name', term).limit(5),
+          ]);
+          return { invoices: invRes.data || [], orders: ordRes.data || [] };
+        }
+        case 'add_expense': {
+          const { data } = await supabase.from('expenses').insert([{
+            user_id: userId, description: args.description, amount: args.amount,
+            category: args.category || 'misc', expense_date: today, created_at: new Date()
+          }]).select().single();
+          return { added: true, expense: data };
+        }
+        case 'get_top_customers': {
+          if (args.ranked_by === 'orders') {
+            const { data } = await supabase.from('orders').select('customer_name,total_amount').eq('user_id', userId).not('status', 'eq', 'cancelled');
+            const map: Record<string, number> = {};
+            (data || []).forEach(o => { map[o.customer_name] = (map[o.customer_name] || 0) + Number(o.total_amount || 0); });
+            return Object.entries(map).sort(([,a],[,b]) => b-a).slice(0, args.limit || 5).map(([name, total]) => ({ name, total: `₹${total.toLocaleString('en-IN')}` }));
+          } else {
+            const { data } = await supabase.from('invoices').select('customer_name,invoice_amount').eq('user_id', userId).eq('status','unpaid').order('invoice_amount', { ascending: false }).limit(args.limit || 5);
+            return data || [];
+          }
+        }
+        default: return { error: 'Unknown tool' };
+      }
+    };
+
+    // Agentic loop — up to 4 tool call rounds
+    const messages: any[] = [
+      { role: 'system', content: systemPrompt },
+      ...(history || []).slice(-20),
+      { role: 'user', content: message },
+    ];
+
+    let finalResponse = '';
+    const toolsUsed: string[] = [];
+
+    for (let round = 0; round < 4; round++) {
+      const aiRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+        body: JSON.stringify({
+          model: 'llama-3.3-70b-versatile',
+          messages,
+          tools,
+          tool_choice: 'auto',
+          temperature: 0.3,
+          max_tokens: 1000,
+        }),
+      });
+      const aiData = await aiRes.json();
+      const choice = aiData.choices?.[0];
+      if (!choice) break;
+
+      if (choice.finish_reason === 'tool_calls' && choice.message?.tool_calls) {
+        messages.push(choice.message);
+        for (const tc of choice.message.tool_calls) {
+          let args: any = {};
+          try { args = JSON.parse(tc.function.arguments); } catch (_) {}
+          const result = await execTool(tc.function.name, args);
+          toolsUsed.push(tc.function.name);
+          messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(result) });
+        }
+      } else {
+        finalResponse = choice.message?.content || '';
+        break;
+      }
+    }
+
+    if (!finalResponse) finalResponse = 'Kuch technical issue aa gaya, please dobara try karo.';
+
+    // Return new history (user+assistant pair only, no system/tools)
+    const newHistory = [
+      ...(history || []).slice(-18),
+      { role: 'user', content: message },
+      { role: 'assistant', content: finalResponse },
+    ];
+
+    res.json({ success: true, response: finalResponse, history: newHistory, tools_used: toolsUsed });
+  } catch (err) {
+    console.error('Brain error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
 // START SERVER
 // ============================================
 
