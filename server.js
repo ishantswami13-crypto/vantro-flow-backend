@@ -4450,6 +4450,112 @@ app.patch('/api/workers/:id/salary', authMiddleware, async (req, res) => {
 });
 
 // ============================================
+// BANK MONITOR ENDPOINTS
+// ============================================
+
+app.get('/api/bank/transactions', authMiddleware, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('bank_transactions')
+      .select('*')
+      .eq('user_id', req.user.userId)
+      .order('txn_date', { ascending: false });
+    if (error) throw error;
+    res.json({ success: true, transactions: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/bank/transactions', authMiddleware, async (req, res) => {
+  try {
+    const { txn_date, description, amount, type } = req.body;
+    if (!amount || !type) return res.status(400).json({ error: 'amount and type required' });
+    const { data, error } = await supabase
+      .from('bank_transactions')
+      .insert([{
+        user_id: req.user.userId,
+        txn_date: txn_date || new Date().toISOString().split('T')[0],
+        description: description || '',
+        amount: parseFloat(amount),
+        type: type,
+        status: 'unmatched',
+      }])
+      .select()
+      .single();
+    if (error) throw error;
+    res.json({ success: true, transaction: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/bank/match', authMiddleware, async (req, res) => {
+  try {
+    const { transaction_id, match_type, match_id } = req.body;
+    if (!transaction_id || !match_type || !match_id) {
+      return res.status(400).json({ error: 'transaction_id, match_type, match_id required' });
+    }
+    const { error: txnErr } = await supabase
+      .from('bank_transactions')
+      .update({ status: 'matched', matched_type: match_type, matched_id: String(match_id) })
+      .eq('id', transaction_id)
+      .eq('user_id', req.user.userId);
+    if (txnErr) throw txnErr;
+
+    if (match_type === 'invoice') {
+      const { error: invErr } = await supabase
+        .from('bills')
+        .update({ status: 'paid', paid_at: new Date().toISOString() })
+        .eq('id', match_id)
+        .eq('user_id', req.user.userId);
+      if (invErr) throw invErr;
+    } else if (match_type === 'khata') {
+      const { data: khata } = await supabase
+        .from('khata_entries')
+        .select('*')
+        .eq('id', match_id)
+        .eq('user_id', req.user.userId)
+        .single();
+      if (khata) {
+        await supabase.from('khata_entries').insert([{
+          user_id: req.user.userId,
+          customer_id: khata.customer_id,
+          customer_name: khata.customer_name,
+          type: 'payment',
+          amount: Math.abs(khata.balance || khata.amount),
+          notes: 'Auto-matched from bank transaction',
+          entry_date: new Date().toISOString().split('T')[0],
+        }]);
+      }
+    }
+    res.json({ success: true, message: 'Matched and marked as paid' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/bank/transactions/:id/ignore', authMiddleware, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('bank_transactions')
+      .update({ status: 'ignored' })
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.userId)
+      .select()
+      .single();
+    if (error) throw error;
+    res.json({ success: true, transaction: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/bank/transactions/:id', authMiddleware, async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from('bank_transactions')
+      .delete()
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.userId);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================
 // START SERVER
 // ============================================
 
