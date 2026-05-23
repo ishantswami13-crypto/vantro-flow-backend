@@ -62,6 +62,7 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true })); // Twilio webhooks send form-encoded
 
 // Rate limiting
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Too many attempts, try again later' } });
@@ -3258,6 +3259,344 @@ Return JSON only:
     const analysis = match ? JSON.parse(match[0]) : { health_score: 50, status: 'warning', summary: 'Insufficient data.', alerts: [], insights: [], top_expenses: [] };
     res.json({ success: true, analysis });
   } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
+
+// ============================================
+// ORDERS — AI voice order management
+// ============================================
+
+app.get('/api/orders', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { date, from, to, status } = req.query;
+    let query = supabase.from('orders').select('*, workers(name, phone)')
+      .eq('user_id', userId).order('created_at', { ascending: false });
+    if (status) query = query.eq('status', status);
+    if (from && to) {
+      query = query.gte('order_date', from).lte('order_date', to);
+    } else {
+      const today = new Date().toISOString().split('T')[0];
+      query = query.eq('order_date', date || today);
+    }
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ success: true, orders: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/orders', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { customer_name, customer_phone, delivery_address, items, total_amount, delivery_time, special_instructions, worker_id } = req.body;
+    const { data, error } = await supabase.from('orders').insert([{
+      user_id: userId, customer_name, customer_phone,
+      delivery_address, items: items || [], total_amount: total_amount || null,
+      delivery_time, special_instructions, worker_id: worker_id || null,
+      source: 'manual', status: 'new',
+      order_date: new Date().toISOString().split('T')[0], created_at: new Date(),
+    }]).select().single();
+    if (error) throw error;
+    res.json({ success: true, order: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/orders/:id', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { data, error } = await supabase.from('orders')
+      .update({ ...req.body, updated_at: new Date() })
+      .eq('id', req.params.id).eq('user_id', userId).select().single();
+    if (error) throw error;
+    res.json({ success: true, order: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/orders/:id', authMiddleware, async (req, res) => {
+  try {
+    await supabase.from('orders').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================
+// WORKERS — team management
+// ============================================
+
+app.get('/api/workers', authMiddleware, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('workers')
+      .select('*').eq('user_id', req.user.userId).order('name');
+    if (error) throw error;
+    res.json({ success: true, workers: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/workers', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { name, phone, role } = req.body;
+    if (!name) return res.status(400).json({ error: 'Worker name required' });
+    const { data, error } = await supabase.from('workers').insert([{
+      user_id: userId, name, phone, role: role || 'delivery', is_active: true, created_at: new Date()
+    }]).select().single();
+    if (error) throw error;
+    res.json({ success: true, worker: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/workers/:id', authMiddleware, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('workers')
+      .update(req.body).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
+    if (error) throw error;
+    res.json({ success: true, worker: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/workers/:id', authMiddleware, async (req, res) => {
+  try {
+    await supabase.from('workers').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================
+// BUSINESS VOCABULARY — AI Training
+// ============================================
+
+app.get('/api/vocabulary', authMiddleware, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('business_vocabulary')
+      .select('*').eq('user_id', req.user.userId).order('category').order('term');
+    if (error) throw error;
+    res.json({ success: true, vocabulary: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/vocabulary', authMiddleware, async (req, res) => {
+  try {
+    const { term, meaning, category, aliases } = req.body;
+    if (!term || !meaning) return res.status(400).json({ error: 'term and meaning required' });
+    const { data, error } = await supabase.from('business_vocabulary').insert([{
+      user_id: req.user.userId, term, meaning,
+      category: category || 'product', aliases: aliases || [], created_at: new Date()
+    }]).select().single();
+    if (error) throw error;
+    res.json({ success: true, item: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/vocabulary/:id', authMiddleware, async (req, res) => {
+  try {
+    await supabase.from('business_vocabulary').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Seed starter vocabulary by industry
+app.post('/api/vocabulary/seed', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { industry } = req.body;
+    const SEEDS = {
+      construction: [
+        { term: 'Bajri',   meaning: 'Fine river sand for plastering/concrete', aliases: ['bairi','najri','rait'] },
+        { term: 'Gitti',   meaning: 'Crushed stone aggregate (10mm/20mm/40mm)', aliases: ['roori','stone chips','gravel'] },
+        { term: 'Sariya',  meaning: 'Iron/TMT steel reinforcement rods', aliases: ['rod','lohiya','tmt','steel'] },
+        { term: 'Cement',  meaning: 'Portland cement 50kg bags', aliases: ['siement','grey powder'] },
+        { term: 'Rait',    meaning: 'General purpose sand', aliases: ['sand','balu'] },
+        { term: 'Surkhi',  meaning: 'Brick powder for mortar', aliases: ['brick dust'] },
+        { term: 'Eent',    meaning: 'Red clay fired bricks', aliases: ['int','bricks','lakhori'] },
+        { term: 'Chuna',   meaning: 'White lime for whitewash or mortar', aliases: ['lime','choona'] },
+        { term: 'Khamba',  meaning: 'RCC concrete pillar or post', aliases: ['pillar','column'] },
+        { term: 'Brass',   meaning: '100 cubic feet — bulk unit for sand/stone', aliases: ['bras','100 cft'] },
+        { term: 'CFT',     meaning: 'Cubic feet — measurement unit for aggregates', category: 'unit', aliases: ['ghanafit'] },
+        { term: 'Truck',   meaning: 'Full truck load delivery (~8–10 tonnes)', category: 'unit', aliases: ['truck bhar','gadi bhar'] },
+      ],
+      textile: [
+        { term: 'Thaan',   meaning: 'Full bolt/roll of fabric (~30m or 100m)', category: 'unit', aliases: ['bolt','roll'] },
+        { term: 'Gaj',     meaning: 'Yard (≈0.9 metres) for fabric', category: 'unit', aliases: ['yard','gaz'] },
+        { term: 'Malmal',  meaning: 'Fine muslin/cotton fabric', aliases: ['muslin','cotton fine'] },
+        { term: 'Resham',  meaning: 'Silk fabric', aliases: ['silk'] },
+        { term: 'Jeans',   meaning: 'Denim fabric or readymade jeans', aliases: ['denim'] },
+      ],
+      grocery: [
+        { term: 'Bora',    meaning: 'Large 50kg gunny sack', category: 'unit', aliases: ['bori','sack','bag'] },
+        { term: 'Peti',    meaning: 'Crate/carton for fruits or goods', category: 'unit', aliases: ['box','carton'] },
+        { term: 'Katta',   meaning: '50kg grain sack', category: 'unit', aliases: ['bag','sack'] },
+        { term: 'Quintal', meaning: '100 kilograms', category: 'unit', aliases: ['kwintal'] },
+        { term: 'Tray',    meaning: 'Tray of eggs (30 pieces)', category: 'unit', aliases: ['egg tray'] },
+      ],
+      pharma: [
+        { term: 'Strip',   meaning: 'Strip of tablets/capsules (typically 10)', category: 'unit', aliases: ['patti'] },
+        { term: 'Vial',    meaning: 'Glass vial for injectable medicines', category: 'product', aliases: ['bottle'] },
+        { term: 'Expiry',  meaning: 'Expiry date on medicines', category: 'process', aliases: ['exp','mfg'] },
+      ],
+    };
+    const items = (SEEDS[industry] || []).map(s => ({
+      user_id: userId, term: s.term, meaning: s.meaning,
+      category: s.category || 'product', aliases: s.aliases || [], created_at: new Date()
+    }));
+    if (items.length === 0) return res.json({ success: true, seeded: 0 });
+    const { error } = await supabase.from('business_vocabulary').insert(items);
+    if (error) throw error;
+    res.json({ success: true, seeded: items.length, industry });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================
+// AI INBOUND CALL — Voice Order Extraction
+// ============================================
+
+// STEP 1 — Owner sets Twilio webhook URL to:
+//   https://vantro-flow-backend-production.up.railway.app/api/voice/inbound?uid=USER_ID
+app.post('/api/voice/inbound', async (req, res) => {
+  try {
+    const userId = req.query.uid;
+    let greeting = 'Vantro Business';
+    if (userId) {
+      const { data: u } = await supabase.from('users')
+        .select('business_name, owner_name').eq('id', userId).single();
+      if (u?.business_name) greeting = u.business_name;
+    }
+    const cbUrl = `${process.env.RAILWAY_PUBLIC_URL || 'https://vantro-flow-backend-production.up.railway.app'}/api/voice/recording?uid=${userId || ''}`;
+    res.set('Content-Type', 'text/xml');
+    res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Aditi" language="hi-IN">Namaste! ${greeting.replace(/&/g,'and')} mein aapka swagat hai. Beep ke baad apna order boliye — apna naam, kya chahiye, kitna chahiye, aur address batayein.</Say>
+  <Record maxLength="180" action="${cbUrl}" transcribe="false" playBeep="true" finishOnKey="*"/>
+  <Say voice="Polly.Aditi" language="hi-IN">Dhanyavaad! Aapka order note ho gaya. Hum jald sampark karenge.</Say>
+</Response>`);
+  } catch (err) {
+    res.set('Content-Type', 'text/xml');
+    res.send(`<?xml version="1.0" encoding="UTF-8"?><Response><Say>System busy, please try again.</Say></Response>`);
+  }
+});
+
+// STEP 2 — Twilio POSTs here when recording is ready
+app.post('/api/voice/recording', async (req, res) => {
+  res.sendStatus(200); // Respond immediately — process async
+
+  const userId = req.query.uid;
+  const { RecordingUrl, RecordingSid, From: callerPhone } = req.body;
+  if (!RecordingUrl || !userId) return;
+
+  try {
+    // 1. Download MP3 from Twilio (auth required)
+    const auth = Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64');
+    const recRes = await fetch(`${RecordingUrl}.mp3`, { headers: { Authorization: `Basic ${auth}` } });
+    if (!recRes.ok) throw new Error(`Recording download failed: ${recRes.status}`);
+    const audioBuf = Buffer.from(await recRes.arrayBuffer());
+
+    // 2. Transcribe with Groq Whisper (hi = Hindi/Hinglish)
+    const fd = new FormData();
+    fd.append('file', new Blob([audioBuf], { type: 'audio/mpeg' }), 'order.mp3');
+    fd.append('model', 'whisper-large-v3');
+    fd.append('language', 'hi');
+    fd.append('response_format', 'text');
+
+    const trRes = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+      method: 'POST', headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}` }, body: fd,
+    });
+    const transcript = trRes.ok ? (await trRes.text()).trim() : '';
+    if (!transcript || transcript.length < 5) {
+      console.log(`⚠️ Empty transcript for ${RecordingSid}`);
+      return;
+    }
+    console.log(`📞 Call transcript (user ${userId}): ${transcript}`);
+
+    // 3. Load vocabulary + user profile for context
+    const [{ data: vocab }, { data: profile }] = await Promise.all([
+      supabase.from('business_vocabulary').select('term,meaning,aliases').eq('user_id', userId),
+      supabase.from('users').select('business_name,city,business_type,owner_name,ai_persona').eq('id', userId).single(),
+    ]);
+
+    const vocabLines = (vocab || []).map(v =>
+      `• ${v.term} = ${v.meaning}${v.aliases?.length ? ` (also called: ${v.aliases.join(', ')})` : ''}`
+    ).join('\n');
+
+    // 4. Extract order with Groq LLaMA + vocabulary context
+    const systemPrompt = `You are an AI order extraction assistant for an Indian MSME.
+Business: ${profile?.business_name || 'Business'}, Location: ${profile?.city || 'India'}
+Caller phone: ${callerPhone || 'unknown'}
+${vocabLines ? `\nBUSINESS VOCABULARY (map caller's local terms to these):\n${vocabLines}` : ''}
+Extract order from Hindi/Hinglish transcript. Return ONLY valid JSON, no commentary.`;
+
+    const userPrompt = `Transcript: "${transcript}"\n\nReturn JSON:\n{"customer_name":null,"customer_phone":null,"delivery_address":null,"items":[{"name":"standard name","local_name":"as said","quantity":1,"unit":"piece"}],"delivery_time":null,"special_instructions":null,"confidence":80,"summary":"one line in Hinglish"}`;
+
+    const aiRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile', temperature: 0.1, max_tokens: 500,
+        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
+      }),
+    });
+    const aiJson = await aiRes.json();
+    const raw = aiJson.choices?.[0]?.message?.content || '{}';
+    let extracted = {};
+    try { const m = raw.match(/\{[\s\S]*\}/); extracted = m ? JSON.parse(m[0]) : {}; } catch (_) {}
+
+    // 5. Save order to DB
+    const orderPayload = {
+      user_id: userId,
+      customer_name: extracted.customer_name || callerPhone || 'Unknown',
+      customer_phone: extracted.customer_phone || (callerPhone ? callerPhone.replace('+91', '').replace(/\D/g, '') : null),
+      delivery_address: extracted.delivery_address || null,
+      items: extracted.items || [],
+      delivery_time: extracted.delivery_time || null,
+      special_instructions: extracted.special_instructions || null,
+      call_recording_url: RecordingUrl,
+      call_transcript: transcript,
+      source: 'ai_call',
+      status: 'new',
+      order_date: new Date().toISOString().split('T')[0],
+      created_at: new Date(),
+    };
+    const { data: savedOrder } = await supabase.from('orders').insert([orderPayload]).select().single();
+
+    // 6. Push notification to owner
+    if (savedOrder) {
+      await sendPushToUser(userId,
+        '📞 Naya Order Aaya — Call Se!',
+        `${extracted.customer_name || callerPhone}: ${extracted.summary || (extracted.items?.[0] ? `${extracted.items[0].quantity} ${extracted.items[0].unit} ${extracted.items[0].name}` : 'Order received')}`,
+        { type: 'new_order', order_id: savedOrder.id }
+      );
+    }
+
+    // 7. Auto-call first active worker (if Twilio configured)
+    if (twilioClient && savedOrder) {
+      const { data: workers } = await supabase.from('workers')
+        .select('name, phone').eq('user_id', userId).eq('is_active', true).limit(1);
+
+      if (workers?.[0]?.phone) {
+        const w = workers[0];
+        const wPhone = String(w.phone).replace(/\D/g, '');
+        const toPhone = wPhone.length === 10 ? `+91${wPhone}` : `+${wPhone}`;
+        const itemsDesc = (extracted.items || []).map(i => `${i.quantity} ${i.unit} ${i.local_name || i.name}`).join(', ');
+        const script = `${w.name} ji, naya order aaya hai. Customer: ${extracted.customer_name || 'customer'}. Maal: ${itemsDesc || 'details app mein hain'}. Address: ${extracted.delivery_address || 'confirm karo'}. Delivery: ${extracted.delivery_time || 'jaldi se'}. Vantro app check karo.`;
+        const safe = script.replace(/&/g,'and').replace(/</g,'').replace(/>/g,'');
+        try {
+          await twilioClient.calls.create({
+            to: toPhone, from: process.env.TWILIO_PHONE_NUMBER,
+            twiml: `<Response><Say voice="Polly.Aditi" language="hi-IN">${safe}</Say></Response>`,
+            timeout: 20,
+          });
+        } catch (ce) { console.error('Worker auto-call error:', ce.message); }
+      }
+    }
+    console.log(`✅ Order from call saved — user ${userId}`);
+  } catch (err) {
+    console.error('Recording processing error:', err.message);
+  }
+});
+
+// Get inbound call webhook URL for this user
+app.get('/api/voice/webhook-url', authMiddleware, (req, res) => {
+  const base = process.env.RAILWAY_PUBLIC_URL || 'https://vantro-flow-backend-production.up.railway.app';
+  const url = `${base}/api/voice/inbound?uid=${req.user.userId}`;
+  const twilioConfigured = !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_PHONE_NUMBER);
+  res.json({ success: true, webhook_url: url, twilio_configured: twilioConfigured });
 });
 
 // ============================================
