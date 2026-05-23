@@ -4048,6 +4048,357 @@ RULES:
 });
 
 // ============================================
+// FEATURE FLAGS — industry-based smart setup
+// ============================================
+
+function buildFeatureFlags({ industry, business_size, gst_registered, sells_on_credit, has_workers, primary_pain }) {
+  const isProduct = ['construction','textile','grocery','pharma','electronics','manufacturing','trading','hardware','auto_parts','furniture'].includes(industry);
+  const isService = ['services','consulting','salon','clinic','coaching','agency'].includes(industry);
+  return {
+    dashboard: true, collections: true, whatsapp: true, ai_chat: true,
+    today_pl: true, brain: true, analytics: true, forecast: true,
+    reports: true, network: true, crm: true, ledger: true,
+    gst_invoices: gst_registered || true,           // most MSMEs need bills
+    khata: sells_on_credit || true,                 // credit is universal
+    purchases: isProduct,                           // buying stock
+    attendance: has_workers,                        // only if they have staff
+    orders: isProduct,                              // order management
+    ai_calling: isProduct,                          // voice orders
+    inventory: isProduct,                           // stock tracking
+    scanner: gst_registered,                        // invoice scanner
+    dunning: sells_on_credit,                       // auto follow-up
+    gstr_export: gst_registered,                    // GSTR-1 export
+    neural_engine: sells_on_credit,                 // ML prioritization
+    billing_feature: true,
+  };
+}
+
+app.post('/api/onboarding/setup', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { industry, business_size, gst_registered, sells_on_credit, has_workers, primary_pain, gstin, business_address, owner_name, city } = req.body;
+    const feature_flags = buildFeatureFlags({ industry, business_size, gst_registered, sells_on_credit, has_workers, primary_pain });
+    await supabase.from('users').update({
+      industry, business_size, gst_registered, gstin: gstin || null,
+      business_address: business_address || null, feature_flags,
+      owner_name: owner_name || null, city: city || null,
+    }).eq('id', userId);
+    await supabase.from('business_vocabulary').upsert(
+      [{user_id: userId, term: 'Industry', meaning: industry, category: 'process', aliases: [], created_at: new Date()}],
+      { onConflict: 'user_id,term' }
+    );
+    res.json({ success: true, feature_flags });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/user/features', authMiddleware, async (req, res) => {
+  try {
+    const { data } = await supabase.from('users').select('feature_flags, industry, business_size, gst_registered, owner_name, city, gstin, business_name, business_address').eq('id', req.user.userId).single();
+    res.json({ success: true, ...(data || {}), feature_flags: data?.feature_flags || {} });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================
+// GST BILLS / INVOICES
+// ============================================
+
+// Public endpoint — no auth — for sharing invoice URL
+app.get('/api/bills/public/:id', async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('bills').select('*, users(business_name, gstin, city, business_address, owner_name)').eq('id', req.params.id).single();
+    if (error || !data) return res.status(404).json({ error: 'Invoice not found' });
+    res.json({ success: true, bill: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/bills', authMiddleware, async (req, res) => {
+  try {
+    const { status, from, to, limit = 50 } = req.query;
+    let q = supabase.from('bills').select('*').eq('user_id', req.user.userId).order('created_at', { ascending: false }).limit(Number(limit));
+    if (status) q = q.eq('status', status);
+    if (from) q = q.gte('bill_date', from);
+    if (to) q = q.lte('bill_date', to);
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json({ success: true, bills: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/bills', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { customer_name, customer_gstin, customer_address, customer_phone, items, is_interstate, due_date, notes } = req.body;
+    if (!customer_name || !items?.length) return res.status(400).json({ error: 'customer_name and items required' });
+
+    // Auto-generate bill number
+    const { data: lastBill } = await supabase.from('bills').select('bill_number').eq('user_id', userId).order('created_at', { ascending: false }).limit(1).single();
+    let nextNum = 1;
+    if (lastBill?.bill_number) { const m = lastBill.bill_number.match(/(\d+)$/); if (m) nextNum = parseInt(m[1]) + 1; }
+    const y = new Date().getFullYear();
+    const bill_number = `INV-${y}-${String(nextNum).padStart(4, '0')}`;
+
+    // Calculate totals
+    let subtotal = 0;
+    const enrichedItems = items.map(item => {
+      const amount = parseFloat(item.quantity || 1) * parseFloat(item.rate || 0);
+      subtotal += amount;
+      return { ...item, amount: Math.round(amount * 100) / 100 };
+    });
+
+    const gstRate = parseFloat(req.body.gst_rate || 18);
+    const gstAmt = (subtotal * gstRate) / 100;
+    const cgst = is_interstate ? 0 : gstAmt / 2;
+    const sgst = is_interstate ? 0 : gstAmt / 2;
+    const igst = is_interstate ? gstAmt : 0;
+    const total = subtotal + gstAmt;
+
+    const { data, error } = await supabase.from('bills').insert([{
+      user_id: userId, bill_number, customer_name, customer_gstin: customer_gstin || null,
+      customer_address: customer_address || null, customer_phone: customer_phone || null,
+      items: enrichedItems, gst_rate: gstRate, subtotal: Math.round(subtotal * 100) / 100,
+      cgst: Math.round(cgst * 100) / 100, sgst: Math.round(sgst * 100) / 100,
+      igst: Math.round(igst * 100) / 100, total: Math.round(total * 100) / 100,
+      is_interstate: !!is_interstate, due_date: due_date || null,
+      notes: notes || null, status: 'unpaid', bill_date: new Date().toISOString().split('T')[0],
+      created_at: new Date(),
+    }]).select().single();
+    if (error) throw error;
+
+    // Also create a receivable invoice for collections tracking
+    await supabase.from('invoices').insert([{
+      user_id: userId, customer_name, invoice_amount: total,
+      due_date: due_date || null, status: 'unpaid',
+      notes: `Bill ${bill_number}`, created_at: new Date(),
+    }]).select();
+
+    res.json({ success: true, bill: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/bills/:id', authMiddleware, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('bills').update(req.body).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
+    if (error) throw error;
+    res.json({ success: true, bill: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/bills/:id', authMiddleware, async (req, res) => {
+  try {
+    await supabase.from('bills').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GSTR-1 export data
+app.get('/api/bills/gstr1', authMiddleware, async (req, res) => {
+  try {
+    const { month, year } = req.query;
+    const m = String(month || new Date().getMonth() + 1).padStart(2, '0');
+    const y = year || new Date().getFullYear();
+    const from = `${y}-${m}-01`;
+    const to = `${y}-${m}-31`;
+    const { data: bills } = await supabase.from('bills').select('*').eq('user_id', req.user.userId).gte('bill_date', from).lte('bill_date', to).eq('status', 'unpaid').neq('status', 'cancelled');
+    const b2b = (bills || []).filter(b => b.customer_gstin).map(b => ({
+      'GSTIN of Recipient': b.customer_gstin, 'Receiver Name': b.customer_name,
+      'Invoice Number': b.bill_number, 'Invoice Date': b.bill_date,
+      'Invoice Value': b.total, 'Taxable Value': b.subtotal,
+      'CGST': b.cgst, 'SGST': b.sgst, 'IGST': b.igst, 'GST Rate': b.gst_rate + '%',
+    }));
+    const b2c = (bills || []).filter(b => !b.customer_gstin).map(b => ({
+      'Customer Name': b.customer_name, 'Invoice Number': b.bill_number,
+      'Invoice Date': b.bill_date, 'Invoice Value': b.total,
+      'Taxable Value': b.subtotal, 'CGST': b.cgst, 'SGST': b.sgst, 'IGST': b.igst,
+    }));
+    const totalTax = (bills || []).reduce((s, b) => s + Number(b.cgst || 0) + Number(b.sgst || 0) + Number(b.igst || 0), 0);
+    const totalSales = (bills || []).reduce((s, b) => s + Number(b.total || 0), 0);
+    res.json({ success: true, month: `${m}/${y}`, b2b, b2c, summary: { total_invoices: (bills||[]).length, total_sales: totalSales, total_tax: totalTax } });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================
+// KHATA — Customer Udhaar / Credit Ledger
+// ============================================
+
+app.get('/api/khata', authMiddleware, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('khata_entries').select('*').eq('user_id', req.user.userId).order('entry_date', { ascending: false });
+    if (error) throw error;
+    // Group by customer with running balance
+    const customers = {};
+    (data || []).forEach(e => {
+      if (!customers[e.customer_name]) customers[e.customer_name] = { customer_name: e.customer_name, balance: 0, entries: [], last_entry: e.entry_date };
+      const amt = Number(e.amount);
+      customers[e.customer_name].balance += e.type === 'debit' ? amt : -amt;
+      customers[e.customer_name].entries.push(e);
+      if (e.entry_date > customers[e.customer_name].last_entry) customers[e.customer_name].last_entry = e.entry_date;
+    });
+    res.json({ success: true, customers: Object.values(customers).sort((a, b) => b.balance - a.balance) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/khata/:customer', authMiddleware, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('khata_entries').select('*')
+      .eq('user_id', req.user.userId).eq('customer_name', decodeURIComponent(req.params.customer))
+      .order('entry_date', { ascending: true });
+    if (error) throw error;
+    let balance = 0;
+    const entries = (data || []).map(e => {
+      balance += e.type === 'debit' ? Number(e.amount) : -Number(e.amount);
+      return { ...e, running_balance: balance };
+    });
+    res.json({ success: true, entries, balance });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/khata/entry', authMiddleware, async (req, res) => {
+  try {
+    const { customer_name, type, amount, payment_mode, notes, entry_date } = req.body;
+    if (!customer_name || !type || !amount) return res.status(400).json({ error: 'customer_name, type, amount required' });
+    const { data, error } = await supabase.from('khata_entries').insert([{
+      user_id: req.user.userId, customer_name, type, amount: parseFloat(amount),
+      payment_mode: payment_mode || 'cash', notes: notes || null,
+      entry_date: entry_date || new Date().toISOString().split('T')[0], created_at: new Date(),
+    }]).select().single();
+    if (error) throw error;
+    res.json({ success: true, entry: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/khata/entry/:id', authMiddleware, async (req, res) => {
+  try {
+    await supabase.from('khata_entries').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================
+// PURCHASES — Payables / Supplier dues
+// ============================================
+
+app.get('/api/purchases', authMiddleware, async (req, res) => {
+  try {
+    const { status } = req.query;
+    let q = supabase.from('purchases').select('*').eq('user_id', req.user.userId).order('due_date', { ascending: true });
+    if (status) q = q.eq('status', status);
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json({ success: true, purchases: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/purchases', authMiddleware, async (req, res) => {
+  try {
+    const { supplier_name, amount, due_date, description, category, supplier_gstin, notes } = req.body;
+    if (!supplier_name || !amount) return res.status(400).json({ error: 'supplier_name and amount required' });
+    const { data, error } = await supabase.from('purchases').insert([{
+      user_id: req.user.userId, supplier_name, amount: parseFloat(amount), paid_amount: 0,
+      due_date: due_date || null, description: description || null,
+      category: category || 'material', supplier_gstin: supplier_gstin || null,
+      notes: notes || null, status: 'unpaid', purchase_date: new Date().toISOString().split('T')[0],
+      created_at: new Date(),
+    }]).select().single();
+    if (error) throw error;
+    res.json({ success: true, purchase: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/purchases/:id', authMiddleware, async (req, res) => {
+  try {
+    const updates = req.body;
+    // Auto-update status based on paid_amount
+    if (updates.paid_amount !== undefined) {
+      const { data: existing } = await supabase.from('purchases').select('amount').eq('id', req.params.id).single();
+      if (existing) {
+        const paid = parseFloat(updates.paid_amount);
+        const total = parseFloat(existing.amount);
+        updates.status = paid >= total ? 'paid' : paid > 0 ? 'partial' : 'unpaid';
+      }
+    }
+    const { data, error } = await supabase.from('purchases').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
+    if (error) throw error;
+    res.json({ success: true, purchase: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/purchases/:id', authMiddleware, async (req, res) => {
+  try {
+    await supabase.from('purchases').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================
+// ATTENDANCE + SALARY
+// ============================================
+
+app.get('/api/attendance', authMiddleware, async (req, res) => {
+  try {
+    const month = req.query.month || String(new Date().getMonth() + 1).padStart(2, '0');
+    const year = req.query.year || new Date().getFullYear();
+    const from = `${year}-${String(month).padStart(2, '0')}-01`;
+    const to = `${year}-${String(month).padStart(2, '0')}-31`;
+    const [{ data: workers }, { data: attendance }] = await Promise.all([
+      supabase.from('workers').select('*').eq('user_id', req.user.userId).eq('is_active', true),
+      supabase.from('attendance').select('*').eq('user_id', req.user.userId).gte('attendance_date', from).lte('attendance_date', to),
+    ]);
+    res.json({ success: true, workers: workers || [], attendance: attendance || [], month, year });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/attendance', authMiddleware, async (req, res) => {
+  try {
+    const { worker_id, attendance_date, status } = req.body;
+    if (!worker_id || !attendance_date) return res.status(400).json({ error: 'worker_id and date required' });
+    const { data, error } = await supabase.from('attendance').upsert([{
+      user_id: req.user.userId, worker_id, attendance_date, status: status || 'present', created_at: new Date(),
+    }], { onConflict: 'worker_id,attendance_date' }).select().single();
+    if (error) throw error;
+    res.json({ success: true, attendance: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/attendance/salary', authMiddleware, async (req, res) => {
+  try {
+    const month = req.query.month || String(new Date().getMonth() + 1).padStart(2, '0');
+    const year = req.query.year || new Date().getFullYear();
+    const from = `${year}-${String(month).padStart(2, '0')}-01`;
+    const to = `${year}-${String(month).padStart(2, '0')}-31`;
+    const [{ data: workers }, { data: attendance }] = await Promise.all([
+      supabase.from('workers').select('*').eq('user_id', req.user.userId).eq('is_active', true),
+      supabase.from('attendance').select('*').eq('user_id', req.user.userId).gte('attendance_date', from).lte('attendance_date', to),
+    ]);
+    // Count working days in month
+    const daysInMonth = new Date(Number(year), Number(month), 0).getDate();
+    const salaries = (workers || []).map(w => {
+      const wAttendance = (attendance || []).filter(a => a.worker_id === w.id);
+      const present = wAttendance.filter(a => a.status === 'present').length;
+      const half = wAttendance.filter(a => a.status === 'half_day').length;
+      const effectiveDays = present + (half * 0.5);
+      const baseSalary = parseFloat(w.monthly_salary || 0);
+      const earned = daysInMonth > 0 ? (effectiveDays / daysInMonth) * baseSalary : 0;
+      const advance = parseFloat(w.advance_balance || 0);
+      const net = Math.max(0, earned - advance);
+      return { ...w, present_days: present, half_days: half, effective_days: effectiveDays, total_days: daysInMonth, earned_salary: Math.round(earned), advance_deducted: advance, net_salary: Math.round(net) };
+    });
+    res.json({ success: true, salaries, month, year });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/workers/:id/salary', authMiddleware, async (req, res) => {
+  try {
+    const { monthly_salary, advance_balance } = req.body;
+    const updates = {};
+    if (monthly_salary !== undefined) updates.monthly_salary = parseFloat(monthly_salary);
+    if (advance_balance !== undefined) updates.advance_balance = parseFloat(advance_balance);
+    const { data, error } = await supabase.from('workers').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
+    if (error) throw error;
+    res.json({ success: true, worker: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================
 // START SERVER
 // ============================================
 
