@@ -4450,6 +4450,56 @@ app.patch('/api/workers/:id/salary', authMiddleware, async (req, res) => {
 });
 
 // ============================================
+// BANK ACCOUNTS ENDPOINTS
+// ============================================
+
+app.get('/api/bank/accounts', authMiddleware, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('bank_accounts')
+      .select('*')
+      .eq('user_id', req.user.userId)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json({ success: true, accounts: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/bank/accounts', authMiddleware, async (req, res) => {
+  try {
+    const { bank_name, account_last4, account_type, nickname, ifsc } = req.body;
+    if (!bank_name) return res.status(400).json({ error: 'bank_name required' });
+    const { data, error } = await supabase
+      .from('bank_accounts')
+      .insert([{
+        user_id: req.user.userId,
+        bank_name,
+        account_last4: account_last4 || '',
+        account_type: account_type || 'current',
+        nickname: nickname || '',
+        ifsc: ifsc || '',
+        is_active: true,
+      }])
+      .select()
+      .single();
+    if (error) throw error;
+    res.json({ success: true, account: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/bank/accounts/:id', authMiddleware, async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from('bank_accounts')
+      .delete()
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.userId);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================
 // BANK MONITOR ENDPOINTS
 // ============================================
 
