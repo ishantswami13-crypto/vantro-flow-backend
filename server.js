@@ -2098,7 +2098,7 @@ app.get('/api/billing/history', authMiddleware, async (req, res) => {
 app.get('/api/settings', authMiddleware, async (req, res) => {
   try {
     const { data, error } = await supabase.from('users')
-      .select('id, email, phone, business_name, gstin, plan, whatsapp_phone, whatsapp_token, logo_url, address, created_at, owner_name, city, voice_style, ai_persona')
+      .select('id, email, phone, business_name, gstin, plan, whatsapp_phone, whatsapp_token, logo_url, address, business_address, created_at, owner_name, city, voice_style, ai_persona, upi_id, invoice_prefix, industry')
       .eq('id', req.user.userId).single();
     if (error) throw error;
     res.json({ success: true, settings: data });
@@ -2109,7 +2109,7 @@ app.get('/api/settings', authMiddleware, async (req, res) => {
 
 app.patch('/api/settings', authMiddleware, async (req, res) => {
   try {
-    const allowed = ['business_name', 'phone', 'gstin', 'address', 'logo_url', 'whatsapp_phone', 'whatsapp_token', 'industry', 'language', 'contact_time', 'owner_name', 'city', 'voice_style', 'ai_persona'];
+    const allowed = ['business_name', 'phone', 'gstin', 'address', 'business_address', 'logo_url', 'whatsapp_phone', 'whatsapp_token', 'industry', 'language', 'contact_time', 'owner_name', 'city', 'voice_style', 'ai_persona', 'upi_id', 'invoice_prefix'];
     const updates = {};
     allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
     updates.updated_at = new Date();
