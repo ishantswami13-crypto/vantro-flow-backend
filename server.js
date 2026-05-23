@@ -2121,6 +2121,26 @@ app.patch('/api/settings', authMiddleware, async (req, res) => {
   }
 });
 
+// Save Twilio credentials (stored per-user in DB, used instead of env vars)
+app.post('/api/settings/twilio', authMiddleware, async (req, res) => {
+  try {
+    const { account_sid, auth_token, phone_number } = req.body;
+    if (!account_sid || !auth_token || !phone_number) {
+      return res.status(400).json({ error: 'account_sid, auth_token, and phone_number required' });
+    }
+    const { error } = await supabase.from('users').update({
+      twilio_account_sid: account_sid.trim(),
+      twilio_auth_token: auth_token.trim(),
+      twilio_phone_number: phone_number.trim(),
+      updated_at: new Date(),
+    }).eq('id', req.user.userId);
+    if (error) throw error;
+    res.json({ success: true, message: 'Twilio credentials saved' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ============================================
 // DUNNING RULES
 // ============================================
@@ -2831,11 +2851,26 @@ Output JSON: { "style_description": "2-3 sentences describing exact style", "det
 // TWILIO VOICE CALLING — AI calls debtors
 // ============================================
 
-const getTwilio = () => {
-  if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) return null;
-  try { const twilio = require('twilio'); return twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN); }
+const getTwilio = (sid, token) => {
+  const s = sid || process.env.TWILIO_ACCOUNT_SID;
+  const t = token || process.env.TWILIO_AUTH_TOKEN;
+  if (!s || !t) return null;
+  try { const twilio = require('twilio'); return twilio(s, t); }
   catch { return null; }
 };
+
+// Helper: get Twilio credentials for a user (DB first, then env vars)
+async function getUserTwilioCreds(userId) {
+  if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+    return { sid: process.env.TWILIO_ACCOUNT_SID, token: process.env.TWILIO_AUTH_TOKEN, phone: process.env.TWILIO_PHONE_NUMBER };
+  }
+  if (!userId) return null;
+  const { data } = await supabase.from('users').select('twilio_account_sid, twilio_auth_token, twilio_phone_number').eq('id', userId).single();
+  if (data?.twilio_account_sid && data?.twilio_auth_token) {
+    return { sid: data.twilio_account_sid, token: data.twilio_auth_token, phone: data.twilio_phone_number };
+  }
+  return null;
+}
 
 // Check Twilio config
 app.get('/api/voice/config', authMiddleware, async (req, res) => {
@@ -3482,8 +3517,12 @@ app.post('/api/voice/recording', async (req, res) => {
   if (!RecordingUrl || !userId) return;
 
   try {
-    // 1. Download MP3 from Twilio (auth required)
-    const auth = Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64');
+    // 1. Download MP3 from Twilio — use per-user credentials if env vars not set
+    const creds = await getUserTwilioCreds(userId);
+    const twilioSid   = creds?.sid   || process.env.TWILIO_ACCOUNT_SID;
+    const twilioToken = creds?.token || process.env.TWILIO_AUTH_TOKEN;
+    const twilioClient = creds ? getTwilio(creds.sid, creds.token) : getTwilio();
+    const auth = Buffer.from(`${twilioSid}:${twilioToken}`).toString('base64');
     const recRes = await fetch(`${RecordingUrl}.mp3`, { headers: { Authorization: `Basic ${auth}` } });
     if (!recRes.ok) throw new Error(`Recording download failed: ${recRes.status}`);
     const audioBuf = Buffer.from(await recRes.arrayBuffer());
@@ -3592,11 +3631,23 @@ Extract order from Hindi/Hinglish transcript. Return ONLY valid JSON, no comment
 });
 
 // Get inbound call webhook URL for this user
-app.get('/api/voice/webhook-url', authMiddleware, (req, res) => {
-  const base = process.env.RAILWAY_PUBLIC_URL || 'https://vantro-flow-backend-production.up.railway.app';
-  const url = `${base}/api/voice/inbound?uid=${req.user.userId}`;
-  const twilioConfigured = !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_PHONE_NUMBER);
-  res.json({ success: true, webhook_url: url, twilio_configured: twilioConfigured });
+app.get('/api/voice/webhook-url', authMiddleware, async (req, res) => {
+  try {
+    const base = process.env.RAILWAY_PUBLIC_URL || 'https://vantro-flow-backend-production.up.railway.app';
+    const url = `${base}/api/voice/inbound?uid=${req.user.userId}`;
+    // Check both env vars AND per-user DB credentials
+    const envConfigured = !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_PHONE_NUMBER);
+    let dbSid = null, dbPhone = null;
+    if (!envConfigured) {
+      const { data } = await supabase.from('users').select('twilio_account_sid, twilio_phone_number').eq('id', req.user.userId).single();
+      dbSid   = data?.twilio_account_sid;
+      dbPhone = data?.twilio_phone_number;
+    }
+    const twilioConfigured = envConfigured || !!(dbSid);
+    res.json({ success: true, webhook_url: url, twilio_configured: twilioConfigured, twilio_account_sid: dbSid, twilio_phone_number: dbPhone });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // ============================================
