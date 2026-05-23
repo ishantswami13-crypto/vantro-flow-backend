@@ -3680,9 +3680,9 @@ app.get('/api/today/summary', authMiddleware, async (req, res) => {
     const netProfit = totalIncome - totalExpenses;
 
     // Top selling items from orders
-    const itemMap: Record<string, number> = {};
+    const itemMap = {};
     (orders || []).forEach(o => {
-      (o.items || []).forEach((item: any) => {
+      (o.items || []).forEach((item) => {
         const key = item.name || item.local_name || 'Unknown';
         itemMap[key] = (itemMap[key] || 0) + (item.quantity || 0);
       });
@@ -3692,7 +3692,7 @@ app.get('/api/today/summary', authMiddleware, async (req, res) => {
       .map(([name, qty]) => ({ name, qty }));
 
     // Expense breakdown by category
-    const expenseByCategory: Record<string, number> = {};
+    const expenseByCategory = {};
     (expenses || []).forEach(e => {
       expenseByCategory[e.category] = (expenseByCategory[e.category] || 0) + Number(e.amount || 0);
     });
@@ -3926,7 +3926,7 @@ RULES:
     ];
 
     // Tool execution handlers
-    const execTool = async (name: string, args: any): Promise<any> => {
+    const execTool = async (name, args) => {
       switch (name) {
         case 'get_invoices': {
           const order = args.sort_by === 'days_overdue' ? 'due_date' : 'invoice_amount';
@@ -3955,7 +3955,7 @@ RULES:
           const { data } = await supabase.from('expenses').select('description,amount,category,expense_date')
             .eq('user_id', userId).gte('expense_date', from).lte('expense_date', to);
           const total = (data || []).reduce((s, e) => s + Number(e.amount || 0), 0);
-          const byCategory: Record<string, number> = {};
+          const byCategory = {};
           (data || []).forEach(e => { byCategory[e.category] = (byCategory[e.category] || 0) + Number(e.amount); });
           return { total: `₹${total.toLocaleString('en-IN')}`, by_category: byCategory, items: data || [] };
         }
@@ -3977,7 +3977,7 @@ RULES:
         case 'get_top_customers': {
           if (args.ranked_by === 'orders') {
             const { data } = await supabase.from('orders').select('customer_name,total_amount').eq('user_id', userId).not('status', 'eq', 'cancelled');
-            const map: Record<string, number> = {};
+            const map = {};
             (data || []).forEach(o => { map[o.customer_name] = (map[o.customer_name] || 0) + Number(o.total_amount || 0); });
             return Object.entries(map).sort(([,a],[,b]) => b-a).slice(0, args.limit || 5).map(([name, total]) => ({ name, total: `₹${total.toLocaleString('en-IN')}` }));
           } else {
@@ -3990,14 +3990,14 @@ RULES:
     };
 
     // Agentic loop — up to 4 tool call rounds
-    const messages: any[] = [
+    const messages = [
       { role: 'system', content: systemPrompt },
       ...(history || []).slice(-20),
       { role: 'user', content: message },
     ];
 
     let finalResponse = '';
-    const toolsUsed: string[] = [];
+    const toolsUsed = [];
 
     for (let round = 0; round < 4; round++) {
       const aiRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -4019,7 +4019,7 @@ RULES:
       if (choice.finish_reason === 'tool_calls' && choice.message?.tool_calls) {
         messages.push(choice.message);
         for (const tc of choice.message.tool_calls) {
-          let args: any = {};
+          let args = {};
           try { args = JSON.parse(tc.function.arguments); } catch (_) {}
           const result = await execTool(tc.function.name, args);
           toolsUsed.push(tc.function.name);
