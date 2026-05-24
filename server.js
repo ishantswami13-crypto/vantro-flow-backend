@@ -22,7 +22,28 @@ if (!process.env.JWT_SECRET) {
 const JWT_SECRET = process.env.JWT_SECRET;
 
 const app = express();
+app.set('trust proxy', 1); // Railway sits behind a proxy — needed for express-rate-limit to see real IP
 const PORT = process.env.PORT || 3001;
+
+// ── In-memory OTP store (keyed by userId) ──────────────────────────────────
+// Structure: Map<userId, { code: string, expiresAt: number, attempts: number }>
+const otpStore = new Map();
+function generateOTP() { return String(Math.floor(100000 + Math.random() * 900000)); }
+function storeOTP(userId) {
+  const code = generateOTP();
+  otpStore.set(userId, { code, expiresAt: Date.now() + 10 * 60 * 1000, attempts: 0 });
+  return code;
+}
+function verifyOTP(userId, code) {
+  const entry = otpStore.get(userId);
+  if (!entry) return { valid: false, reason: 'No OTP found. Click Resend.' };
+  if (Date.now() > entry.expiresAt) { otpStore.delete(userId); return { valid: false, reason: 'OTP expired. Click Resend.' }; }
+  if (entry.attempts >= 5) { otpStore.delete(userId); return { valid: false, reason: 'Too many attempts. Click Resend.' }; }
+  entry.attempts++;
+  if (entry.code !== String(code)) return { valid: false, reason: 'Wrong OTP. Try again.' };
+  otpStore.delete(userId);
+  return { valid: true };
+}
 
 // Initialize Supabase
 const supabase = createClient(
@@ -99,19 +120,6 @@ function requireOwner(req, res, next) {
   if (paramId && req.user.userId !== paramId) {
     return res.status(403).json({ error: 'Forbidden' });
   }
-  next();
-}
-
-// adminOnly — restricts to users with role === 'admin'
-function adminOnly(req, res, next) {
-  const header = req.headers.authorization;
-  if (!header || !header.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing token' });
-  try {
-    req.user = jwt.verify(header.slice(7), JWT_SECRET);
-  } catch {
-    return res.status(401).json({ error: 'Invalid or expired token' });
-  }
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   next();
 }
 
@@ -208,19 +216,102 @@ app.post('/api/auth/signup', async (req, res) => {
 
     const password_hash = await bcrypt.hash(password, 12);
     const insertPayload = { email, phone, business_name, password_hash, plan: 'free', created_at: new Date() };
-    if (referred_by) insertPayload.referred_by = referred_by;
+
+    // Decode referral code (VFxxxxxxxx or CAxxxxxxxx) → actual referrer userId
+    if (referred_by) {
+      try {
+        const codePrefix = referred_by.substring(0, 2).toUpperCase(); // 'VF' or 'CA'
+        const codeBody   = referred_by.substring(2).toUpperCase();    // first 8 chars of UUID (no dashes)
+        // Find user whose UUID (stripped of dashes) starts with that 8-char prefix
+        // UUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx; first group = first 8 hex chars
+        const { data: referrerRows } = await supabase.from('users').select('id').ilike('id', codeBody + '-%');
+        if (referrerRows?.length) {
+          insertPayload.referred_by = referrerRows[0].id; // store actual UUID
+        } else {
+          // Fallback: store the raw code in case it's already a userId
+          insertPayload.referred_by = referred_by;
+        }
+      } catch (_) {
+        insertPayload.referred_by = referred_by;
+      }
+    }
 
     const { data, error } = await supabase
       .from('users')
-      .insert([insertPayload])
+      .insert([{ ...insertPayload, phone_verified: false, email_verified: false }])
       .select('id, email, phone, business_name, plan, created_at');
     if (error) throw error;
 
     const user = data[0];
-    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
-    res.json({ success: true, token, user });
+
+    // Generate and send OTP
+    const otp = storeOTP(user.id);
+    const otpMsg = `Vantro Flow verification code: *${otp}*\n\nYe code 10 minute mein expire ho jaayega. Kisi ke saath share mat karein.`;
+
+    // WhatsApp OTP
+    if (user.phone) {
+      sendWhatsAppMessage(user.phone, otpMsg).catch(e => console.error('[OTP WA]', e.message));
+    }
+
+    // Email OTP — log for now, wire to Resend/SendGrid when ready
+    console.log(`[OTP EMAIL] To: ${user.email} | Code: ${otp}`);
+    // TODO: sendEmail(user.email, 'Vantro OTP: ' + otp, otpMsg);
+
+    // Return a short-lived pre-verification token (5 min), NOT the real 7d session token
+    const preToken = jwt.sign({ userId: user.id, email: user.email, preVerify: true }, JWT_SECRET, { expiresIn: '10m' });
+    res.json({ success: true, needs_otp: true, pre_token: preToken, user: { id: user.id, email: user.email, phone: user.phone, business_name: user.business_name } });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── Resend OTP ────────────────────────────────────────────────────────────────
+app.post('/api/auth/resend-otp', async (req, res) => {
+  try {
+    const header = req.headers.authorization;
+    if (!header?.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing token' });
+    const decoded = jwt.verify(header.slice(7), JWT_SECRET);
+    if (!decoded.preVerify) return res.status(400).json({ error: 'Invalid pre-verification token' });
+
+    const { data: user } = await supabase.from('users').select('id, email, phone').eq('id', decoded.userId).single();
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const otp = storeOTP(user.id);
+    const otpMsg = `Vantro Flow verification code: *${otp}*\n\nYe code 10 minute mein expire ho jaayega. Kisi ke saath share mat karein.`;
+
+    if (user.phone) sendWhatsAppMessage(user.phone, otpMsg).catch(() => {});
+    console.log(`[OTP RESEND EMAIL] To: ${user.email} | Code: ${otp}`);
+
+    res.json({ success: true, message: 'OTP sent to your phone and email' });
+  } catch (err) {
+    res.status(400).json({ error: 'Invalid or expired token. Please sign up again.' });
+  }
+});
+
+// ── Verify OTP → issue real session token ────────────────────────────────────
+app.post('/api/auth/verify-otp', async (req, res) => {
+  try {
+    const header = req.headers.authorization;
+    if (!header?.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing token' });
+    const decoded = jwt.verify(header.slice(7), JWT_SECRET);
+    if (!decoded.preVerify) return res.status(400).json({ error: 'Invalid pre-verification token' });
+
+    const { otp } = req.body;
+    if (!otp) return res.status(400).json({ error: 'OTP required' });
+
+    const result = verifyOTP(decoded.userId, String(otp).trim());
+    if (!result.valid) return res.status(400).json({ error: result.reason });
+
+    // Mark verified in DB (columns added gracefully — silently ignored if columns don't exist yet)
+    await supabase.from('users').update({ phone_verified: true, email_verified: true }).eq('id', decoded.userId).catch(() => {});
+
+    // Issue real 7-day session token
+    const { data: user } = await supabase.from('users').select('id, email, phone, business_name, plan, created_at').eq('id', decoded.userId).single();
+    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+
+    res.json({ success: true, token, user });
+  } catch (err) {
+    res.status(400).json({ error: 'Invalid or expired token. Please sign up again.' });
   }
 });
 
@@ -2344,6 +2435,13 @@ async function runDunningCycle() {
           sent_at: new Date(),
         }]).catch(() => {});
 
+        // Actually send the WhatsApp message
+        if (invoice.customer_phone) {
+          await sendWhatsAppMessage(invoice.customer_phone, msg).catch(e =>
+            console.error(`[Dunning] WA send failed for ${invoice.customer_name}:`, e.message)
+          );
+        }
+
         sent++;
       }
     }
@@ -3199,23 +3297,23 @@ app.post('/api/payments/webhook', async (req, res) => {
 cron.schedule('30 2 * * *', async () => {
   console.log('⏰ Morning briefing cron running — 8am IST');
   try {
-    // Get all users who have push subscriptions
+    // Get all users who have a phone number (for WA brief) OR push subscription
     const { data: users } = await supabase
       .from('users')
-      .select('id, business_name, push_subscription')
-      .not('push_subscription', 'is', null);
+      .select('id, business_name, phone, push_subscription')
+      .or('phone.not.is.null,push_subscription.not.is.null');
 
     if (!users || users.length === 0) return;
 
     for (const user of users) {
       try {
-        // Get their overdue invoices
+        // Get their overdue invoices (payment_status = 'Pending' and days_overdue > 0)
         const { data: overdue } = await supabase
           .from('invoices')
-          .select('id, customer_name, invoice_amount, due_date')
+          .select('id, customer_name, invoice_amount, days_overdue')
           .eq('user_id', user.id)
-          .eq('status', 'unpaid')
-          .lte('due_date', new Date().toISOString().split('T')[0])
+          .eq('payment_status', 'Pending')
+          .gt('days_overdue', 0)
           .order('invoice_amount', { ascending: false })
           .limit(3);
 
@@ -3239,8 +3337,7 @@ cron.schedule('30 2 * * *', async () => {
             const amt = Number(inv.invoice_amount).toLocaleString('en-IN');
             const tag = days > 30 ? '(urgent)' : days > 15 ? '(follow up)' : '(due)';
             return `${i+1}. ${inv.customer_name} - Rs.${amt} ${tag}`;
-          }).join('
-');
+          }).join('\n');
           const waMsg = `Subah ka update - Vantro Flow
 
 Aaj collect karna hai: Rs.${totalOverdue.toLocaleString('en-IN')}
@@ -5015,6 +5112,231 @@ app.get('/api/whatsapp/status', authMiddleware, (req, res) => {
   res.json({ success: true, provider, configured: provider !== 'mock', message: provider === 'mock' ? 'Set INTERAKT_API_KEY or WATI_API_URL+WATI_TOKEN to enable real WhatsApp.' : 'Using ' + provider });
 });
 
+
+// ============================================
+// REPORTS EXPORT — Excel / CSV download
+// ============================================
+
+app.get('/api/reports/export', authMiddleware, async (req, res) => {
+  try {
+    const XLSX = require('xlsx');
+    const userId = req.user.userId;
+    const { report = 'outstanding', format = 'xlsx', from, to } = req.query;
+
+    // Build date filter
+    const fromDate = from || new Date(Date.now() - 30 * 86400000).toISOString().split('T')[0];
+    const toDate   = to   || new Date().toISOString().split('T')[0];
+
+    let wb;
+
+    // ── 1. Outstanding Receivables ──────────────────────────────────────────
+    if (report === 'outstanding') {
+      const { data: invoices, error } = await supabase
+        .from('invoices')
+        .select('customer_name, customer_phone, invoice_amount, invoice_date, days_overdue, payment_status, due_date')
+        .eq('user_id', userId)
+        .eq('payment_status', 'Pending')
+        .order('days_overdue', { ascending: false });
+      if (error) throw error;
+
+      const rows = (invoices || []).map(inv => ({
+        'Customer Name':   inv.customer_name || '',
+        'Phone':           inv.customer_phone || '',
+        'Amount (₹)':      Number(inv.invoice_amount || 0),
+        'Invoice Date':    inv.invoice_date || '',
+        'Due Date':        inv.due_date || '',
+        'Days Overdue':    Number(inv.days_overdue || 0),
+        'Status':          inv.payment_status || 'Pending',
+      }));
+
+      const totalRow = {
+        'Customer Name': 'TOTAL',
+        'Phone': '',
+        'Amount (₹)': rows.reduce((s, r) => s + r['Amount (₹)'], 0),
+        'Invoice Date': '',
+        'Due Date': '',
+        'Days Overdue': '',
+        'Status': `${rows.length} invoices`,
+      };
+
+      const ws = XLSX.utils.json_to_sheet([...rows, totalRow]);
+      ws['!cols'] = [{ wch: 28 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 12 }];
+      wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Outstanding Receivables');
+    }
+
+    // ── 2. Collection Performance (Paid in date range) ──────────────────────
+    else if (report === 'collection') {
+      const { data: paid } = await supabase
+        .from('invoices')
+        .select('customer_name, payment_amount, invoice_amount, payment_date, payment_method, days_overdue')
+        .eq('user_id', userId)
+        .eq('payment_status', 'Paid')
+        .gte('payment_date', fromDate)
+        .lte('payment_date', toDate)
+        .order('payment_date', { ascending: false });
+
+      const { data: calls } = await supabase
+        .from('call_logs')
+        .select('customer_name, did_pick_up, promised_payment_date, notes, called_at')
+        .eq('user_id', userId)
+        .gte('called_at', fromDate)
+        .lte('called_at', toDate)
+        .order('called_at', { ascending: false });
+
+      wb = XLSX.utils.book_new();
+
+      const payRows = (paid || []).map(p => ({
+        'Customer':       p.customer_name || '',
+        'Collected (₹)':  Number(p.payment_amount || p.invoice_amount || 0),
+        'Invoice (₹)':    Number(p.invoice_amount || 0),
+        'Paid On':        p.payment_date || '',
+        'Method':         p.payment_method || 'N/A',
+        'Was Overdue (d)': Number(p.days_overdue || 0),
+      }));
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(payRows.length ? payRows : [{ 'Info': 'No payments in range' }]), 'Payments');
+
+      const callRows = (calls || []).map(c => ({
+        'Customer':         c.customer_name || '',
+        'Date':             (c.called_at || '').split('T')[0],
+        'Picked Up':        c.did_pick_up ? 'Yes' : 'No',
+        'Promised Date':    c.promised_payment_date || '',
+        'Notes':            c.notes || '',
+      }));
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(callRows.length ? callRows : [{ 'Info': 'No calls in range' }]), 'Call Logs');
+    }
+
+    // ── 3. GST Summary ──────────────────────────────────────────────────────
+    else if (report === 'gst') {
+      const { data: bills } = await supabase
+        .from('bills')
+        .select('bill_number, customer_name, customer_gstin, invoice_date, subtotal, tax_amount, total_amount, status')
+        .eq('user_id', userId)
+        .gte('invoice_date', fromDate)
+        .lte('invoice_date', toDate)
+        .order('invoice_date', { ascending: false });
+
+      const rows = (bills || []).map(b => ({
+        'Bill No.':         b.bill_number || '',
+        'Customer':         b.customer_name || '',
+        'GSTIN':            b.customer_gstin || '',
+        'Date':             b.invoice_date || '',
+        'Subtotal (₹)':     Number(b.subtotal || 0),
+        'GST (₹)':          Number(b.tax_amount || 0),
+        'Total (₹)':        Number(b.total_amount || 0),
+        'Status':           b.status || '',
+      }));
+      wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows.length ? rows : [{ 'Info': 'No bills in range' }]), 'GST Bills');
+    }
+
+    // ── 4. Cash Flow Forecast (simple 30d projection) ───────────────────────
+    else if (report === 'cashflow') {
+      const { data: pending } = await supabase
+        .from('invoices')
+        .select('customer_name, invoice_amount, days_overdue, due_date')
+        .eq('user_id', userId)
+        .eq('payment_status', 'Pending')
+        .order('due_date', { ascending: true });
+
+      const rows = (pending || []).map(inv => {
+        const overdue = Number(inv.days_overdue || 0);
+        const prob = overdue <= 7 ? 90 : overdue <= 30 ? 65 : overdue <= 60 ? 35 : 15;
+        return {
+          'Customer':      inv.customer_name || '',
+          'Amount (₹)':    Number(inv.invoice_amount || 0),
+          'Due Date':      inv.due_date || '',
+          'Days Overdue':  overdue,
+          'Pay Probability %': prob,
+          'Expected (₹)':  Math.round(Number(inv.invoice_amount || 0) * prob / 100),
+        };
+      });
+      wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows.length ? rows : [{ 'Info': 'No pending invoices' }]), 'Cash Flow Forecast');
+    }
+
+    // ── 5. Calls Log ────────────────────────────────────────────────────────
+    else if (report === 'calls') {
+      const { data: calls } = await supabase
+        .from('call_logs')
+        .select('customer_name, customer_phone, amount, did_pick_up, promised_payment_date, promised_amount, notes, called_at')
+        .eq('user_id', userId)
+        .gte('called_at', fromDate)
+        .lte('called_at', toDate)
+        .order('called_at', { ascending: false });
+
+      const rows = (calls || []).map(c => ({
+        'Customer':        c.customer_name || '',
+        'Phone':           c.customer_phone || '',
+        'Amount (₹)':      Number(c.amount || 0),
+        'Date':            (c.called_at || '').split('T')[0],
+        'Picked Up':       c.did_pick_up ? 'Yes' : 'No',
+        'Promised Date':   c.promised_payment_date || '',
+        'Promised (₹)':    Number(c.promised_amount || 0),
+        'Notes':           c.notes || '',
+      }));
+      wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows.length ? rows : [{ 'Info': 'No calls in range' }]), 'Call Activity');
+    }
+
+    // ── 6. Customer Statement (all invoices per customer) ───────────────────
+    else if (report === 'customer') {
+      const { data: invoices } = await supabase
+        .from('invoices')
+        .select('customer_name, invoice_amount, payment_amount, payment_status, invoice_date, payment_date, days_overdue')
+        .eq('user_id', userId)
+        .order('customer_name', { ascending: true })
+        .order('invoice_date', { ascending: false });
+
+      wb = XLSX.utils.book_new();
+      // Group by customer
+      const byCustomer = {};
+      (invoices || []).forEach(inv => {
+        const key = inv.customer_name || 'Unknown';
+        if (!byCustomer[key]) byCustomer[key] = [];
+        byCustomer[key].push(inv);
+      });
+      const rows = (invoices || []).map(inv => ({
+        'Customer':       inv.customer_name || '',
+        'Invoice (₹)':    Number(inv.invoice_amount || 0),
+        'Paid (₹)':       inv.payment_status === 'Paid' ? Number(inv.payment_amount || inv.invoice_amount || 0) : 0,
+        'Outstanding (₹)':inv.payment_status === 'Pending' ? Number(inv.invoice_amount || 0) : 0,
+        'Invoice Date':   inv.invoice_date || '',
+        'Payment Date':   inv.payment_date || '',
+        'Status':         inv.payment_status || '',
+        'Days Overdue':   Number(inv.days_overdue || 0),
+      }));
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows.length ? rows : [{ 'Info': 'No invoices found' }]), 'Customer Statements');
+    }
+
+    // Fallback
+    else {
+      return res.status(400).json({ error: 'Unknown report type. Use: outstanding, collection, gst, cashflow, calls, customer' });
+    }
+
+    // Send file
+    if (!wb) return res.status(500).json({ error: 'Failed to build workbook' });
+
+    if (format === 'csv') {
+      const firstSheet = wb.Sheets[wb.SheetNames[0]];
+      const csv = XLSX.utils.sheet_to_csv(firstSheet);
+      const filename = `vantro-${report}-${fromDate}.csv`;
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.setHeader('Content-Type', 'text/csv');
+      return res.send(csv);
+    }
+
+    const buf = XLSX.write(wb, { bookType: 'xlsx', type: 'buffer' });
+    const filename = `vantro-${report}-${fromDate}-to-${toDate}.xlsx`;
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.send(buf);
+
+  } catch (err) {
+    console.error('Report export error:', err);
+    res.status(500).json({ error: 'Export failed: ' + err.message });
+  }
+});
 
 // ============================================
 // START SERVER
