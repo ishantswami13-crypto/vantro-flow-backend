@@ -201,5 +201,90 @@ ALTER TABLE prospects      DISABLE ROW LEVEL SECURITY;
 ALTER TABLE dunning_rules  DISABLE ROW LEVEL SECURITY;
 ALTER TABLE billing_records DISABLE ROW LEVEL SECURITY;
 
+-- ─── PAYMENT PLANS (EMI / Installments) ─────────────────────
+CREATE TABLE IF NOT EXISTS payment_plans (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id         UUID REFERENCES users(id) ON DELETE CASCADE,
+  invoice_id      UUID,
+  customer_name   TEXT NOT NULL,
+  customer_phone  TEXT,
+  total_amount    NUMERIC NOT NULL,
+  installments    JSONB DEFAULT '[]',
+  status          TEXT DEFAULT 'active',
+  notes           TEXT,
+  created_at      TIMESTAMPTZ DEFAULT NOW(),
+  updated_at      TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_payment_plans_user_id ON payment_plans(user_id);
+
+-- ─── DISPUTES ────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS disputes (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id         UUID REFERENCES users(id) ON DELETE CASCADE,
+  invoice_id      UUID,
+  customer_name   TEXT NOT NULL,
+  customer_phone  TEXT,
+  disputed_amount NUMERIC NOT NULL,
+  reason          TEXT NOT NULL,
+  notes           TEXT,
+  status          TEXT DEFAULT 'open',
+  resolution      TEXT,
+  resolved_amount NUMERIC,
+  resolved_at     TIMESTAMPTZ,
+  created_at      TIMESTAMPTZ DEFAULT NOW(),
+  updated_at      TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_disputes_user_id ON disputes(user_id);
+
+-- Add dunning_paused column to invoices for dispute support
+ALTER TABLE invoices ADD COLUMN IF NOT EXISTS dunning_paused BOOLEAN DEFAULT FALSE;
+
+-- ─── CA PARTNERS ─────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS ca_partners (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  ca_user_id      UUID UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+  firm_name       TEXT NOT NULL,
+  license_no      TEXT,
+  city            TEXT,
+  specialization  TEXT,
+  referral_code   TEXT UNIQUE,
+  status          TEXT DEFAULT 'active',
+  created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ca_partners_user_id ON ca_partners(ca_user_id);
+
+-- ─── REFERRAL REWARDS ────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS referral_rewards (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  referrer_id     UUID REFERENCES users(id) ON DELETE CASCADE,
+  type            TEXT DEFAULT 'free_month',
+  value           INTEGER DEFAULT 1,
+  status          TEXT DEFAULT 'granted',
+  created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_referral_rewards_referrer ON referral_rewards(referrer_id);
+
+-- ─── TEAM MEMBERS (multi-user roles) ─────────────────────────
+CREATE TABLE IF NOT EXISTS team_members (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id        UUID REFERENCES users(id) ON DELETE CASCADE,
+  name            TEXT NOT NULL,
+  phone           TEXT,
+  email           TEXT,
+  role            TEXT NOT NULL,
+  permissions     JSONB DEFAULT '[]',
+  is_active       BOOLEAN DEFAULT TRUE,
+  created_at      TIMESTAMPTZ DEFAULT NOW(),
+  updated_at      TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_team_members_owner_id ON team_members(owner_id);
+
+-- ─── RLS for new tables (disabled for now) ───────────────────
+ALTER TABLE payment_plans  DISABLE ROW LEVEL SECURITY;
+ALTER TABLE disputes       DISABLE ROW LEVEL SECURITY;
+ALTER TABLE ca_partners    DISABLE ROW LEVEL SECURITY;
+ALTER TABLE referral_rewards DISABLE ROW LEVEL SECURITY;
+ALTER TABLE team_members   DISABLE ROW LEVEL SECURITY;
+
 -- Done! ✓
 SELECT 'Schema migration complete' AS status;

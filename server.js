@@ -15,7 +15,11 @@ const crypto = require('crypto');
 const webpush = require('web-push');
 const { createClient } = require('@supabase/supabase-js');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'vantro-dev-secret-change-in-prod';
+if (!process.env.JWT_SECRET) {
+  console.error('FATAL: JWT_SECRET environment variable is not set. Refusing to start.');
+  process.exit(1);
+}
+const JWT_SECRET = process.env.JWT_SECRET;
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -82,6 +86,50 @@ function authMiddleware(req, res, next) {
   }
 }
 
+// requireOwner — authenticates AND verifies the caller owns the :userId resource
+function requireOwner(req, res, next) {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing token' });
+  try {
+    req.user = jwt.verify(header.slice(7), JWT_SECRET);
+  } catch {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+  const paramId = req.params.userId;
+  if (paramId && req.user.userId !== paramId) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  next();
+}
+
+// adminOnly — restricts to users with role === 'admin'
+function adminOnly(req, res, next) {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing token' });
+  try {
+    req.user = jwt.verify(header.slice(7), JWT_SECRET);
+  } catch {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  next();
+}
+
+// Module-level pg pool — reused across all requests (avoids per-request connection churn)
+let pgPool = null;
+if (process.env.DATABASE_URL) {
+  const { Pool } = require('pg');
+  pgPool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false },
+    max: 10,
+  });
+}
+function getPool() {
+  if (!pgPool) throw new Error('DATABASE_URL is not configured');
+  return pgPool;
+}
+
 // Razorpay instance (initialised lazily so missing keys don't crash startup)
 let razorpay = null;
 if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
@@ -100,6 +148,50 @@ if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
 }
 
 // ============================================
+// WHATSAPP DELIVERY HELPER (Interakt / Wati)
+// INTERAKT_API_KEY -> uses Interakt
+// WATI_API_URL + WATI_TOKEN -> uses Wati
+// Neither set -> console log only (dev)
+// ============================================
+async function sendWhatsAppMessage(phone, message) {
+  const digits = String(phone || '').replace(/\D/g, '').replace(/^91/, '');
+  if (!digits || digits.length < 10) {
+    console.log('[WA] No valid phone:', message.substring(0, 60));
+    return { success: false, reason: 'no_phone' };
+  }
+  try {
+    if (process.env.INTERAKT_API_KEY) {
+      const b64 = Buffer.from(process.env.INTERAKT_API_KEY + ':').toString('base64');
+      const res = await fetch('https://api.interakt.ai/v1/public/message/', {
+        method: 'POST',
+        headers: { 'Authorization': `Basic ${b64}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ countryCode: '91', phoneNumber: digits, callbackData: 'vantro-auto', type: 'Text', data: { message } }),
+      });
+      const data = await res.json();
+      console.log(`[WA Interakt] ${digits}: ${data.result ? 'sent' : 'failed'}`);
+      return { success: !!data.result, provider: 'interakt', data };
+    }
+    if (process.env.WATI_API_URL && process.env.WATI_TOKEN) {
+      const res = await fetch(`${process.env.WATI_API_URL}/api/v1/sendSessionMessage/${digits}`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${process.env.WATI_TOKEN}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messageText: message }),
+      });
+      const data = await res.json();
+      console.log(`[WA Wati] ${digits}: ${data.result ? 'sent' : 'failed'}`);
+      return { success: !!data.result, provider: 'wati', data };
+    }
+    // Dev mode fallback
+    console.log(`[WA MOCK] To: 91${digits}\n${message}\n`);
+    return { success: true, provider: 'mock' };
+  } catch (err) {
+    console.error('[WA] Send error:', err.message);
+    return { success: false, error: err.message };
+  }
+}
+
+
+// ============================================
 // AUTHENTICATION ENDPOINTS
 // ============================================
 
@@ -109,12 +201,12 @@ app.post('/api/auth/signup', async (req, res) => {
     if (!email || !phone || !business_name || !password) {
       return res.status(400).json({ error: 'All fields are required' });
     }
-    if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
 
     const { data: existing } = await supabase.from('users').select('id').eq('email', email).maybeSingle();
     if (existing) return res.status(409).json({ error: 'Email already registered' });
 
-    const password_hash = await bcrypt.hash(password, 10);
+    const password_hash = await bcrypt.hash(password, 12);
     const insertPayload = { email, phone, business_name, password_hash, plan: 'free', created_at: new Date() };
     if (referred_by) insertPayload.referred_by = referred_by;
 
@@ -125,10 +217,10 @@ app.post('/api/auth/signup', async (req, res) => {
     if (error) throw error;
 
     const user = data[0];
-    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
     res.json({ success: true, token, user });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -163,10 +255,10 @@ app.post('/api/auth/login', async (req, res) => {
     if (!valid) return res.status(401).json({ error: 'Invalid email or password' });
 
     const { password_hash, ...user } = data;
-    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
     res.json({ success: true, token, user });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -180,7 +272,7 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
     if (error || !data) return res.status(404).json({ error: 'User not found' });
     res.json({ success: true, user: data });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -218,12 +310,12 @@ app.post('/api/auth/forgot-password', async (req, res) => {
         })
       });
     } else {
-      console.log(`[DEV] Password reset OTP for ${email}: ${otp}`);
+      // OTP intentionally NOT logged — never put secrets in logs
     }
 
     res.json({ success: true, message: 'If that email exists, an OTP has been sent.' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -246,7 +338,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
     if (!token) return res.status(400).json({ error: 'Invalid or expired OTP' });
 
-    const password_hash = await bcrypt.hash(new_password, 10);
+    const password_hash = await bcrypt.hash(new_password, 12);
     await Promise.all([
       supabase.from('users').update({ password_hash }).eq('email', email),
       supabase.from('password_reset_tokens').update({ used: true }).eq('id', token.id)
@@ -254,7 +346,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
     res.json({ success: true, message: 'Password reset successfully. Please log in.' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -292,12 +384,12 @@ function parseCSVRow(row) {
   return fields;
 }
 
-app.post('/api/upload-csv', upload.single('file'), async (req, res) => {
+app.post('/api/upload-csv', authMiddleware, upload.single('file'), async (req, res) => {
   try {
-    const userId = req.body.user_id;
+    const userId = req.user.userId;
 
     if (!userId || !req.file) {
-      return res.status(400).json({ error: 'Missing user_id or file' });
+      return res.status(400).json({ error: 'Missing file' });
     }
 
     const invoices = [];
@@ -345,7 +437,7 @@ app.post('/api/upload-csv', upload.single('file'), async (req, res) => {
 
     res.json({ success: true, count: invoices.length, invoices: data });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -463,7 +555,7 @@ app.post('/api/import/excel', authMiddleware, upload.single('file'), async (req,
     });
   } catch (err) {
     console.error('Import error:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -494,7 +586,7 @@ app.post('/api/import/manual', authMiddleware, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, imported: invoices.length, invoices: data });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -502,7 +594,7 @@ app.post('/api/import/manual', authMiddleware, async (req, res) => {
 // DASHBOARD - GET ALL INVOICES
 // ============================================
 
-app.get('/api/invoices/:userId', async (req, res) => {
+app.get('/api/invoices/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
 
@@ -526,7 +618,7 @@ app.get('/api/invoices/:userId', async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -545,7 +637,7 @@ function getUrgencyLabel(score) {
   return 'OKAY';
 }
 
-app.post('/api/calculate-priority/:userId', async (req, res) => {
+app.post('/api/calculate-priority/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
 
@@ -571,7 +663,7 @@ app.post('/api/calculate-priority/:userId', async (req, res) => {
 
     res.json({ success: true, priority_list: priorityList });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -598,7 +690,7 @@ Examples of good messages:
 
 Generate the exact message (just the message, no intro/outro):`;
 
-app.post('/api/generate-message', async (req, res) => {
+app.post('/api/generate-message', authMiddleware, async (req, res) => {
   try {
     const { customer_name, amount, days_overdue } = req.body;
 
@@ -635,7 +727,7 @@ app.post('/api/generate-message', async (req, res) => {
       message: generatedText.trim()
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -643,7 +735,7 @@ app.post('/api/generate-message', async (req, res) => {
 // PAYMENT TRACKING
 // ============================================
 
-app.post('/api/mark-paid', async (req, res) => {
+app.post('/api/mark-paid', authMiddleware, async (req, res) => {
   try {
     const { invoice_id, payment_date, payment_amount, payment_method, payment_notes } = req.body;
 
@@ -662,9 +754,21 @@ app.post('/api/mark-paid', async (req, res) => {
 
     if (error) throw error;
 
-    res.json({ success: true, invoice: data[0] });
+    const inv = data[0];
+    // Payment celebration WhatsApp to owner
+    try {
+      const { data: owner } = await supabase.from('users').select('phone, business_name, owner_name').eq('id', req.user.userId).single();
+      if (owner?.phone && inv) {
+        const amt = Number(payment_amount || inv.invoice_amount || 0).toLocaleString('en-IN');
+        const { count: pendingCount } = await supabase.from('invoices').select('id', { count: 'exact', head: true }).eq('user_id', req.user.userId).eq('payment_status', 'Pending');
+        const celebMsg = `Payment Received! ${inv.customer_name} ne Rs.${amt} bheja! ${pendingCount > 0 ? `Abhi bhi ${pendingCount} invoice pending hain — Vantro follow-up bhej raha hai.` : 'Sab payments clear! Badhai ho!'}`;
+        await sendWhatsAppMessage(owner.phone, celebMsg);
+      }
+    } catch (waErr) { console.error('Celebration WA error:', waErr.message); }
+
+    res.json({ success: true, invoice: inv });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -672,13 +776,14 @@ app.post('/api/mark-paid', async (req, res) => {
 // CALL TRACKING
 // ============================================
 
-app.post('/api/log-call', async (req, res) => {
+app.post('/api/log-call', authMiddleware, async (req, res) => {
   try {
     const {
-      user_id, customer_name, amount, notes,
+      customer_name, amount, notes,
       invoice_id, customer_phone, call_duration_minutes,
       did_pick_up, promised_payment_date, promised_amount
     } = req.body;
+    const user_id = req.user.userId;
 
     const { data, error } = await supabase
       .from('call_logs')
@@ -701,11 +806,11 @@ app.post('/api/log-call', async (req, res) => {
 
     res.json({ success: true, log: data[0] });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.get('/api/calls/:userId', async (req, res) => {
+app.get('/api/calls/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
 
@@ -719,11 +824,11 @@ app.get('/api/calls/:userId', async (req, res) => {
 
     res.json({ success: true, calls: data });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.post('/api/call/:callId/update', async (req, res) => {
+app.post('/api/call/:callId/update', authMiddleware, async (req, res) => {
   try {
     const { callId } = req.params;
     const { notes, did_pick_up, promised_payment_date, promised_amount, call_duration_minutes } = req.body;
@@ -738,7 +843,7 @@ app.post('/api/call/:callId/update', async (req, res) => {
 
     res.json({ success: true, log: data[0] });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -746,7 +851,7 @@ app.post('/api/call/:callId/update', async (req, res) => {
 // METRICS & DASHBOARD
 // ============================================
 
-app.get('/api/metrics/:userId', async (req, res) => {
+app.get('/api/metrics/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
 
@@ -782,7 +887,7 @@ app.get('/api/metrics/:userId', async (req, res) => {
 
     res.json({ success: true, metrics });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -790,7 +895,7 @@ app.get('/api/metrics/:userId', async (req, res) => {
 // ANALYTICS
 // ============================================
 
-app.get('/api/analytics/:userId', async (req, res) => {
+app.get('/api/analytics/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
 
@@ -855,7 +960,7 @@ app.get('/api/analytics/:userId', async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -865,7 +970,7 @@ app.get('/api/analytics/:userId', async (req, res) => {
 
 // --- Products ---
 
-app.get('/api/inventory/:userId', async (req, res) => {
+app.get('/api/inventory/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
     const [{ data: products }, { data: movements }] = await Promise.all([
@@ -892,11 +997,11 @@ app.get('/api/inventory/:userId', async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.post('/api/products', async (req, res) => {
+app.post('/api/products', authMiddleware, async (req, res) => {
   try {
     const { user_id, name, sku, description, unit_price, unit, current_stock, low_stock_alert, category } = req.body;
     if (!user_id || !name) return res.status(400).json({ error: 'user_id and name required' });
@@ -909,11 +1014,11 @@ app.post('/api/products', async (req, res) => {
     if (error) throw error;
     res.json({ success: true, product: data[0] });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.post('/api/products/:productId', async (req, res) => {
+app.post('/api/products/:productId', authMiddleware, async (req, res) => {
   try {
     const { productId } = req.params;
     const { name, sku, description, unit_price, unit, low_stock_alert, category } = req.body;
@@ -927,24 +1032,24 @@ app.post('/api/products/:productId', async (req, res) => {
     if (error) throw error;
     res.json({ success: true, product: data[0] });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.post('/api/products/:productId/delete', async (req, res) => {
+app.post('/api/products/:productId/delete', authMiddleware, async (req, res) => {
   try {
     const { productId } = req.params;
     const { error } = await supabase.from('products').delete().eq('id', productId);
     if (error) throw error;
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // --- Stock Movements ---
 
-app.post('/api/stock/move', async (req, res) => {
+app.post('/api/stock/move', authMiddleware, async (req, res) => {
   try {
     const { user_id, product_id, movement_type, quantity, unit_cost, reference, notes } = req.body;
     if (!user_id || !product_id || !movement_type || !quantity) {
@@ -973,11 +1078,11 @@ app.post('/api/stock/move', async (req, res) => {
 
     res.json({ success: true, movement: movement[0], new_stock: newStock });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.get('/api/stock/movements/:userId', async (req, res) => {
+app.get('/api/stock/movements/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
     const { data, error } = await supabase
@@ -989,13 +1094,13 @@ app.get('/api/stock/movements/:userId', async (req, res) => {
     if (error) throw error;
     res.json({ success: true, movements: data });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // --- Suppliers ---
 
-app.get('/api/suppliers/:userId', async (req, res) => {
+app.get('/api/suppliers/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
     const { data, error } = await supabase
@@ -1003,11 +1108,11 @@ app.get('/api/suppliers/:userId', async (req, res) => {
     if (error) throw error;
     res.json({ success: true, suppliers: data });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.post('/api/suppliers', async (req, res) => {
+app.post('/api/suppliers', authMiddleware, async (req, res) => {
   try {
     const { user_id, name, phone, email, address, payment_terms } = req.body;
     if (!user_id || !name) return res.status(400).json({ error: 'user_id and name required' });
@@ -1020,11 +1125,11 @@ app.post('/api/suppliers', async (req, res) => {
     if (error) throw error;
     res.json({ success: true, supplier: data[0] });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.post('/api/suppliers/:supplierId', async (req, res) => {
+app.post('/api/suppliers/:supplierId', authMiddleware, async (req, res) => {
   try {
     const { supplierId } = req.params;
     const { name, phone, email, address, payment_terms } = req.body;
@@ -1034,18 +1139,18 @@ app.post('/api/suppliers/:supplierId', async (req, res) => {
     if (error) throw error;
     res.json({ success: true, supplier: data[0] });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.post('/api/suppliers/:supplierId/delete', async (req, res) => {
+app.post('/api/suppliers/:supplierId/delete', authMiddleware, async (req, res) => {
   try {
     const { supplierId } = req.params;
     const { error } = await supabase.from('suppliers').delete().eq('id', supplierId);
     if (error) throw error;
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1057,7 +1162,7 @@ app.post('/api/suppliers/:supplierId/delete', async (req, res) => {
 // AI INSIGHTS
 // ============================================
 
-app.get('/api/ai-insights/:userId', async (req, res) => {
+app.get('/api/ai-insights/:userId', requireOwner, async (req, res) => {
   const { userId } = req.params;
   try {
     const [{ data: invoices }, { data: calls }, { data: movements }, { data: products }] = await Promise.all([
@@ -1144,7 +1249,7 @@ Calls made: ${totalCalls}, Pick-up rate: ${totalCalls ? Math.round(pickedUp/tota
       insights
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1152,7 +1257,7 @@ Calls made: ${totalCalls}, Pick-up rate: ${totalCalls ? Math.round(pickedUp/tota
 // DEEP AI ANALYSIS (Groq llama-3.3-70b — free)
 // ============================================
 
-app.get('/api/ai-deep-analysis/:userId', async (req, res) => {
+app.get('/api/ai-deep-analysis/:userId', requireOwner, async (req, res) => {
   const { userId } = req.params;
   try {
     const [{ data: invoices }, { data: calls }, { data: movements }, { data: products }, { data: suppliers }] = await Promise.all([
@@ -1288,7 +1393,7 @@ Return a JSON object with this exact structure (no markdown, pure JSON):
     res.json({ success: true, analysis });
   } catch (err) {
     console.error('Deep analysis error:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1296,7 +1401,7 @@ Return a JSON object with this exact structure (no markdown, pure JSON):
 // CAMERA / OCR SCAN
 // ============================================
 
-app.post('/api/scan-document', async (req, res) => {
+app.post('/api/scan-document', authMiddleware, async (req, res) => {
   const { image_base64, scan_type } = req.body; // scan_type: 'invoice' | 'supplier'
   if (!image_base64) return res.status(400).json({ error: 'No image provided' });
 
@@ -1328,7 +1433,7 @@ app.post('/api/scan-document', async (req, res) => {
     const extracted = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
     res.json({ success: true, extracted });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1340,7 +1445,7 @@ app.get('/api/health', (req, res) => {
 // SEED DEMO DATA
 // ============================================
 
-app.post('/api/seed/:userId', async (req, res) => {
+app.post('/api/seed/:userId', requireOwner, async (req, res) => {
   const { userId } = req.params;
 
   try {
@@ -1441,7 +1546,7 @@ app.post('/api/seed/:userId', async (req, res) => {
     });
   } catch (err) {
     console.error('Seed error:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1449,7 +1554,7 @@ app.post('/api/seed/:userId', async (req, res) => {
 // PROSPECTS / CRM LITE
 // ============================================
 
-app.get('/api/prospects/:userId', async (req, res) => {
+app.get('/api/prospects/:userId', requireOwner, async (req, res) => {
   const { userId } = req.params;
   try {
     const { data, error } = await supabase
@@ -1459,10 +1564,10 @@ app.get('/api/prospects/:userId', async (req, res) => {
       .order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ success: true, prospects: data || [] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.post('/api/prospects', async (req, res) => {
+app.post('/api/prospects', authMiddleware, async (req, res) => {
   try {
     const { user_id, name, phone, email, business_type, location, amount_stuck, status } = req.body;
     const { data, error } = await supabase
@@ -1471,10 +1576,10 @@ app.post('/api/prospects', async (req, res) => {
       .select();
     if (error) throw error;
     res.json({ success: true, prospect: data[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.post('/api/prospects/:id', async (req, res) => {
+app.post('/api/prospects/:id', authMiddleware, async (req, res) => {
   const { id } = req.params;
   try {
     const updates = req.body;
@@ -1487,19 +1592,19 @@ app.post('/api/prospects/:id', async (req, res) => {
     const { data, error } = await supabase.from('prospects').update(updates).eq('id', id).select();
     if (error) throw error;
     res.json({ success: true, prospect: data[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.post('/api/prospects/:id/delete', async (req, res) => {
+app.post('/api/prospects/:id/delete', authMiddleware, async (req, res) => {
   const { id } = req.params;
   try {
     const { error } = await supabase.from('prospects').delete().eq('id', id);
     if (error) throw error;
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.post('/api/prospects/:id/notes', async (req, res) => {
+app.post('/api/prospects/:id/notes', authMiddleware, async (req, res) => {
   const { id } = req.params;
   try {
     const { text } = req.body;
@@ -1509,14 +1614,14 @@ app.post('/api/prospects/:id/notes', async (req, res) => {
       .select();
     if (error) throw error;
     res.json({ success: true, note: data[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
 // CASH FLOW FORECAST
 // ============================================
 
-app.get('/api/cash-forecast/:userId', async (req, res) => {
+app.get('/api/cash-forecast/:userId', requireOwner, async (req, res) => {
   const { userId } = req.params;
   const { current_cash = 0, daily_expenses = 13000, days = 30 } = req.query;
 
@@ -1575,14 +1680,14 @@ app.get('/api/cash-forecast/:userId', async (req, res) => {
       scenarios,
       days: n
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
 // DB MIGRATION (safe to call multiple times)
 // ============================================
 
-app.post('/api/migrate', async (req, res) => {
+app.post('/api/migrate', authMiddleware, async (req, res) => {
   const dbUrl = process.env.DATABASE_URL;
   if (!dbUrl) {
     return res.status(400).json({
@@ -1654,7 +1759,7 @@ CREATE INDEX IF NOT EXISTS idx_prospect_notes_prospect_id ON prospect_notes(pros
     res.json({ success: true, message: '✅ Migration complete — prospects & prospect_notes tables created' });
   } catch (err) {
     if (client) await client.end().catch(() => {});
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1694,7 +1799,7 @@ async function groqChat(messages, tools, toolChoice = 'auto') {
   return data.choices[0];
 }
 
-app.post('/api/ai-chat', async (req, res) => {
+app.post('/api/ai-chat', authMiddleware, async (req, res) => {
   const { user_id, messages, business_name } = req.body;
   if (!user_id || !messages) return res.status(400).json({ error: 'Missing user_id or messages' });
 
@@ -1972,7 +2077,7 @@ Summarise actions clearly after doing them.${voiceContext}${overdueContext}`;
     return res.json({ success:true, message:'Done! Let me know if you need anything else.', actions, navigate:navigateTo, waLinks });
   } catch(err) {
     console.error('AI chat error:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2028,7 +2133,7 @@ app.post('/api/payments/create-link', authMiddleware, async (req, res) => {
     });
   } catch (err) {
     console.error('Payment link error:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2057,7 +2162,7 @@ app.post('/api/billing/create-order', authMiddleware, async (req, res) => {
     });
     res.json({ success: true, order, key: process.env.RAZORPAY_KEY_ID });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2076,7 +2181,7 @@ app.post('/api/billing/verify', authMiddleware, async (req, res) => {
     }]);
     res.json({ success: true, message: 'Payment verified, plan upgraded' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2087,7 +2192,7 @@ app.get('/api/billing/history', authMiddleware, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, history: data || [] });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2103,7 +2208,7 @@ app.get('/api/settings', authMiddleware, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, settings: data });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2117,7 +2222,7 @@ app.patch('/api/settings', authMiddleware, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, settings: data[0] });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2137,7 +2242,7 @@ app.post('/api/settings/twilio', authMiddleware, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, message: 'Twilio credentials saved' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2145,18 +2250,18 @@ app.post('/api/settings/twilio', authMiddleware, async (req, res) => {
 // DUNNING RULES
 // ============================================
 
-app.get('/api/dunning/:userId', async (req, res) => {
+app.get('/api/dunning/:userId', requireOwner, async (req, res) => {
   try {
     const { data, error } = await supabase.from('dunning_rules')
       .select('*').eq('user_id', req.params.userId).order('trigger_day');
     if (error) throw error;
     res.json({ success: true, rules: data || [] });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.post('/api/dunning', async (req, res) => {
+app.post('/api/dunning', authMiddleware, async (req, res) => {
   try {
     const { user_id, name, trigger_day, action, tone, enabled } = req.body;
     if (!user_id || !trigger_day || !action) return res.status(400).json({ error: 'Missing required fields' });
@@ -2166,11 +2271,11 @@ app.post('/api/dunning', async (req, res) => {
     if (error) throw error;
     res.json({ success: true, rule: data[0] });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.patch('/api/dunning/:id', async (req, res) => {
+app.patch('/api/dunning/:id', authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
     const updates = { ...req.body, updated_at: new Date() };
@@ -2178,17 +2283,17 @@ app.patch('/api/dunning/:id', async (req, res) => {
     if (error) throw error;
     res.json({ success: true, rule: data[0] });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.delete('/api/dunning/:id', async (req, res) => {
+app.delete('/api/dunning/:id', authMiddleware, async (req, res) => {
   try {
     const { error } = await supabase.from('dunning_rules').delete().eq('id', req.params.id);
     if (error) throw error;
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2255,7 +2360,7 @@ cron.schedule('30 3 * * *', runDunningCycle, { timezone: 'UTC' });
 // VANTRO NETWORK — Business Discovery
 // ============================================
 
-app.get('/api/network/search', async (req, res) => {
+app.get('/api/network/search', authMiddleware, async (req, res) => {
   try {
     const { q = '', type = 'all', limit = 20 } = req.query;
 
@@ -2320,7 +2425,7 @@ app.get('/api/network/search', async (req, res) => {
     res.json({ success: true, businesses: result });
   } catch (error) {
     console.error('Network search error:', error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2495,7 +2600,7 @@ Write a crisp 3-sentence morning briefing for the business owner. Be specific, u
     });
   } catch (err) {
     console.error('ML briefing error:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2559,7 +2664,7 @@ app.get('/api/admin/stats', adminOnly, async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2622,7 +2727,7 @@ app.get('/api/public/profile/:userId', async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2706,7 +2811,7 @@ Use natural Hinglish like "bhai", "aap", "theek hai", "koi baat nahi", "kal tak"
     res.json({ success: true, script, debtor: customer_name, amount: invoice_amount });
   } catch (err) {
     console.error('Call script error:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2788,7 +2893,7 @@ Sort by urgency (most overdue first). Use natural Hinglish.`;
     res.json({ success: true, messages: result, count: result.length });
   } catch (err) {
     console.error('Bulk WhatsApp error:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2843,7 +2948,7 @@ Output JSON: { "style_description": "2-3 sentences describing exact style", "det
     res.json({ success: true, ...result });
   } catch (err) {
     console.error('Extract voice error:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2943,7 +3048,7 @@ app.post('/api/voice/call', authMiddleware, async (req, res) => {
     res.json({ success: true, call_sid: call.sid, status: call.status, script: openingScript });
   } catch (err) {
     console.error('Twilio error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2985,7 +3090,7 @@ app.post('/api/notifications/subscribe', authMiddleware, async (req, res) => {
       .eq('id', userId);
     res.json({ success: true, message: 'Push subscription saved' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3119,12 +3224,32 @@ cron.schedule('30 2 * * *', async () => {
         const topDebtor = overdue[0];
         const totalOverdue = overdue.reduce((s, i) => s + Number(i.invoice_amount), 0);
 
+        // Push notification
         await sendPushToUser(
           user.id,
-          `☀️ Subah ka briefing — Vantro Flow`,
-          `${overdue.length} overdue invoices. Top: ${topDebtor.customer_name} (₹${Number(topDebtor.invoice_amount).toLocaleString('en-IN')}). Total pending: ₹${totalOverdue.toLocaleString('en-IN')}`,
+          `Subah ka briefing - Vantro Flow`,
+          `${overdue.length} overdue invoices. Top: ${topDebtor.customer_name} (Rs.${Number(topDebtor.invoice_amount).toLocaleString('en-IN')}). Total pending: Rs.${totalOverdue.toLocaleString('en-IN')}`,
           { type: 'morning_briefing', count: overdue.length, total: totalOverdue }
         );
+
+        // WhatsApp Morning Brief - the addiction trigger
+        if (user.phone) {
+          const top3 = (overdue || []).slice(0, 3).map((inv, i) => {
+            const days = inv.days_overdue || 0;
+            const amt = Number(inv.invoice_amount).toLocaleString('en-IN');
+            const tag = days > 30 ? '(urgent)' : days > 15 ? '(follow up)' : '(due)';
+            return `${i+1}. ${inv.customer_name} - Rs.${amt} ${tag}`;
+          }).join('
+');
+          const waMsg = `Subah ka update - Vantro Flow
+
+Aaj collect karna hai: Rs.${totalOverdue.toLocaleString('en-IN')}
+
+${top3}
+
+Vantro ne aapke liye auto-reminders queue kar diye hain. App kholein aur ek click mein sab bhejein.`;
+          await sendWhatsAppMessage(user.phone, waMsg);
+        }
       } catch (userErr) {
         console.error(`Morning briefing error for user ${user.id}:`, userErr.message);
       }
@@ -3140,10 +3265,9 @@ cron.schedule('30 2 * * *', async () => {
 // ============================================
 
 // Create transactions table
-app.post('/api/transactions/migrate', async (req, res) => {
+app.post('/api/transactions/migrate', authMiddleware, async (req, res) => {
   try {
-    const { Pool } = require('pg');
-    const pool2 = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+    const pool2 = getPool();
     await pool2.query(`
       CREATE TABLE IF NOT EXISTS transactions (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -3162,13 +3286,12 @@ app.post('/api/transactions/migrate', async (req, res) => {
       CREATE INDEX IF NOT EXISTS idx_txn_user ON transactions(user_id);
       CREATE INDEX IF NOT EXISTS idx_txn_date ON transactions(transaction_date DESC);
     `);
-    await pool2.end();
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+  } catch (err) { console.error('[migrate]', err); res.status(500).json({ success: false, error: 'Internal server error' }); }
 });
 
 // GET all transactions for a user
-app.get('/api/transactions/:userId', async (req, res) => {
+app.get('/api/transactions/:userId', requireOwner, async (req, res) => {
   const { userId } = req.params;
   const { type, category, limit = 200 } = req.query;
   try {
@@ -3184,9 +3307,8 @@ app.get('/api/transactions/:userId', async (req, res) => {
       return r;
     })() : { data: [], error: null };
 
-    // Use raw pg if supabase doesn't have table yet
-    const { Pool } = require('pg');
-    const pool2 = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+    // Use raw pg for transactions table (reuse module-level pool)
+    const pool2 = getPool();
     const result = await pool2.query(q, params);
 
     // Summary
@@ -3198,7 +3320,6 @@ app.get('/api/transactions/:userId', async (req, res) => {
       `SELECT type, SUM(amount) as total FROM transactions WHERE user_id = $1 AND DATE_TRUNC('month', transaction_date) = DATE_TRUNC('month', CURRENT_DATE) GROUP BY type`,
       [userId]
     );
-    await pool2.end();
 
     const totalIn  = parseFloat(sumRes.rows.find(r => r.type === 'in')?.total  || 0);
     const totalOut = parseFloat(sumRes.rows.find(r => r.type === 'out')?.total || 0);
@@ -3209,39 +3330,36 @@ app.get('/api/transactions/:userId', async (req, res) => {
       transactions: result.rows,
       summary: { totalIn, totalOut, balance: totalIn - totalOut, monthIn, monthOut, monthBalance: monthIn - monthOut }
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // POST add a transaction
-app.post('/api/transactions', async (req, res) => {
-  const { user_id, type, category, amount, description, party_name, transaction_date, payment_method, reference, notes } = req.body;
+app.post('/api/transactions', authMiddleware, async (req, res) => {
+  const { type, category, amount, description, party_name, transaction_date, payment_method, reference, notes } = req.body;
+  const user_id = req.user.userId;
   try {
-    const { Pool } = require('pg');
-    const pool2 = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+    const pool2 = getPool();
     const result = await pool2.query(
       `INSERT INTO transactions (user_id,type,category,amount,description,party_name,transaction_date,payment_method,reference,notes)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
       [user_id, type, category, parseFloat(amount), description, party_name,
        transaction_date || new Date().toISOString().split('T')[0], payment_method || 'UPI', reference, notes]
     );
-    await pool2.end();
     res.json({ success: true, transaction: result.rows[0] });
-  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+  } catch (err) { console.error('[transactions POST]', err); res.status(500).json({ success: false, error: 'Internal server error' }); }
 });
 
 // GET financial summary with category breakdown
-app.get('/api/financial-summary/:userId', async (req, res) => {
+app.get('/api/financial-summary/:userId', requireOwner, async (req, res) => {
   const { userId } = req.params;
   try {
-    const { Pool } = require('pg');
-    const pool2 = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+    const pool2 = getPool();
     const [totals, monthly, catBreakdown, recent] = await Promise.all([
       pool2.query(`SELECT type, SUM(amount) as total, COUNT(*) as count FROM transactions WHERE user_id=$1 GROUP BY type`, [userId]),
       pool2.query(`SELECT TO_CHAR(transaction_date,'YYYY-MM') as month, type, SUM(amount) as total FROM transactions WHERE user_id=$1 AND transaction_date >= NOW()-INTERVAL '6 months' GROUP BY month,type ORDER BY month DESC`, [userId]),
       pool2.query(`SELECT category, type, SUM(amount) as total, COUNT(*) as count FROM transactions WHERE user_id=$1 GROUP BY category,type ORDER BY total DESC`, [userId]),
       pool2.query(`SELECT * FROM transactions WHERE user_id=$1 ORDER BY transaction_date DESC, created_at DESC LIMIT 5`, [userId]),
     ]);
-    await pool2.end();
 
     const totalIn  = parseFloat(totals.rows.find(r => r.type === 'in')?.total  || 0);
     const totalOut = parseFloat(totals.rows.find(r => r.type === 'out')?.total || 0);
@@ -3251,21 +3369,19 @@ app.get('/api/financial-summary/:userId', async (req, res) => {
       categories: catBreakdown.rows,
       recentTransactions: recent.rows,
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // AI Financial Monitor
-app.get('/api/ai-financial-monitor/:userId', async (req, res) => {
+app.get('/api/ai-financial-monitor/:userId', requireOwner, async (req, res) => {
   const { userId } = req.params;
   try {
-    const { Pool } = require('pg');
-    const pool2 = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+    const pool2 = getPool();
     const [totals, last30, invoiceSummary] = await Promise.all([
       pool2.query(`SELECT type, SUM(amount) as total FROM transactions WHERE user_id=$1 GROUP BY type`, [userId]),
       pool2.query(`SELECT category, type, SUM(amount) as total FROM transactions WHERE user_id=$1 AND transaction_date >= NOW()-INTERVAL '30 days' GROUP BY category,type ORDER BY total DESC`, [userId]),
       pool2.query(`SELECT payment_status, SUM(invoice_amount) as total, COUNT(*) as cnt FROM invoices WHERE user_id=$1 GROUP BY payment_status`, [userId]),
     ]);
-    await pool2.end();
 
     const totalIn  = parseFloat(totals.rows.find(r => r.type === 'in')?.total  || 0);
     const totalOut = parseFloat(totals.rows.find(r => r.type === 'out')?.total || 0);
@@ -3293,7 +3409,7 @@ Return JSON only:
     const match = text.match(/\{[\s\S]*\}/);
     const analysis = match ? JSON.parse(match[0]) : { health_score: 50, status: 'warning', summary: 'Insufficient data.', alerts: [], insights: [], top_expenses: [] };
     res.json({ success: true, analysis });
-  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -3316,7 +3432,7 @@ app.get('/api/orders', authMiddleware, async (req, res) => {
     const { data, error } = await query;
     if (error) throw error;
     res.json({ success: true, orders: data || [] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/orders', authMiddleware, async (req, res) => {
@@ -3332,7 +3448,7 @@ app.post('/api/orders', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     res.json({ success: true, order: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/orders/:id', authMiddleware, async (req, res) => {
@@ -3343,14 +3459,14 @@ app.patch('/api/orders/:id', authMiddleware, async (req, res) => {
       .eq('id', req.params.id).eq('user_id', userId).select().single();
     if (error) throw error;
     res.json({ success: true, order: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/orders/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('orders').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -3363,7 +3479,7 @@ app.get('/api/workers', authMiddleware, async (req, res) => {
       .select('*').eq('user_id', req.user.userId).order('name');
     if (error) throw error;
     res.json({ success: true, workers: data || [] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/workers', authMiddleware, async (req, res) => {
@@ -3376,7 +3492,7 @@ app.post('/api/workers', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     res.json({ success: true, worker: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/workers/:id', authMiddleware, async (req, res) => {
@@ -3385,14 +3501,14 @@ app.patch('/api/workers/:id', authMiddleware, async (req, res) => {
       .update(req.body).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
     res.json({ success: true, worker: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/workers/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('workers').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -3405,7 +3521,7 @@ app.get('/api/vocabulary', authMiddleware, async (req, res) => {
       .select('*').eq('user_id', req.user.userId).order('category').order('term');
     if (error) throw error;
     res.json({ success: true, vocabulary: data || [] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/vocabulary', authMiddleware, async (req, res) => {
@@ -3418,14 +3534,14 @@ app.post('/api/vocabulary', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     res.json({ success: true, item: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/vocabulary/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('business_vocabulary').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Seed starter vocabulary by industry
@@ -3476,7 +3592,7 @@ app.post('/api/vocabulary/seed', authMiddleware, async (req, res) => {
     const { error } = await supabase.from('business_vocabulary').insert(items);
     if (error) throw error;
     res.json({ success: true, seeded: items.length, industry });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -3646,7 +3762,7 @@ app.get('/api/voice/webhook-url', authMiddleware, async (req, res) => {
     const twilioConfigured = envConfigured || !!(dbSid);
     res.json({ success: true, webhook_url: url, twilio_configured: twilioConfigured, twilio_account_sid: dbSid, twilio_phone_number: dbPhone });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3665,7 +3781,7 @@ app.get('/api/expenses', authMiddleware, async (req, res) => {
     const { data, error } = await q;
     if (error) throw error;
     res.json({ success: true, expenses: data || [] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/expenses', authMiddleware, async (req, res) => {
@@ -3679,7 +3795,7 @@ app.post('/api/expenses', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     res.json({ success: true, expense: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/expenses/:id', authMiddleware, async (req, res) => {
@@ -3688,14 +3804,14 @@ app.patch('/api/expenses/:id', authMiddleware, async (req, res) => {
       .update(req.body).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
     res.json({ success: true, expense: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/expenses/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('expenses').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -3771,7 +3887,7 @@ app.get('/api/today/summary', authMiddleware, async (req, res) => {
       expenses: expenses || [],
       paid_invoices: paidInvoices || [],
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -3784,7 +3900,7 @@ app.get('/api/ai/brain/rules', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('brain_rules').select('*').eq('user_id', req.user.userId).order('created_at');
     if (error) throw error;
     res.json({ success: true, rules: data || [] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/ai/brain/rules', authMiddleware, async (req, res) => {
@@ -3796,14 +3912,14 @@ app.post('/api/ai/brain/rules', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     res.json({ success: true, rule: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/ai/brain/rules/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('brain_rules').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Main Vantro Brain endpoint — full context AI with live tool use
@@ -4094,7 +4210,7 @@ RULES:
     res.json({ success: true, response: finalResponse, history: newHistory, tools_used: toolsUsed });
   } catch (err) {
     console.error('Brain error:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -4139,14 +4255,14 @@ app.post('/api/onboarding/setup', authMiddleware, async (req, res) => {
       { onConflict: 'user_id,term' }
     );
     res.json({ success: true, feature_flags });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/user/features', authMiddleware, async (req, res) => {
   try {
     const { data } = await supabase.from('users').select('feature_flags, industry, business_size, gst_registered, owner_name, city, gstin, business_name, business_address').eq('id', req.user.userId).single();
     res.json({ success: true, ...(data || {}), feature_flags: data?.feature_flags || {} });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -4159,7 +4275,7 @@ app.get('/api/bills/public/:id', async (req, res) => {
     const { data, error } = await supabase.from('bills').select('*, users(business_name, gstin, city, business_address, owner_name)').eq('id', req.params.id).single();
     if (error || !data) return res.status(404).json({ error: 'Invoice not found' });
     res.json({ success: true, bill: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/bills', authMiddleware, async (req, res) => {
@@ -4172,7 +4288,7 @@ app.get('/api/bills', authMiddleware, async (req, res) => {
     const { data, error } = await q;
     if (error) throw error;
     res.json({ success: true, bills: data || [] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/bills', authMiddleware, async (req, res) => {
@@ -4223,7 +4339,7 @@ app.post('/api/bills', authMiddleware, async (req, res) => {
     }]).select();
 
     res.json({ success: true, bill: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/bills/:id', authMiddleware, async (req, res) => {
@@ -4231,14 +4347,14 @@ app.patch('/api/bills/:id', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('bills').update(req.body).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
     res.json({ success: true, bill: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/bills/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('bills').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // GSTR-1 export data
@@ -4264,7 +4380,7 @@ app.get('/api/bills/gstr1', authMiddleware, async (req, res) => {
     const totalTax = (bills || []).reduce((s, b) => s + Number(b.cgst || 0) + Number(b.sgst || 0) + Number(b.igst || 0), 0);
     const totalSales = (bills || []).reduce((s, b) => s + Number(b.total || 0), 0);
     res.json({ success: true, month: `${m}/${y}`, b2b, b2c, summary: { total_invoices: (bills||[]).length, total_sales: totalSales, total_tax: totalTax } });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -4285,7 +4401,7 @@ app.get('/api/khata', authMiddleware, async (req, res) => {
       if (e.entry_date > customers[e.customer_name].last_entry) customers[e.customer_name].last_entry = e.entry_date;
     });
     res.json({ success: true, customers: Object.values(customers).sort((a, b) => b.balance - a.balance) });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/khata/:customer', authMiddleware, async (req, res) => {
@@ -4300,7 +4416,7 @@ app.get('/api/khata/:customer', authMiddleware, async (req, res) => {
       return { ...e, running_balance: balance };
     });
     res.json({ success: true, entries, balance });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/khata/entry', authMiddleware, async (req, res) => {
@@ -4314,14 +4430,14 @@ app.post('/api/khata/entry', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     res.json({ success: true, entry: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/khata/entry/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('khata_entries').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -4336,7 +4452,7 @@ app.get('/api/purchases', authMiddleware, async (req, res) => {
     const { data, error } = await q;
     if (error) throw error;
     res.json({ success: true, purchases: data || [] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/purchases', authMiddleware, async (req, res) => {
@@ -4352,7 +4468,7 @@ app.post('/api/purchases', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     res.json({ success: true, purchase: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/purchases/:id', authMiddleware, async (req, res) => {
@@ -4370,14 +4486,14 @@ app.patch('/api/purchases/:id', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('purchases').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
     res.json({ success: true, purchase: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/purchases/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('purchases').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -4395,7 +4511,7 @@ app.get('/api/attendance', authMiddleware, async (req, res) => {
       supabase.from('attendance').select('*').eq('user_id', req.user.userId).gte('attendance_date', from).lte('attendance_date', to),
     ]);
     res.json({ success: true, workers: workers || [], attendance: attendance || [], month, year });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/attendance', authMiddleware, async (req, res) => {
@@ -4407,7 +4523,7 @@ app.post('/api/attendance', authMiddleware, async (req, res) => {
     }], { onConflict: 'worker_id,attendance_date' }).select().single();
     if (error) throw error;
     res.json({ success: true, attendance: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/attendance/salary', authMiddleware, async (req, res) => {
@@ -4434,7 +4550,7 @@ app.get('/api/attendance/salary', authMiddleware, async (req, res) => {
       return { ...w, present_days: present, half_days: half, effective_days: effectiveDays, total_days: daysInMonth, earned_salary: Math.round(earned), advance_deducted: advance, net_salary: Math.round(net) };
     });
     res.json({ success: true, salaries, month, year });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/workers/:id/salary', authMiddleware, async (req, res) => {
@@ -4446,7 +4562,7 @@ app.patch('/api/workers/:id/salary', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('workers').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
     res.json({ success: true, worker: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -4462,7 +4578,7 @@ app.get('/api/bank/accounts', authMiddleware, async (req, res) => {
       .order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ success: true, accounts: data || [] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/bank/accounts', authMiddleware, async (req, res) => {
@@ -4484,7 +4600,7 @@ app.post('/api/bank/accounts', authMiddleware, async (req, res) => {
       .single();
     if (error) throw error;
     res.json({ success: true, account: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/bank/accounts/:id', authMiddleware, async (req, res) => {
@@ -4496,7 +4612,7 @@ app.delete('/api/bank/accounts/:id', authMiddleware, async (req, res) => {
       .eq('user_id', req.user.userId);
     if (error) throw error;
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -4512,7 +4628,7 @@ app.get('/api/bank/transactions', authMiddleware, async (req, res) => {
       .order('txn_date', { ascending: false });
     if (error) throw error;
     res.json({ success: true, transactions: data || [] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/bank/transactions', authMiddleware, async (req, res) => {
@@ -4533,7 +4649,7 @@ app.post('/api/bank/transactions', authMiddleware, async (req, res) => {
       .single();
     if (error) throw error;
     res.json({ success: true, transaction: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/bank/match', authMiddleware, async (req, res) => {
@@ -4576,7 +4692,7 @@ app.post('/api/bank/match', authMiddleware, async (req, res) => {
       }
     }
     res.json({ success: true, message: 'Matched and marked as paid' });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/bank/transactions/:id/ignore', authMiddleware, async (req, res) => {
@@ -4590,7 +4706,7 @@ app.patch('/api/bank/transactions/:id/ignore', authMiddleware, async (req, res) 
       .single();
     if (error) throw error;
     res.json({ success: true, transaction: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/bank/transactions/:id', authMiddleware, async (req, res) => {
@@ -4602,8 +4718,303 @@ app.delete('/api/bank/transactions/:id', authMiddleware, async (req, res) => {
       .eq('user_id', req.user.userId);
     if (error) throw error;
     res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+
+
+// ============================================
+// WEEKLY SCORECARD CRON -- Sunday 6pm IST (12:30 UTC)
+// ============================================
+cron.schedule('30 12 * * 0', async () => {
+  console.log('Weekly scorecard cron running...');
+  try {
+    const { data: users } = await supabase.from('users').select('id, phone, business_name, owner_name').not('phone', 'is', null);
+    if (!users?.length) return;
+    const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    for (const user of users) {
+      try {
+        const [{ data: collected }, { data: pending }, { data: calls }] = await Promise.all([
+          supabase.from('invoices').select('payment_amount, invoice_amount').eq('user_id', user.id).eq('payment_status', 'Paid').gte('payment_date', weekAgo),
+          supabase.from('invoices').select('invoice_amount, customer_name, days_overdue').eq('user_id', user.id).eq('payment_status', 'Pending').order('days_overdue', { ascending: false }).limit(1),
+          supabase.from('call_logs').select('id').eq('user_id', user.id).gte('called_at', weekAgo),
+        ]);
+        const collectedAmt = (collected || []).reduce((s, i) => s + Number(i.payment_amount || i.invoice_amount), 0);
+        const riskParty = pending?.[0]?.customer_name || null;
+        const riskDays = pending?.[0]?.days_overdue || 0;
+        const callCount = calls?.length || 0;
+        if (collectedAmt === 0 && callCount === 0) continue;
+        const parts = [
+          'Is Hafte ka Report - Vantro Flow',
+          '',
+          'Collections: Rs.' + collectedAmt.toLocaleString('en-IN'),
+          'Calls made: ' + callCount,
+          riskParty ? 'Risky account: ' + riskParty + ' (' + riskDays + ' din overdue - personally call karein)' : 'Koi risky account nahi!',
+          '',
+          'Vantro ne is hafte aapke liye kaam kiya. Agli hafte aur zyada collect karein!',
+        ];
+        await sendWhatsAppMessage(user.phone, parts.join('\n'));
+      } catch (e) { console.error('Scorecard error user', user.id, e.message); }
+    }
+    console.log('Weekly scorecards sent');
+  } catch (err) { console.error('Weekly scorecard cron error:', err.message); }
+}, { timezone: 'UTC' });
+
+// ============================================
+// PAYMENT PLANS / EMI SPLITS
+// ============================================
+
+app.get('/api/payment-plans', authMiddleware, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('payment_plans').select('*').eq('user_id', req.user.userId).order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json({ success: true, plans: data || [] });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+app.post('/api/payment-plans', authMiddleware, async (req, res) => {
+  try {
+    const { invoice_id, customer_name, customer_phone, total_amount, installments, notes } = req.body;
+    if (!customer_name || !total_amount || !installments?.length) return res.status(400).json({ error: 'customer_name, total_amount, installments required' });
+    const { data, error } = await supabase.from('payment_plans').insert([{
+      user_id: req.user.userId, invoice_id: invoice_id || null, customer_name,
+      customer_phone: customer_phone || null, total_amount: parseFloat(total_amount),
+      installments, status: 'active', notes: notes || null, created_at: new Date(),
+    }]).select().single();
+    if (error) throw error;
+    if (customer_phone && installments[0]) {
+      const msg = customer_name + ' ji, payment plan set ho gaya. Pehli installment: Rs.' + Number(installments[0].amount).toLocaleString('en-IN') + ' - due: ' + installments[0].due_date;
+      await sendWhatsAppMessage(customer_phone, msg);
+    }
+    res.json({ success: true, plan: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/payment-plans/:id/installment', authMiddleware, async (req, res) => {
+  try {
+    const { installment_index, paid_at } = req.body;
+    const { data: plan } = await supabase.from('payment_plans').select('*').eq('id', req.params.id).eq('user_id', req.user.userId).single();
+    if (!plan) return res.status(404).json({ error: 'Plan not found' });
+    const installments = plan.installments || [];
+    if (installment_index >= installments.length) return res.status(400).json({ error: 'Invalid installment index' });
+    installments[installment_index].paid = true;
+    installments[installment_index].paid_at = paid_at || new Date().toISOString();
+    const allPaid = installments.every(i => i.paid);
+    const { data, error } = await supabase.from('payment_plans').update({ installments, status: allPaid ? 'completed' : 'active', updated_at: new Date() }).eq('id', req.params.id).select().single();
+    if (error) throw error;
+    res.json({ success: true, plan: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/payment-plans/:id', authMiddleware, async (req, res) => {
+  try {
+    await supabase.from('payment_plans').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================
+// DISPUTE MANAGEMENT
+// ============================================
+
+app.get('/api/disputes', authMiddleware, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('disputes').select('*').eq('user_id', req.user.userId).order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json({ success: true, disputes: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/disputes', authMiddleware, async (req, res) => {
+  try {
+    const { invoice_id, customer_name, customer_phone, disputed_amount, reason, notes } = req.body;
+    if (!customer_name || !disputed_amount || !reason) return res.status(400).json({ error: 'customer_name, disputed_amount, reason required' });
+    const { data, error } = await supabase.from('disputes').insert([{
+      user_id: req.user.userId, invoice_id: invoice_id || null, customer_name,
+      customer_phone: customer_phone || null, disputed_amount: parseFloat(disputed_amount),
+      reason, notes: notes || null, status: 'open', created_at: new Date(),
+    }]).select().single();
+    if (error) throw error;
+    if (invoice_id) await supabase.from('invoices').update({ dunning_paused: true }).eq('id', invoice_id).eq('user_id', req.user.userId);
+    res.json({ success: true, dispute: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/disputes/:id', authMiddleware, async (req, res) => {
+  try {
+    const updates = {};
+    ['status', 'resolution', 'resolved_amount', 'notes'].forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
+    updates.updated_at = new Date();
+    if (updates.status === 'resolved') {
+      updates.resolved_at = new Date();
+      const { data: dispute } = await supabase.from('disputes').select('invoice_id').eq('id', req.params.id).single();
+      if (dispute?.invoice_id) await supabase.from('invoices').update({ dunning_paused: false }).eq('id', dispute.invoice_id).eq('user_id', req.user.userId);
+    }
+    const { data, error } = await supabase.from('disputes').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
+    if (error) throw error;
+    res.json({ success: true, dispute: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/disputes/:id', authMiddleware, async (req, res) => {
+  try {
+    await supabase.from('disputes').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================
+// CA PARTNER PORTAL
+// ============================================
+
+app.post('/api/ca-partners/register', authMiddleware, async (req, res) => {
+  try {
+    const { firm_name, license_no, city, specialization } = req.body;
+    if (!firm_name) return res.status(400).json({ error: 'firm_name required' });
+    const referral_code = 'CA' + req.user.userId.replace(/-/g, '').substring(0, 8).toUpperCase();
+    const { data, error } = await supabase.from('ca_partners').upsert([{
+      ca_user_id: req.user.userId, firm_name, license_no: license_no || null,
+      city: city || null, specialization: specialization || null,
+      referral_code, status: 'active', created_at: new Date(),
+    }], { onConflict: 'ca_user_id' }).select().single();
+    if (error) throw error;
+    res.json({ success: true, partner: data, referral_code });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/ca-partners/dashboard', authMiddleware, async (req, res) => {
+  try {
+    const { data: caData } = await supabase.from('ca_partners').select('*').eq('ca_user_id', req.user.userId).single();
+    if (!caData) return res.status(404).json({ error: 'Not a CA partner. Register first.' });
+    const { count: clientCount } = await supabase.from('users').select('id', { count: 'exact', head: true }).eq('referred_by', req.user.userId);
+    const { count: paidCount } = await supabase.from('users').select('id', { count: 'exact', head: true }).eq('referred_by', req.user.userId).neq('plan', 'free');
+    const monthlyCommission = (paidCount || 0) * 300;
+    res.json({ success: true, ca: caData, stats: { total_clients: clientCount || 0, paid_clients: paidCount || 0, monthly_commission: monthlyCommission, referral_code: caData.referral_code } });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/ca-partners/clients', authMiddleware, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('users').select('id, business_name, phone, plan, industry, created_at').eq('referred_by', req.user.userId).order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json({ success: true, clients: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================
+// REFERRAL REWARD SYSTEM
+// ============================================
+
+app.get('/api/referrals/my-stats', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { count: totalReferrals } = await supabase.from('users').select('id', { count: 'exact', head: true }).eq('referred_by', userId);
+    const { count: paidReferrals } = await supabase.from('users').select('id', { count: 'exact', head: true }).eq('referred_by', userId).neq('plan', 'free');
+    const { data: rewards } = await supabase.from('referral_rewards').select('*').eq('referrer_id', userId).order('created_at', { ascending: false });
+    const freeMonthsEarned = (rewards || []).filter(r => r.type === 'free_month').length;
+    const referralCode = 'VF' + userId.replace(/-/g, '').substring(0, 8).toUpperCase();
+    res.json({ success: true, stats: { total_referrals: totalReferrals || 0, paid_referrals: paidReferrals || 0, free_months_earned: freeMonthsEarned, referral_code: referralCode, referral_link: 'https://vantroflow.app/signup?ref=' + referralCode, rewards: rewards || [] } });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/referrals/claim-reward', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { count: paidReferrals } = await supabase.from('users').select('id', { count: 'exact', head: true }).eq('referred_by', userId).neq('plan', 'free');
+    const { count: claimedRewards } = await supabase.from('referral_rewards').select('id', { count: 'exact', head: true }).eq('referrer_id', userId).eq('type', 'free_month');
+    const newRewards = (paidReferrals || 0) - (claimedRewards || 0);
+    if (newRewards <= 0) return res.json({ success: false, message: 'No new rewards. Refer more paying customers!' });
+    const rewardRows = Array.from({ length: newRewards }, () => ({ referrer_id: userId, type: 'free_month', value: 1, status: 'granted', created_at: new Date() }));
+    await supabase.from('referral_rewards').insert(rewardRows);
+    res.json({ success: true, rewards_granted: newRewards, message: newRewards + ' free month(s) added!' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================
+// BAD DEBT FLAGGING
+// ============================================
+
+app.get('/api/bad-debt-flags/:userId', requireOwner, async (req, res) => {
+  try {
+    const { data: invoices } = await supabase.from('invoices').select('id, customer_name, invoice_amount, days_overdue, customer_phone').eq('user_id', req.params.userId).eq('payment_status', 'Pending').gte('days_overdue', 60).order('days_overdue', { ascending: false });
+    if (!invoices?.length) return res.json({ success: true, flagged: [] });
+    const flagged = (invoices || []).map(inv => {
+      const risk = inv.days_overdue >= 120 ? 'critical' : inv.days_overdue >= 90 ? 'high' : 'medium';
+      const recommendation = inv.days_overdue >= 120 ? 'Legal notice bhejein' : inv.days_overdue >= 90 ? 'Personal call karein' : 'Escalate karein';
+      return { ...inv, risk_level: risk, recommendation };
+    });
+    res.json({ success: true, flagged });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================
+// MULTI-USER TEAM ROLES & PERMISSIONS
+// ============================================
+
+app.get('/api/team/members', authMiddleware, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('team_members').select('*').eq('owner_id', req.user.userId).order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json({ success: true, members: data || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/team/members', authMiddleware, async (req, res) => {
+  try {
+    const { name, phone, email, role } = req.body;
+    const validRoles = ['accountant', 'salesman', 'collections_agent', 'viewer'];
+    if (!name || !role || !validRoles.includes(role)) return res.status(400).json({ error: 'name and valid role required. Roles: ' + validRoles.join(', ') });
+    const permissions = {
+      accountant:        ['dashboard', 'collections', 'khata', 'ledger', 'reports', 'invoices', 'bills'],
+      salesman:          ['dashboard', 'orders', 'customers', 'collections'],
+      collections_agent: ['dashboard', 'collections', 'khata', 'whatsapp', 'calls'],
+      viewer:            ['dashboard', 'reports', 'analytics'],
+    };
+    const { data, error } = await supabase.from('team_members').insert([{
+      owner_id: req.user.userId, name, phone: phone || null, email: email || null,
+      role, permissions: permissions[role], is_active: true, created_at: new Date(),
+    }]).select().single();
+    if (error) throw error;
+    res.json({ success: true, member: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/team/members/:id', authMiddleware, async (req, res) => {
+  try {
+    const updates = {};
+    ['name', 'phone', 'email', 'role', 'permissions', 'is_active'].forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
+    updates.updated_at = new Date();
+    const { data, error } = await supabase.from('team_members').update(updates).eq('id', req.params.id).eq('owner_id', req.user.userId).select().single();
+    if (error) throw error;
+    res.json({ success: true, member: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/team/members/:id', authMiddleware, async (req, res) => {
+  try {
+    await supabase.from('team_members').delete().eq('id', req.params.id).eq('owner_id', req.user.userId);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================
+// WHATSAPP MANUAL SEND & PROVIDER STATUS
+// ============================================
+
+app.post('/api/whatsapp/send', authMiddleware, async (req, res) => {
+  try {
+    const { phone, message } = req.body;
+    if (!phone || !message) return res.status(400).json({ error: 'phone and message required' });
+    const result = await sendWhatsAppMessage(phone, message);
+    res.json({ success: true, result });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/whatsapp/status', authMiddleware, (req, res) => {
+  const provider = process.env.INTERAKT_API_KEY ? 'interakt' : (process.env.WATI_API_URL ? 'wati' : 'mock');
+  res.json({ success: true, provider, configured: provider !== 'mock', message: provider === 'mock' ? 'Set INTERAKT_API_KEY or WATI_API_URL+WATI_TOKEN to enable real WhatsApp.' : 'Using ' + provider });
+});
+
 
 // ============================================
 // START SERVER
