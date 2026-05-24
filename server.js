@@ -199,6 +199,74 @@ async function sendWhatsAppMessage(phone, message) {
 }
 
 
+// ── Email OTP helper (uses Resend if RESEND_API_KEY is set) ──────────────────
+async function sendOTPEmail(email, name, otp) {
+  const displayName = name || 'there';
+  const html = `
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#0a0a0f;">
+  <table width="100%" cellpadding="0" cellspacing="0">
+    <tr><td align="center" style="padding:40px 20px;">
+      <table width="480" cellpadding="0" cellspacing="0" style="background:#141419;border-radius:16px;border:1px solid #2a2a35;overflow:hidden;">
+        <tr>
+          <td style="background:linear-gradient(135deg,#0066ff,#00c853);padding:24px 32px;">
+            <p style="margin:0;color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-0.5px;">⚡ Vantro Flow</p>
+            <p style="margin:4px 0 0;color:rgba(255,255,255,0.75);font-size:13px;">Collections OS for Indian MSMEs</p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:32px;">
+            <p style="margin:0 0 8px;color:#e0e0e8;font-size:16px;">Hi ${displayName},</p>
+            <p style="margin:0 0 24px;color:#9090a0;font-size:14px;line-height:1.6;">
+              Use this OTP to verify your Vantro Flow account. It expires in <strong style="color:#e0e0e8;">10 minutes</strong>.
+            </p>
+            <div style="background:#0d1117;border:2px solid #0066ff;border-radius:12px;padding:24px;text-align:center;margin:0 0 24px;">
+              <p style="margin:0 0 6px;color:#6060a0;font-size:12px;letter-spacing:2px;text-transform:uppercase;">Your OTP</p>
+              <p style="margin:0;color:#ffffff;font-size:40px;font-weight:900;letter-spacing:12px;font-family:monospace;">${otp}</p>
+            </div>
+            <p style="margin:0 0 8px;color:#6060a0;font-size:12px;line-height:1.6;">
+              🔒 Never share this code with anyone. Vantro will never ask for your OTP over call or chat.
+            </p>
+            <p style="margin:0;color:#6060a0;font-size:12px;">
+              If you didn't sign up for Vantro Flow, ignore this email.
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:16px 32px;border-top:1px solid #2a2a35;">
+            <p style="margin:0;color:#404050;font-size:11px;text-align:center;">
+              © 2025 Vantro Flow · Pune, India
+            </p>
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+
+  const RESEND_API_KEY = process.env.RESEND_API_KEY;
+  if (RESEND_API_KEY) {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_API_KEY}` },
+      body: JSON.stringify({
+        from: 'Vantro Flow <noreply@vantroflow.com>',
+        to: email,
+        subject: `${otp} is your Vantro Flow OTP`,
+        html,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    console.log(`[EMAIL OTP] Resend → ${email}: ${data.id ? 'sent' : 'failed'}`);
+  } else {
+    // Dev mode — OTP visible in logs only
+    console.log(`[EMAIL OTP DEV] To: ${email} | Code: ${otp}`);
+  }
+}
+
 // ============================================
 // AUTHENTICATION ENDPOINTS
 // ============================================
@@ -253,9 +321,8 @@ app.post('/api/auth/signup', async (req, res) => {
       sendWhatsAppMessage(user.phone, otpMsg).catch(e => console.error('[OTP WA]', e.message));
     }
 
-    // Email OTP — log for now, wire to Resend/SendGrid when ready
-    console.log(`[OTP EMAIL] To: ${user.email} | Code: ${otp}`);
-    // TODO: sendEmail(user.email, 'Vantro OTP: ' + otp, otpMsg);
+    // Email OTP — send via Resend if configured
+    sendOTPEmail(user.email, user.business_name, otp).catch(e => console.error('[OTP EMAIL]', e.message));
 
     // Return a short-lived pre-verification token (5 min), NOT the real 7d session token
     const preToken = jwt.sign({ userId: user.id, email: user.email, preVerify: true }, JWT_SECRET, { expiresIn: '10m' });
@@ -273,14 +340,14 @@ app.post('/api/auth/resend-otp', async (req, res) => {
     const decoded = jwt.verify(header.slice(7), JWT_SECRET);
     if (!decoded.preVerify) return res.status(400).json({ error: 'Invalid pre-verification token' });
 
-    const { data: user } = await supabase.from('users').select('id, email, phone').eq('id', decoded.userId).single();
+    const { data: user } = await supabase.from('users').select('id, email, phone, business_name').eq('id', decoded.userId).single();
     if (!user) return res.status(404).json({ error: 'User not found' });
 
     const otp = storeOTP(user.id);
     const otpMsg = `Vantro Flow verification code: *${otp}*\n\nYe code 10 minute mein expire ho jaayega. Kisi ke saath share mat karein.`;
 
     if (user.phone) sendWhatsAppMessage(user.phone, otpMsg).catch(() => {});
-    console.log(`[OTP RESEND EMAIL] To: ${user.email} | Code: ${otp}`);
+    sendOTPEmail(user.email, user.business_name, otp).catch(() => {});
 
     res.json({ success: true, message: 'OTP sent to your phone and email' });
   } catch (err) {
@@ -2229,6 +2296,165 @@ app.post('/api/payments/create-link', authMiddleware, async (req, res) => {
 });
 
 // ============================================
+// ONE-CLICK REMINDER — create link + auto-send WhatsApp
+// ============================================
+
+// Single invoice reminder: creates Razorpay/UPI link + sends WhatsApp in one call
+app.post('/api/collections/send-reminder', authMiddleware, async (req, res) => {
+  try {
+    const { invoice_id } = req.body;
+    if (!invoice_id) return res.status(400).json({ error: 'invoice_id required' });
+
+    // Get invoice (ownership enforced via user_id filter)
+    const { data: inv, error: invErr } = await supabase
+      .from('invoices')
+      .select('id, customer_name, customer_phone, invoice_amount, payment_status, payment_link, payment_link_id, reminder_count')
+      .eq('id', invoice_id)
+      .eq('user_id', req.user.userId)
+      .single();
+
+    if (invErr || !inv) return res.status(404).json({ error: 'Invoice not found' });
+    if (inv.payment_status === 'Paid') return res.status(400).json({ error: 'Invoice already paid' });
+
+    // Get owner info
+    const { data: owner } = await supabase
+      .from('users')
+      .select('business_name, upi_id')
+      .eq('id', req.user.userId)
+      .single();
+
+    const bizName = owner?.business_name || 'Vantro';
+
+    // Reuse existing payment link or create a new one
+    let payLink = inv.payment_link;
+    let payLinkId = inv.payment_link_id;
+
+    if (!payLink) {
+      if (razorpay) {
+        try {
+          const pl = await razorpay.paymentLink.create({
+            amount: Math.round(parseFloat(inv.invoice_amount) * 100),
+            currency: 'INR',
+            description: `Invoice payment — ${inv.customer_name}`,
+            customer: { name: inv.customer_name },
+            notify: { sms: false, email: false },
+            reminder_enable: false,
+            notes: { invoice_id, customer_name: inv.customer_name },
+            callback_url: `${process.env.FRONTEND_URL || 'https://vantro-flow.vercel.app'}/collections`,
+            callback_method: 'get',
+          });
+          payLink = pl.short_url;
+          payLinkId = pl.id;
+        } catch (plErr) {
+          console.error('[send-reminder] Razorpay link error:', plErr.message);
+        }
+      }
+      // UPI deeplink fallback
+      if (!payLink) {
+        const upiId = owner?.upi_id || process.env.BUSINESS_UPI_ID || '';
+        if (upiId) {
+          payLink = `upi://pay?pa=${upiId}&pn=${encodeURIComponent(bizName)}&am=${inv.invoice_amount}&tn=${encodeURIComponent('Invoice Payment')}&cu=INR`;
+        }
+      }
+      if (payLink) {
+        await supabase.from('invoices').update({
+          payment_link: payLink,
+          payment_link_id: payLinkId || null,
+        }).eq('id', invoice_id);
+      }
+    }
+
+    // Build WhatsApp message
+    const firstName = (inv.customer_name || '').split(' ')[0];
+    const amtFormatted = Number(inv.invoice_amount).toLocaleString('en-IN');
+    const msg = payLink
+      ? `${firstName} ji 🙏\n\nAapka ₹${amtFormatted} ka payment pending hai.\n\nIs link se abhi pay karein:\n${payLink}\n\nUPI, Card, NetBanking — sab accept hota hai.\n\n— ${bizName}`
+      : `${firstName} ji 🙏\n\nAapka ₹${amtFormatted} ka payment pending hai. Kripya jaldi settle karein.\n\n— ${bizName}`;
+
+    // Auto-send WhatsApp (Interakt / WATI / mock)
+    let waResult = { success: false, reason: 'no_phone' };
+    if (inv.customer_phone) {
+      waResult = await sendWhatsAppMessage(inv.customer_phone, msg);
+    }
+
+    // Update reminder tracking regardless of send status
+    await supabase.from('invoices').update({
+      last_reminder_sent: new Date().toISOString(),
+      reminder_count: (inv.reminder_count || 0) + 1,
+    }).eq('id', invoice_id);
+
+    res.json({
+      success: true,
+      auto_sent: waResult.success,
+      provider: waResult.provider || null,
+      payment_link: payLink,
+      whatsapp_text: msg,
+      phone: inv.customer_phone,
+    });
+  } catch (err) {
+    console.error('Send reminder error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Bulk reminder: send to all overdue invoices (respects min_days filter)
+app.post('/api/collections/bulk-remind', authMiddleware, async (req, res) => {
+  try {
+    const { min_days = 1, tone = 'friendly' } = req.body;
+
+    const { data: invoices } = await supabase
+      .from('invoices')
+      .select('id, customer_name, customer_phone, invoice_amount, days_overdue, payment_link, reminder_count')
+      .eq('user_id', req.user.userId)
+      .eq('payment_status', 'Pending')
+      .gte('days_overdue', Number(min_days))
+      .not('customer_phone', 'is', null);
+
+    const { data: owner } = await supabase
+      .from('users')
+      .select('business_name, upi_id')
+      .eq('id', req.user.userId)
+      .single();
+
+    const bizName = owner?.business_name || 'Vantro';
+    let sent = 0;
+    const results = [];
+
+    for (const inv of (invoices || [])) {
+      try {
+        const firstName = inv.customer_name.split(' ')[0];
+        const amtFmt = Number(inv.invoice_amount).toLocaleString('en-IN');
+        let msg;
+        if (tone === 'firm') {
+          msg = `Dear ${firstName},\n\n₹${amtFmt} payment is ${inv.days_overdue} days overdue. Please settle immediately.\n\n— ${bizName}`;
+        } else if (tone === 'urgent') {
+          msg = `${firstName} — ₹${amtFmt} overdue ${inv.days_overdue} din. Aaj hi payment karein. Urgent hai.\n\n— ${bizName}`;
+        } else {
+          msg = `${firstName} ji 🙏\n\n₹${amtFmt} ka payment ${inv.days_overdue} din se pending hai.${inv.payment_link ? `\n\nLink se pay karein:\n${inv.payment_link}` : ''}\n\nKripya jaldi settle karein.\n\n— ${bizName}`;
+        }
+
+        const waResult = await sendWhatsAppMessage(inv.customer_phone, msg);
+
+        await supabase.from('invoices').update({
+          last_reminder_sent: new Date().toISOString(),
+          reminder_count: (inv.reminder_count || 0) + 1,
+        }).eq('id', inv.id);
+
+        if (waResult.success) sent++;
+        results.push({ id: inv.id, name: inv.customer_name, sent: waResult.success });
+      } catch (e) {
+        results.push({ id: inv.id, name: inv.customer_name, sent: false });
+      }
+    }
+
+    res.json({ success: true, total: (invoices || []).length, sent, results });
+  } catch (err) {
+    console.error('Bulk remind error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============================================
 // RAZORPAY BILLING
 // ============================================
 
@@ -3248,11 +3474,11 @@ app.post('/api/payments/webhook', async (req, res) => {
         const payerName = payment?.notes?.contact || pl.customer?.name || '';
         const paymentId  = payment?.id || '';
 
-        // Find the invoice that has this payment_link_id stored in notes or match by amount+customer
+        // Find the invoice that has this payment_link_id (use payment_status, not status)
         const { data: invoices } = await supabase
           .from('invoices')
-          .select('id, user_id, customer_name, invoice_amount, status')
-          .eq('status', 'unpaid')
+          .select('id, user_id, customer_name, customer_phone, invoice_amount, payment_status')
+          .eq('payment_status', 'Pending')
           .eq('payment_link_id', paymentLinkId)
           .limit(1);
 
@@ -3262,8 +3488,9 @@ app.post('/api/payments/webhook', async (req, res) => {
           // Mark as paid
           await supabase.from('invoices')
             .update({
-              status: 'paid',
-              paid_at: new Date().toISOString(),
+              payment_status: 'Paid',
+              payment_date: new Date().toISOString().split('T')[0],
+              payment_amount: amountPaid,
               payment_id: paymentId,
             })
             .eq('id', inv.id);
@@ -3276,7 +3503,17 @@ app.post('/api/payments/webhook', async (req, res) => {
             { type: 'payment_received', invoice_id: inv.id, amount: inv.invoice_amount }
           );
 
-          console.log(`✅ Webhook: Invoice ${inv.id} marked paid via Razorpay (${paymentLinkId})`);
+          // Send thank-you WhatsApp to customer
+          if (inv.customer_phone) {
+            const firstName = (inv.customer_name || '').split(' ')[0];
+            const amtFmt = Number(inv.invoice_amount).toLocaleString('en-IN');
+            const thankYouMsg = `${firstName} ji 🙏\n\nAapka ₹${amtFmt} payment mil gaya. Bahut shukriya!\n\nReceipt ke liye app dekh sakte hain. Aage bhi aate rehna. 😊`;
+            sendWhatsAppMessage(inv.customer_phone, thankYouMsg).catch(e =>
+              console.error('[Webhook] Thank-you WA failed:', e.message)
+            );
+          }
+
+          console.log(`✅ Webhook: Invoice ${inv.id} marked Paid via Razorpay (${paymentLinkId})`);
         } else {
           // Fallback: try matching by amount if no payment_link_id stored
           console.log(`Webhook: No invoice found for payment_link ${paymentLinkId}`);
