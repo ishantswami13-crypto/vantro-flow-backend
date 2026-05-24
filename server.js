@@ -161,15 +161,20 @@ if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
 // WATI_API_URL + WATI_TOKEN -> uses Wati
 // Neither set -> console log only (dev)
 // ============================================
-async function sendWhatsAppMessage(phone, message) {
+// creds: optional per-user { interakt_api_key, wati_api_url, wati_token }
+// Falls back to env vars → mock
+async function sendWhatsAppMessage(phone, message, creds = {}) {
   const digits = String(phone || '').replace(/\D/g, '').replace(/^91/, '');
   if (!digits || digits.length < 10) {
     console.log('[WA] No valid phone:', message.substring(0, 60));
     return { success: false, reason: 'no_phone' };
   }
+  const interaktKey = creds.interakt_api_key || process.env.INTERAKT_API_KEY;
+  const watiUrl     = creds.wati_api_url     || process.env.WATI_API_URL;
+  const watiToken   = creds.wati_token       || process.env.WATI_TOKEN;
   try {
-    if (process.env.INTERAKT_API_KEY) {
-      const b64 = Buffer.from(process.env.INTERAKT_API_KEY + ':').toString('base64');
+    if (interaktKey) {
+      const b64 = Buffer.from(interaktKey + ':').toString('base64');
       const res = await fetch('https://api.interakt.ai/v1/public/message/', {
         method: 'POST',
         headers: { 'Authorization': `Basic ${b64}`, 'Content-Type': 'application/json' },
@@ -179,10 +184,10 @@ async function sendWhatsAppMessage(phone, message) {
       console.log(`[WA Interakt] ${digits}: ${data.result ? 'sent' : 'failed'}`);
       return { success: !!data.result, provider: 'interakt', data };
     }
-    if (process.env.WATI_API_URL && process.env.WATI_TOKEN) {
-      const res = await fetch(`${process.env.WATI_API_URL}/api/v1/sendSessionMessage/${digits}`, {
+    if (watiUrl && watiToken) {
+      const res = await fetch(`${watiUrl}/api/v1/sendSessionMessage/${digits}`, {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${process.env.WATI_TOKEN}`, 'Content-Type': 'application/json' },
+        headers: { 'Authorization': `Bearer ${watiToken}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ messageText: message }),
       });
       const data = await res.json();
@@ -424,7 +429,7 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('users')
-      .select('id, email, phone, business_name, plan, gstin, created_at')
+      .select('id, email, phone, business_name, plan, gstin, created_at, industry, business_size, gst_registered, has_workers, owner_name, city, onboarding_done')
       .eq('id', req.user.userId)
       .single();
     if (error || !data) return res.status(404).json({ error: 'User not found' });
@@ -2316,12 +2321,18 @@ app.post('/api/collections/send-reminder', authMiddleware, async (req, res) => {
     if (invErr || !inv) return res.status(404).json({ error: 'Invoice not found' });
     if (inv.payment_status === 'Paid') return res.status(400).json({ error: 'Invoice already paid' });
 
-    // Get owner info
+    // Get owner info + per-user WhatsApp credentials
     const { data: owner } = await supabase
       .from('users')
-      .select('business_name, upi_id')
+      .select('business_name, upi_id, interakt_api_key, wati_api_url, wati_token')
       .eq('id', req.user.userId)
       .single();
+
+    const waCreds = {
+      interakt_api_key: owner?.interakt_api_key,
+      wati_api_url:     owner?.wati_api_url,
+      wati_token:       owner?.wati_token,
+    };
 
     const bizName = owner?.business_name || 'Vantro';
 
@@ -2371,10 +2382,10 @@ app.post('/api/collections/send-reminder', authMiddleware, async (req, res) => {
       ? `${firstName} ji 🙏\n\nAapka ₹${amtFormatted} ka payment pending hai.\n\nIs link se abhi pay karein:\n${payLink}\n\nUPI, Card, NetBanking — sab accept hota hai.\n\n— ${bizName}`
       : `${firstName} ji 🙏\n\nAapka ₹${amtFormatted} ka payment pending hai. Kripya jaldi settle karein.\n\n— ${bizName}`;
 
-    // Auto-send WhatsApp (Interakt / WATI / mock)
+    // Auto-send WhatsApp using per-user credentials → env fallback → mock
     let waResult = { success: false, reason: 'no_phone' };
     if (inv.customer_phone) {
-      waResult = await sendWhatsAppMessage(inv.customer_phone, msg);
+      waResult = await sendWhatsAppMessage(inv.customer_phone, msg, waCreds);
     }
 
     // Update reminder tracking regardless of send status
@@ -2520,10 +2531,15 @@ app.get('/api/billing/history', authMiddleware, async (req, res) => {
 app.get('/api/settings', authMiddleware, async (req, res) => {
   try {
     const { data, error } = await supabase.from('users')
-      .select('id, email, phone, business_name, gstin, plan, whatsapp_phone, whatsapp_token, logo_url, address, business_address, created_at, owner_name, city, voice_style, ai_persona, upi_id, invoice_prefix, industry')
+      .select('id, email, phone, business_name, gstin, plan, whatsapp_phone, whatsapp_token, logo_url, address, business_address, created_at, owner_name, city, voice_style, ai_persona, upi_id, invoice_prefix, industry, interakt_api_key, wati_api_url, wati_token, wa_provider, razorpay_key_id, automation_enabled')
       .eq('id', req.user.userId).single();
     if (error) throw error;
-    res.json({ success: true, settings: data });
+    // Mask secrets — only return whether they are set, not the actual values
+    const settings = { ...data };
+    if (settings.interakt_api_key) settings.interakt_api_key = '••••••••';
+    if (settings.wati_token)       settings.wati_token       = '••••••••';
+    // razorpay_key_id is safe to return (public key), razorpay_key_secret never stored per-user
+    res.json({ success: true, settings });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -2531,7 +2547,7 @@ app.get('/api/settings', authMiddleware, async (req, res) => {
 
 app.patch('/api/settings', authMiddleware, async (req, res) => {
   try {
-    const allowed = ['business_name', 'phone', 'gstin', 'address', 'business_address', 'logo_url', 'whatsapp_phone', 'whatsapp_token', 'industry', 'language', 'contact_time', 'owner_name', 'city', 'voice_style', 'ai_persona', 'upi_id', 'invoice_prefix'];
+    const allowed = ['business_name', 'phone', 'gstin', 'address', 'business_address', 'logo_url', 'whatsapp_phone', 'whatsapp_token', 'industry', 'language', 'contact_time', 'owner_name', 'city', 'voice_style', 'ai_persona', 'upi_id', 'invoice_prefix', 'wa_provider', 'wati_api_url', 'razorpay_key_id', 'automation_enabled'];
     const updates = {};
     allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
     updates.updated_at = new Date();
@@ -2610,6 +2626,114 @@ app.delete('/api/dunning/:id', authMiddleware, async (req, res) => {
     if (error) throw error;
     res.json({ success: true });
   } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============================================
+// INTEGRATION SETTINGS — WhatsApp, Razorpay per-user
+// ============================================
+
+// Save WhatsApp credentials (Interakt or WATI)
+app.post('/api/settings/whatsapp', authMiddleware, async (req, res) => {
+  try {
+    const { provider, interakt_api_key, wati_api_url, wati_token } = req.body;
+    if (!provider) return res.status(400).json({ error: 'provider required (interakt or wati)' });
+
+    const updates = { wa_provider: provider, updated_at: new Date() };
+    if (provider === 'interakt') {
+      if (!interakt_api_key) return res.status(400).json({ error: 'interakt_api_key required' });
+      updates.interakt_api_key = interakt_api_key.trim();
+    } else if (provider === 'wati') {
+      if (!wati_api_url || !wati_token) return res.status(400).json({ error: 'wati_api_url and wati_token required' });
+      updates.wati_api_url = wati_api_url.trim();
+      updates.wati_token   = wati_token.trim();
+    } else {
+      return res.status(400).json({ error: 'provider must be interakt or wati' });
+    }
+
+    const { error } = await supabase.from('users').update(updates).eq('id', req.user.userId);
+    if (error) throw error;
+    res.json({ success: true, message: 'WhatsApp credentials saved' });
+  } catch (err) {
+    console.error('Save WA creds error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Test WhatsApp — sends a test message to the owner's own phone
+app.post('/api/settings/whatsapp/test', authMiddleware, async (req, res) => {
+  try {
+    const { data: user } = await supabase.from('users')
+      .select('phone, business_name, interakt_api_key, wati_api_url, wati_token, wa_provider')
+      .eq('id', req.user.userId).single();
+
+    if (!user?.phone) return res.status(400).json({ error: 'No phone number on your profile. Add your phone number in Settings → Profile first.' });
+
+    const creds = {
+      interakt_api_key: user.interakt_api_key,
+      wati_api_url:     user.wati_api_url,
+      wati_token:       user.wati_token,
+    };
+
+    const bizName = user.business_name || 'your business';
+    const msg = `✅ Vantro Flow se test message!\n\nYeh confirm karta hai ki WhatsApp automation ${bizName} ke liye ready hai. Ab se reminders, payment links, aur follow-ups automatically jayenge!\n\n— Vantro Flow`;
+
+    const result = await sendWhatsAppMessage(user.phone, msg, creds);
+
+    if (result.success) {
+      res.json({ success: true, provider: result.provider, message: `Test message sent to ${user.phone} via ${result.provider}` });
+    } else {
+      res.status(400).json({ success: false, error: 'Could not send test message', detail: result.reason || result.error || 'Check your API key and try again' });
+    }
+  } catch (err) {
+    console.error('WA test error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Save Razorpay credentials per-user
+app.post('/api/settings/razorpay', authMiddleware, async (req, res) => {
+  try {
+    const { key_id, key_secret } = req.body;
+    if (!key_id || !key_secret) return res.status(400).json({ error: 'key_id and key_secret required' });
+
+    // Validate by trying to fetch account details
+    let valid = false;
+    try {
+      const creds = Buffer.from(`${key_id.trim()}:${key_secret.trim()}`).toString('base64');
+      const r = await fetch('https://api.razorpay.com/v1/accounts/me', {
+        headers: { 'Authorization': `Basic ${creds}` },
+      });
+      valid = r.ok || r.status === 401; // 401 means keys parsed but invalid, 200 = valid
+      valid = r.ok;
+    } catch { valid = false; }
+
+    const { error } = await supabase.from('users').update({
+      razorpay_key_id:     key_id.trim(),
+      razorpay_key_secret: key_secret.trim(),
+      updated_at: new Date(),
+    }).eq('id', req.user.userId);
+    if (error) throw error;
+
+    res.json({ success: true, valid, message: valid ? 'Razorpay connected ✅' : 'Keys saved — could not verify automatically. They will be validated on first use.' });
+  } catch (err) {
+    console.error('Save Razorpay creds error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Toggle global automation on/off
+app.post('/api/settings/automation/toggle', authMiddleware, async (req, res) => {
+  try {
+    const { enabled } = req.body;
+    const { error } = await supabase.from('users').update({
+      automation_enabled: !!enabled,
+      updated_at: new Date(),
+    }).eq('id', req.user.userId);
+    if (error) throw error;
+    res.json({ success: true, automation_enabled: !!enabled });
+  } catch (err) {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -4583,6 +4707,8 @@ app.post('/api/onboarding/setup', authMiddleware, async (req, res) => {
       industry, business_size, gst_registered, gstin: gstin || null,
       business_address: business_address || null, feature_flags,
       owner_name: owner_name || null, city: city || null,
+      has_workers: has_workers ?? null,
+      onboarding_done: true,
     }).eq('id', userId);
     await supabase.from('business_vocabulary').upsert(
       [{user_id: userId, term: 'Industry', meaning: industry, category: 'process', aliases: [], created_at: new Date()}],
