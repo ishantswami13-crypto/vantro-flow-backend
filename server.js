@@ -182,13 +182,17 @@ if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
 }
 
 // ============================================
-// WHATSAPP DELIVERY HELPER (Interakt / Wati)
-// INTERAKT_API_KEY -> uses Interakt
-// WATI_API_URL + WATI_TOKEN -> uses Wati
-// Neither set -> console log only (dev)
+// WHATSAPP DELIVERY HELPER
+// Priority order:
+//   1. Per-user Interakt key (legacy BYOK)
+//   2. Per-user WATI creds  (legacy BYOK)
+//   3. Vantro's Interakt env key (managed)
+//   4. Vantro's WATI env creds  (managed)
+//   5. Vantro's Twilio WhatsApp  (managed fallback)
+//   6. Console mock             (dev only)
 // ============================================
 // creds: optional per-user { interakt_api_key, wati_api_url, wati_token }
-// Falls back to env vars → mock
+// Falls back to Vantro env vars → Twilio → mock
 async function sendWhatsAppMessage(phone, message, creds = {}) {
   const digits = String(phone || '').replace(/\D/g, '').replace(/^91/, '');
   if (!digits || digits.length < 10) {
@@ -219,6 +223,24 @@ async function sendWhatsAppMessage(phone, message, creds = {}) {
       const data = await res.json();
       console.log(`[WA Wati] ${digits}: ${data.result ? 'sent' : 'failed'}`);
       return { success: !!data.result, provider: 'wati', data };
+    }
+    // Vantro's Twilio WhatsApp — managed fallback for ALL users
+    const twilioWaFrom = process.env.TWILIO_WHATSAPP_NUMBER; // e.g. whatsapp:+14155238886
+    if (twilioWaFrom) {
+      const twilioClient = getTwilio();
+      if (twilioClient) {
+        try {
+          await twilioClient.messages.create({
+            from: twilioWaFrom.startsWith('whatsapp:') ? twilioWaFrom : `whatsapp:${twilioWaFrom}`,
+            to: `whatsapp:+91${digits}`,
+            body: message,
+          });
+          console.log(`[WA Twilio] ${digits}: sent`);
+          return { success: true, provider: 'twilio_whatsapp' };
+        } catch (twilioErr) {
+          console.warn('[WA Twilio] Send failed, falling to mock:', twilioErr.message);
+        }
+      }
     }
     // Dev mode fallback
     console.log(`[WA MOCK] To: 91${digits}\n${message}\n`);
@@ -2793,7 +2815,12 @@ app.post('/api/billing/verify', authMiddleware, async (req, res) => {
 
     if (expectedSig !== razorpay_signature) return res.status(400).json({ error: 'Payment verification failed' });
 
-    await supabase.from('users').update({ plan, plan_updated_at: new Date() }).eq('id', req.user.userId);
+    // Upgrade plan + auto-enable Vantro AutoPilot for all paid subscribers
+    await supabase.from('users').update({
+      plan,
+      plan_updated_at: new Date(),
+      automation_enabled: true, // Vantro manages everything — no manual toggle needed
+    }).eq('id', req.user.userId);
     await supabase.from('billing_history').insert([{
       user_id: req.user.userId, plan, payment_id: razorpay_payment_id,
       order_id: razorpay_order_id, status: 'paid', created_at: new Date(),
@@ -3129,11 +3156,11 @@ async function runDunningCycle() {
       }
     });
 
-    // Get user settings (business name, automation toggle, WA creds)
+    // Get user settings (business name, plan, automation toggle, WA creds)
     const userIds = [...new Set(invoices.map(i => i.user_id))];
     const { data: users } = await supabase
       .from('users')
-      .select('id, business_name, automation_enabled, interakt_api_key, wati_api_url, wati_token')
+      .select('id, business_name, plan, automation_enabled, interakt_api_key, wati_api_url, wati_token')
       .in('id', userIds);
     const userMap = {};
     (users || []).forEach(u => { userMap[u.id] = u; });
@@ -3141,7 +3168,9 @@ async function runDunningCycle() {
     let sent = 0;
     for (const invoice of invoices) {
       const user = userMap[invoice.user_id];
-      if (!user?.automation_enabled) continue; // skip — user has automation off
+      // Run for: (a) any paid plan user, OR (b) free users who manually enabled automation
+      const isPaidPlan = user?.plan && user.plan !== 'free';
+      if (!isPaidPlan && !user?.automation_enabled) continue; // skip free users with automation off
 
       // Match rules using dynamically computed days since invoice_date
       const rules = allRules.filter(r => r.user_id === invoice.user_id && r.trigger_day === invoice._computed_days);
