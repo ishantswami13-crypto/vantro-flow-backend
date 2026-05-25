@@ -1159,6 +1159,7 @@ app.post('/api/generate-message', authMiddleware, async (req, res) => {
 
 app.post('/api/mark-paid', authMiddleware, async (req, res) => {
   try {
+    const userId = req.user.userId;
     const { invoice_id, payment_date, payment_amount, payment_method, payment_notes } = req.body;
 
     const { data, error } = await supabase
@@ -1172,6 +1173,7 @@ app.post('/api/mark-paid', authMiddleware, async (req, res) => {
         payment_notes: payment_notes || null
       })
       .eq('id', invoice_id)
+      .eq('user_id', userId)
       .select();
 
     if (error) throw error;
@@ -3076,13 +3078,26 @@ async function runDunningCycle() {
     if (!allRules?.length) return;
 
     // Get all pending invoices (exclude snoozed ones)
+    // Also fetch invoice_date so we can compute days_overdue dynamically
     const { data: invoices } = await supabase
       .from('invoices')
-      .select('id, user_id, customer_name, customer_phone, invoice_amount, days_overdue, payment_link, payment_link_id, reminder_count, snooze_until')
+      .select('id, user_id, customer_name, customer_phone, invoice_amount, invoice_date, due_date, days_overdue, payment_link, payment_link_id, reminder_count, snooze_until')
       .eq('payment_status', 'Pending')
-      .gt('days_overdue', 0)
       .or(`snooze_until.is.null,snooze_until.lt.${new Date().toISOString()}`);
     if (!invoices?.length) return;
+
+    // Compute actual days overdue from invoice_date (not stored static field)
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    invoices.forEach(inv => {
+      if (inv.invoice_date) {
+        const issueDate = new Date(inv.invoice_date);
+        issueDate.setHours(0, 0, 0, 0);
+        inv._computed_days = Math.floor((today - issueDate) / (1000 * 60 * 60 * 24));
+      } else {
+        inv._computed_days = inv.days_overdue || 0;
+      }
+    });
 
     // Get user settings (business name, automation toggle, WA creds)
     const userIds = [...new Set(invoices.map(i => i.user_id))];
@@ -3098,7 +3113,8 @@ async function runDunningCycle() {
       const user = userMap[invoice.user_id];
       if (!user?.automation_enabled) continue; // skip — user has automation off
 
-      const rules = allRules.filter(r => r.user_id === invoice.user_id && r.trigger_day === invoice.days_overdue);
+      // Match rules using dynamically computed days since invoice_date
+      const rules = allRules.filter(r => r.user_id === invoice.user_id && r.trigger_day === invoice._computed_days);
       for (const rule of rules) {
         if (!invoice.customer_phone) continue;
         const biz = user?.business_name || 'Collections Team';
@@ -3339,7 +3355,7 @@ app.post('/api/ml/briefing', authMiddleware, async (req, res) => {
 
     const invoices = invoicesRaw || [];
     const calls = callsRaw || [];
-    const businessName = userData?.data?.business_name || 'Your Business';
+    const businessName = userData?.business_name || 'Your Business';
 
     // Group calls by customer
     const callsByCustomer = {};
@@ -3464,7 +3480,7 @@ app.get('/api/admin/stats', adminOnly, async (req, res) => {
       supabase.from('users').select('id').gte('created_at', sevenDaysAgo),
       supabase.from('users').select('id').gte('created_at', oneDayAgo),
       supabase.from('invoices').select('id, user_id, created_at'),
-      supabase.from('billing_records').select('amount').eq('status', 'paid'),
+      supabase.from('billing_history').select('amount').eq('status', 'paid'),
     ]);
 
     const safe = (d) => d || [];
@@ -3563,7 +3579,7 @@ app.get('/api/public/profile/:userId', async (req, res) => {
 
 app.post('/api/ai/call-script', authMiddleware, async (req, res) => {
   try {
-    const userId = req.user.id;
+    const userId = req.user.userId;
     const { customer_name, invoice_amount, days_overdue, call_count = 0, has_promise = false, tone = 'soft' } = req.body;
 
     if (!customer_name || !invoice_amount) {
@@ -3647,7 +3663,7 @@ Use natural Hinglish like "bhai", "aap", "theek hai", "koi baat nahi", "kal tak"
 
 app.post('/api/ai/bulk-whatsapp', authMiddleware, async (req, res) => {
   try {
-    const userId = req.user.id;
+    const userId = req.user.userId;
 
     // Get all high-priority overdue invoices
     const { data: invoices } = await supabase
