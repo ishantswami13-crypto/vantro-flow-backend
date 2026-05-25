@@ -2823,11 +2823,13 @@ async function runDunningCycle() {
     const { data: allRules } = await supabase.from('dunning_rules').select('*').eq('enabled', true);
     if (!allRules?.length) return;
 
-    // Get all pending invoices
+    // Get all pending invoices (exclude snoozed ones)
     const { data: invoices } = await supabase
       .from('invoices')
-      .select('id, user_id, customer_name, customer_phone, invoice_amount, days_overdue, payment_link, payment_link_id, reminder_count')
-      .eq('payment_status', 'Pending').gt('days_overdue', 0);
+      .select('id, user_id, customer_name, customer_phone, invoice_amount, days_overdue, payment_link, payment_link_id, reminder_count, snooze_until')
+      .eq('payment_status', 'Pending')
+      .gt('days_overdue', 0)
+      .or(`snooze_until.is.null,snooze_until.lt.${new Date().toISOString()}`);
     if (!invoices?.length) return;
 
     // Get user settings (business name, automation toggle, WA creds)
@@ -3770,6 +3772,104 @@ app.post('/api/payments/webhook', async (req, res) => {
 });
 
 // ============================================
+// WHATSAPP INBOUND WEBHOOK — reply-pause automation
+// ============================================
+// Register this URL in Interakt: Settings → Developer → Webhook URL
+// Register in WATI: Configuration → Webhook → add this URL
+// POST /api/webhooks/whatsapp-inbound
+
+function parseSnoozeIntent(text) {
+  // Returns { snoozeHours: number } if message contains a promise/snooze signal, else null
+  const t = (text || '').toLowerCase().trim();
+
+  // Hindi / Hinglish patterns
+  if (/\b(aaj|today)\b/.test(t)) return { snoozeHours: 6 };
+  if (/kal\s*(tak|dunga|de|deta|deti|payment|pay|kar|karunga|karugi)?/.test(t)) return { snoozeHours: 30 };
+  if (/\bparso\b/.test(t)) return { snoozeHours: 54 };
+  if (/(\d+)\s*din/.test(t)) {
+    const days = parseInt(t.match(/(\d+)\s*din/)[1]);
+    return { snoozeHours: Math.min(days, 30) * 24 };
+  }
+  if (/(\d+)\s*hafte/.test(t)) {
+    const weeks = parseInt(t.match(/(\d+)\s*hafte/)[1]);
+    return { snoozeHours: Math.min(weeks, 4) * 7 * 24 };
+  }
+  if (/\b(ek\s*hafte|next\s*week|1\s*week|one\s*week)\b/.test(t)) return { snoozeHours: 7 * 24 };
+  if (/\b(2\s*week|do\s*hafte|two\s*week)\b/.test(t)) return { snoozeHours: 14 * 24 };
+  if (/\b(mahine|mahina|month|1\s*month|ek\s*mahina)\b/.test(t)) return { snoozeHours: 30 * 24 };
+
+  // English patterns
+  if (/\btomorrow\b/.test(t)) return { snoozeHours: 30 };
+  if (/\bday after tomorrow\b/.test(t)) return { snoozeHours: 54 };
+  if (/(\d+)\s*days?/.test(t)) {
+    const days = parseInt(t.match(/(\d+)\s*days?/)[1]);
+    return { snoozeHours: Math.min(days, 30) * 24 };
+  }
+
+  // Generic payment promises
+  if (/\b(pay|payment|bhejta|bhejtа|dunga|de raha|karunga|transfer)\b/.test(t)) return { snoozeHours: 48 };
+
+  return null;
+}
+
+app.post('/api/webhooks/whatsapp-inbound', async (req, res) => {
+  try {
+    res.sendStatus(200); // Acknowledge immediately (Interakt/WATI require fast 200)
+
+    const body = req.body;
+
+    // ── Normalise across Interakt & WATI formats ──────────────────
+    let senderPhone = null;
+    let messageText = null;
+
+    // Interakt format
+    if (body?.data?.message?.message?.text) {
+      messageText = body.data.message.message.text;
+      senderPhone = body.data.message.customer?.phone_number || body.data.customer?.phone_number;
+    }
+    // WATI format
+    if (body?.waId && body?.text?.body) {
+      senderPhone = body.waId;
+      messageText = body.text.body;
+    }
+    // Generic fallback
+    if (!messageText && body?.message) messageText = body.message;
+    if (!senderPhone && body?.phone) senderPhone = body.phone;
+
+    if (!senderPhone || !messageText) return;
+
+    const snooze = parseSnoozeIntent(messageText);
+    if (!snooze) return; // not a payment promise — ignore
+
+    // Normalise phone (digits only, strip leading 91/+91)
+    const normPhone = String(senderPhone).replace(/\D/g, '').replace(/^91/, '');
+
+    // Find the most recent pending invoice for this phone
+    const { data: invoices } = await supabase
+      .from('invoices')
+      .select('id, user_id, customer_name, invoice_amount')
+      .eq('payment_status', 'Pending')
+      .or(`customer_phone.eq.${normPhone},customer_phone.eq.91${normPhone},customer_phone.eq.+91${normPhone}`)
+      .order('days_overdue', { ascending: false })
+      .limit(1);
+
+    if (!invoices?.length) return;
+    const inv = invoices[0];
+
+    const snoozeUntil = new Date(Date.now() + snooze.snoozeHours * 3600000).toISOString();
+
+    await supabase
+      .from('invoices')
+      .update({ snooze_until: snoozeUntil })
+      .eq('id', inv.id);
+
+    console.log(`[WA-inbound] Snoozed invoice ${inv.id} (${inv.customer_name}) until ${snoozeUntil} — reply: "${messageText.slice(0, 60)}"`);
+  } catch (err) {
+    console.error('[WA-inbound] Error:', err.message);
+  }
+});
+
+// ============================================
 // MORNING BRIEFING CRON — 8:00 AM IST daily
 // ============================================
 // IST = UTC+5:30 → 8am IST = 2:30 UTC
@@ -3841,6 +3941,25 @@ Vantro ne aapke liye auto-reminders queue kar diye hain. App kholein aur ek clic
 // ============================================
 
 // Create transactions table
+// Add snooze_until + reminder tracking columns to invoices
+app.post('/api/invoices/migrate', authMiddleware, async (req, res) => {
+  try {
+    const pool2 = getPool();
+    await pool2.query(`
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS snooze_until TIMESTAMPTZ;
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS last_reminder_sent TIMESTAMPTZ;
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS reminder_count INTEGER DEFAULT 0;
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS payment_link TEXT;
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS payment_link_id TEXT;
+      CREATE INDEX IF NOT EXISTS idx_inv_snooze ON invoices(snooze_until) WHERE snooze_until IS NOT NULL;
+    `);
+    res.json({ success: true, message: 'Invoice columns migrated (snooze_until, last_reminder_sent, reminder_count, payment_link, payment_link_id)' });
+  } catch (err) {
+    console.error('[invoices/migrate]', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.post('/api/transactions/migrate', authMiddleware, async (req, res) => {
   try {
     const pool2 = getPool();
