@@ -756,6 +756,39 @@ app.post('/api/invoices/create', authMiddleware, async (req, res) => {
   }
 });
 
+// ── Get single invoice by ID (authenticated, owner check) ────────────────────
+app.get('/api/invoice/:invoiceId', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { invoiceId } = req.params;
+
+    const { data, error } = await supabase
+      .from('invoices')
+      .select('*')
+      .eq('id', invoiceId)
+      .eq('user_id', userId)
+      .single();
+
+    if (error || !data) return res.status(404).json({ error: 'Invoice not found' });
+
+    // Parse items if stored as string
+    if (data.items && typeof data.items === 'string') {
+      try { data.items = JSON.parse(data.items); } catch { data.items = []; }
+    }
+
+    // Fetch owner profile (business name, address, gstin, upi_id)
+    const { data: owner } = await supabase
+      .from('users')
+      .select('business_name, gstin, business_address, city, upi_id, invoice_prefix')
+      .eq('id', userId).single();
+
+    res.json({ success: true, invoice: data, business: owner || {} });
+  } catch (err) {
+    console.error('[invoice/get]', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ============================================
 // EXCEL / XLSX SMART IMPORT
 // ============================================
