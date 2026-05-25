@@ -89,9 +89,35 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true })); // Twilio webhooks send form-encoded
 
-// Rate limiting
-const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Too many attempts, try again later' } });
-const apiLimiter  = rateLimit({ windowMs: 60 * 1000, max: 120, message: { error: 'Rate limit exceeded' } });
+// ── Security headers (helmet-equivalent, no extra dependency) ─────────────────
+app.use((req, res, next) => {
+  // Prevent clickjacking
+  res.setHeader('X-Frame-Options', 'DENY');
+  // Stop MIME-type sniffing
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  // XSS filter (legacy browsers)
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  // HTTPS only for 1 year (HSTS)
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
+  // Don't send Referer header cross-origin
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  // Restrict browser features
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+  // Remove server fingerprint
+  res.removeHeader('X-Powered-By');
+  next();
+});
+
+// Rate limiting — auth: 8 attempts/15 min, api: 120/min
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  message: { error: 'Too many login attempts. Try again in 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipSuccessfulRequests: true, // only count failed attempts
+});
+const apiLimiter = rateLimit({ windowMs: 60 * 1000, max: 120, message: { error: 'Rate limit exceeded' } });
 app.use('/api/auth', authLimiter);
 app.use('/api', apiLimiter);
 
