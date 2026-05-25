@@ -605,6 +605,57 @@ app.post('/api/upload-csv', authMiddleware, upload.single('file'), async (req, r
 });
 
 // ============================================
+// CREATE SINGLE INVOICE (manual add)
+// ============================================
+
+app.post('/api/invoices/create', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { customer_name, customer_phone, invoice_amount, invoice_date, due_date, invoice_number, notes } = req.body;
+
+    if (!customer_name || !invoice_amount || !invoice_date) {
+      return res.status(400).json({ error: 'customer_name, invoice_amount and invoice_date are required' });
+    }
+
+    const amount = parseFloat(invoice_amount);
+    if (isNaN(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'invoice_amount must be a positive number' });
+    }
+
+    const invoiceDateObj = new Date(invoice_date);
+    if (isNaN(invoiceDateObj.getTime())) {
+      return res.status(400).json({ error: 'invoice_date is not a valid date' });
+    }
+
+    const daysOverdue = Math.max(0, Math.floor((Date.now() - invoiceDateObj.getTime()) / (1000 * 60 * 60 * 24)));
+
+    const record = {
+      user_id: userId,
+      customer_name: customer_name.trim(),
+      customer_phone: customer_phone ? customer_phone.trim() : null,
+      invoice_amount: amount,
+      invoice_date,
+      payment_status: 'Pending',
+      days_overdue: daysOverdue,
+      created_at: new Date(),
+    };
+
+    // optional fields
+    if (invoice_number) record.invoice_number = invoice_number.trim();
+    if (notes) record.notes = notes.trim();
+    if (due_date) record.due_date = due_date;
+
+    const { data, error } = await supabase.from('invoices').insert([record]).select().single();
+    if (error) throw error;
+
+    res.json({ success: true, invoice: data });
+  } catch (error) {
+    console.error('Create invoice error:', error);
+    res.status(500).json({ error: error.message || 'Internal server error' });
+  }
+});
+
+// ============================================
 // EXCEL / XLSX SMART IMPORT
 // ============================================
 
