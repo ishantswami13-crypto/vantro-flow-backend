@@ -627,50 +627,132 @@ app.post('/api/upload-csv', authMiddleware, upload.single('file'), async (req, r
 // CREATE SINGLE INVOICE (manual add)
 // ============================================
 
+// ── Create a single invoice (from UI) ────────────────────────────────────────
 app.post('/api/invoices/create', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { customer_name, customer_phone, invoice_amount, invoice_date, due_date, invoice_number, notes } = req.body;
+    const {
+      customer_name, customer_phone, customer_email,
+      invoice_date, due_date,
+      items,          // array: [{ name, qty, unit, rate }]
+      invoice_amount, // fallback if no items
+      notes,
+    } = req.body;
 
-    if (!customer_name || !invoice_amount || !invoice_date) {
-      return res.status(400).json({ error: 'customer_name, invoice_amount and invoice_date are required' });
+    if (!customer_name) return res.status(400).json({ error: 'customer_name is required' });
+
+    // Calculate total from items or fallback to invoice_amount
+    let total = 0;
+    let processedItems = null;
+    if (Array.isArray(items) && items.length > 0) {
+      processedItems = items.map(it => ({
+        name: String(it.name || '').trim(),
+        qty:  parseFloat(it.qty)  || 1,
+        unit: String(it.unit || 'unit').trim(),
+        rate: parseFloat(it.rate) || 0,
+        amount: Math.round((parseFloat(it.qty) || 1) * (parseFloat(it.rate) || 0) * 100) / 100,
+      })).filter(it => it.name && it.rate > 0);
+      total = processedItems.reduce((s, it) => s + it.amount, 0);
+    } else if (invoice_amount) {
+      total = parseFloat(invoice_amount);
     }
+    if (!total || total <= 0) return res.status(400).json({ error: 'invoice_amount or at least one line item with rate is required' });
 
-    const amount = parseFloat(invoice_amount);
-    if (isNaN(amount) || amount <= 0) {
-      return res.status(400).json({ error: 'invoice_amount must be a positive number' });
-    }
+    const invDate = invoice_date ? new Date(invoice_date) : new Date();
+    const daysOverdue = Math.max(0, Math.floor((Date.now() - invDate.getTime()) / 86400000));
 
-    const invoiceDateObj = new Date(invoice_date);
-    if (isNaN(invoiceDateObj.getTime())) {
-      return res.status(400).json({ error: 'invoice_date is not a valid date' });
-    }
+    // Auto-generate invoice number: PREFIX-YYYYMM-XXXX
+    const { data: owner } = await supabase
+      .from('users')
+      .select('business_name, invoice_prefix, automation_enabled, interakt_api_key, wati_api_url, wati_token, upi_id')
+      .eq('id', userId).single();
 
-    const daysOverdue = Math.max(0, Math.floor((Date.now() - invoiceDateObj.getTime()) / (1000 * 60 * 60 * 24)));
+    const prefix = (owner?.invoice_prefix || (owner?.business_name || 'INV').replace(/[^A-Z0-9]/gi, '').toUpperCase().slice(0, 4)).toUpperCase();
+    const ym = new Date().toISOString().slice(0, 7).replace('-', '');
+
+    // Count existing invoices this month to get sequence
+    const { count } = await supabase
+      .from('invoices')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', userId)
+      .ilike('invoice_number', `${prefix}-${ym}-%`);
+    const seq = String((count || 0) + 1).padStart(4, '0');
+    const invoiceNumber = `${prefix}-${ym}-${seq}`;
 
     const record = {
-      user_id: userId,
-      customer_name: customer_name.trim(),
-      customer_phone: customer_phone ? customer_phone.trim() : null,
-      invoice_amount: amount,
-      invoice_date,
+      user_id:        userId,
+      customer_name:  customer_name.trim(),
+      customer_phone: customer_phone ? String(customer_phone).replace(/\D/g, '').slice(-10) : null,
+      customer_email: customer_email || null,
+      invoice_amount: Math.round(total * 100) / 100,
+      invoice_date:   invDate.toISOString().split('T')[0],
+      due_date:       due_date || null,
+      invoice_number: invoiceNumber,
+      items:          processedItems ? JSON.stringify(processedItems) : null,
+      notes:          notes || null,
       payment_status: 'Pending',
-      days_overdue: daysOverdue,
-      created_at: new Date(),
+      days_overdue:   daysOverdue,
+      created_at:     new Date(),
     };
 
-    // optional fields
-    if (invoice_number) record.invoice_number = invoice_number.trim();
-    if (notes) record.notes = notes.trim();
-    if (due_date) record.due_date = due_date;
-
     const { data, error } = await supabase.from('invoices').insert([record]).select().single();
-    if (error) throw error;
+    if (error) {
+      console.error('[invoices/create] DB error:', error);
+      throw error;
+    }
 
-    res.json({ success: true, invoice: data });
-  } catch (error) {
-    console.error('Create invoice error:', error);
-    res.status(500).json({ error: error.message || 'Internal server error' });
+    // Respond immediately
+    res.json({ success: true, invoice: data, invoice_number: invoiceNumber });
+
+    // Day-0 WhatsApp trigger (fire-and-forget, only if automation on + phone present)
+    if (owner?.automation_enabled && data.customer_phone) {
+      (async () => {
+        try {
+          const waCreds = { interakt_api_key: owner.interakt_api_key, wati_api_url: owner.wati_api_url, wati_token: owner.wati_token };
+          const bizName = owner.business_name || 'Vantro';
+          let payLink = null;
+          let payLinkId = null;
+
+          if (razorpay) {
+            try {
+              const pl = await razorpay.paymentLink.create({
+                amount: Math.round(total * 100),
+                currency: 'INR',
+                description: `Invoice ${invoiceNumber} — ${customer_name}`,
+                customer: { name: customer_name },
+                notify: { sms: false, email: false },
+                reminder_enable: false,
+                notes: { invoice_id: data.id, invoice_number: invoiceNumber },
+                callback_url: `${process.env.FRONTEND_URL || 'https://vantro-flow.vercel.app'}/collections`,
+                callback_method: 'get',
+              });
+              payLink = pl.short_url;
+              payLinkId = pl.id;
+            } catch (e) { console.error('[create/day0] Razorpay:', e.message); }
+          }
+          if (!payLink && owner.upi_id) {
+            payLink = `upi://pay?pa=${owner.upi_id}&pn=${encodeURIComponent(bizName)}&am=${total}&tn=${encodeURIComponent(invoiceNumber)}&cu=INR`;
+          }
+
+          const firstName = customer_name.split(' ')[0];
+          const amtFmt = Number(total).toLocaleString('en-IN');
+          const msg = payLink
+            ? `${firstName} ji 🙏\n\n${bizName} ne aapko *${invoiceNumber}* ke liye ₹${amtFmt} ka invoice raise kiya hai.\n\nOnline pay karein:\n${payLink}\n\nUPI, Card, NetBanking — sab accept hota hai.\n\n— ${bizName}`
+            : `${firstName} ji 🙏\n\n${bizName} ne aapko *${invoiceNumber}* ke liye ₹${amtFmt} ka invoice raise kiya hai. Kripya jaldi settle karein.\n\n— ${bizName}`;
+
+          await sendWhatsAppMessage(data.customer_phone, msg, waCreds);
+          await supabase.from('invoices').update({
+            payment_link: payLink || null,
+            payment_link_id: payLinkId || null,
+            last_reminder_sent: new Date().toISOString(),
+            reminder_count: 1,
+          }).eq('id', data.id);
+        } catch (bgErr) { console.error('[create/day0]', bgErr.message); }
+      })();
+    }
+  } catch (err) {
+    console.error('[invoices/create]', err);
+    res.status(500).json({ error: err.message || 'Internal server error' });
   }
 });
 
@@ -6126,7 +6208,49 @@ ${sheetsHtml}
 // START SERVER
 // ============================================
 
+// ── Auto-migration on startup ─────────────────────────────────────────────────
+async function runAutoMigrations() {
+  if (!pgPool) {
+    console.log('[migrate] No DATABASE_URL — skipping auto-migration');
+    return;
+  }
+  let client;
+  try {
+    client = await pgPool.connect();
+    await client.query(`
+      -- invoices: automation tracking columns
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS snooze_until       TIMESTAMPTZ;
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS last_reminder_sent TIMESTAMPTZ;
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS reminder_count     INTEGER DEFAULT 0;
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS payment_link       TEXT;
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS payment_link_id    TEXT;
+
+      -- users: verification flags
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_verified  BOOLEAN DEFAULT FALSE;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified  BOOLEAN DEFAULT FALSE;
+
+      -- invoices: invoice creation fields
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS invoice_number TEXT;
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS due_date       DATE;
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS items          JSONB;
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS notes          TEXT;
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS customer_email TEXT;
+
+      -- indexes (safe — IF NOT EXISTS)
+      CREATE INDEX IF NOT EXISTS idx_inv_snooze        ON invoices(snooze_until)        WHERE snooze_until IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_inv_user_status   ON invoices(user_id, payment_status);
+      CREATE INDEX IF NOT EXISTS idx_inv_phone         ON invoices(customer_phone)      WHERE customer_phone IS NOT NULL;
+    `);
+    console.log('[migrate] Auto-migration completed successfully');
+  } catch (err) {
+    console.error('[migrate] Auto-migration error (non-fatal):', err.message);
+  } finally {
+    if (client) client.release();
+  }
+}
+
 app.listen(PORT, () => {
   console.log(`✅ Vantro Flow Backend running on port ${PORT}`);
   console.log(`📝 API Base URL: http://localhost:${PORT}`);
+  runAutoMigrations();
 });
