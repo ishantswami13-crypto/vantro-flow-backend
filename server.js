@@ -747,7 +747,81 @@ app.post('/api/import/manual', authMiddleware, async (req, res) => {
     if (invoices.length === 0) return res.status(400).json({ error: 'No valid entries' });
     const { data, error } = await supabase.from('invoices').insert(invoices).select();
     if (error) throw error;
+
+    // Respond immediately — Day-0 WA fires in background
     res.json({ success: true, imported: invoices.length, invoices: data });
+
+    // ── Day-0 WhatsApp trigger (fire-and-forget) ──────────────────
+    (async () => {
+      try {
+        // Load owner settings once
+        const { data: owner } = await supabase
+          .from('users')
+          .select('business_name, upi_id, automation_enabled, interakt_api_key, wati_api_url, wati_token')
+          .eq('id', userId)
+          .single();
+
+        if (!owner?.automation_enabled) return; // automation off — skip
+
+        const bizName = owner.business_name || 'Vantro';
+        const waCreds = {
+          interakt_api_key: owner.interakt_api_key,
+          wati_api_url:     owner.wati_api_url,
+          wati_token:       owner.wati_token,
+        };
+
+        for (const inv of data) {
+          if (!inv.customer_phone || inv.payment_status !== 'Pending') continue;
+
+          // Create Razorpay payment link if available
+          let payLink = null;
+          let payLinkId = null;
+          if (razorpay) {
+            try {
+              const pl = await razorpay.paymentLink.create({
+                amount: Math.round(parseFloat(inv.invoice_amount) * 100),
+                currency: 'INR',
+                description: `Invoice — ${inv.customer_name}`,
+                customer: { name: inv.customer_name },
+                notify: { sms: false, email: false },
+                reminder_enable: false,
+                notes: { invoice_id: inv.id, customer_name: inv.customer_name },
+                callback_url: `${process.env.FRONTEND_URL || 'https://vantro-flow.vercel.app'}/collections`,
+                callback_method: 'get',
+              });
+              payLink = pl.short_url;
+              payLinkId = pl.id;
+            } catch (e) {
+              console.error('[day0] Razorpay link error:', e.message);
+            }
+          }
+          // UPI fallback
+          if (!payLink && owner.upi_id) {
+            payLink = `upi://pay?pa=${owner.upi_id}&pn=${encodeURIComponent(bizName)}&am=${inv.invoice_amount}&tn=${encodeURIComponent('Invoice Payment')}&cu=INR`;
+          }
+
+          // Build intro message
+          const firstName = (inv.customer_name || '').split(' ')[0];
+          const amtFmt = Number(inv.invoice_amount).toLocaleString('en-IN');
+          const msg = payLink
+            ? `${firstName} ji 🙏\n\n${bizName} ne aapko ₹${amtFmt} ka invoice raise kiya hai.\n\nOnline pay karein:\n${payLink}\n\nUPI, Card, NetBanking — sab accept hota hai.\n\n— ${bizName}`
+            : `${firstName} ji 🙏\n\n${bizName} ne aapko ₹${amtFmt} ka invoice raise kiya hai. Kripya jaldi settle karein.\n\n— ${bizName}`;
+
+          // Send WhatsApp
+          await sendWhatsAppMessage(inv.customer_phone, msg, waCreds);
+
+          // Persist payment link + mark first reminder sent
+          await supabase.from('invoices').update({
+            payment_link:       payLink   || null,
+            payment_link_id:    payLinkId || null,
+            last_reminder_sent: new Date().toISOString(),
+            reminder_count:     1,
+          }).eq('id', inv.id);
+        }
+      } catch (bgErr) {
+        console.error('[day0] Background WA error:', bgErr.message);
+      }
+    })();
   } catch (err) {
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -2751,30 +2825,69 @@ async function runDunningCycle() {
 
     // Get all pending invoices
     const { data: invoices } = await supabase
-      .from('invoices').select('id, user_id, customer_name, customer_phone, invoice_amount, days_overdue')
+      .from('invoices')
+      .select('id, user_id, customer_name, customer_phone, invoice_amount, days_overdue, payment_link, payment_link_id, reminder_count')
       .eq('payment_status', 'Pending').gt('days_overdue', 0);
     if (!invoices?.length) return;
 
-    // Get user business names
+    // Get user settings (business name, automation toggle, WA creds)
     const userIds = [...new Set(invoices.map(i => i.user_id))];
-    const { data: users } = await supabase.from('users').select('id, business_name').in('id', userIds);
+    const { data: users } = await supabase
+      .from('users')
+      .select('id, business_name, automation_enabled, interakt_api_key, wati_api_url, wati_token')
+      .in('id', userIds);
     const userMap = {};
     (users || []).forEach(u => { userMap[u.id] = u; });
 
     let sent = 0;
     for (const invoice of invoices) {
+      const user = userMap[invoice.user_id];
+      if (!user?.automation_enabled) continue; // skip — user has automation off
+
       const rules = allRules.filter(r => r.user_id === invoice.user_id && r.trigger_day === invoice.days_overdue);
       for (const rule of rules) {
         if (!invoice.customer_phone) continue;
-        const biz = userMap[invoice.user_id]?.business_name || 'Collections Team';
+        const biz = user?.business_name || 'Collections Team';
+        const waCreds = {
+          interakt_api_key: user?.interakt_api_key,
+          wati_api_url:     user?.wati_api_url,
+          wati_token:       user?.wati_token,
+        };
         const phone = String(invoice.customer_phone).replace(/\D/g, '');
+        const amtFmt = Number(invoice.invoice_amount).toLocaleString('en-IN');
+        const firstName = (invoice.customer_name || '').split(' ')[0];
+
+        // Reuse existing payment link or create one
+        let payLink = invoice.payment_link || null;
+        if (!payLink && razorpay) {
+          try {
+            const pl = await razorpay.paymentLink.create({
+              amount: Math.round(parseFloat(invoice.invoice_amount) * 100),
+              currency: 'INR',
+              description: `Invoice — ${invoice.customer_name}`,
+              customer: { name: invoice.customer_name },
+              notify: { sms: false, email: false },
+              reminder_enable: false,
+              notes: { invoice_id: invoice.id },
+            });
+            payLink = pl.short_url;
+            await supabase.from('invoices').update({ payment_link: payLink, payment_link_id: pl.id }).eq('id', invoice.id);
+          } catch (e) { console.error('[Dunning] Razorpay link error:', e.message); }
+        }
+
         let msg = '';
         if (rule.tone === 'gentle') {
-          msg = `Namaste ${invoice.customer_name} ji 🙏\n\n₹${Number(invoice.invoice_amount).toLocaleString('en-IN')} ka payment ${invoice.days_overdue} din se pending hai.\n\nKripya is hafte payment karein.\n— ${biz}`;
+          msg = payLink
+            ? `Namaste ${firstName} ji 🙏\n\n₹${amtFmt} ka payment ${invoice.days_overdue} din se pending hai.\n\nIs link se abhi pay karein:\n${payLink}\n\n— ${biz}`
+            : `Namaste ${firstName} ji 🙏\n\n₹${amtFmt} ka payment ${invoice.days_overdue} din se pending hai. Kripya is hafte payment karein.\n— ${biz}`;
         } else if (rule.tone === 'firm') {
-          msg = `Dear ${invoice.customer_name},\n\n₹${Number(invoice.invoice_amount).toLocaleString('en-IN')} payment is ${invoice.days_overdue} days overdue. Please pay within 3 days.\n— ${biz}`;
+          msg = payLink
+            ? `Dear ${invoice.customer_name},\n\n₹${amtFmt} payment is ${invoice.days_overdue} days overdue. Pay now:\n${payLink}\n\nPlease pay within 3 days.\n— ${biz}`
+            : `Dear ${invoice.customer_name},\n\n₹${amtFmt} payment is ${invoice.days_overdue} days overdue. Please pay within 3 days.\n— ${biz}`;
         } else {
-          msg = `URGENT: ${invoice.customer_name} — ₹${Number(invoice.invoice_amount).toLocaleString('en-IN')} overdue ${invoice.days_overdue} days. Immediate action required.\n— ${biz}`;
+          msg = payLink
+            ? `URGENT: ${invoice.customer_name} — ₹${amtFmt} overdue ${invoice.days_overdue} days.\n\nPay NOW:\n${payLink}\n— ${biz}`
+            : `URGENT: ${invoice.customer_name} — ₹${amtFmt} overdue ${invoice.days_overdue} days. Immediate action required.\n— ${biz}`;
         }
 
         // Log the dunning action
@@ -2785,11 +2898,16 @@ async function runDunningCycle() {
           sent_at: new Date(),
         }]).catch(() => {});
 
-        // Actually send the WhatsApp message
+        // Actually send the WhatsApp message (per-user creds → env fallback → mock)
         if (invoice.customer_phone) {
-          await sendWhatsAppMessage(invoice.customer_phone, msg).catch(e =>
+          await sendWhatsAppMessage(invoice.customer_phone, msg, waCreds).catch(e =>
             console.error(`[Dunning] WA send failed for ${invoice.customer_name}:`, e.message)
           );
+          // Track reminder timestamp for frontend display
+          await supabase.from('invoices').update({
+            last_reminder_sent: new Date().toISOString(),
+            reminder_count: (invoice.reminder_count || 0) + 1,
+          }).eq('id', invoice.id).catch(() => {});
         }
 
         sent++;
