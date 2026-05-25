@@ -309,11 +309,26 @@ app.post('/api/auth/signup', async (req, res) => {
       }
     }
 
+    // Only insert columns that definitely exist in the schema
+    // phone_verified / email_verified are optional columns — added via migration
+    const safePayload = {
+      email:         insertPayload.email,
+      phone:         insertPayload.phone,
+      business_name: insertPayload.business_name,
+      password_hash: insertPayload.password_hash,
+      plan:          insertPayload.plan,
+      created_at:    insertPayload.created_at,
+    };
+    if (insertPayload.referred_by) safePayload.referred_by = insertPayload.referred_by;
+
     const { data, error } = await supabase
       .from('users')
-      .insert([{ ...insertPayload, phone_verified: false, email_verified: false }])
+      .insert([safePayload])
       .select('id, email, phone, business_name, plan, created_at');
-    if (error) throw error;
+    if (error) {
+      console.error('[signup] Supabase insert error:', error);
+      throw error;
+    }
 
     const user = data[0];
 
@@ -333,7 +348,11 @@ app.post('/api/auth/signup', async (req, res) => {
     const preToken = jwt.sign({ userId: user.id, email: user.email, preVerify: true }, JWT_SECRET, { expiresIn: '10m' });
     res.json({ success: true, needs_otp: true, pre_token: preToken, user: { id: user.id, email: user.email, phone: user.phone, business_name: user.business_name } });
   } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('[signup] Error:', error);
+    // Return a safe but informative message
+    const msg = error?.message || 'Internal server error';
+    const isDbError = msg.includes('column') || msg.includes('relation') || msg.includes('violates');
+    res.status(500).json({ error: isDbError ? 'Database error — please contact support' : 'Internal server error' });
   }
 });
 
