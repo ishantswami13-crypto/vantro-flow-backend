@@ -258,7 +258,7 @@ async function sendOTPEmail(email, name, otp) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_API_KEY}` },
       body: JSON.stringify({
-        from: 'Vantro Flow <noreply@vantroflow.com>',
+        from: 'Vantro Flow <onboarding@resend.dev>',
         to: email,
         subject: `${otp} is your Vantro Flow OTP`,
         html,
@@ -466,7 +466,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_API_KEY}` },
         body: JSON.stringify({
-          from: 'Vantro Flow <noreply@vantroflow.com>',
+          from: 'Vantro Flow <onboarding@resend.dev>',
           to: email,
           subject: `Your Vantro OTP: ${otp}`,
           html: `<p>Hi ${user.business_name},</p><p>Your OTP to reset your Vantro Flow password is: <strong style="font-size:24px">${otp}</strong></p><p>Valid for 15 minutes. Do not share this with anyone.</p>`
@@ -2816,6 +2816,73 @@ app.post('/api/settings/automation/toggle', authMiddleware, async (req, res) => 
 // DUNNING CRON — runs every day at 9:00 AM IST
 // ============================================
 
+// Helper: trigger an auto-call via Twilio for a dunning action
+async function makeAutoCall(userId, invoice) {
+  try {
+    const twilioClient = getTwilio();
+    if (!twilioClient) {
+      console.log(`[Dunning/call] Twilio not configured — skipping call for ${invoice.customer_name}`);
+      return false;
+    }
+
+    const { data: profile } = await supabase
+      .from('users')
+      .select('business_name, owner_name, ai_persona')
+      .eq('id', userId)
+      .single();
+
+    const bizName = profile?.business_name || 'Vantro';
+
+    // AI-generated opening script (Groq) with Hinglish fallback
+    let openingScript = `Namaste ${invoice.customer_name} ji, main ${bizName} se bol raha hoon. Aapka ₹${Number(invoice.invoice_amount).toLocaleString('en-IN')} payment ${invoice.days_overdue} din se pending hai. Kya aaj payment ho sakti hai?`;
+    try {
+      const gr = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+        body: JSON.stringify({
+          model: 'llama-3.3-70b-versatile',
+          messages: [{ role: 'user', content: `Write a 25-word Hinglish phone call opening for collecting ₹${invoice.invoice_amount} from ${invoice.customer_name}, ${invoice.days_overdue} days overdue. Business: ${bizName}. Output only the script text, no quotes.` }],
+          temperature: 0.3, max_tokens: 80,
+        }),
+      });
+      const gd = await gr.json();
+      const s = gd.choices?.[0]?.message?.content?.trim();
+      if (s && s.length > 10) openingScript = s;
+    } catch (_) {}
+
+    const phone = String(invoice.customer_phone).replace(/\D/g, '');
+    const toPhone = phone.length === 10 ? `+91${phone}` : `+${phone}`;
+    const safeScript = openingScript.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const payLink = invoice.payment_link;
+    const payPrompt = payLink
+      ? `<Say voice="Polly.Aditi" language="hi-IN">Is link pe click kar ke abhi pay karein: ${payLink.replace(/https?:\/\//, '')}</Say><Pause length="1"/>`
+      : '';
+
+    await twilioClient.calls.create({
+      to: toPhone,
+      from: process.env.TWILIO_PHONE_NUMBER,
+      twiml: `<Response><Say voice="Polly.Aditi" language="hi-IN">${safeScript}</Say><Pause length="2"/>${payPrompt}<Say voice="Polly.Aditi" language="hi-IN">Payment ke liye please call wapas karein ya WhatsApp karein. Dhanyavaad.</Say></Response>`,
+      statusCallback: `${process.env.RAILWAY_PUBLIC_URL || 'https://vantro-flow-backend-production.up.railway.app'}/api/voice/status`,
+      statusCallbackEvent: ['completed'],
+      timeout: 30,
+    });
+
+    // Log the auto-call
+    await supabase.from('call_logs').insert([{
+      user_id: userId, invoice_id: invoice.id,
+      customer_name: invoice.customer_name, customer_phone: invoice.customer_phone,
+      amount: invoice.invoice_amount, did_pick_up: false,
+      notes: `[Auto-call by dunning cron, day ${invoice.days_overdue}] Script: "${openingScript}"`,
+      created_at: new Date(),
+    }]).catch(() => {});
+
+    return true;
+  } catch (err) {
+    console.error(`[Dunning/call] Call failed for ${invoice.customer_name}:`, err.message);
+    return false;
+  }
+}
+
 async function runDunningCycle() {
   console.log('🔔 Dunning cron started:', new Date().toISOString());
   try {
@@ -2900,11 +2967,17 @@ async function runDunningCycle() {
           sent_at: new Date(),
         }]).catch(() => {});
 
-        // Actually send the WhatsApp message (per-user creds → env fallback → mock)
+        // Execute the dunning action: call or whatsapp
         if (invoice.customer_phone) {
-          await sendWhatsAppMessage(invoice.customer_phone, msg, waCreds).catch(e =>
-            console.error(`[Dunning] WA send failed for ${invoice.customer_name}:`, e.message)
-          );
+          if (rule.action === 'call') {
+            // Auto-call via Twilio (AI script, Polly voice)
+            await makeAutoCall(invoice.user_id, invoice);
+          } else {
+            // WhatsApp (per-user creds → env fallback → mock)
+            await sendWhatsAppMessage(invoice.customer_phone, msg, waCreds).catch(e =>
+              console.error(`[Dunning] WA send failed for ${invoice.customer_name}:`, e.message)
+            );
+          }
           // Track reminder timestamp for frontend display
           await supabase.from('invoices').update({
             last_reminder_sent: new Date().toISOString(),
@@ -5916,6 +5989,47 @@ app.get('/api/reports/export', authMiddleware, async (req, res) => {
 
     // Send file
     if (!wb) return res.status(500).json({ error: 'Failed to build workbook' });
+
+    // ── PDF / Print-friendly HTML ───────────────────────────────────────────
+    if (format === 'pdf' || format === 'html') {
+      const REPORT_NAMES = {
+        outstanding: 'Outstanding Receivables', collection: 'Collection Performance',
+        gst: 'GST Summary', cashflow: 'Cash Flow Forecast',
+        calls: 'Call Activity Log', customer: 'Customer Statement',
+      };
+      // Flatten all sheets into one HTML table per sheet
+      const sheetsHtml = wb.SheetNames.map(sheetName => {
+        const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName]);
+        if (!rows.length) return `<h3>${sheetName}</h3><p style="color:#888">No data</p>`;
+        const headers = Object.keys(rows[0]);
+        return `
+          <h3 style="margin:24px 0 8px;font-size:14px;color:#0066FF">${sheetName}</h3>
+          <table>
+            <thead><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead>
+            <tbody>${rows.map(row => `<tr>${headers.map(h => `<td>${row[h] ?? ''}</td>`).join('')}</tr>`).join('')}</tbody>
+          </table>`;
+      }).join('');
+
+      const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<title>Vantro — ${REPORT_NAMES[report] || report}</title>
+<style>
+  body{font-family:system-ui,sans-serif;padding:32px;color:#111;max-width:960px;margin:0 auto}
+  h1{font-size:20px;font-weight:800;margin-bottom:2px}
+  .meta{font-size:12px;color:#666;margin-bottom:24px}
+  table{width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px}
+  th{background:#0066FF;color:#fff;padding:8px 10px;text-align:left;font-weight:600}
+  td{padding:6px 10px;border-bottom:1px solid #e2e8f0}
+  tr:nth-child(even) td{background:#f8fafc}
+  @media print{body{padding:0} button{display:none}}
+</style></head><body>
+<button onclick="window.print()" style="float:right;padding:8px 16px;background:#0066FF;color:#fff;border:none;border-radius:8px;font-weight:600;cursor:pointer;font-size:13px">🖨 Print / Save PDF</button>
+<h1>Vantro Flow — ${REPORT_NAMES[report] || report}</h1>
+<p class="meta">Period: ${fromDate} to ${toDate} &nbsp;·&nbsp; Generated: ${new Date().toLocaleDateString('en-IN', { day:'numeric',month:'long',year:'numeric' })}</p>
+${sheetsHtml}
+</body></html>`;
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.send(html);
+    }
 
     if (format === 'csv') {
       const firstSheet = wb.Sheets[wb.SheetNames[0]];
