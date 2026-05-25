@@ -1866,11 +1866,15 @@ app.get('/api/health', (req, res) => {
 });
 
 // ============================================
-// SEED DEMO DATA
+// SEED DEMO DATA — DISABLED
+// Real users start with zero data. No sample/demo data injected on signup.
 // ============================================
 
 app.post('/api/seed/:userId', requireOwner, async (req, res) => {
-  const { userId } = req.params;
+  // Seed endpoint permanently disabled — users provide their own real data
+  return res.status(410).json({ error: 'Seed endpoint disabled' });
+
+  const { userId } = req.params; // unreachable below
 
   try {
     // Verify user exists
