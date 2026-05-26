@@ -5625,7 +5625,7 @@ CRITICAL RULES:
         'Authorization': `Bearer ${process.env.GROQ_API_KEY}`
       },
       body: JSON.stringify({
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        model: 'meta-llama/llama-4-maverick-17b-128e-instruct',
         messages: [{
           role: 'user',
           content: [
@@ -5636,14 +5636,14 @@ CRITICAL RULES:
             { type: 'text', text: prompt }
           ]
         }],
-        max_tokens: 800,
+        max_tokens: 1500,
         temperature: 0.1,
       })
     });
 
     const groqData = await response.json();
     if (!response.ok) {
-      console.error('GROQ vision error:', groqData);
+      console.error('GROQ vision error (purchases):', groqData);
       return res.status(500).json({ error: 'AI scan failed', details: groqData.error?.message || 'Unknown error' });
     }
 
@@ -5653,7 +5653,7 @@ CRITICAL RULES:
       const jsonMatch = text.match(/\{[\s\S]*\}/);
       extracted = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
     } catch (e) {
-      console.error('JSON parse error from vision:', text);
+      console.error('JSON parse error from vision (purchases):', text);
       extracted = {};
     }
 
@@ -5744,66 +5744,80 @@ app.post('/api/sales/scan', authMiddleware, async (req, res) => {
     if (!image) return res.status(400).json({ error: 'image is required' });
     if (!process.env.GROQ_API_KEY) return res.status(503).json({ error: 'AI not configured' });
 
-    const prompt = `You are an expert at reading Indian sales invoices and bills.
-Extract ALL information from this invoice and return ONLY a valid JSON object. No explanation, no markdown, just raw JSON.
+    const prompt = `You are an expert OCR system for Indian tax invoices and GST bills.
+Read EVERY detail from this invoice image carefully and return ONLY a valid JSON object. No explanation, no markdown, no preamble — just raw JSON starting with {
 
 Return exactly this structure:
 {
-  "customer_name": "buyer/party name (string)",
-  "customer_gstin": "buyer GSTIN if visible (string or null)",
-  "supplier_name": "seller business name at top of bill (string or null)",
-  "invoice_number": "Invoice No / Bill No value (string or null)",
+  "customer_name": "BUYER company/person name from Buyer/Bill To/Party section",
+  "customer_gstin": "BUYER GSTIN/UIN — 15-char code near buyer address (string or null)",
+  "seller_gstin": "SELLER GSTIN/UIN — 15-char code near seller letterhead at top (string or null)",
+  "supplier_name": "SELLER business name from top of invoice header (string or null)",
+  "invoice_number": "Invoice No / Bill No / Tax Invoice No value (string or null)",
   "sale_date": "invoice date in YYYY-MM-DD format (string or null)",
   "due_date": "payment due date in YYYY-MM-DD if visible (string or null)",
   "items": [
     {
-      "description": "full item/product name",
-      "hsn_sac": "HSN or SAC code as string",
+      "description": "full item/product name and model",
+      "hsn_sac": "HSN or SAC code digits as string",
       "qty": numeric quantity as number,
-      "unit": "unit like PCS/SET/KG/MTR/BOX/NOS",
-      "price": unit price as number,
+      "unit": "unit like PCS/SET/KG/MTR/BOX/NOS/UNT",
+      "price": unit rate/price as number,
       "amount": line total amount as number
     }
   ],
-  "subtotal": taxable amount before GST as number or null,
+  "subtotal": taxable value before GST as number or null,
   "gst_rate": GST rate percentage as number e.g. 18 or 5 (number or null),
   "gst_amount": total GST/tax amount as number or null,
   "igst_amount": IGST amount if shown separately as number or null,
-  "cgst_amount": CGST amount if shown separately as number or null,
-  "sgst_amount": SGST amount if shown separately as number or null,
+  "cgst_amount": CGST/Output CGST amount if shown as number or null,
+  "sgst_amount": SGST/Output SGST amount if shown as number or null,
   "igst_rate": IGST rate percentage if shown as number or null,
   "cgst_rate": CGST rate percentage if shown as number or null,
   "sgst_rate": SGST rate percentage if shown as number or null,
-  "total_amount": GRAND TOTAL including all taxes as number,
-  "notes": "short summary of what was sold, max 100 chars (string or null)"
+  "total_amount": GRAND TOTAL final payable amount including all taxes as number,
+  "notes": "one-line summary of goods sold, max 80 chars (string or null)"
 }
 
 CRITICAL RULES:
-- customer_name: The BUYER at top/address section of the bill
-- items: Extract EVERY line item — description, HSN, qty, unit, price, amount
-- total_amount: The GRAND TOTAL / Final amount — must be a plain number
-- All monetary values: plain numbers only, NO ₹ symbol, NO commas
-- If any field not visible, use null
-- Return ONLY the raw JSON object, nothing else`;
+- customer_name: BUYER name — in "Buyer:" or "Bill To:" or "Party:" section
+- customer_gstin: BUYER GSTIN — 15-char alphanumeric code near buyer address
+- seller_gstin: SELLER GSTIN — 15-char alphanumeric code at top near seller name
+- invoice_number: exact "Invoice No" / "Bill No" field value
+- sale_date: the DATE on the invoice — convert any format to YYYY-MM-DD
+- total_amount: the FINAL GRAND TOTAL payable — largest amount at invoice bottom
+- items: extract EVERY row from the items/goods table — never skip any row
+- All monetary values: plain numbers ONLY — no Rs, no commas, no spaces
+- If a field is genuinely not visible, use null — do NOT invent values
+- Return ONLY the raw JSON object, nothing else, starting with {`;
 
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
       body: JSON.stringify({
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        model: 'meta-llama/llama-4-maverick-17b-128e-instruct',
         messages: [{ role: 'user', content: [
           { type: 'image_url', image_url: { url: `data:${mimeType};base64,${image}` } },
           { type: 'text', text: prompt }
         ]}],
-        max_tokens: 800,
+        max_tokens: 1500,
         temperature: 0.1,
       })
     });
     const groqData = await response.json();
-    if (!response.ok) return res.status(500).json({ error: 'AI scan failed' });
+    if (!response.ok) {
+      console.error('GROQ vision error (sales):', groqData);
+      return res.status(500).json({ error: 'AI scan failed', details: groqData.error?.message || 'Unknown error' });
+    }
     const text = groqData.choices[0]?.message?.content || '{}';
+    console.log('Sales scan raw response:', text.substring(0, 300));
     let extracted = {};
-    try { const m = text.match(/\{[\s\S]*\}/); extracted = m ? JSON.parse(m[0]) : {}; } catch {}
+    try {
+      const m = text.match(/\{[\s\S]*\}/);
+      extracted = m ? JSON.parse(m[0]) : {};
+    } catch (e) {
+      console.error('JSON parse error from vision (sales):', text);
+    }
     res.json({ success: true, data: extracted });
   } catch (err) {
     console.error('Sales scan error:', err);
