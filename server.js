@@ -5573,11 +5573,11 @@ app.post('/api/purchases/scan', authMiddleware, async (req, res) => {
   try {
     const { image, mimeType = 'image/jpeg' } = req.body;
     if (!image) return res.status(400).json({ error: 'image is required' });
-    if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: 'AI not configured' });
+    if (!process.env.GROQ_API_KEY) return res.status(503).json({ error: 'AI not configured' });
 
     const prompt = `You are an expert OCR system for Indian purchase bills, tax invoices, and challans.
 
-Read the ENTIRE invoice image carefully: seller header at top, buyer/party block, invoice number + date, items table with ALL rows, and totals at bottom.
+Read the ENTIRE invoice image carefully: seller header at top, buyer/party block, invoice number + date, items table with ALL rows, totals at bottom.
 
 Return ONLY a valid JSON object — no explanation, no markdown, no text before or after.
 
@@ -5602,35 +5602,30 @@ Return ONLY a valid JSON object — no explanation, no markdown, no text before 
   "notes": "brief summary e.g. '5 items, cotton fabric' or null"
 }
 
-Rules: numbers without ₹ or commas (147630 not 1,47,630). Dates as YYYY-MM-DD. Read every item row. total_amount is the final Grand Total.`;
+Rules: numbers without rupee symbol or commas (147630 not 1,47,630). Dates as YYYY-MM-DD. Read every item row. total_amount must not be null if any amount is visible.`;
 
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
       body: JSON.stringify({
-        model: 'claude-haiku-4-5',
+        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        messages: [{ role: 'user', content: [
+          { type: 'text', text: prompt },
+          { type: 'image_url', image_url: { url: `data:${mimeType};base64,${image}` } },
+        ]}],
         max_tokens: 1500,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'image', source: { type: 'base64', media_type: mimeType, data: image } },
-            { type: 'text', text: prompt }
-          ]
-        }]
+        temperature: 0,
       })
     });
 
-    const aiData = await response.json();
-    const rawText = aiData.content?.[0]?.text || '';
-    console.log('=== PURCHASES SCAN RAW ===', JSON.stringify({ ok: response.ok, status: response.status, raw: rawText.substring(0, 500), error: aiData.error }));
+    const groqData = await response.json();
+    const rawText = groqData.choices?.[0]?.message?.content || '';
+    console.log('=== PURCHASES SCAN RAW ===', JSON.stringify({ ok: response.ok, status: response.status, raw: rawText.substring(0, 500), error: groqData.error }));
 
     if (!response.ok) {
-      const errMsg = aiData.error?.message || '';
-      console.error('Purchases scan AI error:', errMsg);
+      const errMsg = groqData.error?.message || '';
+      const isRateLimit = response.status === 429 || errMsg.toLowerCase().includes('rate limit') || errMsg.toLowerCase().includes('tokens per');
+      if (isRateLimit) return res.status(429).json({ error: 'rate_limit', details: 'AI scan limit reached. Try again in a few minutes.' });
       return res.status(500).json({ error: 'AI scan failed', details: errMsg || 'Unknown' });
     }
 
@@ -5727,11 +5722,11 @@ app.post('/api/sales/scan', authMiddleware, async (req, res) => {
   try {
     const { image, mimeType = 'image/jpeg' } = req.body;
     if (!image) return res.status(400).json({ error: 'image is required' });
-    if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: 'AI not configured' });
+    if (!process.env.GROQ_API_KEY) return res.status(503).json({ error: 'AI not configured' });
 
     const prompt = `You are an expert OCR system for Indian tax invoices and GST bills.
 
-Read the ENTIRE invoice image carefully: seller header at top, buyer block, invoice number + date, items table with ALL rows, and totals at bottom.
+Read the ENTIRE invoice image carefully: seller header at top, buyer block, invoice number + date, items table with ALL rows, totals at bottom.
 
 Return ONLY a valid JSON object — no explanation, no markdown, no text before or after.
 
@@ -5757,35 +5752,30 @@ Return ONLY a valid JSON object — no explanation, no markdown, no text before 
   "notes": "brief summary e.g. '19 sewing machines, JK brand' or null"
 }
 
-Rules: numbers without ₹ or commas (147630 not 1,47,630). Dates as YYYY-MM-DD. Read ALL item rows. total_amount must never be null if any amount visible.`;
+Rules: numbers without rupee symbol or commas (147630 not 1,47,630). Dates as YYYY-MM-DD. Read ALL item rows. total_amount must never be null if any amount visible.`;
 
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
       body: JSON.stringify({
-        model: 'claude-haiku-4-5',
+        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        messages: [{ role: 'user', content: [
+          { type: 'text', text: prompt },
+          { type: 'image_url', image_url: { url: `data:${mimeType};base64,${image}` } },
+        ]}],
         max_tokens: 1500,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'image', source: { type: 'base64', media_type: mimeType, data: image } },
-            { type: 'text', text: prompt }
-          ]
-        }]
+        temperature: 0,
       })
     });
 
-    const aiData = await response.json();
-    const rawText = aiData.content?.[0]?.text || '';
-    console.log('=== SALES SCAN RAW ===', JSON.stringify({ ok: response.ok, status: response.status, raw: rawText.substring(0, 500), error: aiData.error }));
+    const groqData = await response.json();
+    const rawText = groqData.choices?.[0]?.message?.content || '';
+    console.log('=== SALES SCAN RAW ===', JSON.stringify({ ok: response.ok, status: response.status, raw: rawText.substring(0, 500), error: groqData.error }));
 
     if (!response.ok) {
-      const errMsg = aiData.error?.message || '';
-      console.error('Sales scan AI error:', errMsg);
+      const errMsg = groqData.error?.message || '';
+      const isRateLimit = response.status === 429 || errMsg.toLowerCase().includes('rate limit') || errMsg.toLowerCase().includes('tokens per');
+      if (isRateLimit) return res.status(429).json({ error: 'rate_limit', details: 'AI scan limit reached. Try again in a few minutes.' });
       return res.status(500).json({ error: 'AI scan failed', details: errMsg || 'Unknown' });
     }
 
