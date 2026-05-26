@@ -1873,7 +1873,8 @@ Return a JSON object with this exact structure (no markdown, pure JSON):
 // CAMERA / OCR SCAN
 // ============================================
 
-const VISION_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
+const VISION_MODEL = process.env.GROQ_VISION_MODEL || 'meta-llama/llama-4-scout-17b-16e-instruct';
+const DEFAULT_SCAN_AI_PROVIDERS = ['groq', 'gemini', 'openrouter', 'huggingface', 'ocrspace'];
 
 function cleanScanString(value) {
   if (value === null || value === undefined) return null;
@@ -2011,6 +2012,206 @@ function imageToDataUrl(image, mimeType = 'image/jpeg') {
   return `data:${safeMime};base64,${raw.replace(/^base64,/i, '')}`;
 }
 
+function splitDataUrl(dataUrl) {
+  const text = cleanScanString(dataUrl);
+  const match = text?.match(/^data:([^;,]+);base64,(.+)$/i);
+  if (!match) return { mimeType: 'image/jpeg', base64: text || '' };
+  return { mimeType: match[1], base64: match[2] };
+}
+
+function getConfiguredVisionProviders() {
+  const rawOrder = cleanScanString(process.env.SCAN_AI_PROVIDERS);
+  const order = rawOrder
+    ? rawOrder.split(',').map(item => item.trim().toLowerCase()).filter(Boolean)
+    : DEFAULT_SCAN_AI_PROVIDERS;
+  return [...new Set(order)].filter(provider => DEFAULT_SCAN_AI_PROVIDERS.includes(provider));
+}
+
+function getVisionModels(envName, fallback) {
+  const raw = cleanScanString(process.env[`${envName}S`]) || cleanScanString(process.env[envName]) || fallback;
+  return String(raw || '').split(',').map(model => model.trim()).filter(Boolean);
+}
+
+function hasMeaningfulScanData(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  return Object.values(value).some((entry) => {
+    if (entry === null || entry === undefined || entry === '') return false;
+    if (Array.isArray(entry)) return entry.length > 0;
+    return true;
+  });
+}
+
+function getProviderRawText(data) {
+  const content = data?.choices?.[0]?.message?.content;
+  if (Array.isArray(content)) {
+    return content.map(part => part?.text || part?.content || '').filter(Boolean).join('\n').trim();
+  }
+  if (content && typeof content === 'object') return cleanScanString(content.text || content.content) || '';
+  return cleanScanString(content) || '';
+}
+
+function makeVisionError(provider, status, message, data) {
+  const err = new Error(message || `${provider} vision API error`);
+  err.status = status;
+  err.provider = provider;
+  err.providerData = data;
+  return err;
+}
+
+function isVisionRateLimit(err) {
+  const lower = String(err?.message || '').toLowerCase();
+  return err?.status === 429 || lower.includes('rate limit') || lower.includes('quota') || lower.includes('too many requests') || lower.includes('tokens per');
+}
+
+function findNextOcrValue(lines, labelRegex, validator = value => Boolean(value)) {
+  const index = lines.findIndex(line => labelRegex.test(line));
+  if (index === -1) return null;
+  const inline = lines[index].replace(labelRegex, '').replace(/^[:\s.-]+/, '').trim();
+  if (inline && validator(inline)) return inline;
+  for (let i = index + 1; i < Math.min(lines.length, index + 5); i++) {
+    const candidate = lines[i].trim();
+    if (candidate && validator(candidate)) return candidate;
+  }
+  return null;
+}
+
+function parseOcrInvoiceNumber(lines, text) {
+  const direct = text.match(/\b(?:invoice|bill|challan)\s*(?:no|number|#)?\.?\s*[:#-]?\s*([A-Z0-9][A-Z0-9/.-]{1,30})/i);
+  const directValue = cleanScanString(direct?.[1]);
+  if (directValue && !/^(no|number|dated|e-way)$/i.test(directValue)) return directValue;
+  return findNextOcrValue(
+    lines,
+    /\b(?:invoice|bill|challan)\s*(?:no|number|#)?\.?\b/i,
+    value => /^[A-Z0-9][A-Z0-9/.-]{1,30}$/i.test(value) && !/dated|delivery|supplier|buyer|e-way/i.test(value),
+  );
+}
+
+function parseOcrDate(lines, text) {
+  const datePattern = /\b(\d{1,2}\s*[-/. ]\s*(?:\d{1,2}|jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)\s*[-/. ,]\s*\d{2,4})\b/i;
+  const datedValue = findNextOcrValue(lines, /\bdated\b/i, value => datePattern.test(value) || Boolean(parseScanDate(value)));
+  if (datedValue) return parseScanDate(datedValue.match(datePattern)?.[1] || datedValue);
+  const match = text.match(datePattern);
+  return parseScanDate(match?.[1]);
+}
+
+function parseOcrBuyerName(lines) {
+  const buyerIndex = lines.findIndex(line => /^\s*(buyer|bill to|party|customer)\b/i.test(line));
+  if (buyerIndex === -1) return null;
+  const noise = /^(gstin|gstin\/uin|pan|pan\/it|state name|contact|email|e-mail|mode\/terms|supplier|invoice|dated|delivery|terms|despatched|destination)\b/i;
+  const candidates = [];
+  for (let i = buyerIndex + 1; i < Math.min(lines.length, buyerIndex + 8); i++) {
+    const line = cleanScanString(lines[i]);
+    if (!line || noise.test(line) || /\b\d{2}[A-Z0-9]{13}\b/i.test(line)) continue;
+    if (/^[\d\s,./-]+$/.test(line)) continue;
+    candidates.push(line.replace(/^[:\s.-]+/, '').trim());
+  }
+  if (!candidates.length) return null;
+  if (/^cash$/i.test(candidates[0]) && candidates[1]) return candidates[1];
+  return candidates[0];
+}
+
+function parseOcrTotalAmount(lines) {
+  const amountPattern = /(?:₹|rs\.?|inr)?\s*(-?\d{1,3}(?:,\d{2,3})+(?:\.\d{1,2})?|-?\d+\.\d{2})/ig;
+  const preferred = [];
+  const fallback = [];
+  lines.forEach((line, index) => {
+    const matches = [...line.matchAll(amountPattern)].map(match => parseScanNumber(match[1])).filter(amount => amount !== null);
+    if (!matches.length) return;
+    const lower = line.toLowerCase();
+    const entry = { index, values: matches };
+    if (/[₹]/.test(line) || lower.includes('grand') || lower.includes('amount chargeable') || lower.includes('e. & o.e') || lower.includes('e & o.e')) preferred.push(entry);
+    if (lower.includes('total')) preferred.push(entry);
+    fallback.push(entry);
+  });
+
+  const chooseLast = (entries) => {
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const value = entries[i].values[entries[i].values.length - 1];
+      if (value > 0) return value;
+    }
+    return null;
+  };
+  return chooseLast(preferred) ?? chooseLast(fallback);
+}
+
+function parseOcrTaxAmount(lines, label) {
+  const labelRegex = new RegExp(label, 'i');
+  const amountPattern = /(-?\d{1,3}(?:,\d{2,3})+(?:\.\d{1,2})?|-?\d+\.\d{2})/g;
+  for (const line of lines) {
+    if (!labelRegex.test(line)) continue;
+    const values = [...line.matchAll(amountPattern)].map(match => parseScanNumber(match[1])).filter(value => value !== null);
+    if (values.length) return values[values.length - 1];
+  }
+  return null;
+}
+
+function parseOcrItems(lines) {
+  const itemKeywords = /(machine|lockstitch|overlock|interlock|steam|cloth|button|stand|table|secondhand|industrial|sewing|heat transfer)/i;
+  return lines
+    .filter(line => itemKeywords.test(line) && !/declaration|service|jurisdiction|bank|subject/i.test(line))
+    .slice(0, 8)
+    .map((line) => {
+      const hsn = line.match(/\b\d{8}\b/)?.[0] || null;
+      const qty = parseScanNumber(line.match(/\b(\d+)\s*(?:set|pcs|nos?|piece)\b/i)?.[1]) ?? null;
+      const amountMatches = [...line.matchAll(/\b\d{1,3}(?:,\d{2,3})+(?:\.\d{1,2})?\b/g)].map(match => parseScanNumber(match[0]));
+      const amount = amountMatches.length ? amountMatches[amountMatches.length - 1] : null;
+      const description = line
+        .replace(/\b\d{8}\b/g, '')
+        .replace(/\b\d+\s*(?:set|pcs|nos?|piece)\b/ig, '')
+        .replace(/\b\d{1,3}(?:,\d{2,3})+(?:\.\d{1,2})?\b/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      return { description: description || line, hsn_sac: hsn, qty: qty || 1, unit: null, price: null, amount };
+    });
+}
+
+function parseInvoiceFromOcrText(rawText) {
+  const text = cleanScanString(rawText) || '';
+  const lines = text.split(/\r?\n/).map(line => line.replace(/\s+/g, ' ').trim()).filter(Boolean);
+  const gstins = [...text.matchAll(/\b\d{2}[A-Z0-9]{13}\b/gi)].map(match => match[0].toUpperCase());
+  const phone = text.match(/\b(?:\+?91[-\s]?)?[6-9]\d{9}\b/)?.[0] || null;
+  const invoiceNumber = parseOcrInvoiceNumber(lines, text);
+  const invoiceDate = parseOcrDate(lines, text);
+  const customerName = parseOcrBuyerName(lines);
+  const totalAmount = parseOcrTotalAmount(lines);
+  const igstAmount = parseOcrTaxAmount(lines, 'igst|integrated tax|output igst');
+  const cgstAmount = parseOcrTaxAmount(lines, 'cgst|central tax|output cgst');
+  const sgstAmount = parseOcrTaxAmount(lines, 'sgst|state tax|output sgst');
+  const gstAmount = [igstAmount, cgstAmount, sgstAmount].filter(value => value !== null).reduce((sum, value) => sum + value, 0) || null;
+
+  return {
+    customer_name: customerName,
+    customer_phone: phone,
+    customer_gstin: gstins[1] || null,
+    supplier_name: lines.find(line => /enterprises|trading|company|co\.|fashion|spares|clothing|creations/i.test(line)) || null,
+    seller_gstin: gstins[0] || null,
+    invoice_number: invoiceNumber,
+    bill_number: invoiceNumber,
+    invoice_date: invoiceDate,
+    purchase_date: invoiceDate,
+    sale_date: invoiceDate,
+    items: parseOcrItems(lines),
+    gst_amount: gstAmount,
+    igst_amount: igstAmount,
+    cgst_amount: cgstAmount,
+    sgst_amount: sgstAmount,
+    total_amount: totalAmount,
+    invoice_amount: totalAmount,
+    notes: 'Extracted with OCR fallback',
+    ocr_text: text.substring(0, 3000),
+  };
+}
+
+function hasUsableOcrInvoiceData(parsed) {
+  return Boolean(
+    parsed?.total_amount ||
+    parsed?.invoice_number ||
+    parsed?.customer_name ||
+    parsed?.customer_gstin ||
+    (Array.isArray(parsed?.items) && parsed.items.length > 0)
+  );
+}
+
 function normalizeScanItems(value) {
   const rawItems = Array.isArray(value) ? value : [];
   return rawItems.map((item) => {
@@ -2116,22 +2317,12 @@ function normalizeSupplierExtraction(raw) {
   };
 }
 
-async function runVisionExtraction({ prompt, image, mimeType = 'image/jpeg', maxTokens = 1200 }) {
-  if (!process.env.GROQ_API_KEY) {
-    const err = new Error('AI not configured');
-    err.status = 503;
-    throw err;
-  }
-  const dataUrl = imageToDataUrl(image, mimeType);
-  if (!dataUrl) {
-    const err = new Error('image is required');
-    err.status = 400;
-    throw err;
-  }
-
+async function runGroqVisionExtraction({ prompt, dataUrl, maxTokens }) {
+  const apiKey = cleanScanString(process.env.GROQ_API_KEY);
+  if (!apiKey) return null;
   const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
     body: JSON.stringify({
       model: VISION_MODEL,
       messages: [{ role: 'user', content: [
@@ -2143,25 +2334,217 @@ async function runVisionExtraction({ prompt, image, mimeType = 'image/jpeg', max
     })
   });
 
-  const groqData = await response.json().catch(() => ({}));
-  const rawText = groqData.choices?.[0]?.message?.content || '';
-  if (!response.ok) {
-    const err = new Error(groqData.error?.message || 'Vision API error');
-    err.status = response.status;
-    err.groqError = groqData.error;
+  const data = await response.json().catch(() => ({}));
+  const rawText = getProviderRawText(data);
+  if (!response.ok) throw makeVisionError('groq', response.status, data.error?.message || 'Groq vision API error', data.error || data);
+  const parsed = parseScanJson(rawText);
+  if (!hasMeaningfulScanData(parsed)) throw makeVisionError('groq', 422, 'Groq returned no parseable invoice JSON', { rawText: rawText.substring(0, 300) });
+  return { provider: 'groq', model: VISION_MODEL, rawText, parsed, status: response.status };
+}
+
+async function runGeminiVisionExtraction({ prompt, dataUrl, maxTokens }) {
+  const apiKey = cleanScanString(process.env.GEMINI_API_KEY) || cleanScanString(process.env.GOOGLE_API_KEY);
+  if (!apiKey) return null;
+  const { mimeType, base64 } = splitDataUrl(dataUrl);
+  const model = cleanScanString(process.env.GEMINI_VISION_MODEL) || 'gemini-3.5-flash';
+  const modelPath = model.replace(/^models\//i, '');
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelPath}:generateContent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+    body: JSON.stringify({
+      contents: [{
+        role: 'user',
+        parts: [
+          { text: prompt },
+          { inline_data: { mime_type: mimeType, data: base64 } },
+        ],
+      }],
+      generationConfig: {
+        temperature: 0,
+        maxOutputTokens: maxTokens,
+        responseMimeType: 'application/json',
+      },
+    }),
+  });
+
+  const data = await response.json().catch(() => ({}));
+  const rawText = (data.candidates?.[0]?.content?.parts || [])
+    .map(part => part?.text || '')
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+  if (!response.ok) throw makeVisionError('gemini', response.status, data.error?.message || 'Gemini vision API error', data.error || data);
+  const parsed = parseScanJson(rawText);
+  if (!hasMeaningfulScanData(parsed)) throw makeVisionError('gemini', 422, 'Gemini returned no parseable invoice JSON', { rawText: rawText.substring(0, 300) });
+  return { provider: 'gemini', model, rawText, parsed, status: response.status };
+}
+
+async function runOpenRouterVisionExtraction({ prompt, dataUrl, maxTokens }) {
+  const apiKey = cleanScanString(process.env.OPENROUTER_API_KEY);
+  if (!apiKey) return null;
+  const models = getVisionModels('OPENROUTER_VISION_MODEL', 'qwen/qwen2.5-vl-72b-instruct:free,qwen/qwen2.5-vl-32b-instruct:free');
+  let lastError = null;
+  for (const model of models) {
+    try {
+      const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+          'HTTP-Referer': process.env.PUBLIC_APP_URL || process.env.FRONTEND_URL || 'https://vantro-flow-frontend.vercel.app',
+          'X-Title': 'Vantro Flow Scanner',
+        },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: [
+            { type: 'text', text: prompt },
+            { type: 'image_url', image_url: { url: dataUrl } },
+          ]}],
+          max_tokens: maxTokens,
+          temperature: 0,
+        }),
+      });
+      const data = await response.json().catch(() => ({}));
+      const rawText = getProviderRawText(data);
+      if (!response.ok) throw makeVisionError('openrouter', response.status, data.error?.message || `OpenRouter model ${model} failed`, data.error || data);
+      const parsed = parseScanJson(rawText);
+      if (!hasMeaningfulScanData(parsed)) throw makeVisionError('openrouter', 422, `OpenRouter model ${model} returned no parseable invoice JSON`, { rawText: rawText.substring(0, 300) });
+      return { provider: 'openrouter', model, rawText, parsed, status: response.status };
+    } catch (err) {
+      err.provider = err.provider || 'openrouter';
+      err.model = err.model || model;
+      lastError = err;
+      if (!isVisionRateLimit(err) && err.status !== 404 && err.status !== 422) break;
+    }
+  }
+  if (lastError) throw lastError;
+  return null;
+}
+
+async function runHuggingFaceVisionExtraction({ prompt, dataUrl, maxTokens }) {
+  const apiKey = cleanScanString(process.env.HF_TOKEN) || cleanScanString(process.env.HUGGINGFACE_API_KEY);
+  if (!apiKey) return null;
+  const model = cleanScanString(process.env.HF_VISION_MODEL) || 'zai-org/GLM-4.5V';
+  const response = await fetch('https://router.huggingface.co/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model,
+      messages: [{ role: 'user', content: [
+        { type: 'text', text: prompt },
+        { type: 'image_url', image_url: { url: dataUrl } },
+      ]}],
+      max_tokens: maxTokens,
+      temperature: 0,
+    }),
+  });
+
+  const data = await response.json().catch(() => ({}));
+  const rawText = getProviderRawText(data);
+  if (!response.ok) throw makeVisionError('huggingface', response.status, data.error?.message || 'Hugging Face vision API error', data.error || data);
+  const parsed = parseScanJson(rawText);
+  if (!hasMeaningfulScanData(parsed)) throw makeVisionError('huggingface', 422, 'Hugging Face returned no parseable invoice JSON', { rawText: rawText.substring(0, 300) });
+  return { provider: 'huggingface', model, rawText, parsed, status: response.status };
+}
+
+async function runOcrSpaceExtraction({ dataUrl }) {
+  if (/^(true|1|yes)$/i.test(cleanScanString(process.env.DISABLE_OCRSPACE_FALLBACK) || '')) return null;
+  const apiKey = cleanScanString(process.env.OCRSPACE_API_KEY) || cleanScanString(process.env.OCR_SPACE_API_KEY) || 'helloworld';
+  const form = new FormData();
+  form.append('base64Image', dataUrl);
+  form.append('language', 'eng');
+  form.append('isOverlayRequired', 'false');
+  form.append('isTable', 'true');
+  form.append('scale', 'true');
+  form.append('OCREngine', cleanScanString(process.env.OCRSPACE_ENGINE) || '2');
+
+  const response = await fetch('https://api.ocr.space/parse/image', {
+    method: 'POST',
+    headers: { apikey: apiKey },
+    body: form,
+  });
+  const data = await response.json().catch(() => ({}));
+  const rawText = (data.ParsedResults || [])
+    .map(result => result?.ParsedText || '')
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+  if (!response.ok || data.IsErroredOnProcessing) {
+    const message = data.ErrorMessage || data.ErrorDetails || 'OCR.space API error';
+    throw makeVisionError('ocrspace', response.status || 500, Array.isArray(message) ? message.join('; ') : message, data);
+  }
+  const parsed = parseInvoiceFromOcrText(rawText);
+  if (!rawText || !hasUsableOcrInvoiceData(parsed)) throw makeVisionError('ocrspace', 422, 'OCR.space returned no readable invoice text', data);
+  return { provider: 'ocrspace', model: `engine-${cleanScanString(process.env.OCRSPACE_ENGINE) || '2'}`, rawText, parsed, status: response.status };
+}
+
+async function runVisionExtraction({ prompt, image, mimeType = 'image/jpeg', maxTokens = 1200 }) {
+  const dataUrl = imageToDataUrl(image, mimeType);
+  if (!dataUrl) {
+    const err = new Error('image is required');
+    err.status = 400;
     throw err;
   }
-  return { rawText, parsed: parseScanJson(rawText), groqData, status: response.status };
+
+  const runners = {
+    groq: runGroqVisionExtraction,
+    gemini: runGeminiVisionExtraction,
+    openrouter: runOpenRouterVisionExtraction,
+    huggingface: runHuggingFaceVisionExtraction,
+    ocrspace: runOcrSpaceExtraction,
+  };
+  const providerOrder = getConfiguredVisionProviders();
+  const providerErrors = [];
+  let attempted = 0;
+
+  for (const provider of providerOrder) {
+    const runner = runners[provider];
+    if (!runner) continue;
+    try {
+      const result = await runner({ prompt, dataUrl, maxTokens });
+      if (!result) continue;
+      attempted += 1;
+      return { ...result, providersTried: [...providerErrors.map(error => error.provider), provider] };
+    } catch (err) {
+      attempted += 1;
+      providerErrors.push({
+        provider: err.provider || provider,
+        model: err.model || null,
+        status: err.status || 500,
+        message: err.message || 'Unknown provider error',
+        rateLimited: isVisionRateLimit(err),
+      });
+      console.warn(`Vision provider ${provider} failed:`, err.message || err);
+      continue;
+    }
+  }
+
+  const err = new Error(providerErrors.length
+    ? providerErrors.map(error => `${error.provider}: ${error.message}`).join(' | ')
+    : 'No scan AI providers are configured');
+  err.status = attempted === 0 ? 503 : providerErrors.every(error => error.rateLimited) ? 429 : 500;
+  err.providerErrors = providerErrors;
+  throw err;
 }
 
 function sendVisionError(res, err, label) {
   const errMsg = err?.message || 'Unknown';
-  const lower = errMsg.toLowerCase();
-  const isRateLimit = err?.status === 429 || lower.includes('rate limit') || lower.includes('tokens per');
-  if (isRateLimit) return res.status(429).json({ error: 'rate_limit', details: 'AI scan limit reached. Try again in a few minutes.' });
+  const providerErrors = Array.isArray(err?.providerErrors) ? err.providerErrors : [];
+  const isRateLimit = isVisionRateLimit(err) || (providerErrors.length > 0 && providerErrors.every(error => error.rateLimited));
+  if (isRateLimit) {
+    return res.status(429).json({
+      error: 'rate_limit',
+      details: 'All configured AI scan providers are rate limited. Try again in a few minutes.',
+      providers: providerErrors,
+    });
+  }
   const status = err?.status === 400 || err?.status === 503 ? err.status : 500;
-  console.error(`${label} scan error:`, errMsg);
-  return res.status(status).json({ error: status === 503 ? 'AI not configured' : 'AI scan failed', details: errMsg });
+  console.error(`${label} scan error:`, errMsg, providerErrors);
+  return res.status(status).json({
+    error: status === 503 ? 'AI not configured' : 'AI scan failed',
+    details: errMsg,
+    providers: providerErrors,
+  });
 }
 
 app.post('/api/scan-document', authMiddleware, async (req, res) => {
@@ -5894,12 +6277,11 @@ app.delete('/api/purchases/:id', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
-// Bill Scanner — AI extracts purchase data from photo using GROQ Vision
+// Bill Scanner — AI extracts purchase data from photo using vision provider fallback
 app.post('/api/purchases/scan', authMiddleware, async (req, res) => {
   try {
     const { image, mimeType = 'image/jpeg' } = req.body;
     if (!image) return res.status(400).json({ error: 'image is required' });
-    if (!process.env.GROQ_API_KEY) return res.status(503).json({ error: 'AI not configured' });
 
     const prompt = `You are an expert OCR system for Indian purchase bills, tax invoices, and challans.
 
@@ -5930,11 +6312,11 @@ Return ONLY a valid JSON object — no explanation, no markdown, no text before 
 
 Rules: numbers without rupee symbol or commas (147630 not 1,47,630). Dates as YYYY-MM-DD. Read every item row. total_amount must not be null if any amount is visible.`;
 
-    const { rawText, parsed } = await runVisionExtraction({ prompt, image, mimeType, maxTokens: 1600 });
+    const { rawText, parsed, provider, model, providersTried } = await runVisionExtraction({ prompt, image, mimeType, maxTokens: 1600 });
     const extracted = normalizeScanExtraction(parsed, 'purchase');
-    console.log('=== PURCHASES SCAN RAW ===', JSON.stringify({ raw: rawText.substring(0, 500), extracted_keys: Object.keys(extracted) }));
+    console.log('=== PURCHASES SCAN RAW ===', JSON.stringify({ provider, model, raw: rawText.substring(0, 500), extracted_keys: Object.keys(extracted) }));
 
-    res.json({ success: true, data: extracted, _debug: rawText.substring(0, 300) });
+    res.json({ success: true, data: extracted, _debug: rawText.substring(0, 300), _provider: provider, _providers_tried: providersTried });
   } catch (err) {
     sendVisionError(res, err, 'Purchase bill');
   }
@@ -6013,12 +6395,11 @@ app.delete('/api/sales/:id', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
-// Sales Bill Scanner — AI extracts sale/invoice data from photo
+// Sales Bill Scanner — AI extracts sale/invoice data from photo using vision provider fallback
 app.post('/api/sales/scan', authMiddleware, async (req, res) => {
   try {
     const { image, mimeType = 'image/jpeg' } = req.body;
     if (!image) return res.status(400).json({ error: 'image is required' });
-    if (!process.env.GROQ_API_KEY) return res.status(503).json({ error: 'AI not configured' });
 
     const prompt = `You are an expert OCR system for Indian tax invoices and GST bills.
 
@@ -6050,10 +6431,10 @@ Return ONLY a valid JSON object — no explanation, no markdown, no text before 
 
 Rules: numbers without rupee symbol or commas (147630 not 1,47,630). Dates as YYYY-MM-DD. Read ALL item rows. total_amount must never be null if any amount visible.`;
 
-    const { rawText, parsed } = await runVisionExtraction({ prompt, image, mimeType, maxTokens: 1600 });
+    const { rawText, parsed, provider, model, providersTried } = await runVisionExtraction({ prompt, image, mimeType, maxTokens: 1600 });
     const extracted = normalizeScanExtraction(parsed, 'sale');
-    console.log('=== SALES SCAN RAW ===', JSON.stringify({ raw: rawText.substring(0, 500), extracted_keys: Object.keys(extracted) }));
-    res.json({ success: true, data: extracted, _debug: rawText.substring(0, 300) });
+    console.log('=== SALES SCAN RAW ===', JSON.stringify({ provider, model, raw: rawText.substring(0, 500), extracted_keys: Object.keys(extracted) }));
+    res.json({ success: true, data: extracted, _debug: rawText.substring(0, 300), _provider: provider, _providers_tried: providersTried });
   } catch (err) {
     sendVisionError(res, err, 'Sales bill');
   }
