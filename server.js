@@ -5646,7 +5646,12 @@ STRICT RULES:
     const rawText = groqData.choices?.[0]?.message?.content || '';
     console.log('=== PURCHASES SCAN RAW ===', JSON.stringify({ ok: response.ok, status: response.status, raw: rawText.substring(0, 800), error: groqData.error }));
     if (!response.ok) {
-      return res.status(500).json({ error: 'AI scan failed', details: groqData.error?.message || 'Unknown', _raw: rawText });
+      const errMsg = groqData.error?.message || '';
+      const isRateLimit = response.status === 429 || errMsg.toLowerCase().includes('rate limit') || errMsg.toLowerCase().includes('tokens per');
+      if (isRateLimit) {
+        return res.status(429).json({ error: 'rate_limit', details: 'AI daily scan limit reached. Try again tomorrow or upgrade GROQ plan.' });
+      }
+      return res.status(500).json({ error: 'AI scan failed', details: errMsg || 'Unknown', _raw: rawText });
     }
 
     let extracted = {};
@@ -5809,7 +5814,12 @@ STRICT RULES — follow exactly:
     const rawText = groqData.choices?.[0]?.message?.content || '';
     console.log('=== SALES SCAN RAW ===', JSON.stringify({ ok: response.ok, status: response.status, raw: rawText.substring(0, 800), error: groqData.error }));
     if (!response.ok) {
-      return res.status(500).json({ error: 'AI scan failed', details: groqData.error?.message || 'Unknown', _raw: rawText });
+      const errMsg = groqData.error?.message || '';
+      const isRateLimit = response.status === 429 || errMsg.toLowerCase().includes('rate limit') || errMsg.toLowerCase().includes('tokens per');
+      if (isRateLimit) {
+        return res.status(429).json({ error: 'rate_limit', details: 'AI daily scan limit reached. Try again tomorrow or upgrade GROQ plan.' });
+      }
+      return res.status(500).json({ error: 'AI scan failed', details: errMsg || 'Unknown', _raw: rawText });
     }
     let extracted = {};
     try {
