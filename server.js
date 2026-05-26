@@ -5629,7 +5629,7 @@ STRICT RULES:
         'Authorization': `Bearer ${process.env.GROQ_API_KEY}`
       },
       body: JSON.stringify({
-        model: 'meta-llama/llama-4-maverick-17b-128e-instruct',
+        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
         messages: [{
           role: 'user',
           content: [
@@ -5637,28 +5637,27 @@ STRICT RULES:
             { type: 'image_url', image_url: { url: `data:${mimeType};base64,${image}` } },
           ]
         }],
-        max_tokens: 1500,
+        max_tokens: 2000,
         temperature: 0,
       })
     });
 
     const groqData = await response.json();
+    const rawText = groqData.choices?.[0]?.message?.content || '';
+    console.log('=== PURCHASES SCAN RAW ===', JSON.stringify({ ok: response.ok, status: response.status, raw: rawText.substring(0, 800), error: groqData.error }));
     if (!response.ok) {
-      console.error('GROQ vision error (purchases):', groqData);
-      return res.status(500).json({ error: 'AI scan failed', details: groqData.error?.message || 'Unknown error' });
+      return res.status(500).json({ error: 'AI scan failed', details: groqData.error?.message || 'Unknown', _raw: rawText });
     }
 
-    const text = groqData.choices[0]?.message?.content || '{}';
     let extracted = {};
     try {
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      const jsonMatch = rawText.match(/\{[\s\S]*\}/);
       extracted = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
     } catch (e) {
-      console.error('JSON parse error from vision (purchases):', text);
-      extracted = {};
+      console.error('JSON parse error (purchases):', rawText.substring(0, 300));
     }
 
-    res.json({ success: true, data: extracted });
+    res.json({ success: true, data: extracted, _debug: rawText.substring(0, 300) });
   } catch (err) {
     console.error('Bill scan error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -5797,30 +5796,29 @@ STRICT RULES — follow exactly:
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
       body: JSON.stringify({
-        model: 'meta-llama/llama-4-maverick-17b-128e-instruct',
+        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
         messages: [{ role: 'user', content: [
           { type: 'text', text: prompt },
           { type: 'image_url', image_url: { url: `data:${mimeType};base64,${image}` } },
         ]}],
-        max_tokens: 1500,
+        max_tokens: 2000,
         temperature: 0,
       })
     });
     const groqData = await response.json();
+    const rawText = groqData.choices?.[0]?.message?.content || '';
+    console.log('=== SALES SCAN RAW ===', JSON.stringify({ ok: response.ok, status: response.status, raw: rawText.substring(0, 800), error: groqData.error }));
     if (!response.ok) {
-      console.error('GROQ vision error (sales):', groqData);
-      return res.status(500).json({ error: 'AI scan failed', details: groqData.error?.message || 'Unknown error' });
+      return res.status(500).json({ error: 'AI scan failed', details: groqData.error?.message || 'Unknown', _raw: rawText });
     }
-    const text = groqData.choices[0]?.message?.content || '{}';
-    console.log('Sales scan raw AI response:', text.substring(0, 500));
     let extracted = {};
     try {
-      const m = text.match(/\{[\s\S]*\}/);
+      const m = rawText.match(/\{[\s\S]*\}/);
       extracted = m ? JSON.parse(m[0]) : {};
     } catch (e) {
-      console.error('JSON parse error from vision (sales):', text);
+      console.error('JSON parse error (sales):', rawText.substring(0, 300));
     }
-    res.json({ success: true, data: extracted });
+    res.json({ success: true, data: extracted, _debug: rawText.substring(0, 300) });
   } catch (err) {
     console.error('Sales scan error:', err);
     res.status(500).json({ error: 'Internal server error' });
