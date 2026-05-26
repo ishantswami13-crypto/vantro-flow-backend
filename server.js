@@ -3532,8 +3532,7 @@ app.post('/api/admin/create-pro-user', async (req, res) => {
     const password_hash = await bcrypt.hash(password, 12);
     const { data: user, error } = await supabase.from('users').insert({
       email, phone, business_name, password_hash,
-      plan: 'pro', phone_verified: true, email_verified: true,
-      created_at: new Date(),
+      plan: 'pro', created_at: new Date(),
     }).select('id, email, business_name, plan').single();
     if (error) return res.status(400).json({ error: error.message });
     const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '90d' });
