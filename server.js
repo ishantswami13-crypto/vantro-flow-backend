@@ -5494,7 +5494,7 @@ app.post('/api/purchases', authMiddleware, async (req, res) => {
   try {
     const {
       supplier_name, total_amount, amount,
-      supplier_phone, bill_number,
+      supplier_phone, bill_number, supplier_gstin,
       purchase_date, due_date, paid_amount, notes,
     } = req.body;
 
@@ -5506,17 +5506,18 @@ app.post('/api/purchases', authMiddleware, async (req, res) => {
     const autoStatus = finalPaid >= finalAmount ? 'paid' : finalPaid > 0 ? 'partial' : 'unpaid';
 
     const { data, error } = await supabase.from('purchases').insert([{
-      user_id:       req.user.userId,
+      user_id:        req.user.userId,
       supplier_name,
-      amount:        finalAmount,
-      paid_amount:   finalPaid,
-      status:        autoStatus,
-      purchase_date: purchase_date || new Date().toISOString().split('T')[0],
-      due_date:      due_date      || null,
-      bill_number:   bill_number   || null,
+      amount:         finalAmount,
+      paid_amount:    finalPaid,
+      status:         autoStatus,
+      purchase_date:  purchase_date  || new Date().toISOString().split('T')[0],
+      due_date:       due_date       || null,
+      bill_number:    bill_number    || null,
       supplier_phone: supplier_phone || null,
-      notes:         notes         || null,
-      category:      'material',
+      supplier_gstin: supplier_gstin || null,
+      notes:          notes          || null,
+      category:       'material',
     }]).select().single();
 
     if (error) throw error;
@@ -5529,7 +5530,7 @@ app.post('/api/purchases', authMiddleware, async (req, res) => {
 
 app.patch('/api/purchases/:id', authMiddleware, async (req, res) => {
   try {
-    const { total_amount, amount, paid_amount, supplier_name, purchase_date, due_date, notes, bill_number, supplier_phone } = req.body;
+    const { total_amount, amount, paid_amount, supplier_name, purchase_date, due_date, notes, bill_number, supplier_phone, supplier_gstin } = req.body;
 
     const finalAmount = total_amount !== undefined ? parseFloat(total_amount) : amount !== undefined ? parseFloat(amount) : null;
     const finalPaid   = paid_amount  !== undefined ? parseFloat(paid_amount)  : null;
@@ -5544,11 +5545,12 @@ app.patch('/api/purchases/:id', authMiddleware, async (req, res) => {
 
     const updates = { amount: newAmount, paid_amount: newPaid, status: newStatus };
     if (supplier_name  !== undefined) updates.supplier_name  = supplier_name;
-    if (purchase_date  !== undefined) updates.purchase_date  = purchase_date || null;
-    if (due_date       !== undefined) updates.due_date       = due_date      || null;
-    if (notes          !== undefined) updates.notes          = notes         || null;
-    if (bill_number    !== undefined) updates.bill_number    = bill_number   || null;
+    if (purchase_date  !== undefined) updates.purchase_date  = purchase_date  || null;
+    if (due_date       !== undefined) updates.due_date       = due_date       || null;
+    if (notes          !== undefined) updates.notes          = notes          || null;
+    if (bill_number    !== undefined) updates.bill_number    = bill_number    || null;
     if (supplier_phone !== undefined) updates.supplier_phone = supplier_phone || null;
+    if (supplier_gstin !== undefined) updates.supplier_gstin = supplier_gstin || null;
 
     const { data, error } = await supabase.from('purchases').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
@@ -5680,7 +5682,7 @@ app.get('/api/sales', authMiddleware, async (req, res) => {
 
 app.post('/api/sales', authMiddleware, async (req, res) => {
   try {
-    const { customer_name, total_amount, amount, customer_phone, invoice_number,
+    const { customer_name, total_amount, amount, customer_phone, customer_gstin, invoice_number,
             sale_date, due_date, paid_amount, notes, items, gst_type, gst_rate, gst_amount,
             cgst_amount, sgst_amount, igst_amount, subtotal } = req.body;
     const finalAmount = parseFloat(total_amount || amount || 0);
@@ -5691,7 +5693,8 @@ app.post('/api/sales', authMiddleware, async (req, res) => {
       user_id: req.user.userId, customer_name, amount: finalAmount, paid_amount: finalPaid,
       status: autoStatus, sale_date: sale_date || new Date().toISOString().split('T')[0],
       due_date: due_date || null, invoice_number: invoice_number || null,
-      customer_phone: customer_phone || null, notes: notes || null,
+      customer_phone: customer_phone || null, customer_gstin: customer_gstin || null,
+      notes: notes || null,
       items: items ? JSON.stringify(items) : null,
       gst_type: gst_type || null, gst_rate: gst_rate || null, gst_amount: gst_amount || null,
       cgst_amount: cgst_amount || null, sgst_amount: sgst_amount || null, igst_amount: igst_amount || null,
@@ -5704,14 +5707,15 @@ app.post('/api/sales', authMiddleware, async (req, res) => {
 
 app.patch('/api/sales/:id', authMiddleware, async (req, res) => {
   try {
-    const { total_amount, amount, paid_amount, customer_name, sale_date, due_date, notes, invoice_number, customer_phone } = req.body;
+    const { total_amount, amount, paid_amount, customer_name, sale_date, due_date, notes, invoice_number, customer_phone, customer_gstin } = req.body;
     const updates = {};
-    if (customer_name !== undefined) updates.customer_name = customer_name;
-    if (sale_date !== undefined) updates.sale_date = sale_date;
-    if (due_date !== undefined) updates.due_date = due_date;
-    if (notes !== undefined) updates.notes = notes;
+    if (customer_name  !== undefined) updates.customer_name  = customer_name;
+    if (sale_date      !== undefined) updates.sale_date      = sale_date;
+    if (due_date       !== undefined) updates.due_date       = due_date;
+    if (notes          !== undefined) updates.notes          = notes;
     if (invoice_number !== undefined) updates.invoice_number = invoice_number;
     if (customer_phone !== undefined) updates.customer_phone = customer_phone;
+    if (customer_gstin !== undefined) updates.customer_gstin = customer_gstin || null;
     const newAmount = parseFloat(total_amount || amount || 0);
     if (newAmount > 0) updates.amount = newAmount;
     if (paid_amount !== undefined) {
