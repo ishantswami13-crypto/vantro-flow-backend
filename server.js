@@ -5595,8 +5595,14 @@ Return exactly this structure:
     }
   ],
   "subtotal": taxable amount before GST as number or null,
-  "gst_rate": "GST rate like 18% or 5% (string or null)",
+  "gst_rate": "GST rate percentage as number e.g. 18 or 5 (number or null)",
   "gst_amount": total GST/tax amount as number or null,
+  "igst_amount": IGST amount if shown separately as number or null,
+  "cgst_amount": CGST amount if shown separately as number or null,
+  "sgst_amount": SGST amount if shown separately as number or null,
+  "igst_rate": IGST rate percentage if shown as number or null,
+  "cgst_rate": CGST rate percentage if shown as number or null,
+  "sgst_rate": SGST rate percentage if shown as number or null,
   "total_amount": GRAND TOTAL including all taxes as number,
   "notes": "short summary of what was purchased, max 100 chars (string or null)"
 }
@@ -5628,7 +5634,7 @@ CRITICAL RULES:
             { type: 'text', text: prompt }
           ]
         }],
-        max_tokens: 600,
+        max_tokens: 800,
         temperature: 0.1,
       })
     });
@@ -5652,6 +5658,151 @@ CRITICAL RULES:
     res.json({ success: true, data: extracted });
   } catch (err) {
     console.error('Bill scan error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============================================
+// SALES / RECEIVABLES
+// ============================================
+
+app.get('/api/sales', authMiddleware, async (req, res) => {
+  try {
+    const { status } = req.query;
+    let q = supabase.from('sales').select('*').eq('user_id', req.user.userId).order('sale_date', { ascending: false });
+    if (status) q = q.eq('status', status);
+    const { data, error } = await q;
+    if (error) throw error;
+    const sales = (data || []).map(s => ({ ...s, total_amount: parseFloat(s.amount) || 0 }));
+    res.json({ success: true, sales });
+  } catch (err) { res.status(500).json({ error: err.message || 'Internal server error' }); }
+});
+
+app.post('/api/sales', authMiddleware, async (req, res) => {
+  try {
+    const { customer_name, total_amount, amount, customer_phone, invoice_number,
+            sale_date, due_date, paid_amount, notes, items, gst_type, gst_rate, gst_amount,
+            cgst_amount, sgst_amount, igst_amount, subtotal } = req.body;
+    const finalAmount = parseFloat(total_amount || amount || 0);
+    if (!customer_name || !finalAmount) return res.status(400).json({ error: 'customer_name and total_amount are required' });
+    const finalPaid = parseFloat(paid_amount || 0);
+    const autoStatus = finalPaid >= finalAmount ? 'paid' : finalPaid > 0 ? 'partial' : 'unpaid';
+    const { data, error } = await supabase.from('sales').insert([{
+      user_id: req.user.userId, customer_name, amount: finalAmount, paid_amount: finalPaid,
+      status: autoStatus, sale_date: sale_date || new Date().toISOString().split('T')[0],
+      due_date: due_date || null, invoice_number: invoice_number || null,
+      customer_phone: customer_phone || null, notes: notes || null,
+      items: items ? JSON.stringify(items) : null,
+      gst_type: gst_type || null, gst_rate: gst_rate || null, gst_amount: gst_amount || null,
+      cgst_amount: cgst_amount || null, sgst_amount: sgst_amount || null, igst_amount: igst_amount || null,
+      subtotal: subtotal || null,
+    }]).select().single();
+    if (error) throw error;
+    res.json({ success: true, sale: { ...data, total_amount: parseFloat(data.amount) } });
+  } catch (err) { res.status(500).json({ error: err.message || 'Internal server error' }); }
+});
+
+app.patch('/api/sales/:id', authMiddleware, async (req, res) => {
+  try {
+    const { total_amount, amount, paid_amount, customer_name, sale_date, due_date, notes, invoice_number, customer_phone } = req.body;
+    const updates = {};
+    if (customer_name !== undefined) updates.customer_name = customer_name;
+    if (sale_date !== undefined) updates.sale_date = sale_date;
+    if (due_date !== undefined) updates.due_date = due_date;
+    if (notes !== undefined) updates.notes = notes;
+    if (invoice_number !== undefined) updates.invoice_number = invoice_number;
+    if (customer_phone !== undefined) updates.customer_phone = customer_phone;
+    const newAmount = parseFloat(total_amount || amount || 0);
+    if (newAmount > 0) updates.amount = newAmount;
+    if (paid_amount !== undefined) {
+      updates.paid_amount = parseFloat(paid_amount);
+      const finalAmt = newAmount || 0;
+      const finalPaid = updates.paid_amount;
+      if (finalAmt > 0) updates.status = finalPaid >= finalAmt ? 'paid' : finalPaid > 0 ? 'partial' : 'unpaid';
+    }
+    const { data, error } = await supabase.from('sales').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
+    if (error) throw error;
+    res.json({ success: true, sale: { ...data, total_amount: parseFloat(data.amount) } });
+  } catch (err) { res.status(500).json({ error: err.message || 'Internal server error' }); }
+});
+
+app.delete('/api/sales/:id', authMiddleware, async (req, res) => {
+  try {
+    await supabase.from('sales').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Sales Bill Scanner — AI extracts sale/invoice data from photo
+app.post('/api/sales/scan', authMiddleware, async (req, res) => {
+  try {
+    const { image, mimeType = 'image/jpeg' } = req.body;
+    if (!image) return res.status(400).json({ error: 'image is required' });
+    if (!process.env.GROQ_API_KEY) return res.status(503).json({ error: 'AI not configured' });
+
+    const prompt = `You are an expert at reading Indian sales invoices and bills.
+Extract ALL information from this invoice and return ONLY a valid JSON object. No explanation, no markdown, just raw JSON.
+
+Return exactly this structure:
+{
+  "customer_name": "buyer/party name (string)",
+  "customer_gstin": "buyer GSTIN if visible (string or null)",
+  "supplier_name": "seller business name at top of bill (string or null)",
+  "invoice_number": "Invoice No / Bill No value (string or null)",
+  "sale_date": "invoice date in YYYY-MM-DD format (string or null)",
+  "due_date": "payment due date in YYYY-MM-DD if visible (string or null)",
+  "items": [
+    {
+      "description": "full item/product name",
+      "hsn_sac": "HSN or SAC code as string",
+      "qty": numeric quantity as number,
+      "unit": "unit like PCS/SET/KG/MTR/BOX/NOS",
+      "price": unit price as number,
+      "amount": line total amount as number
+    }
+  ],
+  "subtotal": taxable amount before GST as number or null,
+  "gst_rate": GST rate percentage as number e.g. 18 or 5 (number or null),
+  "gst_amount": total GST/tax amount as number or null,
+  "igst_amount": IGST amount if shown separately as number or null,
+  "cgst_amount": CGST amount if shown separately as number or null,
+  "sgst_amount": SGST amount if shown separately as number or null,
+  "igst_rate": IGST rate percentage if shown as number or null,
+  "cgst_rate": CGST rate percentage if shown as number or null,
+  "sgst_rate": SGST rate percentage if shown as number or null,
+  "total_amount": GRAND TOTAL including all taxes as number,
+  "notes": "short summary of what was sold, max 100 chars (string or null)"
+}
+
+CRITICAL RULES:
+- customer_name: The BUYER at top/address section of the bill
+- items: Extract EVERY line item — description, HSN, qty, unit, price, amount
+- total_amount: The GRAND TOTAL / Final amount — must be a plain number
+- All monetary values: plain numbers only, NO ₹ symbol, NO commas
+- If any field not visible, use null
+- Return ONLY the raw JSON object, nothing else`;
+
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+      body: JSON.stringify({
+        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        messages: [{ role: 'user', content: [
+          { type: 'image_url', image_url: { url: `data:${mimeType};base64,${image}` } },
+          { type: 'text', text: prompt }
+        ]}],
+        max_tokens: 800,
+        temperature: 0.1,
+      })
+    });
+    const groqData = await response.json();
+    if (!response.ok) return res.status(500).json({ error: 'AI scan failed' });
+    const text = groqData.choices[0]?.message?.content || '{}';
+    let extracted = {};
+    try { const m = text.match(/\{[\s\S]*\}/); extracted = m ? JSON.parse(m[0]) : {}; } catch {}
+    res.json({ success: true, data: extracted });
+  } catch (err) {
+    console.error('Sales scan error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
