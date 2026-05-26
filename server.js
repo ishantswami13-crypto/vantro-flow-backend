@@ -5492,41 +5492,45 @@ app.post('/api/purchases', authMiddleware, async (req, res) => {
   try {
     const {
       supplier_name,
-      total_amount, amount,           // frontend sends total_amount, old API sent amount
+      total_amount, amount,
       supplier_phone, bill_number,
       purchase_date, due_date,
       paid_amount, notes,
-      category, supplier_gstin, description,
     } = req.body;
 
     const finalAmount = parseFloat(total_amount || amount || 0);
     if (!supplier_name || !finalAmount) {
       return res.status(400).json({ error: 'supplier_name and total_amount are required' });
     }
-    const finalPaid   = parseFloat(paid_amount || 0);
-    const autoStatus  = finalPaid >= finalAmount ? 'paid' : finalPaid > 0 ? 'partial' : 'unpaid';
+    const finalPaid  = parseFloat(paid_amount || 0);
+    const autoStatus = finalPaid >= finalAmount ? 'paid' : finalPaid > 0 ? 'partial' : 'unpaid';
 
-    const row = {
-      user_id:        req.user.userId,
+    // Build notes — embed bill_number and phone since those columns may not exist in DB yet
+    let fullNotes = notes || null;
+    const extras = [];
+    if (bill_number)    extras.push(`Bill: ${bill_number}`);
+    if (supplier_phone) extras.push(`Ph: ${supplier_phone}`);
+    if (extras.length)  fullNotes = extras.join(' | ') + (fullNotes ? ' | ' + fullNotes : '');
+
+    const { data, error } = await supabase.from('purchases').insert([{
+      user_id:       req.user.userId,
       supplier_name,
-      amount:         finalAmount,         // DB column is 'amount'
-      paid_amount:    finalPaid,
-      status:         autoStatus,
-      purchase_date:  purchase_date  || new Date().toISOString().split('T')[0],
-      due_date:       due_date       || null,
-      notes:          notes          || null,
-      description:    description    || null,
-      category:       category       || 'material',
-      supplier_gstin: supplier_gstin || null,
-      created_at:     new Date(),
-    };
-    // Add optional columns only if they exist on the table
-    if (bill_number    !== undefined) row.bill_number    = bill_number    || null;
-    if (supplier_phone !== undefined) row.supplier_phone = supplier_phone || null;
+      amount:        finalAmount,
+      paid_amount:   finalPaid,
+      status:        autoStatus,
+      purchase_date: purchase_date || new Date().toISOString().split('T')[0],
+      due_date:      due_date      || null,
+      notes:         fullNotes,
+      description:   bill_number   || null,
+      category:      'material',
+      created_at:    new Date(),
+    }]).select().single();
 
-    const { data, error } = await supabase.from('purchases').insert([row]).select().single();
-    if (error) throw error;
-    res.json({ success: true, purchase: { ...data, total_amount: data.total_amount ?? data.amount } });
+    if (error) {
+      console.error('Supabase insert error:', error);
+      return res.status(500).json({ error: 'DB error', detail: error.message });
+    }
+    res.json({ success: true, purchase: { ...data, total_amount: data.amount } });
   } catch (err) {
     console.error('Purchase create error:', err);
     res.status(500).json({ error: 'Internal server error', detail: err.message });
@@ -5535,12 +5539,16 @@ app.post('/api/purchases', authMiddleware, async (req, res) => {
 
 app.patch('/api/purchases/:id', authMiddleware, async (req, res) => {
   try {
-    const updates = { ...req.body };
+    // Only update columns that actually exist in the DB
+    const allowed = ['supplier_name', 'amount', 'paid_amount', 'status', 'purchase_date', 'due_date', 'notes', 'description', 'category', 'supplier_gstin'];
+    const updates = {};
+    for (const key of allowed) {
+      if (req.body[key] !== undefined) updates[key] = req.body[key];
+    }
 
-    // Map total_amount → amount for DB column
-    if (updates.total_amount !== undefined) {
-      updates.amount = parseFloat(updates.total_amount);
-      delete updates.total_amount;
+    // Map total_amount → amount
+    if (req.body.total_amount !== undefined) {
+      updates.amount = parseFloat(req.body.total_amount);
     }
 
     // Auto-update status based on paid_amount
@@ -5552,9 +5560,13 @@ app.patch('/api/purchases/:id', authMiddleware, async (req, res) => {
         updates.status = paid >= total ? 'paid' : paid > 0 ? 'partial' : 'unpaid';
       }
     }
+
     const { data, error } = await supabase.from('purchases').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
-    if (error) throw error;
-    res.json({ success: true, purchase: { ...data, total_amount: data.total_amount ?? data.amount } });
+    if (error) {
+      console.error('Supabase patch error:', error);
+      return res.status(500).json({ error: 'DB error', detail: error.message });
+    }
+    res.json({ success: true, purchase: { ...data, total_amount: data.amount } });
   } catch (err) {
     console.error('Purchase patch error:', err);
     res.status(500).json({ error: 'Internal server error', detail: err.message });
