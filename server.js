@@ -1327,17 +1327,23 @@ app.get('/api/metrics/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
 
-    const [{ data: invoices }, { data: callLogs }] = await Promise.all([
+    const [{ data: invoices }, { data: callLogs }, { data: purchases }] = await Promise.all([
       supabase.from('invoices').select('*').eq('user_id', userId),
-      supabase.from('call_logs').select('*').eq('user_id', userId)
+      supabase.from('call_logs').select('*').eq('user_id', userId),
+      supabase.from('purchases').select('amount, paid_amount, status').eq('user_id', userId)
     ]);
 
     const safeInvoices = invoices || [];
     const safeCallLogs = callLogs || [];
+    const safePurchases = purchases || [];
 
     const metrics = {
       total_outstanding: safeInvoices.reduce(
         (sum, inv) => sum + (inv.payment_status === 'Pending' ? inv.invoice_amount : 0),
+        0
+      ),
+      total_payable: safePurchases.reduce(
+        (sum, purchase) => sum + (purchase.status !== 'paid' ? calculateOutstanding(purchase.amount, purchase.paid_amount) : 0),
         0
       ),
       total_paid: safeInvoices.reduce(
@@ -1570,6 +1576,227 @@ app.get('/api/stock/movements/:userId', requireOwner, async (req, res) => {
   }
 });
 
+function toMoney(value) {
+  const number = Number.parseFloat(value || 0);
+  return Number.isFinite(number) ? Math.round(number * 100) / 100 : 0;
+}
+
+function normalizePartyName(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function normalizePartyKey(value) {
+  return normalizePartyName(value).toLowerCase();
+}
+
+function calculateOutstanding(total, paid) {
+  return Math.max(toMoney(total) - toMoney(paid), 0);
+}
+
+function calculateDaysOverdue(dateValue, isPaid = false) {
+  if (isPaid || !dateValue) return 0;
+  const due = new Date(dateValue);
+  if (Number.isNaN(due.getTime())) return 0;
+  const today = new Date();
+  due.setHours(0, 0, 0, 0);
+  today.setHours(0, 0, 0, 0);
+  return Math.max(Math.floor((today - due) / (1000 * 60 * 60 * 24)), 0);
+}
+
+function stripOptionalInvoiceColumns(payload) {
+  const copy = { ...payload };
+  delete copy.source_type;
+  delete copy.source_id;
+  delete copy.customer_gstin;
+  return copy;
+}
+
+async function safeInvoiceInsert(payload) {
+  let result = await supabase.from('invoices').insert([payload]).select().single();
+  if (!result.error) return result;
+
+  const retry = await supabase.from('invoices').insert([stripOptionalInvoiceColumns(payload)]).select().single();
+  return retry.error ? result : retry;
+}
+
+async function safeInvoiceUpdate(invoiceId, userId, payload) {
+  let result = await supabase
+    .from('invoices')
+    .update(payload)
+    .eq('id', invoiceId)
+    .eq('user_id', userId)
+    .select()
+    .single();
+  if (!result.error) return result;
+
+  const retry = await supabase
+    .from('invoices')
+    .update(stripOptionalInvoiceColumns(payload))
+    .eq('id', invoiceId)
+    .eq('user_id', userId)
+    .select()
+    .single();
+  return retry.error ? result : retry;
+}
+
+async function findLinkedSalesInvoice(userId, sale) {
+  if (sale?.id) {
+    const bySource = await supabase
+      .from('invoices')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('source_type', 'sales')
+      .eq('source_id', String(sale.id))
+      .limit(1)
+      .maybeSingle();
+    if (!bySource.error && bySource.data) return bySource.data;
+  }
+
+  const invoiceNumber = normalizePartyName(sale?.invoice_number || (sale?.id ? `SALE-${sale.id}` : ''));
+  if (!invoiceNumber) return null;
+
+  const byInvoiceNumber = await supabase
+    .from('invoices')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('invoice_number', invoiceNumber)
+    .limit(1)
+    .maybeSingle();
+
+  return byInvoiceNumber.error ? null : byInvoiceNumber.data;
+}
+
+async function syncReceivableFromSale(userId, sale) {
+  const customerName = normalizePartyName(sale?.customer_name);
+  const amount = toMoney(sale?.amount || sale?.total_amount);
+  if (!userId || !customerName || amount <= 0) return null;
+
+  const paidAmount = toMoney(sale?.paid_amount);
+  const isPaid = paidAmount >= amount;
+  const invoiceNumber = normalizePartyName(sale.invoice_number || `SALE-${sale.id}`);
+  const invoiceDate = sale.sale_date || new Date().toISOString().split('T')[0];
+  const dueDate = sale.due_date || invoiceDate;
+
+  const payload = {
+    user_id: userId,
+    customer_name: customerName,
+    customer_phone: sale.customer_phone || null,
+    customer_gstin: sale.customer_gstin || null,
+    invoice_amount: amount,
+    invoice_number: invoiceNumber,
+    invoice_date: invoiceDate,
+    due_date: dueDate,
+    items: sale.items || null,
+    notes: sale.notes || `Created from Sales ${invoiceNumber}`,
+    payment_status: isPaid ? 'Paid' : 'Pending',
+    payment_amount: paidAmount > 0 ? paidAmount : null,
+    payment_date: isPaid ? new Date().toISOString().split('T')[0] : null,
+    days_overdue: calculateDaysOverdue(dueDate, isPaid),
+    source_type: 'sales',
+    source_id: String(sale.id),
+  };
+
+  const existing = await findLinkedSalesInvoice(userId, { ...sale, invoice_number: invoiceNumber });
+  const result = existing
+    ? await safeInvoiceUpdate(existing.id, userId, payload)
+    : await safeInvoiceInsert(payload);
+
+  if (result.error) {
+    console.warn('Sales receivable sync failed:', result.error.message);
+    return null;
+  }
+
+  return result.data;
+}
+
+async function deleteReceivableForSale(userId, saleId, invoiceNumber) {
+  if (!userId || !saleId) return;
+  let deleteResult = await supabase
+    .from('invoices')
+    .delete()
+    .eq('user_id', userId)
+    .eq('source_type', 'sales')
+    .eq('source_id', String(saleId));
+
+  if (deleteResult.error && invoiceNumber) {
+    deleteResult = await supabase
+      .from('invoices')
+      .delete()
+      .eq('user_id', userId)
+      .eq('invoice_number', invoiceNumber);
+  }
+
+  if (deleteResult.error) {
+    console.warn('Sales receivable delete sync failed:', deleteResult.error.message);
+  }
+}
+
+async function ensureSupplierFromPurchase(userId, purchase) {
+  const name = normalizePartyName(purchase?.supplier_name);
+  if (!userId || !name) return null;
+
+  const existingResult = await supabase
+    .from('suppliers')
+    .select('*')
+    .eq('user_id', userId)
+    .ilike('name', name)
+    .limit(1)
+    .maybeSingle();
+
+  const existing = existingResult.error ? null : existingResult.data;
+  if (existing) {
+    const updates = {};
+    if (purchase.supplier_phone && !existing.phone) updates.phone = purchase.supplier_phone;
+    if (purchase.supplier_gstin && !existing.gstin) updates.gstin = purchase.supplier_gstin;
+
+    if (Object.keys(updates).length === 0) return existing;
+
+    let updated = await supabase
+      .from('suppliers')
+      .update(updates)
+      .eq('id', existing.id)
+      .eq('user_id', userId)
+      .select()
+      .single();
+
+    if (updated.error && updates.gstin) {
+      delete updates.gstin;
+      updated = await supabase
+        .from('suppliers')
+        .update(updates)
+        .eq('id', existing.id)
+        .eq('user_id', userId)
+        .select()
+        .single();
+    }
+
+    return updated.error ? existing : updated.data;
+  }
+
+  const payload = {
+    user_id: userId,
+    name,
+    phone: purchase.supplier_phone || null,
+    email: null,
+    address: null,
+    payment_terms: 30,
+    gstin: purchase.supplier_gstin || null,
+  };
+
+  let inserted = await supabase.from('suppliers').insert([payload]).select().single();
+  if (inserted.error && payload.gstin) {
+    delete payload.gstin;
+    inserted = await supabase.from('suppliers').insert([payload]).select().single();
+  }
+
+  if (inserted.error) {
+    console.warn('Supplier sync failed:', inserted.error.message);
+    return null;
+  }
+
+  return inserted.data;
+}
+
 // --- Suppliers ---
 
 app.get('/api/suppliers/:userId', requireOwner, async (req, res) => {
@@ -1577,8 +1804,10 @@ app.get('/api/suppliers/:userId', requireOwner, async (req, res) => {
     const { userId } = req.params;
     const [{ data, error }, { data: purchases, error: purchaseError }] = await Promise.all([
       supabase
-      .from('suppliers').select('*').eq('user_id', userId).order('name');
-      ,
+        .from('suppliers')
+        .select('*')
+        .eq('user_id', userId)
+        .order('name'),
       supabase
         .from('purchases')
         .select('supplier_name, amount, paid_amount, status, purchase_date')
@@ -1628,16 +1857,26 @@ app.get('/api/suppliers/:userId', requireOwner, async (req, res) => {
 
 app.post('/api/suppliers', authMiddleware, async (req, res) => {
   try {
-    const { user_id, name, phone, email, address, payment_terms } = req.body;
-    if (!user_id || !name) return res.status(400).json({ error: 'user_id and name required' });
+    const { name, phone, email, address, payment_terms, gstin } = req.body;
+    const userId = req.user.userId;
+    if (!name) return res.status(400).json({ error: 'name required' });
 
-    const { data, error } = await supabase
+    let { data, error } = await supabase
       .from('suppliers')
-      .insert([{ user_id, name, phone: phone || null, email: email || null, address: address || null, payment_terms: payment_terms || 30 }])
-      .select();
+      .insert([{ user_id: userId, name, phone: phone || null, email: email || null, address: address || null, payment_terms: payment_terms || 30, gstin: gstin || null }])
+      .select()
+      .single();
+
+    if (error && gstin) {
+      ({ data, error } = await supabase
+        .from('suppliers')
+        .insert([{ user_id: userId, name, phone: phone || null, email: email || null, address: address || null, payment_terms: payment_terms || 30 }])
+        .select()
+        .single());
+    }
 
     if (error) throw error;
-    res.json({ success: true, supplier: data[0] });
+    res.json({ success: true, supplier: data });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -1646,12 +1885,30 @@ app.post('/api/suppliers', authMiddleware, async (req, res) => {
 app.post('/api/suppliers/:supplierId', authMiddleware, async (req, res) => {
   try {
     const { supplierId } = req.params;
-    const { name, phone, email, address, payment_terms } = req.body;
+    const { name, phone, email, address, payment_terms, gstin } = req.body;
+    const updates = { name, phone, email, address, payment_terms, gstin: gstin || null };
+    Object.keys(updates).forEach((key) => updates[key] === undefined && delete updates[key]);
 
-    const { data, error } = await supabase
-      .from('suppliers').update({ name, phone, email, address, payment_terms }).eq('id', supplierId).select();
+    let { data, error } = await supabase
+      .from('suppliers')
+      .update(updates)
+      .eq('id', supplierId)
+      .eq('user_id', req.user.userId)
+      .select()
+      .single();
+
+    if (error && updates.gstin !== undefined) {
+      delete updates.gstin;
+      ({ data, error } = await supabase
+        .from('suppliers')
+        .update(updates)
+        .eq('id', supplierId)
+        .eq('user_id', req.user.userId)
+        .select()
+        .single());
+    }
     if (error) throw error;
-    res.json({ success: true, supplier: data[0] });
+    res.json({ success: true, supplier: data });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -1660,7 +1917,7 @@ app.post('/api/suppliers/:supplierId', authMiddleware, async (req, res) => {
 app.post('/api/suppliers/:supplierId/delete', authMiddleware, async (req, res) => {
   try {
     const { supplierId } = req.params;
-    const { error } = await supabase.from('suppliers').delete().eq('id', supplierId);
+    const { error } = await supabase.from('suppliers').delete().eq('id', supplierId).eq('user_id', req.user.userId);
     if (error) throw error;
     res.json({ success: true });
   } catch (error) {
@@ -6105,12 +6362,24 @@ app.post('/api/bills', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
 
-    // Also create a receivable invoice for collections tracking
-    await supabase.from('invoices').insert([{
-      user_id: userId, customer_name, invoice_amount: total,
-      due_date: due_date || null, status: 'unpaid',
-      notes: `Bill ${bill_number}`, created_at: new Date(),
-    }]).select();
+    // Also create a receivable invoice for collections tracking.
+    await safeInvoiceInsert({
+      user_id: userId,
+      customer_name,
+      customer_phone: customer_phone || null,
+      customer_gstin: customer_gstin || null,
+      invoice_amount: Math.round(total * 100) / 100,
+      invoice_number: bill_number,
+      invoice_date: new Date().toISOString().split('T')[0],
+      due_date: due_date || null,
+      items: enrichedItems,
+      notes: `Bill ${bill_number}`,
+      payment_status: 'Pending',
+      days_overdue: calculateDaysOverdue(due_date || new Date().toISOString().split('T')[0]),
+      source_type: 'bills',
+      source_id: String(data.id),
+      created_at: new Date(),
+    });
 
     res.json({ success: true, bill: data });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
@@ -6126,7 +6395,27 @@ app.patch('/api/bills/:id', authMiddleware, async (req, res) => {
 
 app.delete('/api/bills/:id', authMiddleware, async (req, res) => {
   try {
+    const { data: bill } = await supabase
+      .from('bills')
+      .select('id, bill_number')
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.userId)
+      .single();
     await supabase.from('bills').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
+    let invoiceDelete = await supabase
+      .from('invoices')
+      .delete()
+      .eq('user_id', req.user.userId)
+      .eq('source_type', 'bills')
+      .eq('source_id', String(req.params.id));
+    if (invoiceDelete.error && bill?.bill_number) {
+      invoiceDelete = await supabase
+        .from('invoices')
+        .delete()
+        .eq('user_id', req.user.userId)
+        .eq('invoice_number', bill.bill_number);
+    }
+    if (invoiceDelete.error) console.warn('Bill receivable delete sync failed:', invoiceDelete.error.message);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
@@ -6274,7 +6563,8 @@ app.post('/api/purchases', authMiddleware, async (req, res) => {
     }]).select().single();
 
     if (error) throw error;
-    res.json({ success: true, purchase: { ...data, total_amount: parseFloat(data.amount) } });
+    const supplier = await ensureSupplierFromPurchase(req.user.userId, data);
+    res.json({ success: true, purchase: { ...data, total_amount: parseFloat(data.amount) }, supplier });
   } catch (err) {
     console.error('Purchase create error:', err.message);
     res.status(500).json({ error: 'Internal server error', detail: err.message });
@@ -6316,7 +6606,8 @@ app.patch('/api/purchases/:id', authMiddleware, async (req, res) => {
 
     const { data, error } = await supabase.from('purchases').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
-    res.json({ success: true, purchase: { ...data, total_amount: parseFloat(data.amount) } });
+    const supplier = await ensureSupplierFromPurchase(req.user.userId, data);
+    res.json({ success: true, purchase: { ...data, total_amount: parseFloat(data.amount) }, supplier });
   } catch (err) {
     console.error('Purchase patch error:', err.message);
     res.status(500).json({ error: 'Internal server error', detail: err.message });
@@ -6412,38 +6703,88 @@ app.post('/api/sales', authMiddleware, async (req, res) => {
       subtotal: subtotal || null,
     }]).select().single();
     if (error) throw error;
-    res.json({ success: true, sale: { ...data, total_amount: parseFloat(data.amount) } });
+    const receivable = await syncReceivableFromSale(req.user.userId, data);
+    let sale = data;
+    if (!sale.invoice_number && receivable?.invoice_number) {
+      const updatedSale = await supabase
+        .from('sales')
+        .update({ invoice_number: receivable.invoice_number })
+        .eq('id', sale.id)
+        .eq('user_id', req.user.userId)
+        .select()
+        .single();
+      if (!updatedSale.error && updatedSale.data) sale = updatedSale.data;
+    }
+    res.json({ success: true, sale: { ...sale, total_amount: parseFloat(sale.amount) }, receivable });
   } catch (err) { res.status(500).json({ error: err.message || 'Internal server error' }); }
 });
 
 app.patch('/api/sales/:id', authMiddleware, async (req, res) => {
   try {
-    const { total_amount, amount, paid_amount, customer_name, sale_date, due_date, notes, invoice_number, customer_phone, customer_gstin } = req.body;
+    const { total_amount, amount, paid_amount, customer_name, sale_date, due_date, notes, invoice_number, customer_phone, customer_gstin,
+            items, gst_type, gst_rate, gst_amount, cgst_amount, sgst_amount, igst_amount, subtotal } = req.body;
+    const { data: current, error: currentError } = await supabase
+      .from('sales')
+      .select('*')
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.userId)
+      .single();
+    if (currentError || !current) return res.status(404).json({ error: 'Sale not found' });
+
     const updates = {};
     if (customer_name  !== undefined) updates.customer_name  = customer_name;
-    if (sale_date      !== undefined) updates.sale_date      = sale_date;
-    if (due_date       !== undefined) updates.due_date       = due_date;
-    if (notes          !== undefined) updates.notes          = notes;
-    if (invoice_number !== undefined) updates.invoice_number = invoice_number;
-    if (customer_phone !== undefined) updates.customer_phone = customer_phone;
+    if (sale_date      !== undefined) updates.sale_date      = sale_date || null;
+    if (due_date       !== undefined) updates.due_date       = due_date || null;
+    if (notes          !== undefined) updates.notes          = notes || null;
+    if (invoice_number !== undefined) updates.invoice_number = invoice_number || null;
+    if (customer_phone !== undefined) updates.customer_phone = customer_phone || null;
     if (customer_gstin !== undefined) updates.customer_gstin = customer_gstin || null;
-    const newAmount = parseFloat(total_amount || amount || 0);
-    if (newAmount > 0) updates.amount = newAmount;
+    if (items          !== undefined) updates.items          = items ? JSON.stringify(items) : null;
+    if (gst_type       !== undefined) updates.gst_type       = gst_type || null;
+    if (gst_rate       !== undefined) updates.gst_rate       = gst_rate || null;
+    if (gst_amount     !== undefined) updates.gst_amount     = gst_amount || null;
+    if (cgst_amount    !== undefined) updates.cgst_amount    = cgst_amount || null;
+    if (sgst_amount    !== undefined) updates.sgst_amount    = sgst_amount || null;
+    if (igst_amount    !== undefined) updates.igst_amount    = igst_amount || null;
+    if (subtotal       !== undefined) updates.subtotal       = subtotal || null;
+
+    const newAmount = total_amount !== undefined ? parseFloat(total_amount) : amount !== undefined ? parseFloat(amount) : null;
+    const finalAmount = newAmount !== null && Number.isFinite(newAmount) ? newAmount : parseFloat(current.amount || 0);
+    const finalPaid = paid_amount !== undefined ? parseFloat(paid_amount || 0) : parseFloat(current.paid_amount || 0);
+    updates.amount = finalAmount;
+    updates.paid_amount = finalPaid;
+    updates.status = finalPaid >= finalAmount ? 'paid' : finalPaid > 0 ? 'partial' : 'unpaid';
     if (paid_amount !== undefined) {
-      updates.paid_amount = parseFloat(paid_amount);
-      const finalAmt = newAmount || 0;
-      const finalPaid = updates.paid_amount;
-      if (finalAmt > 0) updates.status = finalPaid >= finalAmt ? 'paid' : finalPaid > 0 ? 'partial' : 'unpaid';
+      updates.paid_amount = finalPaid;
     }
     const { data, error } = await supabase.from('sales').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
-    res.json({ success: true, sale: { ...data, total_amount: parseFloat(data.amount) } });
+    const receivable = await syncReceivableFromSale(req.user.userId, data);
+    let sale = data;
+    if (!sale.invoice_number && receivable?.invoice_number) {
+      const updatedSale = await supabase
+        .from('sales')
+        .update({ invoice_number: receivable.invoice_number })
+        .eq('id', sale.id)
+        .eq('user_id', req.user.userId)
+        .select()
+        .single();
+      if (!updatedSale.error && updatedSale.data) sale = updatedSale.data;
+    }
+    res.json({ success: true, sale: { ...sale, total_amount: parseFloat(sale.amount) }, receivable });
   } catch (err) { res.status(500).json({ error: err.message || 'Internal server error' }); }
 });
 
 app.delete('/api/sales/:id', authMiddleware, async (req, res) => {
   try {
+    const { data: sale } = await supabase
+      .from('sales')
+      .select('id, invoice_number')
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.userId)
+      .single();
     await supabase.from('sales').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
+    if (sale) await deleteReceivableForSale(req.user.userId, sale.id, sale.invoice_number);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
@@ -7293,6 +7634,21 @@ async function runAutoMigrations() {
   try {
     client = await pgPool.connect();
     await client.query(`
+      -- suppliers table (create if missing)
+      CREATE TABLE IF NOT EXISTS public.suppliers (
+        id            BIGSERIAL PRIMARY KEY,
+        user_id       UUID NOT NULL,
+        name          TEXT NOT NULL,
+        phone         TEXT,
+        email         TEXT,
+        address       TEXT,
+        payment_terms INTEGER DEFAULT 30,
+        gstin         TEXT,
+        created_at    TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_suppliers_user ON public.suppliers(user_id);
+      CREATE INDEX IF NOT EXISTS idx_suppliers_name ON public.suppliers(user_id, name);
+
       -- ── purchases table (create if missing) ──────────────────────────────
       CREATE TABLE IF NOT EXISTS public.purchases (
         id             BIGSERIAL PRIMARY KEY,
@@ -7393,11 +7749,18 @@ async function runAutoMigrations() {
       ALTER TABLE invoices ADD COLUMN IF NOT EXISTS items          JSONB;
       ALTER TABLE invoices ADD COLUMN IF NOT EXISTS notes          TEXT;
       ALTER TABLE invoices ADD COLUMN IF NOT EXISTS customer_email TEXT;
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS customer_gstin TEXT;
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS source_type    TEXT;
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS source_id      TEXT;
+
+      -- suppliers: purchase sync fields
+      ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS gstin TEXT;
 
       -- indexes (safe — IF NOT EXISTS)
       CREATE INDEX IF NOT EXISTS idx_inv_snooze        ON invoices(snooze_until)        WHERE snooze_until IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_inv_user_status   ON invoices(user_id, payment_status);
       CREATE INDEX IF NOT EXISTS idx_inv_phone         ON invoices(customer_phone)      WHERE customer_phone IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_inv_source        ON invoices(user_id, source_type, source_id) WHERE source_type IS NOT NULL;
     `);
     console.log('[migrate] Auto-migration completed successfully');
   } catch (err) {
