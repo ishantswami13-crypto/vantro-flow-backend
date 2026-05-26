@@ -5575,48 +5575,52 @@ app.post('/api/purchases/scan', authMiddleware, async (req, res) => {
     if (!image) return res.status(400).json({ error: 'image is required' });
     if (!process.env.GROQ_API_KEY) return res.status(503).json({ error: 'AI not configured' });
 
-    const prompt = `You are an expert at reading Indian purchase bills, tax invoices, and challans.
-Extract ALL information from this bill and return ONLY a valid JSON object. No explanation, no markdown, just raw JSON.
+    const prompt = `You are an expert OCR system for Indian purchase bills, tax invoices, and challans. You have PERFECT vision — zoom into every part of this image and read even the smallest printed text.
+
+Scan the ENTIRE invoice: seller header at top, buyer/party block, invoice number + date, items table with all rows, and totals at bottom. Return ONLY a valid JSON object starting with { — no explanation, no markdown.
 
 Return exactly this structure:
 {
-  "supplier_name": "seller business name from top of bill (string)",
-  "supplier_gstin": "seller GSTIN if visible (string or null)",
-  "party_name": "buyer/party name if shown (string or null)",
-  "bill_number": "Invoice No / Bill No / Challan No value (string or null)",
+  "supplier_name": "SELLER company name — printed at the very TOP of the invoice (string)",
+  "supplier_gstin": "SELLER GSTIN/UIN — 15-char code near seller letterhead (string or null)",
+  "party_name": "BUYER / PARTY / CONSIGNEE name if shown in buyer section (string or null)",
+  "bill_number": "exact Invoice No / Bill No / Challan No value (string or null)",
   "purchase_date": "invoice date in YYYY-MM-DD format (string or null)",
-  "due_date": "payment due date in YYYY-MM-DD if visible (string or null)",
+  "due_date": "payment due date in YYYY-MM-DD if explicitly stated (string or null)",
   "items": [
     {
-      "description": "full item/product name and model",
-      "hsn_sac": "HSN or SAC code as string",
-      "qty": numeric quantity as number,
-      "unit": "unit like PCS/SET/KG/MTR/BOX/NOS",
-      "price": unit price as number,
-      "amount": line total amount as number
+      "description": "full product/item name exactly as printed",
+      "hsn_sac": "HSN or SAC numeric code from the HSN/SAC column (string or null)",
+      "qty": quantity as a plain number (e.g. 11 for '11 set'),
+      "unit": "unit like SET/PCS/KG/MTR/NOS/UNT/BOX",
+      "price": unit Rate as a plain number,
+      "amount": line total Amount as a plain number
     }
   ],
-  "subtotal": taxable amount before GST as number or null,
-  "gst_rate": "GST rate percentage as number e.g. 18 or 5 (number or null)",
-  "gst_amount": total GST/tax amount as number or null,
-  "igst_amount": IGST amount if shown separately as number or null,
-  "cgst_amount": CGST amount if shown separately as number or null,
-  "sgst_amount": SGST amount if shown separately as number or null,
-  "igst_rate": IGST rate percentage if shown as number or null,
-  "cgst_rate": CGST rate percentage if shown as number or null,
-  "sgst_rate": SGST rate percentage if shown as number or null,
-  "total_amount": GRAND TOTAL including all taxes as number,
-  "notes": "short summary of what was purchased, max 100 chars (string or null)"
+  "subtotal": taxable value before tax as number or null,
+  "gst_rate": GST % as number (e.g. 5 or 18) or null,
+  "gst_amount": total tax amount as number or null,
+  "igst_amount": IGST amount if present as number or null,
+  "cgst_amount": CGST / Input CGST / Output CGST as number or null,
+  "sgst_amount": SGST / Input SGST / Output SGST as number or null,
+  "igst_rate": IGST rate % as number or null,
+  "cgst_rate": CGST rate % as number or null,
+  "sgst_rate": SGST rate % as number or null,
+  "total_amount": GRAND TOTAL final amount including all taxes as number,
+  "notes": "brief summary e.g. 'JK sewing machines, 7 items' (string or null)"
 }
 
-CRITICAL RULES:
-- supplier_name: The SELLER at top of bill, NOT the buyer/party
-- items: Extract EVERY line item from the goods table — description, HSN, qty, unit, price, amount
-- total_amount: The GRAND TOTAL / Final amount — must be a plain number like 147630
-- All monetary values: plain numbers only, NO ₹ symbol, NO commas
-- If any field is not visible, use null
-- items array must be complete — don't skip any line
-- Return ONLY the raw JSON object, nothing else`;
+STRICT RULES:
+1. ZOOM and carefully read: seller block, buyer block, table header + every row, grand total
+2. supplier_name: company name printed at the very top (e.g. 'Swami Enterprises')
+3. supplier_gstin: seller GSTIN — different from buyer GSTIN — at top near seller name
+4. party_name: the buyer/consignee name if shown — can be null for cash bills
+5. ALL items: read EVERY numbered row in the items table — do not skip any
+6. total_amount: the final Grand Total rupee amount at the bottom of the invoice
+7. Dates: convert dd-Mon-yyyy or dd/mm/yyyy → YYYY-MM-DD (e.g. 1-Apr-2026 → 2026-04-01)
+8. Numbers: plain digits ONLY — NO ₹, NO commas (e.g. 147630 not 1,47,630)
+9. Do NOT invent data — if a field is truly not present, use null
+10. Return ONLY the JSON object starting with { — nothing before or after`;
 
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
@@ -5741,52 +5745,53 @@ app.post('/api/sales/scan', authMiddleware, async (req, res) => {
     if (!image) return res.status(400).json({ error: 'image is required' });
     if (!process.env.GROQ_API_KEY) return res.status(503).json({ error: 'AI not configured' });
 
-    const prompt = `You are an expert OCR system for Indian tax invoices and GST bills.
-Read EVERY detail from this invoice image carefully and return ONLY a valid JSON object. No explanation, no markdown, no preamble — just raw JSON starting with {
+    const prompt = `You are an expert OCR system for Indian tax invoices and GST bills. You have PERFECT vision — zoom into every section of this image and read even the smallest printed text.
+
+Look carefully at the ENTIRE invoice image. Read the header, address blocks, table rows, and footer. Then return ONLY a valid JSON object starting with { — no explanation, no markdown.
 
 Return exactly this structure:
 {
-  "customer_name": "BUYER company/person name from Buyer/Bill To/Party section",
-  "customer_gstin": "BUYER GSTIN/UIN — 15-char code near buyer address (string or null)",
-  "seller_gstin": "SELLER GSTIN/UIN — 15-char code near seller letterhead at top (string or null)",
-  "supplier_name": "SELLER business name from top of invoice header (string or null)",
-  "invoice_number": "Invoice No / Bill No / Tax Invoice No value (string or null)",
-  "sale_date": "invoice date in YYYY-MM-DD format (string or null)",
-  "due_date": "payment due date in YYYY-MM-DD if visible (string or null)",
+  "customer_name": "BUYER company name from 'Buyer:' or 'Bill To:' section. If no buyer name visible, use 'Cash Sale'",
+  "customer_gstin": "BUYER GSTIN/UIN — the 15-character alphanumeric code in the Buyer section (string or null)",
+  "seller_gstin": "SELLER GSTIN/UIN — the 15-character code near the seller letterhead at the TOP of the invoice (string or null)",
+  "supplier_name": "SELLER / FROM business name — the company name printed at the very top of the invoice (string)",
+  "invoice_number": "exact value of Invoice No / Bill No / Tax Invoice No field (string or null)",
+  "sale_date": "the date printed on this invoice in YYYY-MM-DD format (string or null)",
+  "due_date": "payment due date in YYYY-MM-DD if explicitly shown (string or null)",
   "items": [
     {
-      "description": "full item/product name and model",
-      "hsn_sac": "HSN or SAC code digits as string",
-      "qty": numeric quantity as number,
-      "unit": "unit like PCS/SET/KG/MTR/BOX/NOS/UNT",
-      "price": unit rate/price as number,
-      "amount": line total amount as number
+      "description": "full product/item name exactly as printed",
+      "hsn_sac": "HSN or SAC code — the numeric code in the HSN/SAC column (string or null)",
+      "qty": quantity as a number (e.g. 11 for '11 set'),
+      "unit": "unit string like SET/PCS/KG/MTR/NOS/UNT",
+      "price": unit Rate/Price as a plain number,
+      "amount": line Amount/Total as a plain number
     }
   ],
-  "subtotal": taxable value before GST as number or null,
-  "gst_rate": GST rate percentage as number e.g. 18 or 5 (number or null),
-  "gst_amount": total GST/tax amount as number or null,
-  "igst_amount": IGST amount if shown separately as number or null,
-  "cgst_amount": CGST/Output CGST amount if shown as number or null,
-  "sgst_amount": SGST/Output SGST amount if shown as number or null,
-  "igst_rate": IGST rate percentage if shown as number or null,
-  "cgst_rate": CGST rate percentage if shown as number or null,
-  "sgst_rate": SGST rate percentage if shown as number or null,
-  "total_amount": GRAND TOTAL final payable amount including all taxes as number,
-  "notes": "one-line summary of goods sold, max 80 chars (string or null)"
+  "subtotal": taxable amount before GST as number or null,
+  "gst_rate": GST % rate as number (e.g. 5 or 18) or null,
+  "gst_amount": total tax amount as number or null,
+  "igst_amount": IGST amount if present as number or null,
+  "cgst_amount": CGST / Input CGST / Output CGST amount as number or null,
+  "sgst_amount": SGST / Input SGST / Output SGST amount as number or null,
+  "igst_rate": IGST rate % as number or null,
+  "cgst_rate": CGST rate % as number or null,
+  "sgst_rate": SGST rate % as number or null,
+  "total_amount": the GRAND TOTAL / final payable amount including all taxes as number,
+  "notes": "brief summary of what was sold e.g. 'JK sewing machines, 19 sets' (string or null)"
 }
 
-CRITICAL RULES:
-- customer_name: BUYER name — in "Buyer:" or "Bill To:" or "Party:" section
-- customer_gstin: BUYER GSTIN — 15-char alphanumeric code near buyer address
-- seller_gstin: SELLER GSTIN — 15-char alphanumeric code at top near seller name
-- invoice_number: exact "Invoice No" / "Bill No" field value
-- sale_date: the DATE on the invoice — convert any format to YYYY-MM-DD
-- total_amount: the FINAL GRAND TOTAL payable — largest amount at invoice bottom
-- items: extract EVERY row from the items/goods table — never skip any row
-- All monetary values: plain numbers ONLY — no Rs, no commas, no spaces
-- If a field is genuinely not visible, use null — do NOT invent values
-- Return ONLY the raw JSON object, nothing else, starting with {`;
+STRICT RULES — follow exactly:
+1. ZOOM and read every part: seller block top-left, buyer block, invoice no + date top-right, items table, totals at bottom
+2. customer_name: look for 'Buyer', 'Bill To', 'Consignee', 'Party'. If truly absent → use "Cash Sale"
+3. seller_gstin: the GSTIN in the seller/from block at top (different from buyer GSTIN)
+4. customer_gstin: the GSTIN in the buyer/bill-to block
+5. ALL items in the table: read every numbered row — qty, HSN, rate, amount
+6. total_amount: the largest/final rupee figure at the bottom (Grand Total / Net Amount)
+7. Dates: convert dd-Mon-yyyy or dd/mm/yyyy → YYYY-MM-DD
+8. Numbers: plain digits only — NO ₹ symbol, NO commas (e.g. 147630 not 1,47,630)
+9. Do NOT skip items, do NOT invent data, do NOT leave total_amount as null if any amount is visible
+10. Return ONLY the JSON object starting with { — nothing before or after`;
 
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
