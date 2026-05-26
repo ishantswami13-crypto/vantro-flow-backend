@@ -5613,7 +5613,7 @@ Rules: numbers without rupee symbol or commas (147630 not 1,47,630). Dates as YY
           { type: 'text', text: prompt },
           { type: 'image_url', image_url: { url: `data:${mimeType};base64,${image}` } },
         ]}],
-        max_tokens: 1500,
+        max_tokens: 600,
         temperature: 0,
       })
     });
@@ -5763,7 +5763,7 @@ Rules: numbers without rupee symbol or commas (147630 not 1,47,630). Dates as YY
           { type: 'text', text: prompt },
           { type: 'image_url', image_url: { url: `data:${mimeType};base64,${image}` } },
         ]}],
-        max_tokens: 1500,
+        max_tokens: 600,
         temperature: 0,
       })
     });
