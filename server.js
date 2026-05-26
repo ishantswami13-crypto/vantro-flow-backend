@@ -5527,6 +5527,81 @@ app.delete('/api/purchases/:id', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// Bill Scanner — AI extracts purchase data from photo using GROQ Vision
+app.post('/api/purchases/scan', authMiddleware, async (req, res) => {
+  try {
+    const { image, mimeType = 'image/jpeg' } = req.body;
+    if (!image) return res.status(400).json({ error: 'image is required' });
+    if (!process.env.GROQ_API_KEY) return res.status(503).json({ error: 'AI not configured' });
+
+    const prompt = `You are an expert at reading Indian purchase bills, invoices, and challans.
+Extract information from this bill image and return ONLY a valid JSON object, no explanation or extra text.
+
+Return exactly this structure:
+{
+  "supplier_name": "seller/vendor business name (string, required — look at the top of the bill)",
+  "bill_number": "invoice/bill/challan number (string or null)",
+  "purchase_date": "date in YYYY-MM-DD format (string or null)",
+  "due_date": "payment due date in YYYY-MM-DD format if visible (string or null)",
+  "total_amount": "final total amount as a plain number without rupee symbol (number or null)",
+  "gst_amount": "GST or tax amount if shown as a plain number (number or null)",
+  "notes": "short summary of main items purchased, max 80 chars (string or null)"
+}
+
+Tips:
+- supplier_name: The seller's business at the TOP — not the buyer
+- bill_number: Look for labels like Invoice No, Bill No, Challan No, Ref No
+- purchase_date: Labels like Date, Invoice Date, Bill Date — convert to YYYY-MM-DD
+- total_amount: The FINAL grand total including all taxes — just the number
+- If a field is unclear or not visible, use null
+- Return ONLY the JSON, nothing else`;
+
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        messages: [{
+          role: 'user',
+          content: [
+            {
+              type: 'image_url',
+              image_url: { url: `data:${mimeType};base64,${image}` }
+            },
+            { type: 'text', text: prompt }
+          ]
+        }],
+        max_tokens: 600,
+        temperature: 0.1,
+      })
+    });
+
+    const groqData = await response.json();
+    if (!response.ok) {
+      console.error('GROQ vision error:', groqData);
+      return res.status(500).json({ error: 'AI scan failed', details: groqData.error?.message || 'Unknown error' });
+    }
+
+    const text = groqData.choices[0]?.message?.content || '{}';
+    let extracted = {};
+    try {
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      extracted = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
+    } catch (e) {
+      console.error('JSON parse error from vision:', text);
+      extracted = {};
+    }
+
+    res.json({ success: true, data: extracted });
+  } catch (err) {
+    console.error('Bill scan error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ============================================
 // ATTENDANCE + SALARY
 // ============================================
