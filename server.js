@@ -1873,39 +1873,346 @@ Return a JSON object with this exact structure (no markdown, pure JSON):
 // CAMERA / OCR SCAN
 // ============================================
 
-app.post('/api/scan-document', authMiddleware, async (req, res) => {
-  const { image_base64, scan_type } = req.body; // scan_type: 'invoice' | 'supplier'
-  if (!image_base64) return res.status(400).json({ error: 'No image provided' });
+const VISION_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
 
-  const invoicePrompt = `Extract invoice/bill details from this image. Return ONLY a JSON object with these fields (use null if not found):
-{"customer_name": "", "customer_phone": "", "invoice_amount": null, "invoice_date": "YYYY-MM-DD", "items": "brief description of items"}`;
+function cleanScanString(value) {
+  if (value === null || value === undefined) return null;
+  const text = String(value).trim();
+  if (!text) return null;
+  const lower = text.toLowerCase();
+  if (['null', 'undefined', 'n/a', 'na', 'none', 'not found', 'not available', '-'].includes(lower)) return null;
+  return text;
+}
+
+function pickScanValue(obj, keys) {
+  if (!obj || typeof obj !== 'object') return null;
+  for (const key of keys) {
+    const value = obj[key];
+    if (value !== undefined && value !== null && value !== '') return value;
+  }
+  const lowerMap = Object.keys(obj).reduce((acc, key) => {
+    acc[key.toLowerCase()] = obj[key];
+    return acc;
+  }, {});
+  for (const key of keys) {
+    const value = lowerMap[key.toLowerCase()];
+    if (value !== undefined && value !== null && value !== '') return value;
+  }
+  return null;
+}
+
+function parseScanNumber(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? Math.round(value * 100) / 100 : null;
+  const text = cleanScanString(value);
+  if (!text) return null;
+  const normalized = text.replace(/,/g, '').replace(/\s+/g, '').replace(/\/-$/, '');
+  const match = normalized.match(/-?\d+(?:\.\d+)?/);
+  if (!match) return null;
+  const parsed = parseFloat(match[0]);
+  return Number.isFinite(parsed) ? Math.round(parsed * 100) / 100 : null;
+}
+
+function makeIsoDate(year, month, day) {
+  const y = Number(year);
+  const m = Number(month);
+  const d = Number(day);
+  if (!y || !m || !d || m < 1 || m > 12 || d < 1 || d > 31) return null;
+  return `${String(y).padStart(4, '0')}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+}
+
+function parseScanDate(value) {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString().split('T')[0];
+  const text = cleanScanString(value);
+  if (!text) return null;
+  const compact = text.replace(/\s+/g, ' ').trim();
+  let match = compact.match(/(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/);
+  if (match) return makeIsoDate(match[1], match[2], match[3]);
+
+  match = compact.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})$/);
+  if (match) {
+    const year = Number(match[3]) < 100 ? 2000 + Number(match[3]) : Number(match[3]);
+    return makeIsoDate(year, match[2], match[1]);
+  }
+
+  const months = {
+    jan: 1, january: 1, feb: 2, february: 2, mar: 3, march: 3, apr: 4, april: 4,
+    may: 5, jun: 6, june: 6, jul: 7, july: 7, aug: 8, august: 8, sep: 9, sept: 9,
+    september: 9, oct: 10, october: 10, nov: 11, november: 11, dec: 12, december: 12,
+  };
+  match = compact.match(/(\d{1,2})\s*[- ]\s*([A-Za-z]{3,9})\s*[-, ]\s*(\d{2,4})/);
+  if (match) {
+    const year = Number(match[3]) < 100 ? 2000 + Number(match[3]) : Number(match[3]);
+    return makeIsoDate(year, months[match[2].toLowerCase()], match[1]);
+  }
+  match = compact.match(/([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{2,4})/);
+  if (match) {
+    const year = Number(match[3]) < 100 ? 2000 + Number(match[3]) : Number(match[3]);
+    return makeIsoDate(year, months[match[1].toLowerCase()], match[2]);
+  }
+
+  const parsed = new Date(compact);
+  if (!Number.isNaN(parsed.getTime())) return parsed.toISOString().split('T')[0];
+  return null;
+}
+
+function extractBalancedJson(text) {
+  const cleaned = String(text || '').replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
+  const start = cleaned.indexOf('{');
+  if (start === -1) return '';
+  let depth = 0;
+  let inString = false;
+  let quote = '';
+  let escaped = false;
+  for (let i = start; i < cleaned.length; i++) {
+    const ch = cleaned[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === quote) inString = false;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      inString = true;
+      quote = ch;
+    } else if (ch === '{') {
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0) return cleaned.slice(start, i + 1);
+    }
+  }
+  return cleaned.slice(start);
+}
+
+function parseScanJson(rawText) {
+  const json = extractBalancedJson(rawText);
+  if (!json) return {};
+  const attempts = [
+    json,
+    json.replace(/(:\s*)(-?\d{1,3}(?:,\d{2,3})+(?:\.\d+)?)(\s*[,}])/g, (_, prefix, number, suffix) => `${prefix}${number.replace(/,/g, '')}${suffix}`),
+    json.replace(/,\s*([}\]])/g, '$1'),
+    json
+      .replace(/(:\s*)(-?\d{1,3}(?:,\d{2,3})+(?:\.\d+)?)(\s*[,}])/g, (_, prefix, number, suffix) => `${prefix}${number.replace(/,/g, '')}${suffix}`)
+      .replace(/,\s*([}\]])/g, '$1')
+      .replace(/([{,]\s*)'([^']+?)'\s*:/g, '$1"$2":')
+      .replace(/:\s*'([^']*?)'/g, ': "$1"'),
+  ];
+  for (const attempt of attempts) {
+    try { return JSON.parse(attempt); } catch (_) {}
+  }
+  return {};
+}
+
+function imageToDataUrl(image, mimeType = 'image/jpeg') {
+  const raw = cleanScanString(image);
+  if (!raw) return null;
+  if (/^data:/i.test(raw)) return raw;
+  const safeMime = cleanScanString(mimeType) || 'image/jpeg';
+  return `data:${safeMime};base64,${raw.replace(/^base64,/i, '')}`;
+}
+
+function normalizeScanItems(value) {
+  const rawItems = Array.isArray(value) ? value : [];
+  return rawItems.map((item) => {
+    if (typeof item === 'string') {
+      return { description: item, hsn_sac: null, qty: 1, unit: null, price: null, amount: null };
+    }
+    const description = cleanScanString(pickScanValue(item, ['description', 'item', 'item_name', 'name', 'product', 'particulars']));
+    const qty = parseScanNumber(pickScanValue(item, ['qty', 'quantity', 'pcs', 'nos']));
+    const price = parseScanNumber(pickScanValue(item, ['price', 'rate', 'unit_price', 'unit_rate']));
+    const explicitAmount = parseScanNumber(pickScanValue(item, ['amount', 'total', 'line_total', 'taxable_amount', 'value']));
+    const amount = explicitAmount ?? (qty && price ? Math.round(qty * price * 100) / 100 : null);
+    return {
+      description: description || 'Item',
+      hsn_sac: cleanScanString(pickScanValue(item, ['hsn_sac', 'hsn', 'sac'])),
+      qty: qty ?? 1,
+      unit: cleanScanString(pickScanValue(item, ['unit', 'uom'])) || null,
+      price: price ?? null,
+      amount: amount ?? null,
+    };
+  }).filter(item => item.description || item.amount);
+}
+
+function normalizeScanExtraction(raw, type = 'invoice') {
+  const source = raw && typeof raw === 'object' ? raw : {};
+  const items = normalizeScanItems(pickScanValue(source, ['items', 'line_items', 'products', 'particulars']));
+  const subtotal = parseScanNumber(pickScanValue(source, ['subtotal', 'sub_total', 'taxable_amount', 'taxable_value', 'before_tax_amount']));
+  const igstAmount = parseScanNumber(pickScanValue(source, ['igst_amount', 'igst']));
+  const cgstAmount = parseScanNumber(pickScanValue(source, ['cgst_amount', 'cgst']));
+  const sgstAmount = parseScanNumber(pickScanValue(source, ['sgst_amount', 'sgst']));
+  const componentGst = [igstAmount, cgstAmount, sgstAmount].filter(n => n !== null).reduce((sum, n) => sum + n, 0);
+  const gstAmount = parseScanNumber(pickScanValue(source, ['gst_amount', 'tax_amount', 'total_tax', 'tax'])) ?? (componentGst > 0 ? componentGst : null);
+  let totalAmount = parseScanNumber(pickScanValue(source, [
+    'total_amount', 'grand_total', 'invoice_total', 'bill_total', 'net_amount', 'amount', 'invoice_amount', 'bill_amount', 'total',
+  ]));
+  if (totalAmount === null && subtotal !== null && gstAmount !== null) totalAmount = Math.round((subtotal + gstAmount) * 100) / 100;
+  if (totalAmount === null && items.length) {
+    const itemTotal = items.reduce((sum, item) => sum + Number(item.amount || 0), 0);
+    if (itemTotal > 0) totalAmount = Math.round(itemTotal * 100) / 100;
+  }
+
+  const invoiceNumber = cleanScanString(pickScanValue(source, [
+    'invoice_number', 'invoice_no', 'invoice_num', 'bill_number', 'bill_no', 'challan_no', 'document_number',
+  ]));
+  const invoiceDate = parseScanDate(pickScanValue(source, [
+    'invoice_date', 'bill_date', 'purchase_date', 'sale_date', 'date', 'document_date',
+  ]));
+  const notes = cleanScanString(pickScanValue(source, ['notes', 'summary', 'description'])) || (items.length ? `${items.length} items` : null);
+
+  const common = {
+    invoice_number: invoiceNumber,
+    bill_number: invoiceNumber,
+    invoice_date: invoiceDate,
+    purchase_date: invoiceDate,
+    sale_date: invoiceDate,
+    due_date: parseScanDate(pickScanValue(source, ['due_date', 'payment_due_date'])),
+    items,
+    subtotal,
+    gst_rate: parseScanNumber(pickScanValue(source, ['gst_rate', 'tax_rate'])),
+    gst_amount: gstAmount,
+    igst_amount: igstAmount,
+    cgst_amount: cgstAmount,
+    sgst_amount: sgstAmount,
+    igst_rate: parseScanNumber(pickScanValue(source, ['igst_rate'])),
+    cgst_rate: parseScanNumber(pickScanValue(source, ['cgst_rate'])),
+    sgst_rate: parseScanNumber(pickScanValue(source, ['sgst_rate'])),
+    total_amount: totalAmount,
+    invoice_amount: totalAmount,
+    notes,
+  };
+
+  if (type === 'purchase') {
+    const supplierName = cleanScanString(pickScanValue(source, [
+      'supplier_name', 'seller_name', 'vendor_name', 'company_name', 'business_name', 'from', 'billed_by',
+    ]));
+    const partyName = cleanScanString(pickScanValue(source, ['party_name', 'buyer_name', 'customer_name', 'bill_to', 'consignee']));
+    return {
+      ...common,
+      supplier_name: supplierName,
+      party_name: partyName,
+      supplier_gstin: cleanScanString(pickScanValue(source, ['supplier_gstin', 'seller_gstin', 'vendor_gstin', 'gstin'])),
+      customer_name: partyName,
+    };
+  }
+
+  return {
+    ...common,
+    customer_name: cleanScanString(pickScanValue(source, ['customer_name', 'buyer_name', 'party_name', 'bill_to', 'receiver_name', 'consignee'])),
+    customer_phone: cleanScanString(pickScanValue(source, ['customer_phone', 'phone', 'mobile', 'contact'])),
+    customer_gstin: cleanScanString(pickScanValue(source, ['customer_gstin', 'buyer_gstin', 'party_gstin'])),
+    seller_gstin: cleanScanString(pickScanValue(source, ['seller_gstin', 'supplier_gstin', 'vendor_gstin'])),
+    supplier_name: cleanScanString(pickScanValue(source, ['supplier_name', 'seller_name', 'business_name', 'company_name'])),
+  };
+}
+
+function normalizeSupplierExtraction(raw) {
+  const source = raw && typeof raw === 'object' ? raw : {};
+  return {
+    name: cleanScanString(pickScanValue(source, ['name', 'supplier_name', 'vendor_name', 'seller_name', 'company_name'])),
+    phone: cleanScanString(pickScanValue(source, ['phone', 'mobile', 'contact'])),
+    email: cleanScanString(pickScanValue(source, ['email', 'mail'])),
+    address: cleanScanString(pickScanValue(source, ['address', 'billing_address'])),
+    payment_terms: parseScanNumber(pickScanValue(source, ['payment_terms', 'credit_days', 'terms'])),
+  };
+}
+
+async function runVisionExtraction({ prompt, image, mimeType = 'image/jpeg', maxTokens = 1200 }) {
+  if (!process.env.GROQ_API_KEY) {
+    const err = new Error('AI not configured');
+    err.status = 503;
+    throw err;
+  }
+  const dataUrl = imageToDataUrl(image, mimeType);
+  if (!dataUrl) {
+    const err = new Error('image is required');
+    err.status = 400;
+    throw err;
+  }
+
+  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+    body: JSON.stringify({
+      model: VISION_MODEL,
+      messages: [{ role: 'user', content: [
+        { type: 'text', text: prompt },
+        { type: 'image_url', image_url: { url: dataUrl } },
+      ]}],
+      max_tokens: maxTokens,
+      temperature: 0,
+    })
+  });
+
+  const groqData = await response.json().catch(() => ({}));
+  const rawText = groqData.choices?.[0]?.message?.content || '';
+  if (!response.ok) {
+    const err = new Error(groqData.error?.message || 'Vision API error');
+    err.status = response.status;
+    err.groqError = groqData.error;
+    throw err;
+  }
+  return { rawText, parsed: parseScanJson(rawText), groqData, status: response.status };
+}
+
+function sendVisionError(res, err, label) {
+  const errMsg = err?.message || 'Unknown';
+  const lower = errMsg.toLowerCase();
+  const isRateLimit = err?.status === 429 || lower.includes('rate limit') || lower.includes('tokens per');
+  if (isRateLimit) return res.status(429).json({ error: 'rate_limit', details: 'AI scan limit reached. Try again in a few minutes.' });
+  const status = err?.status === 400 || err?.status === 503 ? err.status : 500;
+  console.error(`${label} scan error:`, errMsg);
+  return res.status(status).json({ error: status === 503 ? 'AI not configured' : 'AI scan failed', details: errMsg });
+}
+
+app.post('/api/scan-document', authMiddleware, async (req, res) => {
+  const { image_base64, image, mimeType = 'image/jpeg', scan_type } = req.body; // scan_type: 'invoice' | 'supplier'
+  const scanImage = image_base64 || image;
+  if (!scanImage) return res.status(400).json({ error: 'No image provided' });
+
+  const invoicePrompt = `You are an expert OCR system for Indian GST invoices, bills, and challans.
+
+Read the full document: seller header, buyer/party block, invoice number, date, items table, taxes, and grand total.
+
+Return ONLY a valid JSON object. Use null when a value is not visible.
+
+{
+  "customer_name": "buyer/customer/party name",
+  "customer_phone": "phone or mobile if visible",
+  "customer_gstin": "buyer GSTIN if visible",
+  "supplier_name": "seller/business name at top",
+  "seller_gstin": "seller GSTIN if visible",
+  "invoice_number": "invoice/bill/challan number",
+  "invoice_date": "YYYY-MM-DD",
+  "due_date": "YYYY-MM-DD or null",
+  "items": [{ "description": "item name", "hsn_sac": "HSN/SAC or null", "qty": number, "unit": "PCS/KG/etc", "price": unit_rate_number, "amount": line_total_number }],
+  "subtotal": taxable_amount_before_tax,
+  "gst_rate": gst_percent_number,
+  "gst_amount": total_tax_amount,
+  "igst_amount": igst_amount,
+  "cgst_amount": cgst_amount,
+  "sgst_amount": sgst_amount,
+  "total_amount": grand_total_including_tax,
+  "notes": "short item summary"
+}
+
+Rules: numbers only, no currency symbols or commas. Dates must be YYYY-MM-DD.`;
 
   const supplierPrompt = `Extract supplier/vendor details from this document image. Return ONLY a JSON object with these fields (use null if not found):
 {"name": "", "phone": "", "email": "", "address": "", "payment_terms": null}`;
 
   try {
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
-      body: JSON.stringify({
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-        max_tokens: 400,
-        messages: [
-          { role: 'user', content: [
-            { type: 'text', text: scan_type === 'supplier' ? supplierPrompt : invoicePrompt },
-            { type: 'image_url', image_url: { url: image_base64 } }
-          ]}
-        ]
-      })
+    const { rawText, parsed } = await runVisionExtraction({
+      prompt: scan_type === 'supplier' ? supplierPrompt : invoicePrompt,
+      image: scanImage,
+      mimeType,
+      maxTokens: scan_type === 'supplier' ? 500 : 1400,
     });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error?.message || 'Vision API error');
-    const text = data.choices[0]?.message?.content || '{}';
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    const extracted = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
-    res.json({ success: true, extracted });
+    const extracted = scan_type === 'supplier'
+      ? normalizeSupplierExtraction(parsed)
+      : normalizeScanExtraction(parsed, 'invoice');
+    res.json({ success: true, extracted, data: extracted, _debug: rawText.substring(0, 300) });
   } catch (err) {
-    res.status(500).json({ error: 'Internal server error' });
+    sendVisionError(res, err, 'Document');
   }
 });
 
@@ -5496,6 +5803,8 @@ app.post('/api/purchases', authMiddleware, async (req, res) => {
       supplier_name, total_amount, amount,
       supplier_phone, bill_number, supplier_gstin,
       purchase_date, due_date, paid_amount, notes,
+      items, gst_type, gst_rate, gst_amount,
+      cgst_amount, sgst_amount, igst_amount, subtotal,
     } = req.body;
 
     const finalAmount = parseFloat(total_amount || amount || 0);
@@ -5518,6 +5827,14 @@ app.post('/api/purchases', authMiddleware, async (req, res) => {
       supplier_gstin: supplier_gstin || null,
       notes:          notes          || null,
       category:       'material',
+      items:          items ? JSON.stringify(items) : null,
+      gst_type:       gst_type || null,
+      gst_rate:       gst_rate || null,
+      gst_amount:     gst_amount || null,
+      cgst_amount:    cgst_amount || null,
+      sgst_amount:    sgst_amount || null,
+      igst_amount:    igst_amount || null,
+      subtotal:       subtotal || null,
     }]).select().single();
 
     if (error) throw error;
@@ -5530,7 +5847,8 @@ app.post('/api/purchases', authMiddleware, async (req, res) => {
 
 app.patch('/api/purchases/:id', authMiddleware, async (req, res) => {
   try {
-    const { total_amount, amount, paid_amount, supplier_name, purchase_date, due_date, notes, bill_number, supplier_phone, supplier_gstin } = req.body;
+    const { total_amount, amount, paid_amount, supplier_name, purchase_date, due_date, notes, bill_number, supplier_phone, supplier_gstin,
+            items, gst_type, gst_rate, gst_amount, cgst_amount, sgst_amount, igst_amount, subtotal } = req.body;
 
     const finalAmount = total_amount !== undefined ? parseFloat(total_amount) : amount !== undefined ? parseFloat(amount) : null;
     const finalPaid   = paid_amount  !== undefined ? parseFloat(paid_amount)  : null;
@@ -5551,6 +5869,14 @@ app.patch('/api/purchases/:id', authMiddleware, async (req, res) => {
     if (bill_number    !== undefined) updates.bill_number    = bill_number    || null;
     if (supplier_phone !== undefined) updates.supplier_phone = supplier_phone || null;
     if (supplier_gstin !== undefined) updates.supplier_gstin = supplier_gstin || null;
+    if (items          !== undefined) updates.items          = items ? JSON.stringify(items) : null;
+    if (gst_type       !== undefined) updates.gst_type       = gst_type || null;
+    if (gst_rate       !== undefined) updates.gst_rate       = gst_rate || null;
+    if (gst_amount     !== undefined) updates.gst_amount     = gst_amount || null;
+    if (cgst_amount    !== undefined) updates.cgst_amount    = cgst_amount || null;
+    if (sgst_amount    !== undefined) updates.sgst_amount    = sgst_amount || null;
+    if (igst_amount    !== undefined) updates.igst_amount    = igst_amount || null;
+    if (subtotal       !== undefined) updates.subtotal       = subtotal || null;
 
     const { data, error } = await supabase.from('purchases').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
@@ -5604,43 +5930,13 @@ Return ONLY a valid JSON object — no explanation, no markdown, no text before 
 
 Rules: numbers without rupee symbol or commas (147630 not 1,47,630). Dates as YYYY-MM-DD. Read every item row. total_amount must not be null if any amount is visible.`;
 
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
-      body: JSON.stringify({
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-        messages: [{ role: 'user', content: [
-          { type: 'text', text: prompt },
-          { type: 'image_url', image_url: { url: `data:${mimeType};base64,${image}` } },
-        ]}],
-        max_tokens: 900,
-        temperature: 0,
-      })
-    });
-
-    const groqData = await response.json();
-    const rawText = groqData.choices?.[0]?.message?.content || '';
-    console.log('=== PURCHASES SCAN RAW ===', JSON.stringify({ ok: response.ok, status: response.status, raw: rawText.substring(0, 500), error: groqData.error }));
-
-    if (!response.ok) {
-      const errMsg = groqData.error?.message || '';
-      const isRateLimit = response.status === 429 || errMsg.toLowerCase().includes('rate limit') || errMsg.toLowerCase().includes('tokens per');
-      if (isRateLimit) return res.status(429).json({ error: 'rate_limit', details: 'AI scan limit reached. Try again in a few minutes.' });
-      return res.status(500).json({ error: 'AI scan failed', details: errMsg || 'Unknown' });
-    }
-
-    let extracted = {};
-    try {
-      const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-      extracted = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
-    } catch (e) {
-      console.error('JSON parse error (purchases):', rawText.substring(0, 300));
-    }
+    const { rawText, parsed } = await runVisionExtraction({ prompt, image, mimeType, maxTokens: 1600 });
+    const extracted = normalizeScanExtraction(parsed, 'purchase');
+    console.log('=== PURCHASES SCAN RAW ===', JSON.stringify({ raw: rawText.substring(0, 500), extracted_keys: Object.keys(extracted) }));
 
     res.json({ success: true, data: extracted, _debug: rawText.substring(0, 300) });
   } catch (err) {
-    console.error('Bill scan error:', err);
-    res.status(500).json({ error: 'Internal server error' });
+    sendVisionError(res, err, 'Purchase bill');
   }
 });
 
@@ -5754,42 +6050,12 @@ Return ONLY a valid JSON object — no explanation, no markdown, no text before 
 
 Rules: numbers without rupee symbol or commas (147630 not 1,47,630). Dates as YYYY-MM-DD. Read ALL item rows. total_amount must never be null if any amount visible.`;
 
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
-      body: JSON.stringify({
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-        messages: [{ role: 'user', content: [
-          { type: 'text', text: prompt },
-          { type: 'image_url', image_url: { url: `data:${mimeType};base64,${image}` } },
-        ]}],
-        max_tokens: 900,
-        temperature: 0,
-      })
-    });
-
-    const groqData = await response.json();
-    const rawText = groqData.choices?.[0]?.message?.content || '';
-    console.log('=== SALES SCAN RAW ===', JSON.stringify({ ok: response.ok, status: response.status, raw: rawText.substring(0, 500), error: groqData.error }));
-
-    if (!response.ok) {
-      const errMsg = groqData.error?.message || '';
-      const isRateLimit = response.status === 429 || errMsg.toLowerCase().includes('rate limit') || errMsg.toLowerCase().includes('tokens per');
-      if (isRateLimit) return res.status(429).json({ error: 'rate_limit', details: 'AI scan limit reached. Try again in a few minutes.' });
-      return res.status(500).json({ error: 'AI scan failed', details: errMsg || 'Unknown' });
-    }
-
-    let extracted = {};
-    try {
-      const m = rawText.match(/\{[\s\S]*\}/);
-      extracted = m ? JSON.parse(m[0]) : {};
-    } catch (e) {
-      console.error('JSON parse error (sales):', rawText.substring(0, 300));
-    }
+    const { rawText, parsed } = await runVisionExtraction({ prompt, image, mimeType, maxTokens: 1600 });
+    const extracted = normalizeScanExtraction(parsed, 'sale');
+    console.log('=== SALES SCAN RAW ===', JSON.stringify({ raw: rawText.substring(0, 500), extracted_keys: Object.keys(extracted) }));
     res.json({ success: true, data: extracted, _debug: rawText.substring(0, 300) });
   } catch (err) {
-    console.error('Sales scan error:', err);
-    res.status(500).json({ error: 'Internal server error' });
+    sendVisionError(res, err, 'Sales bill');
   }
 });
 
@@ -6609,15 +6875,72 @@ async function runAutoMigrations() {
         supplier_gstin TEXT,
         bill_number    TEXT,
         supplier_phone TEXT,
+        items          JSONB,
+        gst_type       TEXT,
+        gst_rate       NUMERIC(6,2),
+        gst_amount     NUMERIC(14,2),
+        cgst_amount    NUMERIC(14,2),
+        sgst_amount    NUMERIC(14,2),
+        igst_amount    NUMERIC(14,2),
+        subtotal       NUMERIC(14,2),
         created_at     TIMESTAMPTZ DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS idx_purchases_user ON public.purchases(user_id);
       CREATE INDEX IF NOT EXISTS idx_purchases_status ON public.purchases(user_id, status);
 
+      -- sales table (create if missing)
+      CREATE TABLE IF NOT EXISTS public.sales (
+        id              BIGSERIAL PRIMARY KEY,
+        user_id         UUID NOT NULL,
+        customer_name   TEXT NOT NULL,
+        amount          NUMERIC(14,2) NOT NULL DEFAULT 0,
+        paid_amount     NUMERIC(14,2) NOT NULL DEFAULT 0,
+        status          TEXT NOT NULL DEFAULT 'unpaid',
+        sale_date       DATE NOT NULL DEFAULT CURRENT_DATE,
+        due_date        DATE,
+        notes           TEXT,
+        customer_phone  TEXT,
+        customer_gstin  TEXT,
+        invoice_number  TEXT,
+        items           JSONB,
+        gst_type        TEXT,
+        gst_rate        NUMERIC(6,2),
+        gst_amount      NUMERIC(14,2),
+        cgst_amount     NUMERIC(14,2),
+        sgst_amount     NUMERIC(14,2),
+        igst_amount     NUMERIC(14,2),
+        subtotal        NUMERIC(14,2),
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_sales_user ON public.sales(user_id);
+      CREATE INDEX IF NOT EXISTS idx_sales_status ON public.sales(user_id, status);
+
       -- ── purchases: add any missing columns to existing table ─────────────
       ALTER TABLE public.purchases ADD COLUMN IF NOT EXISTS bill_number    TEXT;
       ALTER TABLE public.purchases ADD COLUMN IF NOT EXISTS supplier_phone TEXT;
       ALTER TABLE public.purchases ADD COLUMN IF NOT EXISTS description    TEXT;
+      ALTER TABLE public.purchases ADD COLUMN IF NOT EXISTS supplier_gstin TEXT;
+      ALTER TABLE public.purchases ADD COLUMN IF NOT EXISTS items          JSONB;
+      ALTER TABLE public.purchases ADD COLUMN IF NOT EXISTS gst_type       TEXT;
+      ALTER TABLE public.purchases ADD COLUMN IF NOT EXISTS gst_rate       NUMERIC(6,2);
+      ALTER TABLE public.purchases ADD COLUMN IF NOT EXISTS gst_amount     NUMERIC(14,2);
+      ALTER TABLE public.purchases ADD COLUMN IF NOT EXISTS cgst_amount    NUMERIC(14,2);
+      ALTER TABLE public.purchases ADD COLUMN IF NOT EXISTS sgst_amount    NUMERIC(14,2);
+      ALTER TABLE public.purchases ADD COLUMN IF NOT EXISTS igst_amount    NUMERIC(14,2);
+      ALTER TABLE public.purchases ADD COLUMN IF NOT EXISTS subtotal       NUMERIC(14,2);
+
+      -- sales: add any missing columns to existing table
+      ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS customer_phone TEXT;
+      ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS customer_gstin TEXT;
+      ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS invoice_number TEXT;
+      ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS items          JSONB;
+      ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS gst_type       TEXT;
+      ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS gst_rate       NUMERIC(6,2);
+      ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS gst_amount     NUMERIC(14,2);
+      ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS cgst_amount    NUMERIC(14,2);
+      ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS sgst_amount    NUMERIC(14,2);
+      ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS igst_amount    NUMERIC(14,2);
+      ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS subtotal       NUMERIC(14,2);
 
       -- invoices: automation tracking columns
       ALTER TABLE invoices ADD COLUMN IF NOT EXISTS snooze_until       TIMESTAMPTZ;
