@@ -1332,37 +1332,31 @@ app.get('/api/metrics/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
 
-    const [{ data: invoices }, { data: callLogs }, { data: purchases }] = await Promise.all([
-      supabase.from('invoices').select('*').eq('user_id', userId),
+    await syncExistingSalesReceivables(userId);
+
+    const [receivables, payables, { data: callLogs }] = await Promise.all([
+      getReceivableRows(userId),
+      getPayableRows(userId),
       supabase.from('call_logs').select('*').eq('user_id', userId),
-      supabase.from('purchases').select('amount, paid_amount, status').eq('user_id', userId)
     ]);
 
-    const safeInvoices = invoices || [];
     const safeCallLogs = callLogs || [];
-    const safePurchases = purchases || [];
+    const paidReceivables = receivables.filter((row) => row.outstanding_amount <= 0);
+    const pendingReceivables = receivables.filter((row) => row.outstanding_amount > 0);
 
     const metrics = {
-      total_outstanding: safeInvoices.reduce(
-        (sum, inv) => sum + (inv.payment_status === 'Pending' ? inv.invoice_amount : 0),
-        0
-      ),
-      total_payable: safePurchases.reduce(
-        (sum, purchase) => sum + (purchase.status !== 'paid' ? calculateOutstanding(purchase.amount, purchase.paid_amount) : 0),
-        0
-      ),
-      total_paid: safeInvoices.reduce(
-        (sum, inv) => sum + (inv.payment_status === 'Paid' ? inv.invoice_amount : 0),
-        0
-      ),
-      pending_invoices: safeInvoices.filter(inv => inv.payment_status === 'Pending').length,
-      total_customers: new Set(safeInvoices.map(inv => inv.customer_name)).size,
+      total_outstanding: pendingReceivables.reduce((sum, row) => sum + row.outstanding_amount, 0),
+      total_payable: payables.reduce((sum, row) => sum + row.outstanding_amount, 0),
+      total_paid: receivables.reduce((sum, row) => sum + row.paid_amount, 0),
+      pending_invoices: pendingReceivables.length,
+      total_customers: new Set(receivables.map(row => row.customer_name)).size,
+      total_suppliers: new Set(payables.map(row => row.supplier_name)).size,
       calls_made: safeCallLogs.length,
       avg_recovery_rate:
-        safeInvoices.length > 0
+        receivables.length > 0
           ? (
-              (safeInvoices.filter(inv => inv.payment_status === 'Paid').length /
-                safeInvoices.length) *
+              (paidReceivables.length /
+                receivables.length) *
               100
             ).toFixed(1)
           : 0
@@ -1602,6 +1596,17 @@ function normalizePartyKey(value) {
 
 function calculateOutstanding(total, paid) {
   return Math.max(toMoney(total) - toMoney(paid), 0);
+}
+
+function parseJsonArray(value) {
+  if (Array.isArray(value)) return value;
+  if (!value) return [];
+  try {
+    const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_) {
+    return [];
+  }
 }
 
 function calculateDaysOverdue(dateValue, isPaid = false) {
@@ -3319,22 +3324,54 @@ app.post('/api/seed/:userId', requireOwner, async (req, res) => {
 app.get('/api/prospects/:userId', requireOwner, async (req, res) => {
   const { userId } = req.params;
   try {
-    const { data, error } = await supabase
+    const [{ data, error }, receivables] = await Promise.all([
+      supabase
       .from('prospects')
       .select('*, prospect_notes(*)')
       .eq('user_id', userId)
-      .order('created_at', { ascending: false });
+        .order('created_at', { ascending: false }),
+      getReceivableRows(userId),
+    ]);
     if (error) throw error;
-    res.json({ success: true, prospects: data || [] });
+
+    const prospects = data || [];
+    const existingNames = new Set(prospects.map((p) => normalizePartyKey(p.name)));
+    const customerMap = {};
+    receivables.forEach((row) => {
+      const key = normalizePartyKey(row.customer_name);
+      if (!key || existingNames.has(key)) return;
+      if (!customerMap[key]) {
+        customerMap[key] = {
+          id: `customer:${key}`,
+          user_id: userId,
+          name: row.customer_name,
+          phone: row.customer_phone || null,
+          business_type: 'Customer',
+          location: null,
+          amount_stuck: 0,
+          status: 'customer',
+          source_type: 'customer',
+          source_label: 'Auto from Sales/Collections',
+          invoices_count: 0,
+          created_at: row.invoice_date || new Date().toISOString(),
+          prospect_notes: [],
+        };
+      }
+      customerMap[key].amount_stuck += row.outstanding_amount;
+      customerMap[key].invoices_count += 1;
+      if (!customerMap[key].phone && row.customer_phone) customerMap[key].phone = row.customer_phone;
+    });
+
+    res.json({ success: true, prospects: [...Object.values(customerMap), ...prospects] });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/prospects', authMiddleware, async (req, res) => {
   try {
-    const { user_id, name, phone, email, business_type, location, amount_stuck, status } = req.body;
+    const { name, phone, email, business_type, location, amount_stuck, status } = req.body;
     const { data, error } = await supabase
       .from('prospects')
-      .insert([{ user_id, name, phone, email, business_type, location, amount_stuck: amount_stuck || null, status: status || 'cold' }])
+      .insert([{ user_id: req.user.userId, name, phone, email, business_type, location, amount_stuck: amount_stuck || null, status: status || 'lead' }])
       .select();
     if (error) throw error;
     res.json({ success: true, prospect: data[0] });
@@ -3344,6 +3381,7 @@ app.post('/api/prospects', authMiddleware, async (req, res) => {
 app.post('/api/prospects/:id', authMiddleware, async (req, res) => {
   const { id } = req.params;
   try {
+    if (id.startsWith('customer:')) return res.status(400).json({ error: 'Auto customers are updated from Sales, Collections, and Khata' });
     const updates = req.body;
     updates.updated_at = new Date();
     if (updates.status === 'trial' && !updates.trial_start_date) {
@@ -3351,7 +3389,7 @@ app.post('/api/prospects/:id', authMiddleware, async (req, res) => {
       const end = new Date(); end.setDate(end.getDate() + 14);
       updates.trial_end_date = end.toISOString().split('T')[0];
     }
-    const { data, error } = await supabase.from('prospects').update(updates).eq('id', id).select();
+    const { data, error } = await supabase.from('prospects').update(updates).eq('id', id).eq('user_id', req.user.userId).select();
     if (error) throw error;
     res.json({ success: true, prospect: data[0] });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
@@ -3360,7 +3398,8 @@ app.post('/api/prospects/:id', authMiddleware, async (req, res) => {
 app.post('/api/prospects/:id/delete', authMiddleware, async (req, res) => {
   const { id } = req.params;
   try {
-    const { error } = await supabase.from('prospects').delete().eq('id', id);
+    if (id.startsWith('customer:')) return res.status(400).json({ error: 'Auto customers are removed by clearing Sales/Collections dues' });
+    const { error } = await supabase.from('prospects').delete().eq('id', id).eq('user_id', req.user.userId);
     if (error) throw error;
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
@@ -5691,17 +5730,44 @@ app.get('/api/financial-summary/:userId', requireOwner, async (req, res) => {
   const { userId } = req.params;
   try {
     const pool2 = getPool();
-    const [totals, monthly, catBreakdown, recent] = await Promise.all([
+    await syncExistingSalesReceivables(userId);
+
+    const [totals, monthly, catBreakdown, recent, receivables, payables] = await Promise.all([
       pool2.query(`SELECT type, SUM(amount) as total, COUNT(*) as count FROM transactions WHERE user_id=$1 GROUP BY type`, [userId]),
       pool2.query(`SELECT TO_CHAR(transaction_date,'YYYY-MM') as month, type, SUM(amount) as total FROM transactions WHERE user_id=$1 AND transaction_date >= NOW()-INTERVAL '6 months' GROUP BY month,type ORDER BY month DESC`, [userId]),
       pool2.query(`SELECT category, type, SUM(amount) as total, COUNT(*) as count FROM transactions WHERE user_id=$1 GROUP BY category,type ORDER BY total DESC`, [userId]),
       pool2.query(`SELECT * FROM transactions WHERE user_id=$1 ORDER BY transaction_date DESC, created_at DESC LIMIT 5`, [userId]),
+      getReceivableRows(userId),
+      getPayableRows(userId),
     ]);
 
     const totalIn  = parseFloat(totals.rows.find(r => r.type === 'in')?.total  || 0);
     const totalOut = parseFloat(totals.rows.find(r => r.type === 'out')?.total || 0);
+    const receivableOutstanding = receivables.reduce((sum, row) => sum + row.outstanding_amount, 0);
+    const payableOutstanding = payables.reduce((sum, row) => sum + row.outstanding_amount, 0);
+    const salesBooked = receivables.reduce((sum, row) => sum + row.amount, 0);
+    const purchasesBooked = payables.reduce((sum, row) => sum + row.amount, 0);
+    const collectedFromSales = receivables.reduce((sum, row) => sum + row.paid_amount, 0);
+    const paidToSuppliers = payables.reduce((sum, row) => sum + row.paid_amount, 0);
+    const cashPosition = totalIn - totalOut;
+    const netPosition = cashPosition + receivableOutstanding - payableOutstanding;
+
     res.json({
-      summary: { totalIn, totalOut, balance: totalIn - totalOut },
+      summary: {
+        totalIn,
+        totalOut,
+        balance: cashPosition,
+        cashPosition,
+        netPosition,
+        receivableOutstanding,
+        payableOutstanding,
+        salesBooked,
+        purchasesBooked,
+        collectedFromSales,
+        paidToSuppliers,
+        receivablesCount: receivables.filter(row => row.outstanding_amount > 0).length,
+        payablesCount: payables.filter(row => row.outstanding_amount > 0).length,
+      },
       monthly: monthly.rows,
       categories: catBreakdown.rows,
       recentTransactions: recent.rows,
@@ -5714,22 +5780,31 @@ app.get('/api/ai-financial-monitor/:userId', requireOwner, async (req, res) => {
   const { userId } = req.params;
   try {
     const pool2 = getPool();
-    const [totals, last30, invoiceSummary] = await Promise.all([
+    await syncExistingSalesReceivables(userId);
+
+    const [totals, last30, receivables, payables] = await Promise.all([
       pool2.query(`SELECT type, SUM(amount) as total FROM transactions WHERE user_id=$1 GROUP BY type`, [userId]),
       pool2.query(`SELECT category, type, SUM(amount) as total FROM transactions WHERE user_id=$1 AND transaction_date >= NOW()-INTERVAL '30 days' GROUP BY category,type ORDER BY total DESC`, [userId]),
-      pool2.query(`SELECT payment_status, SUM(invoice_amount) as total, COUNT(*) as cnt FROM invoices WHERE user_id=$1 GROUP BY payment_status`, [userId]),
+      getReceivableRows(userId),
+      getPayableRows(userId),
     ]);
 
     const totalIn  = parseFloat(totals.rows.find(r => r.type === 'in')?.total  || 0);
     const totalOut = parseFloat(totals.rows.find(r => r.type === 'out')?.total || 0);
-    const outstanding = parseFloat(invoiceSummary.rows.find(r => r.payment_status === 'Pending')?.total || 0);
+    const outstanding = receivables.reduce((sum, row) => sum + row.outstanding_amount, 0);
+    const payable = payables.reduce((sum, row) => sum + row.outstanding_amount, 0);
+    const salesBooked = receivables.reduce((sum, row) => sum + row.amount, 0);
+    const purchasesBooked = payables.reduce((sum, row) => sum + row.amount, 0);
 
     const expenseLines = last30.rows.filter(r => r.type === 'out').map(r => `  - ${r.category}: ₹${parseFloat(r.total).toLocaleString('en-IN')}`).join('\n');
     const incomeLines  = last30.rows.filter(r => r.type === 'in').map(r => `  - ${r.category}: ₹${parseFloat(r.total).toLocaleString('en-IN')}`).join('\n');
 
     const prompt = `You are a financial AI for an Indian MSME. Analyze this data:
 TOTAL: In ₹${totalIn.toLocaleString('en-IN')}, Out ₹${totalOut.toLocaleString('en-IN')}, Balance ₹${(totalIn-totalOut).toLocaleString('en-IN')}
-OUTSTANDING INVOICES: ₹${outstanding.toLocaleString('en-IN')}
+SALES BOOKED: ₹${salesBooked.toLocaleString('en-IN')}
+PURCHASES BOOKED: ₹${purchasesBooked.toLocaleString('en-IN')}
+CUSTOMER RECEIVABLES: ₹${outstanding.toLocaleString('en-IN')}
+SUPPLIER PAYABLES: ₹${payable.toLocaleString('en-IN')}
 LAST 30 DAYS EXPENSES:\n${expenseLines || '  (none)'}
 LAST 30 DAYS INCOME:\n${incomeLines || '  (none)'}
 
@@ -6163,12 +6238,16 @@ app.get('/api/today/summary', authMiddleware, async (req, res) => {
     const [
       { data: orders },
       { data: expenses },
+      { data: sales },
+      { data: purchases },
       { data: paidInvoices },
       { data: callLogs },
     ] = await Promise.all([
       supabase.from('orders').select('*').eq('user_id', userId).eq('order_date', date),
       supabase.from('expenses').select('*').eq('user_id', userId).eq('expense_date', date),
-      supabase.from('invoices').select('*').eq('user_id', userId).gte('paid_at', date + 'T00:00:00').lte('paid_at', date + 'T23:59:59'),
+      supabase.from('sales').select('*').eq('user_id', userId).eq('sale_date', date),
+      supabase.from('purchases').select('*').eq('user_id', userId).eq('purchase_date', date),
+      supabase.from('invoices').select('*').eq('user_id', userId).eq('payment_status', 'Paid').eq('payment_date', date),
       supabase.from('call_logs').select('*').eq('user_id', userId).gte('created_at', date + 'T00:00:00').lte('created_at', date + 'T23:59:59'),
     ]);
 
@@ -6177,10 +6256,17 @@ app.get('/api/today/summary', authMiddleware, async (req, res) => {
       .reduce((s, o) => s + (Number(o.total_amount) || 0), 0);
 
     const invoiceIncome = (paidInvoices || [])
-      .reduce((s, i) => s + Number(i.invoice_amount || 0), 0);
+      .reduce((s, i) => s + Number(i.payment_amount || i.invoice_amount || 0), 0);
 
-    const totalIncome = orderIncome + invoiceIncome;
-    const totalExpenses = (expenses || []).reduce((s, e) => s + Number(e.amount || 0), 0);
+    const salesIncome = (sales || [])
+      .filter(sale => sale.status !== 'cancelled')
+      .reduce((s, sale) => s + Number(sale.amount || 0), 0);
+
+    const purchaseExpense = (purchases || [])
+      .reduce((s, purchase) => s + Number(purchase.amount || 0), 0);
+
+    const totalIncome = orderIncome + salesIncome + invoiceIncome;
+    const totalExpenses = (expenses || []).reduce((s, e) => s + Number(e.amount || 0), 0) + purchaseExpense;
     const netProfit = totalIncome - totalExpenses;
 
     // Top selling items from orders
@@ -6189,6 +6275,13 @@ app.get('/api/today/summary', authMiddleware, async (req, res) => {
       (o.items || []).forEach((item) => {
         const key = item.name || item.local_name || 'Unknown';
         itemMap[key] = (itemMap[key] || 0) + (item.quantity || 0);
+      });
+    });
+    (sales || []).forEach(sale => {
+      const items = parseJsonArray(sale.items);
+      items.forEach((item) => {
+        const key = item.description || item.name || 'Sale';
+        itemMap[key] = (itemMap[key] || 0) + Number(item.qty || item.quantity || 1);
       });
     });
     const topItems = Object.entries(itemMap)
@@ -6206,9 +6299,13 @@ app.get('/api/today/summary', authMiddleware, async (req, res) => {
       date,
       summary: {
         income: { orders: orderIncome, invoices: invoiceIncome, total: totalIncome },
-        expenses: { total: totalExpenses, by_category: expenseByCategory },
+        expenses: { total: totalExpenses, purchases: purchaseExpense, by_category: expenseByCategory },
+        sales_total: salesIncome,
+        purchases_total: purchaseExpense,
         net_profit: netProfit,
         order_count: (orders || []).length,
+        sales_count: (sales || []).length,
+        purchase_count: (purchases || []).length,
         orders_by_status: {
           new: (orders || []).filter(o => o.status === 'new').length,
           confirmed: (orders || []).filter(o => o.status === 'confirmed').length,
@@ -6222,6 +6319,8 @@ app.get('/api/today/summary', authMiddleware, async (req, res) => {
       },
       orders: orders || [],
       expenses: expenses || [],
+      sales: sales || [],
+      purchases: purchases || [],
       paid_invoices: paidInvoices || [],
     });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
