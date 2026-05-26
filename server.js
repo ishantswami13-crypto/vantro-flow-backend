@@ -5477,14 +5477,12 @@ app.delete('/api/khata/entry/:id', authMiddleware, async (req, res) => {
 
 app.get('/api/purchases', authMiddleware, async (req, res) => {
   try {
-    const pool = getPool();
     const { status } = req.query;
-    let sql    = 'SELECT * FROM purchases WHERE user_id=$1';
-    const vals = [req.user.userId];
-    if (status) { sql += ` AND status=$${vals.length+1}`; vals.push(status); }
-    sql += ' ORDER BY purchase_date DESC';
-    const { rows } = await pool.query(sql, vals);
-    const purchases = rows.map(p => ({ ...p, total_amount: parseFloat(p.amount) || 0 }));
+    let q = supabase.from('purchases').select('*').eq('user_id', req.user.userId).order('purchase_date', { ascending: false });
+    if (status) q = q.eq('status', status);
+    const { data, error } = await q;
+    if (error) throw error;
+    const purchases = (data || []).map(p => ({ ...p, total_amount: parseFloat(p.amount) || 0 }));
     res.json({ success: true, purchases });
   } catch (err) {
     console.error('GET purchases error:', err.message);
@@ -5494,7 +5492,6 @@ app.get('/api/purchases', authMiddleware, async (req, res) => {
 
 app.post('/api/purchases', authMiddleware, async (req, res) => {
   try {
-    const pool = getPool();
     const {
       supplier_name, total_amount, amount,
       supplier_phone, bill_number,
@@ -5508,21 +5505,22 @@ app.post('/api/purchases', authMiddleware, async (req, res) => {
     const finalPaid  = parseFloat(paid_amount || 0);
     const autoStatus = finalPaid >= finalAmount ? 'paid' : finalPaid > 0 ? 'partial' : 'unpaid';
 
-    const { rows } = await pool.query(
-      `INSERT INTO purchases
-         (user_id, supplier_name, amount, paid_amount, status, purchase_date, due_date,
-          bill_number, supplier_phone, notes, category, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'material',NOW())
-       RETURNING *`,
-      [
-        req.user.userId, supplier_name, finalAmount, finalPaid, autoStatus,
-        purchase_date || new Date().toISOString().split('T')[0],
-        due_date || null,
-        bill_number || null, supplier_phone || null, notes || null,
-      ]
-    );
-    const p = rows[0];
-    res.json({ success: true, purchase: { ...p, total_amount: parseFloat(p.amount) } });
+    const { data, error } = await supabase.from('purchases').insert([{
+      user_id:       req.user.userId,
+      supplier_name,
+      amount:        finalAmount,
+      paid_amount:   finalPaid,
+      status:        autoStatus,
+      purchase_date: purchase_date || new Date().toISOString().split('T')[0],
+      due_date:      due_date      || null,
+      bill_number:   bill_number   || null,
+      supplier_phone: supplier_phone || null,
+      notes:         notes         || null,
+      category:      'material',
+    }]).select().single();
+
+    if (error) throw error;
+    res.json({ success: true, purchase: { ...data, total_amount: parseFloat(data.amount) } });
   } catch (err) {
     console.error('Purchase create error:', err.message);
     res.status(500).json({ error: 'Internal server error', detail: err.message });
@@ -5531,43 +5529,30 @@ app.post('/api/purchases', authMiddleware, async (req, res) => {
 
 app.patch('/api/purchases/:id', authMiddleware, async (req, res) => {
   try {
-    const pool = getPool();
     const { total_amount, amount, paid_amount, supplier_name, purchase_date, due_date, notes, bill_number, supplier_phone } = req.body;
 
     const finalAmount = total_amount !== undefined ? parseFloat(total_amount) : amount !== undefined ? parseFloat(amount) : null;
     const finalPaid   = paid_amount  !== undefined ? parseFloat(paid_amount)  : null;
 
     // Get current record to compute status
-    const { rows: cur } = await pool.query('SELECT * FROM purchases WHERE id=$1 AND user_id=$2', [req.params.id, req.user.userId]);
-    if (!cur.length) return res.status(404).json({ error: 'Purchase not found' });
-    const current = cur[0];
+    const { data: current } = await supabase.from('purchases').select('amount, paid_amount').eq('id', req.params.id).eq('user_id', req.user.userId).single();
+    if (!current) return res.status(404).json({ error: 'Purchase not found' });
 
     const newAmount = finalAmount ?? parseFloat(current.amount);
     const newPaid   = finalPaid   ?? parseFloat(current.paid_amount);
     const newStatus = newPaid >= newAmount ? 'paid' : newPaid > 0 ? 'partial' : 'unpaid';
 
-    const { rows } = await pool.query(
-      `UPDATE purchases SET
-         supplier_name  = COALESCE($1, supplier_name),
-         amount         = $2,
-         paid_amount    = $3,
-         status         = $4,
-         purchase_date  = COALESCE($5, purchase_date),
-         due_date       = COALESCE($6, due_date),
-         notes          = COALESCE($7, notes),
-         bill_number    = COALESCE($8, bill_number),
-         supplier_phone = COALESCE($9, supplier_phone)
-       WHERE id=$10 AND user_id=$11
-       RETURNING *`,
-      [
-        supplier_name || null, newAmount, newPaid, newStatus,
-        purchase_date || null, due_date || null, notes || null,
-        bill_number || null, supplier_phone || null,
-        req.params.id, req.user.userId,
-      ]
-    );
-    const p = rows[0];
-    res.json({ success: true, purchase: { ...p, total_amount: parseFloat(p.amount) } });
+    const updates = { amount: newAmount, paid_amount: newPaid, status: newStatus };
+    if (supplier_name  !== undefined) updates.supplier_name  = supplier_name;
+    if (purchase_date  !== undefined) updates.purchase_date  = purchase_date || null;
+    if (due_date       !== undefined) updates.due_date       = due_date      || null;
+    if (notes          !== undefined) updates.notes          = notes         || null;
+    if (bill_number    !== undefined) updates.bill_number    = bill_number   || null;
+    if (supplier_phone !== undefined) updates.supplier_phone = supplier_phone || null;
+
+    const { data, error } = await supabase.from('purchases').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
+    if (error) throw error;
+    res.json({ success: true, purchase: { ...data, total_amount: parseFloat(data.amount) } });
   } catch (err) {
     console.error('Purchase patch error:', err.message);
     res.status(500).json({ error: 'Internal server error', detail: err.message });
@@ -5576,8 +5561,7 @@ app.patch('/api/purchases/:id', authMiddleware, async (req, res) => {
 
 app.delete('/api/purchases/:id', authMiddleware, async (req, res) => {
   try {
-    const pool = getPool();
-    await pool.query('DELETE FROM purchases WHERE id=$1 AND user_id=$2', [req.params.id, req.user.userId]);
+    await supabase.from('purchases').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
