@@ -1068,6 +1068,8 @@ app.get('/api/invoices/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
 
+    await syncExistingSalesReceivables(userId);
+
     const { data, error } = await supabase
       .from('invoices')
       .select('*')
@@ -1076,7 +1078,10 @@ app.get('/api/invoices/:userId', requireOwner, async (req, res) => {
 
     if (error) throw error;
 
-    const totalOutstanding = data.reduce((sum, inv) => sum + inv.invoice_amount, 0);
+    const totalOutstanding = data.reduce(
+      (sum, inv) => sum + (inv.payment_status === 'Pending' ? calculateOutstanding(inv.invoice_amount, inv.payment_amount) : 0),
+      0
+    );
 
     res.json({
       success: true,
@@ -1377,16 +1382,18 @@ app.get('/api/analytics/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
 
-    const [{ data: invoices }, { data: callLogs }] = await Promise.all([
-      supabase.from('invoices').select('*').eq('user_id', userId),
+    await syncExistingSalesReceivables(userId);
+
+    const [receivables, payables, { data: callLogs }] = await Promise.all([
+      getReceivableRows(userId),
+      getPayableRows(userId),
       supabase.from('call_logs').select('*').eq('user_id', userId)
     ]);
 
-    const safeInvoices = invoices || [];
     const safeCallLogs = callLogs || [];
 
-    const paidInvoices = safeInvoices.filter(inv => inv.payment_status === 'Paid');
-    const pendingInvoices = safeInvoices.filter(inv => inv.payment_status === 'Pending');
+    const paidInvoices = receivables.filter(inv => inv.outstanding_amount <= 0);
+    const pendingInvoices = receivables.filter(inv => inv.outstanding_amount > 0);
 
     // Monthly recovery for last 6 months
     const monthly = {};
@@ -1397,11 +1404,11 @@ app.get('/api/analytics/:userId', requireOwner, async (req, res) => {
       monthly[key] = { month: key, recovered: 0, invoices_paid: 0 };
     }
     paidInvoices.forEach(inv => {
-      const date = inv.payment_date || inv.updated_at;
+      const date = inv.payment_date || inv.invoice_date;
       if (!date) return;
       const key = date.substring(0, 7);
       if (monthly[key]) {
-        monthly[key].recovered += Number(inv.payment_amount || inv.invoice_amount);
+        monthly[key].recovered += Number(inv.paid_amount || inv.amount);
         monthly[key].invoices_paid += 1;
       }
     });
@@ -1410,29 +1417,33 @@ app.get('/api/analytics/:userId', requireOwner, async (req, res) => {
     const customerMap = {};
     pendingInvoices.forEach(inv => {
       if (!customerMap[inv.customer_name]) customerMap[inv.customer_name] = 0;
-      customerMap[inv.customer_name] += Number(inv.invoice_amount);
+      customerMap[inv.customer_name] += Number(inv.outstanding_amount);
     });
     const topCustomers = Object.entries(customerMap)
       .map(([name, amount]) => ({ name, amount }))
       .sort((a, b) => b.amount - a.amount)
       .slice(0, 5);
 
-    const totalOutstanding = pendingInvoices.reduce((s, i) => s + Number(i.invoice_amount), 0);
-    const totalRecovered = paidInvoices.reduce((s, i) => s + Number(i.payment_amount || i.invoice_amount), 0);
-    const recoveryRate = safeInvoices.length > 0
-      ? ((paidInvoices.length / safeInvoices.length) * 100).toFixed(1)
+    const totalOutstanding = pendingInvoices.reduce((s, i) => s + Number(i.outstanding_amount), 0);
+    const totalRecovered = receivables.reduce((s, i) => s + Number(i.paid_amount || 0), 0);
+    const totalPayable = payables.reduce((s, p) => s + Number(p.outstanding_amount || 0), 0);
+    const recoveryRate = receivables.length > 0
+      ? ((paidInvoices.length / receivables.length) * 100).toFixed(1)
       : 0;
 
     res.json({
       success: true,
       analytics: {
         total_outstanding: totalOutstanding,
+        total_payable: totalPayable,
         total_recovered: totalRecovered,
         recovery_rate: recoveryRate,
-        total_invoices: safeInvoices.length,
+        total_invoices: receivables.length,
         paid_invoices: paidInvoices.length,
         pending_invoices: pendingInvoices.length,
         calls_made: safeCallLogs.length,
+        total_customers: new Set(receivables.map((i) => i.customer_name)).size,
+        total_suppliers: new Set(payables.map((p) => p.supplier_name)).size,
         monthly_trend: Object.values(monthly),
         top_customers: topCustomers
       }
@@ -1601,6 +1612,267 @@ function calculateDaysOverdue(dateValue, isPaid = false) {
   due.setHours(0, 0, 0, 0);
   today.setHours(0, 0, 0, 0);
   return Math.max(Math.floor((today - due) / (1000 * 60 * 60 * 24)), 0);
+}
+
+function normalizeReceivableInvoice(inv) {
+  const amount = toMoney(inv.invoice_amount);
+  const paidAmount = inv.payment_status === 'Paid'
+    ? toMoney(inv.payment_amount || amount)
+    : toMoney(inv.payment_amount);
+  const outstanding = inv.payment_status === 'Paid' ? 0 : calculateOutstanding(amount, paidAmount);
+  const dueDate = inv.due_date || inv.invoice_date || inv.created_at;
+
+  return {
+    id: inv.id,
+    source_type: inv.source_type || 'invoices',
+    source_id: inv.source_id || String(inv.id),
+    invoice_number: inv.invoice_number || null,
+    customer_name: normalizePartyName(inv.customer_name),
+    customer_phone: inv.customer_phone || null,
+    amount,
+    paid_amount: paidAmount,
+    outstanding_amount: outstanding,
+    status: outstanding <= 0 ? 'Paid' : 'Pending',
+    invoice_date: inv.invoice_date || inv.created_at || null,
+    due_date: dueDate || null,
+    payment_date: inv.payment_date || null,
+    days_overdue: calculateDaysOverdue(dueDate, outstanding <= 0),
+    raw: inv,
+  };
+}
+
+function normalizeReceivableSale(sale) {
+  const amount = toMoney(sale.amount || sale.total_amount);
+  const paidAmount = toMoney(sale.paid_amount);
+  const outstanding = sale.status === 'paid' ? 0 : calculateOutstanding(amount, paidAmount);
+  const dueDate = sale.due_date || sale.sale_date || sale.created_at;
+
+  return {
+    id: `sale:${sale.id}`,
+    source_type: 'sales',
+    source_id: String(sale.id),
+    invoice_number: sale.invoice_number || `SALE-${sale.id}`,
+    customer_name: normalizePartyName(sale.customer_name),
+    customer_phone: sale.customer_phone || null,
+    amount,
+    paid_amount: paidAmount,
+    outstanding_amount: outstanding,
+    status: outstanding <= 0 ? 'Paid' : 'Pending',
+    invoice_date: sale.sale_date || sale.created_at || null,
+    due_date: dueDate || null,
+    payment_date: sale.status === 'paid' ? sale.sale_date || sale.created_at || null : null,
+    days_overdue: calculateDaysOverdue(dueDate, outstanding <= 0),
+    raw: sale,
+  };
+}
+
+function normalizePayablePurchase(purchase) {
+  const amount = toMoney(purchase.amount || purchase.total_amount);
+  const paidAmount = toMoney(purchase.paid_amount);
+  const outstanding = purchase.status === 'paid' ? 0 : calculateOutstanding(amount, paidAmount);
+  const dueDate = purchase.due_date || purchase.purchase_date || purchase.created_at;
+
+  return {
+    id: purchase.id,
+    supplier_name: normalizePartyName(purchase.supplier_name),
+    supplier_phone: purchase.supplier_phone || null,
+    amount,
+    paid_amount: paidAmount,
+    outstanding_amount: outstanding,
+    status: outstanding <= 0 ? 'paid' : purchase.status || 'unpaid',
+    purchase_date: purchase.purchase_date || purchase.created_at || null,
+    due_date: dueDate || null,
+    days_overdue: calculateDaysOverdue(dueDate, outstanding <= 0),
+    raw: purchase,
+  };
+}
+
+async function getReceivableRows(userId) {
+  const [invoiceResult, saleResult] = await Promise.all([
+    supabase.from('invoices').select('*').eq('user_id', userId),
+    supabase.from('sales').select('*').eq('user_id', userId),
+  ]);
+
+  const invoices = invoiceResult.error ? [] : invoiceResult.data || [];
+  const sales = saleResult.error ? [] : saleResult.data || [];
+  const invoiceRows = invoices.map(normalizeReceivableInvoice).filter((row) => row.customer_name && row.amount > 0);
+  const linkedSaleIds = new Set(invoiceRows.filter((row) => row.source_type === 'sales').map((row) => String(row.source_id)));
+  const invoiceNumbers = new Set(invoiceRows.map((row) => normalizePartyKey(row.invoice_number)).filter(Boolean));
+
+  const saleRows = sales
+    .filter((sale) => !linkedSaleIds.has(String(sale.id)))
+    .filter((sale) => !sale.invoice_number || !invoiceNumbers.has(normalizePartyKey(sale.invoice_number)))
+    .map(normalizeReceivableSale)
+    .filter((row) => row.customer_name && row.amount > 0);
+
+  return [...invoiceRows, ...saleRows];
+}
+
+async function getPayableRows(userId) {
+  const { data, error } = await supabase.from('purchases').select('*').eq('user_id', userId);
+  if (error) return [];
+  return (data || []).map(normalizePayablePurchase).filter((row) => row.supplier_name && row.amount > 0);
+}
+
+async function syncExistingSalesReceivables(userId) {
+  const { data: sales, error } = await supabase.from('sales').select('*').eq('user_id', userId);
+  if (error || !sales?.length) return;
+  for (const sale of sales.slice(0, 100)) {
+    await syncReceivableFromSale(userId, sale);
+  }
+}
+
+async function buildKhataEntries(userId, partyName = null) {
+  await syncExistingSalesReceivables(userId);
+
+  const [{ data: manualEntries, error: manualError }, receivables, payables] = await Promise.all([
+    supabase.from('khata_entries').select('*').eq('user_id', userId),
+    getReceivableRows(userId),
+    getPayableRows(userId),
+  ]);
+  if (manualError) throw manualError;
+
+  const targetKey = partyName ? normalizePartyKey(partyName) : null;
+  const rows = [];
+  const addRow = (row) => {
+    if (!row.customer_name || !row.amount) return;
+    if (targetKey && normalizePartyKey(row.customer_name) !== targetKey) return;
+    rows.push({
+      id: row.id,
+      customer_name: row.customer_name,
+      customer_phone: row.customer_phone || null,
+      type: row.type,
+      amount: toMoney(row.amount),
+      payment_mode: row.payment_mode || 'system',
+      note: row.note || row.notes || null,
+      notes: row.note || row.notes || null,
+      created_at: row.created_at || row.entry_date || new Date().toISOString(),
+      entry_date: row.entry_date || row.created_at || new Date().toISOString(),
+      source_type: row.source_type || 'manual',
+      party_type: row.party_type || 'customer',
+    });
+  };
+
+  (manualEntries || []).forEach((entry) => addRow({
+    id: entry.id,
+    customer_name: normalizePartyName(entry.customer_name),
+    customer_phone: entry.customer_phone || null,
+    type: entry.type,
+    amount: entry.amount,
+    payment_mode: entry.payment_mode,
+    note: entry.note || entry.notes,
+    created_at: entry.entry_date || entry.created_at,
+    entry_date: entry.entry_date || entry.created_at,
+    source_type: 'manual',
+    party_type: 'customer',
+  }));
+
+  receivables.forEach((invoice) => {
+    addRow({
+      id: `${invoice.source_type}:${invoice.source_id}:debit`,
+      customer_name: invoice.customer_name,
+      customer_phone: invoice.customer_phone,
+      type: 'debit',
+      amount: invoice.amount,
+      payment_mode: 'invoice',
+      note: invoice.invoice_number ? `Invoice ${invoice.invoice_number}` : 'Sale invoice',
+      created_at: invoice.invoice_date || invoice.due_date,
+      entry_date: invoice.invoice_date || invoice.due_date,
+      source_type: invoice.source_type,
+      party_type: 'customer',
+    });
+    if (invoice.paid_amount > 0) {
+      addRow({
+        id: `${invoice.source_type}:${invoice.source_id}:credit`,
+        customer_name: invoice.customer_name,
+        customer_phone: invoice.customer_phone,
+        type: 'credit',
+        amount: invoice.paid_amount,
+        payment_mode: 'collection',
+        note: invoice.invoice_number ? `Payment for ${invoice.invoice_number}` : 'Payment received',
+        created_at: invoice.payment_date || invoice.invoice_date,
+        entry_date: invoice.payment_date || invoice.invoice_date,
+        source_type: invoice.source_type,
+        party_type: 'customer',
+      });
+    }
+  });
+
+  payables.forEach((purchase) => {
+    addRow({
+      id: `purchase:${purchase.id}:credit`,
+      customer_name: purchase.supplier_name,
+      customer_phone: purchase.supplier_phone,
+      type: 'credit',
+      amount: purchase.amount,
+      payment_mode: 'purchase',
+      note: purchase.raw?.bill_number ? `Purchase bill ${purchase.raw.bill_number}` : 'Purchase bill',
+      created_at: purchase.purchase_date || purchase.due_date,
+      entry_date: purchase.purchase_date || purchase.due_date,
+      source_type: 'purchases',
+      party_type: 'supplier',
+    });
+    if (purchase.paid_amount > 0) {
+      addRow({
+        id: `purchase:${purchase.id}:debit`,
+        customer_name: purchase.supplier_name,
+        customer_phone: purchase.supplier_phone,
+        type: 'debit',
+        amount: purchase.paid_amount,
+        payment_mode: 'supplier_payment',
+        note: purchase.raw?.bill_number ? `Paid against ${purchase.raw.bill_number}` : 'Supplier payment',
+        created_at: purchase.purchase_date || purchase.due_date,
+        entry_date: purchase.purchase_date || purchase.due_date,
+        source_type: 'purchases',
+        party_type: 'supplier',
+      });
+    }
+  });
+
+  return rows.sort((a, b) => new Date(a.entry_date || a.created_at) - new Date(b.entry_date || b.created_at));
+}
+
+function summarizeKhataEntries(entries) {
+  const customers = {};
+  entries.forEach((entry) => {
+    const name = entry.customer_name;
+    if (!customers[name]) {
+      customers[name] = {
+        customer_name: name,
+        customer_phone: entry.customer_phone || null,
+        party_type: entry.party_type || 'customer',
+        total_debit: 0,
+        total_credit: 0,
+        balance: 0,
+        entries: [],
+        entry_count: 0,
+        last_entry: entry.entry_date || entry.created_at,
+      };
+    }
+    const amount = toMoney(entry.amount);
+    if (entry.type === 'debit') {
+      customers[name].total_debit += amount;
+      customers[name].balance += amount;
+    } else {
+      customers[name].total_credit += amount;
+      customers[name].balance -= amount;
+    }
+    customers[name].entries.push(entry);
+    customers[name].entry_count += 1;
+    if ((entry.entry_date || entry.created_at) > customers[name].last_entry) {
+      customers[name].last_entry = entry.entry_date || entry.created_at;
+    }
+    if (!customers[name].customer_phone && entry.customer_phone) customers[name].customer_phone = entry.customer_phone;
+  });
+
+  return Object.values(customers)
+    .map((customer) => ({
+      ...customer,
+      total_debit: toMoney(customer.total_debit),
+      total_credit: toMoney(customer.total_credit),
+      balance: toMoney(customer.balance),
+    }))
+    .sort((a, b) => Math.abs(b.balance) - Math.abs(a.balance));
 }
 
 function stripOptionalInvoiceColumns(payload) {
@@ -1810,7 +2082,7 @@ app.get('/api/suppliers/:userId', requireOwner, async (req, res) => {
         .order('name'),
       supabase
         .from('purchases')
-        .select('supplier_name, amount, paid_amount, status, purchase_date')
+        .select('supplier_name, supplier_phone, supplier_gstin, amount, paid_amount, status, purchase_date')
         .eq('user_id', userId),
     ]);
     if (error) throw error;
@@ -1841,13 +2113,38 @@ app.get('/api/suppliers/:userId', requireOwner, async (req, res) => {
       }
     });
 
-    const suppliers = (data || []).map((supplier) => ({
+    const seenSupplierKeys = new Set();
+    const suppliers = (data || []).map((supplier) => {
+      seenSupplierKeys.add(normalizePartyKey(supplier.name));
+      return ({
       ...supplier,
       total_payable: Math.round((payableBySupplier[normalizePartyKey(supplier.name)]?.total_payable || 0) * 100) / 100,
       outstanding_amount: Math.round((payableBySupplier[normalizePartyKey(supplier.name)]?.outstanding_amount || 0) * 100) / 100,
       purchase_count: payableBySupplier[normalizePartyKey(supplier.name)]?.purchase_count || 0,
       last_purchase_date: payableBySupplier[normalizePartyKey(supplier.name)]?.last_purchase_date || null,
-    }));
+      inferred_from_purchases: false,
+    });
+    });
+
+    Object.entries(payableBySupplier).forEach(([key, totals]) => {
+      if (seenSupplierKeys.has(key)) return;
+      const sourcePurchase = (purchases || []).find((purchase) => normalizePartyKey(purchase.supplier_name) === key);
+      suppliers.push({
+        id: `purchase-supplier:${key}`,
+        user_id: userId,
+        name: normalizePartyName(sourcePurchase?.supplier_name || key),
+        phone: sourcePurchase?.supplier_phone || null,
+        email: null,
+        address: null,
+        payment_terms: 30,
+        gstin: sourcePurchase?.supplier_gstin || null,
+        total_payable: Math.round(totals.total_payable * 100) / 100,
+        outstanding_amount: Math.round(totals.outstanding_amount * 100) / 100,
+        purchase_count: totals.purchase_count,
+        last_purchase_date: totals.last_purchase_date,
+        inferred_from_purchases: true,
+      });
+    });
 
     res.json({ success: true, suppliers });
   } catch (error) {
@@ -3091,32 +3388,34 @@ app.get('/api/cash-forecast/:userId', requireOwner, async (req, res) => {
   const { current_cash = 0, days = 30 } = req.query;
 
   try {
-    const { data: invoices } = await supabase
-      .from('invoices')
-      .select('invoice_amount, payment_amount, payment_status, payment_date, days_overdue, customer_name')
-      .eq('user_id', userId);
+    await syncExistingSalesReceivables(userId);
 
-    // Calculate real daily burn rate from purchases (last 30 days)
+    const [receivables, payables] = await Promise.all([
+      getReceivableRows(userId),
+      getPayableRows(userId),
+    ]);
+
     const thirtyDaysAgo = new Date(); thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-    const { data: recentPurchases } = await supabase
-      .from('purchases')
-      .select('total_amount, purchase_date')
-      .eq('user_id', userId)
-      .gte('purchase_date', thirtyDaysAgo.toISOString().split('T')[0]);
+    const recentPurchases = payables.filter((p) => p.purchase_date && p.purchase_date >= thirtyDaysAgo.toISOString().split('T')[0]);
+    const purchaseTotal = recentPurchases.reduce((s, p) => s + Number(p.amount || 0), 0);
+    const totalPayable = payables.reduce((s, p) => s + Number(p.outstanding_amount || 0), 0);
+    const calculatedBurnRate = recentPurchases.length > 0 ? Math.round(purchaseTotal / 30) : Math.round(totalPayable / 30);
 
-    const purchaseTotal = (recentPurchases || []).reduce((s, p) => s + Number(p.total_amount || 0), 0);
-    const calculatedBurnRate = recentPurchases?.length > 0 ? Math.round(purchaseTotal / 30) : 0;
-
-    const safe = invoices || [];
-    const paid = safe.filter(i => i.payment_status === 'Paid' && i.payment_date);
-    const totalRecovered = paid.reduce((s, i) => s + Number(i.payment_amount || i.invoice_amount), 0);
-    const pending = safe.filter(i => i.payment_status !== 'Paid');
-    const totalOutstanding = pending.reduce((s, i) => s + Number(i.invoice_amount), 0);
+    const paid = receivables.filter(i => i.paid_amount > 0);
+    const paidLast90 = paid.filter((i) => {
+      if (!i.payment_date) return true;
+      const d = new Date(i.payment_date);
+      const ninetyDaysAgo = new Date(); ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
+      return !Number.isNaN(d.getTime()) && d >= ninetyDaysAgo;
+    });
+    const totalRecovered = paidLast90.reduce((s, i) => s + Number(i.paid_amount || 0), 0);
+    const pending = receivables.filter(i => i.outstanding_amount > 0);
+    const totalOutstanding = pending.reduce((s, i) => s + Number(i.outstanding_amount), 0);
     const totalOverdue30 = pending.filter(i => Number(i.days_overdue) >= 30)
-      .reduce((s, i) => s + Number(i.invoice_amount), 0);
+      .reduce((s, i) => s + Number(i.outstanding_amount), 0);
 
     // Average daily collections over last 90 days (or estimate from outstanding if not enough data)
-    const avgDailyCollections = paid.length > 0 ? Math.round(totalRecovered / 90) : Math.round(totalOutstanding * 0.03);
+    const avgDailyCollections = paidLast90.length > 0 ? Math.round(totalRecovered / 90) : Math.round(totalOutstanding * 0.03);
 
     const cashStart = Number(current_cash);
     const burnRate = calculatedBurnRate;
@@ -3152,7 +3451,16 @@ app.get('/api/cash-forecast/:userId', requireOwner, async (req, res) => {
       burnRate,
       avgDailyCollections,
       totalOutstanding,
+      totalPayable,
       totalOverdue30,
+      topOutstanding: pending
+        .sort((a, b) => b.outstanding_amount - a.outstanding_amount)
+        .slice(0, 5)
+        .map((i) => ({
+          name: i.customer_name,
+          amount: i.outstanding_amount,
+          days_overdue: i.days_overdue,
+        })),
       scenarios,
       days: n
     });
@@ -6452,27 +6760,14 @@ app.get('/api/bills/gstr1', authMiddleware, async (req, res) => {
 
 app.get('/api/khata', authMiddleware, async (req, res) => {
   try {
-    const { data, error } = await supabase.from('khata_entries').select('*').eq('user_id', req.user.userId).order('entry_date', { ascending: false });
-    if (error) throw error;
-    // Group by customer with running balance
-    const customers = {};
-    (data || []).forEach(e => {
-      if (!customers[e.customer_name]) customers[e.customer_name] = { customer_name: e.customer_name, balance: 0, entries: [], last_entry: e.entry_date };
-      const amt = Number(e.amount);
-      customers[e.customer_name].balance += e.type === 'debit' ? amt : -amt;
-      customers[e.customer_name].entries.push(e);
-      if (e.entry_date > customers[e.customer_name].last_entry) customers[e.customer_name].last_entry = e.entry_date;
-    });
-    res.json({ success: true, customers: Object.values(customers).sort((a, b) => b.balance - a.balance) });
+    const entries = await buildKhataEntries(req.user.userId);
+    res.json({ success: true, customers: summarizeKhataEntries(entries) });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/khata/:customer', authMiddleware, async (req, res) => {
   try {
-    const { data, error } = await supabase.from('khata_entries').select('*')
-      .eq('user_id', req.user.userId).eq('customer_name', decodeURIComponent(req.params.customer))
-      .order('entry_date', { ascending: true });
-    if (error) throw error;
+    const data = await buildKhataEntries(req.user.userId, decodeURIComponent(req.params.customer));
     let balance = 0;
     const entries = (data || []).map(e => {
       balance += e.type === 'debit' ? Number(e.amount) : -Number(e.amount);
@@ -6484,11 +6779,12 @@ app.get('/api/khata/:customer', authMiddleware, async (req, res) => {
 
 app.post('/api/khata/entry', authMiddleware, async (req, res) => {
   try {
-    const { customer_name, type, amount, payment_mode, notes, entry_date } = req.body;
+    const { customer_name, customer_phone, type, amount, payment_mode, note, notes, entry_date } = req.body;
     if (!customer_name || !type || !amount) return res.status(400).json({ error: 'customer_name, type, amount required' });
     const { data, error } = await supabase.from('khata_entries').insert([{
       user_id: req.user.userId, customer_name, type, amount: parseFloat(amount),
-      payment_mode: payment_mode || 'cash', notes: notes || null,
+      customer_phone: customer_phone || null,
+      payment_mode: payment_mode || 'cash', notes: notes || note || null,
       entry_date: entry_date || new Date().toISOString().split('T')[0], created_at: new Date(),
     }]).select().single();
     if (error) throw error;
@@ -7648,6 +7944,25 @@ async function runAutoMigrations() {
       );
       CREATE INDEX IF NOT EXISTS idx_suppliers_user ON public.suppliers(user_id);
       CREATE INDEX IF NOT EXISTS idx_suppliers_name ON public.suppliers(user_id, name);
+
+      -- khata table (create if missing)
+      CREATE TABLE IF NOT EXISTS public.khata_entries (
+        id             BIGSERIAL PRIMARY KEY,
+        user_id        UUID NOT NULL,
+        customer_name  TEXT NOT NULL,
+        customer_phone TEXT,
+        type           TEXT NOT NULL,
+        amount         NUMERIC(14,2) NOT NULL DEFAULT 0,
+        payment_mode   TEXT DEFAULT 'cash',
+        notes          TEXT,
+        entry_date     DATE DEFAULT CURRENT_DATE,
+        created_at     TIMESTAMPTZ DEFAULT NOW()
+      );
+      ALTER TABLE public.khata_entries ADD COLUMN IF NOT EXISTS customer_phone TEXT;
+      ALTER TABLE public.khata_entries ADD COLUMN IF NOT EXISTS notes TEXT;
+      ALTER TABLE public.khata_entries ADD COLUMN IF NOT EXISTS entry_date DATE DEFAULT CURRENT_DATE;
+      CREATE INDEX IF NOT EXISTS idx_khata_user ON public.khata_entries(user_id);
+      CREATE INDEX IF NOT EXISTS idx_khata_customer ON public.khata_entries(user_id, customer_name);
 
       -- ── purchases table (create if missing) ──────────────────────────────
       CREATE TABLE IF NOT EXISTS public.purchases (
