@@ -5629,15 +5629,12 @@ CRITICAL RULES:
         messages: [{
           role: 'user',
           content: [
-            {
-              type: 'image_url',
-              image_url: { url: `data:${mimeType};base64,${image}` }
-            },
-            { type: 'text', text: prompt }
+            { type: 'text', text: prompt },
+            { type: 'image_url', image_url: { url: `data:${mimeType};base64,${image}` } },
           ]
         }],
         max_tokens: 1500,
-        temperature: 0.1,
+        temperature: 0,
       })
     });
 
@@ -5797,11 +5794,11 @@ CRITICAL RULES:
       body: JSON.stringify({
         model: 'meta-llama/llama-4-maverick-17b-128e-instruct',
         messages: [{ role: 'user', content: [
+          { type: 'text', text: prompt },
           { type: 'image_url', image_url: { url: `data:${mimeType};base64,${image}` } },
-          { type: 'text', text: prompt }
         ]}],
         max_tokens: 1500,
-        temperature: 0.1,
+        temperature: 0,
       })
     });
     const groqData = await response.json();
@@ -5810,7 +5807,7 @@ CRITICAL RULES:
       return res.status(500).json({ error: 'AI scan failed', details: groqData.error?.message || 'Unknown error' });
     }
     const text = groqData.choices[0]?.message?.content || '{}';
-    console.log('Sales scan raw response:', text.substring(0, 300));
+    console.log('Sales scan raw AI response:', text.substring(0, 500));
     let extracted = {};
     try {
       const m = text.match(/\{[\s\S]*\}/);
