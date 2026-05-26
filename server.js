@@ -1575,10 +1575,52 @@ app.get('/api/stock/movements/:userId', requireOwner, async (req, res) => {
 app.get('/api/suppliers/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
-    const { data, error } = await supabase
+    const [{ data, error }, { data: purchases, error: purchaseError }] = await Promise.all([
+      supabase
       .from('suppliers').select('*').eq('user_id', userId).order('name');
+      ,
+      supabase
+        .from('purchases')
+        .select('supplier_name, amount, paid_amount, status, purchase_date')
+        .eq('user_id', userId),
+    ]);
     if (error) throw error;
-    res.json({ success: true, suppliers: data });
+    if (purchaseError) throw purchaseError;
+
+    const payableBySupplier = {};
+    (purchases || []).forEach((purchase) => {
+      const key = normalizePartyKey(purchase.supplier_name);
+      if (!key) return;
+      if (!payableBySupplier[key]) {
+        payableBySupplier[key] = {
+          total_payable: 0,
+          outstanding_amount: 0,
+          purchase_count: 0,
+          last_purchase_date: null,
+        };
+      }
+      const total = toMoney(purchase.amount);
+      const paid = toMoney(purchase.paid_amount);
+      payableBySupplier[key].total_payable += total;
+      payableBySupplier[key].outstanding_amount += Math.max(total - paid, 0);
+      payableBySupplier[key].purchase_count += 1;
+      if (
+        purchase.purchase_date &&
+        (!payableBySupplier[key].last_purchase_date || purchase.purchase_date > payableBySupplier[key].last_purchase_date)
+      ) {
+        payableBySupplier[key].last_purchase_date = purchase.purchase_date;
+      }
+    });
+
+    const suppliers = (data || []).map((supplier) => ({
+      ...supplier,
+      total_payable: Math.round((payableBySupplier[normalizePartyKey(supplier.name)]?.total_payable || 0) * 100) / 100,
+      outstanding_amount: Math.round((payableBySupplier[normalizePartyKey(supplier.name)]?.outstanding_amount || 0) * 100) / 100,
+      purchase_count: payableBySupplier[normalizePartyKey(supplier.name)]?.purchase_count || 0,
+      last_purchase_date: payableBySupplier[normalizePartyKey(supplier.name)]?.last_purchase_date || null,
+    }));
+
+    res.json({ success: true, suppliers });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -2789,13 +2831,24 @@ app.post('/api/prospects/:id/notes', authMiddleware, async (req, res) => {
 
 app.get('/api/cash-forecast/:userId', requireOwner, async (req, res) => {
   const { userId } = req.params;
-  const { current_cash = 0, daily_expenses = 13000, days = 30 } = req.query;
+  const { current_cash = 0, days = 30 } = req.query;
 
   try {
     const { data: invoices } = await supabase
       .from('invoices')
       .select('invoice_amount, payment_amount, payment_status, payment_date, days_overdue, customer_name')
       .eq('user_id', userId);
+
+    // Calculate real daily burn rate from purchases (last 30 days)
+    const thirtyDaysAgo = new Date(); thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const { data: recentPurchases } = await supabase
+      .from('purchases')
+      .select('total_amount, purchase_date')
+      .eq('user_id', userId)
+      .gte('purchase_date', thirtyDaysAgo.toISOString().split('T')[0]);
+
+    const purchaseTotal = (recentPurchases || []).reduce((s, p) => s + Number(p.total_amount || 0), 0);
+    const calculatedBurnRate = recentPurchases?.length > 0 ? Math.round(purchaseTotal / 30) : 0;
 
     const safe = invoices || [];
     const paid = safe.filter(i => i.payment_status === 'Paid' && i.payment_date);
@@ -2809,7 +2862,7 @@ app.get('/api/cash-forecast/:userId', requireOwner, async (req, res) => {
     const avgDailyCollections = paid.length > 0 ? Math.round(totalRecovered / 90) : Math.round(totalOutstanding * 0.03);
 
     const cashStart = Number(current_cash);
-    const burnRate = Number(daily_expenses);
+    const burnRate = calculatedBurnRate;
     const n = Number(days);
 
     const buildCurve = (inflow) => {
