@@ -5573,85 +5573,65 @@ app.post('/api/purchases/scan', authMiddleware, async (req, res) => {
   try {
     const { image, mimeType = 'image/jpeg' } = req.body;
     if (!image) return res.status(400).json({ error: 'image is required' });
-    if (!process.env.GROQ_API_KEY) return res.status(503).json({ error: 'AI not configured' });
+    if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: 'AI not configured' });
 
-    const prompt = `You are an expert OCR system for Indian purchase bills, tax invoices, and challans. You have PERFECT vision — zoom into every part of this image and read even the smallest printed text.
+    const prompt = `You are an expert OCR system for Indian purchase bills, tax invoices, and challans.
 
-Scan the ENTIRE invoice: seller header at top, buyer/party block, invoice number + date, items table with all rows, and totals at bottom. Return ONLY a valid JSON object starting with { — no explanation, no markdown.
+Read the ENTIRE invoice image carefully: seller header at top, buyer/party block, invoice number + date, items table with ALL rows, and totals at bottom.
 
-Return exactly this structure:
+Return ONLY a valid JSON object — no explanation, no markdown, no text before or after.
+
 {
-  "supplier_name": "SELLER company name — printed at the very TOP of the invoice (string)",
-  "supplier_gstin": "SELLER GSTIN/UIN — 15-char code near seller letterhead (string or null)",
-  "party_name": "BUYER / PARTY / CONSIGNEE name if shown in buyer section (string or null)",
-  "bill_number": "exact Invoice No / Bill No / Challan No value (string or null)",
-  "purchase_date": "invoice date in YYYY-MM-DD format (string or null)",
-  "due_date": "payment due date in YYYY-MM-DD if explicitly stated (string or null)",
-  "items": [
-    {
-      "description": "full product/item name exactly as printed",
-      "hsn_sac": "HSN or SAC numeric code from the HSN/SAC column (string or null)",
-      "qty": quantity as a plain number (e.g. 11 for '11 set'),
-      "unit": "unit like SET/PCS/KG/MTR/NOS/UNT/BOX",
-      "price": unit Rate as a plain number,
-      "amount": line total Amount as a plain number
-    }
-  ],
-  "subtotal": taxable value before tax as number or null,
-  "gst_rate": GST % as number (e.g. 5 or 18) or null,
-  "gst_amount": total tax amount as number or null,
-  "igst_amount": IGST amount if present as number or null,
-  "cgst_amount": CGST / Input CGST / Output CGST as number or null,
-  "sgst_amount": SGST / Input SGST / Output SGST as number or null,
-  "igst_rate": IGST rate % as number or null,
-  "cgst_rate": CGST rate % as number or null,
-  "sgst_rate": SGST rate % as number or null,
-  "total_amount": GRAND TOTAL final amount including all taxes as number,
-  "notes": "brief summary e.g. 'JK sewing machines, 7 items' (string or null)"
+  "supplier_name": "SELLER company name at the very TOP of the invoice",
+  "supplier_gstin": "SELLER GSTIN — 15-char alphanumeric code near seller name (or null)",
+  "party_name": "BUYER/PARTY/CONSIGNEE name in buyer block (or null for cash bills)",
+  "bill_number": "Invoice No / Bill No / Challan No exact value (or null)",
+  "purchase_date": "invoice date as YYYY-MM-DD (or null)",
+  "due_date": "payment due date as YYYY-MM-DD if shown (or null)",
+  "items": [{ "description": "item name", "hsn_sac": "HSN code or null", "qty": number, "unit": "PCS/KG/SET/etc", "price": unit_rate_number, "amount": line_total_number }],
+  "subtotal": taxable_amount_before_gst_or_null,
+  "gst_rate": gst_percent_number_or_null,
+  "gst_amount": total_tax_amount_number_or_null,
+  "igst_amount": igst_amount_or_null,
+  "cgst_amount": cgst_amount_or_null,
+  "sgst_amount": sgst_amount_or_null,
+  "igst_rate": igst_rate_percent_or_null,
+  "cgst_rate": cgst_rate_percent_or_null,
+  "sgst_rate": sgst_rate_percent_or_null,
+  "total_amount": GRAND_TOTAL_including_all_taxes,
+  "notes": "brief summary e.g. '5 items, cotton fabric' or null"
 }
 
-STRICT RULES:
-1. ZOOM and carefully read: seller block, buyer block, table header + every row, grand total
-2. supplier_name: company name printed at the very top (e.g. 'Swami Enterprises')
-3. supplier_gstin: seller GSTIN — different from buyer GSTIN — at top near seller name
-4. party_name: the buyer/consignee name if shown — can be null for cash bills
-5. ALL items: read EVERY numbered row in the items table — do not skip any
-6. total_amount: the final Grand Total rupee amount at the bottom of the invoice
-7. Dates: convert dd-Mon-yyyy or dd/mm/yyyy → YYYY-MM-DD (e.g. 1-Apr-2026 → 2026-04-01)
-8. Numbers: plain digits ONLY — NO ₹, NO commas (e.g. 147630 not 1,47,630)
-9. Do NOT invent data — if a field is truly not present, use null
-10. Return ONLY the JSON object starting with { — nothing before or after`;
+Rules: numbers without ₹ or commas (147630 not 1,47,630). Dates as YYYY-MM-DD. Read every item row. total_amount is the final Grand Total.`;
 
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        model: 'claude-haiku-4-5',
+        max_tokens: 1500,
         messages: [{
           role: 'user',
           content: [
-            { type: 'text', text: prompt },
-            { type: 'image_url', image_url: { url: `data:${mimeType};base64,${image}` } },
+            { type: 'image', source: { type: 'base64', media_type: mimeType, data: image } },
+            { type: 'text', text: prompt }
           ]
-        }],
-        max_tokens: 2000,
-        temperature: 0,
+        }]
       })
     });
 
-    const groqData = await response.json();
-    const rawText = groqData.choices?.[0]?.message?.content || '';
-    console.log('=== PURCHASES SCAN RAW ===', JSON.stringify({ ok: response.ok, status: response.status, raw: rawText.substring(0, 800), error: groqData.error }));
+    const aiData = await response.json();
+    const rawText = aiData.content?.[0]?.text || '';
+    console.log('=== PURCHASES SCAN RAW ===', JSON.stringify({ ok: response.ok, status: response.status, raw: rawText.substring(0, 500), error: aiData.error }));
+
     if (!response.ok) {
-      const errMsg = groqData.error?.message || '';
-      const isRateLimit = response.status === 429 || errMsg.toLowerCase().includes('rate limit') || errMsg.toLowerCase().includes('tokens per');
-      if (isRateLimit) {
-        return res.status(429).json({ error: 'rate_limit', details: 'AI daily scan limit reached. Try again tomorrow or upgrade GROQ plan.' });
-      }
-      return res.status(500).json({ error: 'AI scan failed', details: errMsg || 'Unknown', _raw: rawText });
+      const errMsg = aiData.error?.message || '';
+      console.error('Purchases scan AI error:', errMsg);
+      return res.status(500).json({ error: 'AI scan failed', details: errMsg || 'Unknown' });
     }
 
     let extracted = {};
@@ -5747,80 +5727,68 @@ app.post('/api/sales/scan', authMiddleware, async (req, res) => {
   try {
     const { image, mimeType = 'image/jpeg' } = req.body;
     if (!image) return res.status(400).json({ error: 'image is required' });
-    if (!process.env.GROQ_API_KEY) return res.status(503).json({ error: 'AI not configured' });
+    if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: 'AI not configured' });
 
-    const prompt = `You are an expert OCR system for Indian tax invoices and GST bills. You have PERFECT vision — zoom into every section of this image and read even the smallest printed text.
+    const prompt = `You are an expert OCR system for Indian tax invoices and GST bills.
 
-Look carefully at the ENTIRE invoice image. Read the header, address blocks, table rows, and footer. Then return ONLY a valid JSON object starting with { — no explanation, no markdown.
+Read the ENTIRE invoice image carefully: seller header at top, buyer block, invoice number + date, items table with ALL rows, and totals at bottom.
 
-Return exactly this structure:
+Return ONLY a valid JSON object — no explanation, no markdown, no text before or after.
+
 {
-  "customer_name": "BUYER company name from 'Buyer:' or 'Bill To:' section. If no buyer name visible, use 'Cash Sale'",
-  "customer_gstin": "BUYER GSTIN/UIN — the 15-character alphanumeric code in the Buyer section (string or null)",
-  "seller_gstin": "SELLER GSTIN/UIN — the 15-character code near the seller letterhead at the TOP of the invoice (string or null)",
-  "supplier_name": "SELLER / FROM business name — the company name printed at the very top of the invoice (string)",
-  "invoice_number": "exact value of Invoice No / Bill No / Tax Invoice No field (string or null)",
-  "sale_date": "the date printed on this invoice in YYYY-MM-DD format (string or null)",
-  "due_date": "payment due date in YYYY-MM-DD if explicitly shown (string or null)",
-  "items": [
-    {
-      "description": "full product/item name exactly as printed",
-      "hsn_sac": "HSN or SAC code — the numeric code in the HSN/SAC column (string or null)",
-      "qty": quantity as a number (e.g. 11 for '11 set'),
-      "unit": "unit string like SET/PCS/KG/MTR/NOS/UNT",
-      "price": unit Rate/Price as a plain number,
-      "amount": line Amount/Total as a plain number
-    }
-  ],
-  "subtotal": taxable amount before GST as number or null,
-  "gst_rate": GST % rate as number (e.g. 5 or 18) or null,
-  "gst_amount": total tax amount as number or null,
-  "igst_amount": IGST amount if present as number or null,
-  "cgst_amount": CGST / Input CGST / Output CGST amount as number or null,
-  "sgst_amount": SGST / Input SGST / Output SGST amount as number or null,
-  "igst_rate": IGST rate % as number or null,
-  "cgst_rate": CGST rate % as number or null,
-  "sgst_rate": SGST rate % as number or null,
-  "total_amount": the GRAND TOTAL / final payable amount including all taxes as number,
-  "notes": "brief summary of what was sold e.g. 'JK sewing machines, 19 sets' (string or null)"
+  "customer_name": "BUYER company/person name from Buyer/Bill To/Party section. If no buyer visible use 'Cash Sale'",
+  "customer_gstin": "BUYER GSTIN — 15-char code in buyer block (or null)",
+  "seller_gstin": "SELLER GSTIN — 15-char code near seller name at TOP (or null)",
+  "supplier_name": "SELLER business name at very top of invoice",
+  "invoice_number": "Invoice No / Bill No / Tax Invoice No exact value (or null)",
+  "sale_date": "invoice date as YYYY-MM-DD (or null)",
+  "due_date": "payment due date as YYYY-MM-DD if shown (or null)",
+  "items": [{ "description": "item name", "hsn_sac": "HSN code or null", "qty": number, "unit": "PCS/KG/SET/etc", "price": unit_rate_number, "amount": line_total_number }],
+  "subtotal": taxable_amount_before_gst_or_null,
+  "gst_rate": gst_percent_number_or_null,
+  "gst_amount": total_tax_number_or_null,
+  "igst_amount": igst_amount_or_null,
+  "cgst_amount": cgst_amount_or_null,
+  "sgst_amount": sgst_amount_or_null,
+  "igst_rate": igst_rate_or_null,
+  "cgst_rate": cgst_rate_or_null,
+  "sgst_rate": sgst_rate_or_null,
+  "total_amount": GRAND_TOTAL_including_all_taxes,
+  "notes": "brief summary e.g. '19 sewing machines, JK brand' or null"
 }
 
-STRICT RULES — follow exactly:
-1. ZOOM and read every part: seller block top-left, buyer block, invoice no + date top-right, items table, totals at bottom
-2. customer_name: look for 'Buyer', 'Bill To', 'Consignee', 'Party'. If truly absent → use "Cash Sale"
-3. seller_gstin: the GSTIN in the seller/from block at top (different from buyer GSTIN)
-4. customer_gstin: the GSTIN in the buyer/bill-to block
-5. ALL items in the table: read every numbered row — qty, HSN, rate, amount
-6. total_amount: the largest/final rupee figure at the bottom (Grand Total / Net Amount)
-7. Dates: convert dd-Mon-yyyy or dd/mm/yyyy → YYYY-MM-DD
-8. Numbers: plain digits only — NO ₹ symbol, NO commas (e.g. 147630 not 1,47,630)
-9. Do NOT skip items, do NOT invent data, do NOT leave total_amount as null if any amount is visible
-10. Return ONLY the JSON object starting with { — nothing before or after`;
+Rules: numbers without ₹ or commas (147630 not 1,47,630). Dates as YYYY-MM-DD. Read ALL item rows. total_amount must never be null if any amount visible.`;
 
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
       body: JSON.stringify({
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-        messages: [{ role: 'user', content: [
-          { type: 'text', text: prompt },
-          { type: 'image_url', image_url: { url: `data:${mimeType};base64,${image}` } },
-        ]}],
-        max_tokens: 2000,
-        temperature: 0,
+        model: 'claude-haiku-4-5',
+        max_tokens: 1500,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: mimeType, data: image } },
+            { type: 'text', text: prompt }
+          ]
+        }]
       })
     });
-    const groqData = await response.json();
-    const rawText = groqData.choices?.[0]?.message?.content || '';
-    console.log('=== SALES SCAN RAW ===', JSON.stringify({ ok: response.ok, status: response.status, raw: rawText.substring(0, 800), error: groqData.error }));
+
+    const aiData = await response.json();
+    const rawText = aiData.content?.[0]?.text || '';
+    console.log('=== SALES SCAN RAW ===', JSON.stringify({ ok: response.ok, status: response.status, raw: rawText.substring(0, 500), error: aiData.error }));
+
     if (!response.ok) {
-      const errMsg = groqData.error?.message || '';
-      const isRateLimit = response.status === 429 || errMsg.toLowerCase().includes('rate limit') || errMsg.toLowerCase().includes('tokens per');
-      if (isRateLimit) {
-        return res.status(429).json({ error: 'rate_limit', details: 'AI daily scan limit reached. Try again tomorrow or upgrade GROQ plan.' });
-      }
-      return res.status(500).json({ error: 'AI scan failed', details: errMsg || 'Unknown', _raw: rawText });
+      const errMsg = aiData.error?.message || '';
+      console.error('Sales scan AI error:', errMsg);
+      return res.status(500).json({ error: 'AI scan failed', details: errMsg || 'Unknown' });
     }
+
     let extracted = {};
     try {
       const m = rawText.match(/\{[\s\S]*\}/);
