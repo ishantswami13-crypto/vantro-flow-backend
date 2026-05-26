@@ -5534,27 +5534,42 @@ app.post('/api/purchases/scan', authMiddleware, async (req, res) => {
     if (!image) return res.status(400).json({ error: 'image is required' });
     if (!process.env.GROQ_API_KEY) return res.status(503).json({ error: 'AI not configured' });
 
-    const prompt = `You are an expert at reading Indian purchase bills, invoices, and challans.
-Extract information from this bill image and return ONLY a valid JSON object, no explanation or extra text.
+    const prompt = `You are an expert at reading Indian purchase bills, tax invoices, and challans.
+Extract ALL information from this bill and return ONLY a valid JSON object. No explanation, no markdown, just raw JSON.
 
 Return exactly this structure:
 {
-  "supplier_name": "seller/vendor business name (string, required — look at the top of the bill)",
-  "bill_number": "invoice/bill/challan number (string or null)",
-  "purchase_date": "date in YYYY-MM-DD format (string or null)",
-  "due_date": "payment due date in YYYY-MM-DD format if visible (string or null)",
-  "total_amount": "final total amount as a plain number without rupee symbol (number or null)",
-  "gst_amount": "GST or tax amount if shown as a plain number (number or null)",
-  "notes": "short summary of main items purchased, max 80 chars (string or null)"
+  "supplier_name": "seller business name from top of bill (string)",
+  "supplier_gstin": "seller GSTIN if visible (string or null)",
+  "party_name": "buyer/party name if shown (string or null)",
+  "bill_number": "Invoice No / Bill No / Challan No value (string or null)",
+  "purchase_date": "invoice date in YYYY-MM-DD format (string or null)",
+  "due_date": "payment due date in YYYY-MM-DD if visible (string or null)",
+  "items": [
+    {
+      "description": "full item/product name and model",
+      "hsn_sac": "HSN or SAC code as string",
+      "qty": numeric quantity as number,
+      "unit": "unit like PCS/SET/KG/MTR/BOX/NOS",
+      "price": unit price as number,
+      "amount": line total amount as number
+    }
+  ],
+  "subtotal": taxable amount before GST as number or null,
+  "gst_rate": "GST rate like 18% or 5% (string or null)",
+  "gst_amount": total GST/tax amount as number or null,
+  "total_amount": GRAND TOTAL including all taxes as number,
+  "notes": "short summary of what was purchased, max 100 chars (string or null)"
 }
 
-Tips:
-- supplier_name: The seller's business at the TOP — not the buyer
-- bill_number: Look for labels like Invoice No, Bill No, Challan No, Ref No
-- purchase_date: Labels like Date, Invoice Date, Bill Date — convert to YYYY-MM-DD
-- total_amount: The FINAL grand total including all taxes — just the number
-- If a field is unclear or not visible, use null
-- Return ONLY the JSON, nothing else`;
+CRITICAL RULES:
+- supplier_name: The SELLER at top of bill, NOT the buyer/party
+- items: Extract EVERY line item from the goods table — description, HSN, qty, unit, price, amount
+- total_amount: The GRAND TOTAL / Final amount — must be a plain number like 147630
+- All monetary values: plain numbers only, NO ₹ symbol, NO commas
+- If any field is not visible, use null
+- items array must be complete — don't skip any line
+- Return ONLY the raw JSON object, nothing else`;
 
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
