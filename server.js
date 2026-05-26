@@ -5478,46 +5478,87 @@ app.delete('/api/khata/entry/:id', authMiddleware, async (req, res) => {
 app.get('/api/purchases', authMiddleware, async (req, res) => {
   try {
     const { status } = req.query;
-    let q = supabase.from('purchases').select('*').eq('user_id', req.user.userId).order('due_date', { ascending: true });
+    let q = supabase.from('purchases').select('*').eq('user_id', req.user.userId).order('purchase_date', { ascending: false });
     if (status) q = q.eq('status', status);
     const { data, error } = await q;
     if (error) throw error;
-    res.json({ success: true, purchases: data || [] });
+    // Normalize: DB stores as 'amount', frontend expects 'total_amount'
+    const purchases = (data || []).map(p => ({ ...p, total_amount: p.total_amount ?? p.amount ?? 0 }));
+    res.json({ success: true, purchases });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/purchases', authMiddleware, async (req, res) => {
   try {
-    const { supplier_name, amount, due_date, description, category, supplier_gstin, notes } = req.body;
-    if (!supplier_name || !amount) return res.status(400).json({ error: 'supplier_name and amount required' });
-    const { data, error } = await supabase.from('purchases').insert([{
-      user_id: req.user.userId, supplier_name, amount: parseFloat(amount), paid_amount: 0,
-      due_date: due_date || null, description: description || null,
-      category: category || 'material', supplier_gstin: supplier_gstin || null,
-      notes: notes || null, status: 'unpaid', purchase_date: new Date().toISOString().split('T')[0],
-      created_at: new Date(),
-    }]).select().single();
+    const {
+      supplier_name,
+      total_amount, amount,           // frontend sends total_amount, old API sent amount
+      supplier_phone, bill_number,
+      purchase_date, due_date,
+      paid_amount, notes,
+      category, supplier_gstin, description,
+    } = req.body;
+
+    const finalAmount = parseFloat(total_amount || amount || 0);
+    if (!supplier_name || !finalAmount) {
+      return res.status(400).json({ error: 'supplier_name and total_amount are required' });
+    }
+    const finalPaid   = parseFloat(paid_amount || 0);
+    const autoStatus  = finalPaid >= finalAmount ? 'paid' : finalPaid > 0 ? 'partial' : 'unpaid';
+
+    const row = {
+      user_id:        req.user.userId,
+      supplier_name,
+      amount:         finalAmount,         // DB column is 'amount'
+      paid_amount:    finalPaid,
+      status:         autoStatus,
+      purchase_date:  purchase_date  || new Date().toISOString().split('T')[0],
+      due_date:       due_date       || null,
+      notes:          notes          || null,
+      description:    description    || null,
+      category:       category       || 'material',
+      supplier_gstin: supplier_gstin || null,
+      created_at:     new Date(),
+    };
+    // Add optional columns only if they exist on the table
+    if (bill_number    !== undefined) row.bill_number    = bill_number    || null;
+    if (supplier_phone !== undefined) row.supplier_phone = supplier_phone || null;
+
+    const { data, error } = await supabase.from('purchases').insert([row]).select().single();
     if (error) throw error;
-    res.json({ success: true, purchase: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+    res.json({ success: true, purchase: { ...data, total_amount: data.total_amount ?? data.amount } });
+  } catch (err) {
+    console.error('Purchase create error:', err);
+    res.status(500).json({ error: 'Internal server error', detail: err.message });
+  }
 });
 
 app.patch('/api/purchases/:id', authMiddleware, async (req, res) => {
   try {
-    const updates = req.body;
+    const updates = { ...req.body };
+
+    // Map total_amount → amount for DB column
+    if (updates.total_amount !== undefined) {
+      updates.amount = parseFloat(updates.total_amount);
+      delete updates.total_amount;
+    }
+
     // Auto-update status based on paid_amount
     if (updates.paid_amount !== undefined) {
       const { data: existing } = await supabase.from('purchases').select('amount').eq('id', req.params.id).single();
       if (existing) {
-        const paid = parseFloat(updates.paid_amount);
-        const total = parseFloat(existing.amount);
+        const paid  = parseFloat(updates.paid_amount);
+        const total = parseFloat(updates.amount ?? existing.amount);
         updates.status = paid >= total ? 'paid' : paid > 0 ? 'partial' : 'unpaid';
       }
     }
     const { data, error } = await supabase.from('purchases').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
-    res.json({ success: true, purchase: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+    res.json({ success: true, purchase: { ...data, total_amount: data.total_amount ?? data.amount } });
+  } catch (err) {
+    console.error('Purchase patch error:', err);
+    res.status(500).json({ error: 'Internal server error', detail: err.message });
+  }
 });
 
 app.delete('/api/purchases/:id', authMiddleware, async (req, res) => {
