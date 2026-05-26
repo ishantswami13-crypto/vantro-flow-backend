@@ -3523,6 +3523,24 @@ function adminOnly(req, res, next) {
   }
 }
 
+// ── TEMP: one-time pro account creator (remove after use) ──
+app.post('/api/admin/create-pro-user', async (req, res) => {
+  if (req.headers['x-admin-secret'] !== 'vantro-setup-2026') return res.status(403).json({ error: 'Forbidden' });
+  const { email, phone, business_name, password } = req.body;
+  if (!email || !phone || !business_name || !password) return res.status(400).json({ error: 'All fields required' });
+  try {
+    const password_hash = await bcrypt.hash(password, 12);
+    const { data: user, error } = await supabase.from('users').insert({
+      email, phone, business_name, password_hash,
+      plan: 'pro', phone_verified: true, email_verified: true,
+      created_at: new Date(),
+    }).select('id, email, business_name, plan').single();
+    if (error) return res.status(400).json({ error: error.message });
+    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '90d' });
+    res.json({ success: true, user, token });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/admin/stats', adminOnly, async (req, res) => {
   try {
     const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
