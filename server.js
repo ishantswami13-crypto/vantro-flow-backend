@@ -5477,25 +5477,28 @@ app.delete('/api/khata/entry/:id', authMiddleware, async (req, res) => {
 
 app.get('/api/purchases', authMiddleware, async (req, res) => {
   try {
+    const pool = getPool();
     const { status } = req.query;
-    let q = supabase.from('purchases').select('*').eq('user_id', req.user.userId).order('purchase_date', { ascending: false });
-    if (status) q = q.eq('status', status);
-    const { data, error } = await q;
-    if (error) throw error;
-    // Normalize: DB stores as 'amount', frontend expects 'total_amount'
-    const purchases = (data || []).map(p => ({ ...p, total_amount: p.total_amount ?? p.amount ?? 0 }));
+    let sql    = 'SELECT * FROM purchases WHERE user_id=$1';
+    const vals = [req.user.userId];
+    if (status) { sql += ` AND status=$${vals.length+1}`; vals.push(status); }
+    sql += ' ORDER BY purchase_date DESC';
+    const { rows } = await pool.query(sql, vals);
+    const purchases = rows.map(p => ({ ...p, total_amount: parseFloat(p.amount) || 0 }));
     res.json({ success: true, purchases });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) {
+    console.error('GET purchases error:', err.message);
+    res.status(500).json({ error: 'Internal server error', detail: err.message });
+  }
 });
 
 app.post('/api/purchases', authMiddleware, async (req, res) => {
   try {
+    const pool = getPool();
     const {
-      supplier_name,
-      total_amount, amount,
+      supplier_name, total_amount, amount,
       supplier_phone, bill_number,
-      purchase_date, due_date,
-      paid_amount, notes,
+      purchase_date, due_date, paid_amount, notes,
     } = req.body;
 
     const finalAmount = parseFloat(total_amount || amount || 0);
@@ -5505,77 +5508,76 @@ app.post('/api/purchases', authMiddleware, async (req, res) => {
     const finalPaid  = parseFloat(paid_amount || 0);
     const autoStatus = finalPaid >= finalAmount ? 'paid' : finalPaid > 0 ? 'partial' : 'unpaid';
 
-    // Build notes — embed bill_number and phone since those columns may not exist in DB yet
-    let fullNotes = notes || null;
-    const extras = [];
-    if (bill_number)    extras.push(`Bill: ${bill_number}`);
-    if (supplier_phone) extras.push(`Ph: ${supplier_phone}`);
-    if (extras.length)  fullNotes = extras.join(' | ') + (fullNotes ? ' | ' + fullNotes : '');
-
-    const { data, error } = await supabase.from('purchases').insert([{
-      user_id:       req.user.userId,
-      supplier_name,
-      amount:        finalAmount,
-      paid_amount:   finalPaid,
-      status:        autoStatus,
-      purchase_date: purchase_date || new Date().toISOString().split('T')[0],
-      due_date:      due_date      || null,
-      notes:         fullNotes,
-      description:   bill_number   || null,
-      category:      'material',
-      created_at:    new Date(),
-    }]).select().single();
-
-    if (error) {
-      console.error('Supabase insert error:', error);
-      return res.status(500).json({ error: 'DB error', detail: error.message });
-    }
-    res.json({ success: true, purchase: { ...data, total_amount: data.amount } });
+    const { rows } = await pool.query(
+      `INSERT INTO purchases
+         (user_id, supplier_name, amount, paid_amount, status, purchase_date, due_date,
+          bill_number, supplier_phone, notes, category, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'material',NOW())
+       RETURNING *`,
+      [
+        req.user.userId, supplier_name, finalAmount, finalPaid, autoStatus,
+        purchase_date || new Date().toISOString().split('T')[0],
+        due_date || null,
+        bill_number || null, supplier_phone || null, notes || null,
+      ]
+    );
+    const p = rows[0];
+    res.json({ success: true, purchase: { ...p, total_amount: parseFloat(p.amount) } });
   } catch (err) {
-    console.error('Purchase create error:', err);
+    console.error('Purchase create error:', err.message);
     res.status(500).json({ error: 'Internal server error', detail: err.message });
   }
 });
 
 app.patch('/api/purchases/:id', authMiddleware, async (req, res) => {
   try {
-    // Only update columns that actually exist in the DB
-    const allowed = ['supplier_name', 'amount', 'paid_amount', 'status', 'purchase_date', 'due_date', 'notes', 'description', 'category', 'supplier_gstin'];
-    const updates = {};
-    for (const key of allowed) {
-      if (req.body[key] !== undefined) updates[key] = req.body[key];
-    }
+    const pool = getPool();
+    const { total_amount, amount, paid_amount, supplier_name, purchase_date, due_date, notes, bill_number, supplier_phone } = req.body;
 
-    // Map total_amount → amount
-    if (req.body.total_amount !== undefined) {
-      updates.amount = parseFloat(req.body.total_amount);
-    }
+    const finalAmount = total_amount !== undefined ? parseFloat(total_amount) : amount !== undefined ? parseFloat(amount) : null;
+    const finalPaid   = paid_amount  !== undefined ? parseFloat(paid_amount)  : null;
 
-    // Auto-update status based on paid_amount
-    if (updates.paid_amount !== undefined) {
-      const { data: existing } = await supabase.from('purchases').select('amount').eq('id', req.params.id).single();
-      if (existing) {
-        const paid  = parseFloat(updates.paid_amount);
-        const total = parseFloat(updates.amount ?? existing.amount);
-        updates.status = paid >= total ? 'paid' : paid > 0 ? 'partial' : 'unpaid';
-      }
-    }
+    // Get current record to compute status
+    const { rows: cur } = await pool.query('SELECT * FROM purchases WHERE id=$1 AND user_id=$2', [req.params.id, req.user.userId]);
+    if (!cur.length) return res.status(404).json({ error: 'Purchase not found' });
+    const current = cur[0];
 
-    const { data, error } = await supabase.from('purchases').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
-    if (error) {
-      console.error('Supabase patch error:', error);
-      return res.status(500).json({ error: 'DB error', detail: error.message });
-    }
-    res.json({ success: true, purchase: { ...data, total_amount: data.amount } });
+    const newAmount = finalAmount ?? parseFloat(current.amount);
+    const newPaid   = finalPaid   ?? parseFloat(current.paid_amount);
+    const newStatus = newPaid >= newAmount ? 'paid' : newPaid > 0 ? 'partial' : 'unpaid';
+
+    const { rows } = await pool.query(
+      `UPDATE purchases SET
+         supplier_name  = COALESCE($1, supplier_name),
+         amount         = $2,
+         paid_amount    = $3,
+         status         = $4,
+         purchase_date  = COALESCE($5, purchase_date),
+         due_date       = COALESCE($6, due_date),
+         notes          = COALESCE($7, notes),
+         bill_number    = COALESCE($8, bill_number),
+         supplier_phone = COALESCE($9, supplier_phone)
+       WHERE id=$10 AND user_id=$11
+       RETURNING *`,
+      [
+        supplier_name || null, newAmount, newPaid, newStatus,
+        purchase_date || null, due_date || null, notes || null,
+        bill_number || null, supplier_phone || null,
+        req.params.id, req.user.userId,
+      ]
+    );
+    const p = rows[0];
+    res.json({ success: true, purchase: { ...p, total_amount: parseFloat(p.amount) } });
   } catch (err) {
-    console.error('Purchase patch error:', err);
+    console.error('Purchase patch error:', err.message);
     res.status(500).json({ error: 'Internal server error', detail: err.message });
   }
 });
 
 app.delete('/api/purchases/:id', authMiddleware, async (req, res) => {
   try {
-    await supabase.from('purchases').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
+    const pool = getPool();
+    await pool.query('DELETE FROM purchases WHERE id=$1 AND user_id=$2', [req.params.id, req.user.userId]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
@@ -6470,6 +6472,32 @@ async function runAutoMigrations() {
   try {
     client = await pgPool.connect();
     await client.query(`
+      -- ── purchases table (create if missing) ──────────────────────────────
+      CREATE TABLE IF NOT EXISTS public.purchases (
+        id             BIGSERIAL PRIMARY KEY,
+        user_id        UUID        NOT NULL,
+        supplier_name  TEXT        NOT NULL,
+        amount         NUMERIC(14,2) NOT NULL DEFAULT 0,
+        paid_amount    NUMERIC(14,2) NOT NULL DEFAULT 0,
+        status         TEXT        NOT NULL DEFAULT 'unpaid',
+        purchase_date  DATE        NOT NULL DEFAULT CURRENT_DATE,
+        due_date       DATE,
+        notes          TEXT,
+        description    TEXT,
+        category       TEXT        DEFAULT 'material',
+        supplier_gstin TEXT,
+        bill_number    TEXT,
+        supplier_phone TEXT,
+        created_at     TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_purchases_user ON public.purchases(user_id);
+      CREATE INDEX IF NOT EXISTS idx_purchases_status ON public.purchases(user_id, status);
+
+      -- ── purchases: add any missing columns to existing table ─────────────
+      ALTER TABLE public.purchases ADD COLUMN IF NOT EXISTS bill_number    TEXT;
+      ALTER TABLE public.purchases ADD COLUMN IF NOT EXISTS supplier_phone TEXT;
+      ALTER TABLE public.purchases ADD COLUMN IF NOT EXISTS description    TEXT;
+
       -- invoices: automation tracking columns
       ALTER TABLE invoices ADD COLUMN IF NOT EXISTS snooze_until       TIMESTAMPTZ;
       ALTER TABLE invoices ADD COLUMN IF NOT EXISTS last_reminder_sent TIMESTAMPTZ;
