@@ -162,6 +162,32 @@ function requireOwner(req, res, next) {
   next();
 }
 
+function authenticatedUserId(req) {
+  return req.user?.userId || req.user?.id || null;
+}
+
+function isAdminEmail(email) {
+  const admins = (process.env.ADMIN_EMAILS || '')
+    .split(',')
+    .map(e => e.trim().toLowerCase())
+    .filter(Boolean);
+  return admins.includes(String(email || '').toLowerCase());
+}
+
+function requireAdmin(req, res, next) {
+  authMiddleware(req, res, () => {
+    if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: 'Forbidden' });
+    next();
+  });
+}
+
+function pickAllowed(source, allowed) {
+  return allowed.reduce((out, key) => {
+    if (source[key] !== undefined) out[key] = source[key];
+    return out;
+  }, {});
+}
+
 // Module-level pg pool — reused across all requests (avoids per-request connection churn)
 let pgPool = null;
 if (process.env.DATABASE_URL) {
@@ -299,7 +325,10 @@ if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
   razorpay = new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET });
 }
 
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024, files: 1 },
+});
 
 // Web Push — VAPID
 if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
@@ -1474,9 +1503,11 @@ app.post('/api/call/:callId/update', authMiddleware, async (req, res) => {
       .from('call_logs')
       .update({ notes, did_pick_up, promised_payment_date, promised_amount, call_duration_minutes })
       .eq('id', callId)
+      .eq('user_id', req.user.userId)
       .select();
 
     if (error) throw error;
+    if (!data?.length) return res.status(404).json({ error: 'Call log not found' });
 
     res.json({ success: true, log: data[0] });
   } catch (error) {
@@ -1681,42 +1712,33 @@ app.get('/api/inventory/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
     await ensureConnectedBusinessData(userId);
-    const [{ data: products }, { data: movements }] = await Promise.all([
+    const [{ data: products }, { data: movements }, summary] = await Promise.all([
       supabase.from('products').select('*').eq('user_id', userId).order('name'),
-      supabase.from('stock_movements').select('*').eq('user_id', userId).order('moved_at', { ascending: false }).limit(50)
+      supabase.from('stock_movements').select('*').eq('user_id', userId).order('moved_at', { ascending: false }).limit(50),
+      calculateInventorySummary(userId)
     ]);
-
-    const safeProducts = products || [];
-    const totalValue = safeProducts.reduce((s, p) => s + Number(p.current_stock) * Number(p.unit_price), 0);
-    const lowStock = safeProducts.filter(p => p.current_stock > 0 && p.current_stock <= p.low_stock_alert);
-    const outOfStock = safeProducts.filter(p => p.current_stock === 0);
 
     res.json({
       success: true,
-      products: safeProducts,
+      products: products || [],
       movements: movements || [],
-      summary: {
-        total_products: safeProducts.length,
-        total_value: totalValue,
-        low_stock_count: lowStock.length,
-        out_of_stock_count: outOfStock.length,
-        low_stock_items: lowStock,
-        out_of_stock_items: outOfStock
-      }
+      summary
     });
   } catch (error) {
+    console.error('[inventory list endpoint]', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 app.post('/api/products', authMiddleware, async (req, res) => {
   try {
-    const { user_id, name, sku, description, unit_price, unit, current_stock, low_stock_alert, category } = req.body;
-    if (!user_id || !name) return res.status(400).json({ error: 'user_id and name required' });
+    const userId = authenticatedUserId(req);
+    const { name, sku, description, unit_price, unit, current_stock, low_stock_alert, category } = req.body;
+    if (!userId || !name) return res.status(400).json({ error: 'name required' });
 
     const { data, error } = await supabase
       .from('products')
-      .insert([{ user_id, name, sku: sku || null, description: description || null, unit_price: unit_price || 0, unit: unit || 'unit', current_stock: current_stock || 0, low_stock_alert: low_stock_alert || 10, category: category || null }])
+      .insert([{ user_id: userId, name, sku: sku || null, description: description || null, unit_price: unit_price || 0, unit: unit || 'unit', current_stock: current_stock || 0, low_stock_alert: low_stock_alert || 10, category: category || null }])
       .select();
 
     if (error) throw error;
@@ -1735,9 +1757,11 @@ app.post('/api/products/:productId', authMiddleware, async (req, res) => {
       .from('products')
       .update({ name, sku, description, unit_price, unit, low_stock_alert, category, updated_at: new Date() })
       .eq('id', productId)
+      .eq('user_id', req.user.userId)
       .select();
 
     if (error) throw error;
+    if (!data?.length) return res.status(404).json({ error: 'Product not found' });
     res.json({ success: true, product: data[0] });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
@@ -1747,7 +1771,7 @@ app.post('/api/products/:productId', authMiddleware, async (req, res) => {
 app.post('/api/products/:productId/delete', authMiddleware, async (req, res) => {
   try {
     const { productId } = req.params;
-    const { error } = await supabase.from('products').delete().eq('id', productId);
+    const { error } = await supabase.from('products').delete().eq('id', productId).eq('user_id', req.user.userId);
     if (error) throw error;
     res.json({ success: true });
   } catch (error) {
@@ -1759,26 +1783,30 @@ app.post('/api/products/:productId/delete', authMiddleware, async (req, res) => 
 
 app.post('/api/stock/move', authMiddleware, async (req, res) => {
   try {
-    const { user_id, product_id, movement_type, quantity, unit_cost, reference, notes } = req.body;
-    if (!user_id || !product_id || !movement_type || !quantity) {
+    const userId = authenticatedUserId(req);
+    const { product_id, movement_type, quantity, unit_cost, reference, notes } = req.body;
+    if (!userId || !product_id || !movement_type || !quantity) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
     const qty = parseInt(quantity);
+    if (!Number.isFinite(qty) || qty <= 0) return res.status(400).json({ error: 'quantity must be greater than zero' });
+    if (!['in', 'out'].includes(movement_type)) return res.status(400).json({ error: 'movement_type must be in or out' });
     const delta = movement_type === 'in' ? qty : -qty;
 
     const { data: product, error: fetchErr } = await supabase
-      .from('products').select('current_stock').eq('id', product_id).single();
+      .from('products').select('current_stock').eq('id', product_id).eq('user_id', userId).single();
     if (fetchErr) throw fetchErr;
+    if (!product) return res.status(404).json({ error: 'Product not found' });
 
     const newStock = Math.max(0, (product.current_stock || 0) + delta);
 
     const [{ data: movement, error: movErr }, { error: updateErr }] = await Promise.all([
       supabase.from('stock_movements').insert([{
-        user_id, product_id, movement_type, quantity: qty,
+        user_id: userId, product_id, movement_type, quantity: qty,
         unit_cost: unit_cost || null, reference: reference || null, notes: notes || null
       }]).select(),
-      supabase.from('products').update({ current_stock: newStock, updated_at: new Date() }).eq('id', product_id)
+      supabase.from('products').update({ current_stock: newStock, updated_at: new Date() }).eq('id', product_id).eq('user_id', userId)
     ]);
 
     if (movErr) throw movErr;
@@ -2178,13 +2206,68 @@ async function calculateInventorySummary(userId) {
   const lowStock = safeProducts.filter(p => p.current_stock > 0 && p.current_stock <= p.low_stock_alert);
   const outOfStock = safeProducts.filter(p => p.current_stock === 0);
 
+  // Fast-moving products (past 30 days)
+  const thirtyDaysAgo = new Date(); thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+  const { data: recentOutMovements } = await supabase
+    .from('stock_movements')
+    .select('product_id, quantity')
+    .eq('user_id', userId)
+    .eq('movement_type', 'out')
+    .gte('moved_at', thirtyDaysAgo.toISOString());
+
+  const fastMovingMap = {};
+  (recentOutMovements || []).forEach(m => {
+    fastMovingMap[m.product_id] = (fastMovingMap[m.product_id] || 0) + Number(m.quantity || 0);
+  });
+  const fastMovingItems = safeProducts
+    .filter(p => fastMovingMap[p.id] > 0)
+    .map(p => ({
+      product_id: p.id,
+      name: p.name,
+      sku: p.sku,
+      unit: p.unit,
+      quantity_sold_30d: fastMovingMap[p.id],
+      value_sold_30d: fastMovingMap[p.id] * Number(p.unit_price || 0)
+    }))
+    .sort((a, b) => b.quantity_sold_30d - a.quantity_sold_30d)
+    .slice(0, 5);
+
+  // Dead stock (no movements in past 60 days)
+  const sixtyDaysAgo = new Date(); sixtyDaysAgo.setDate(sixtyDaysAgo.getDate() - 60);
+  const { data: recentMovements } = await supabase
+    .from('stock_movements')
+    .select('product_id')
+    .eq('user_id', userId)
+    .gte('moved_at', sixtyDaysAgo.toISOString());
+
+  const movedProductIds = new Set((recentMovements || []).map(m => m.product_id));
+  const deadStock = safeProducts.filter(p => !movedProductIds.has(p.id) && Number(p.current_stock) > 0);
+
+  // Reorder suggestions
+  const reorderSuggestions = [...lowStock, ...outOfStock].map(p => {
+    const recommendedQty = Math.max(50, Number(p.low_stock_alert || 10) * 2);
+    return {
+      product_id: p.id,
+      name: p.name,
+      sku: p.sku,
+      current_stock: p.current_stock,
+      low_stock_alert: p.low_stock_alert,
+      unit: p.unit,
+      recommended_reorder_qty: recommendedQty,
+      estimated_cost: recommendedQty * Number(p.unit_price || 0)
+    };
+  });
+
   return {
     total_products: safeProducts.length,
     total_value: totalValue,
     low_stock_count: lowStock.length,
     out_of_stock_count: outOfStock.length,
     low_stock_items: lowStock,
-    out_of_stock_items: outOfStock
+    out_of_stock_items: outOfStock,
+    fast_moving_items: fastMovingItems,
+    dead_stock_items: deadStock,
+    reorder_suggestions: reorderSuggestions
   };
 }
 
@@ -2192,29 +2275,88 @@ async function calculateInventorySummary(userId) {
 async function calculateCollectionsSummary(userId) {
   const { data: invoices } = await supabase.from('invoices').select('*').eq('user_id', userId);
   const safeInvoices = invoices || [];
-  const totalOutstanding = safeInvoices.reduce(
-    (sum, inv) => sum + (inv.payment_status === 'Pending' ? calculateOutstanding(inv.invoice_amount, inv.payment_amount) : 0),
-    0
-  );
+  
+  let totalOutstanding = 0;
+  let dueToday = 0;
+  let overdue_1_7 = 0;
+  let overdue_8_30 = 0;
+  let overdue_31_60 = 0;
+  let overdue_60_plus = 0;
+  const criticalOverdueInvoices = [];
+  const pendingInvoices = [];
+
+  safeInvoices.forEach(inv => {
+    if (inv.payment_status === 'Pending') {
+      const outstanding = calculateOutstanding(inv.invoice_amount, inv.payment_amount);
+      if (outstanding > 0) {
+        totalOutstanding += outstanding;
+        pendingInvoices.push({ ...inv, outstanding });
+
+        const days = Number(inv.days_overdue || 0);
+        if (days <= 0) {
+          dueToday += outstanding;
+        } else if (days <= 7) {
+          overdue_1_7 += outstanding;
+        } else if (days <= 30) {
+          overdue_8_30 += outstanding;
+        } else if (days <= 60) {
+          overdue_31_60 += outstanding;
+        } else {
+          overdue_60_plus += outstanding;
+          criticalOverdueInvoices.push({ ...inv, outstanding });
+        }
+      }
+    }
+  });
+
   return {
     total_outstanding: totalOutstanding,
-    total_customers: new Set(safeInvoices.map(inv => inv.customer_name)).size,
-    most_overdue_days: Math.max(...safeInvoices.map(inv => inv.days_overdue || 0), 0)
+    total_customers: new Set(pendingInvoices.map(inv => inv.customer_name)).size,
+    most_overdue_days: Math.max(...safeInvoices.map(inv => inv.days_overdue || 0), 0),
+    buckets: {
+      due_today: dueToday,
+      overdue_1_7: overdue_1_7,
+      overdue_8_30: overdue_8_30,
+      overdue_31_60: overdue_31_60,
+      overdue_60_plus: overdue_60_plus
+    },
+    critical_overdue_count: criticalOverdueInvoices.length,
+    critical_overdue_items: criticalOverdueInvoices
   };
 }
 
 // ─── Shared Cash Flow Forecast Service ────────────────────────────────────────
 async function calculateCashFlowForecast(userId, current_cash = 0, days = 30) {
-  const [receivables, payables] = await Promise.all([
+  const [receivables, payables, bankTxnsResult] = await Promise.all([
     getReceivableRows(userId),
     getPayableRows(userId),
+    supabase.from('bank_transactions').select('*').eq('user_id', userId)
   ]);
 
-  const thirtyDaysAgo = new Date(); thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-  const recentPurchases = payables.filter((p) => p.purchase_date && p.purchase_date >= thirtyDaysAgo.toISOString().split('T')[0]);
+  const bankTxns = bankTxnsResult.error ? [] : bankTxnsResult.data || [];
+
+  const thirtyDaysAgo = new Date();
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+  const thirtyDaysAgoStr = thirtyDaysAgo.toISOString().split('T')[0];
+
+  // Calculate historical burn rate from actual bank debits
+  const recentDebits = bankTxns.filter((t) => t.type === 'debit' && t.txn_date && t.txn_date >= thirtyDaysAgoStr);
+  const totalDebitAmount = recentDebits.reduce((sum, t) => sum + Math.abs(Number(t.amount || 0)), 0);
+  const bankBurnRate = recentDebits.length > 0 ? Math.round(totalDebitAmount / 30) : null;
+
+  // Fallback to purchase burn rate
+  const recentPurchases = payables.filter((p) => p.purchase_date && p.purchase_date >= thirtyDaysAgoStr);
   const purchaseTotal = recentPurchases.reduce((s, p) => s + Number(p.amount || 0), 0);
   const totalPayable = payables.reduce((s, p) => s + Number(p.outstanding_amount || 0), 0);
-  const calculatedBurnRate = recentPurchases.length > 0 ? Math.round(purchaseTotal / 30) : Math.round(totalPayable / 30);
+  const purchaseBurnRate = recentPurchases.length > 0 ? Math.round(purchaseTotal / 30) : Math.round(totalPayable / 30);
+
+  // Real historical burn rate (prefer bank transaction debits, fallback to purchases)
+  const calculatedBurnRate = bankBurnRate !== null ? bankBurnRate : purchaseBurnRate;
+
+  // Calculate historical inflows from actual bank credits
+  const recentCredits = bankTxns.filter((t) => t.type === 'credit' && t.txn_date && t.txn_date >= thirtyDaysAgoStr);
+  const totalCreditAmount = recentCredits.reduce((sum, t) => sum + Math.abs(Number(t.amount || 0)), 0);
+  const bankInflowDaily = recentCredits.length > 0 ? Math.round(totalCreditAmount / 30) : null;
 
   const paid = receivables.filter(i => i.paid_amount > 0);
   const paidLast90 = paid.filter((i) => {
@@ -2228,7 +2370,8 @@ async function calculateCashFlowForecast(userId, current_cash = 0, days = 30) {
   const totalOutstanding = pending.reduce((s, i) => s + Number(i.outstanding_amount), 0);
   const totalOverdue30 = pending.filter(i => Number(i.days_overdue) >= 30).reduce((s, i) => s + Number(i.outstanding_amount), 0);
 
-  const avgDailyCollections = paidLast90.length > 0 ? Math.round(totalRecovered / 90) : Math.round(totalOutstanding * 0.03);
+  // Prefer bank transaction credits for actual daily inflows, fallback to historical collections average
+  const avgDailyCollections = bankInflowDaily !== null ? bankInflowDaily : (paidLast90.length > 0 ? Math.round(totalRecovered / 90) : Math.round(totalOutstanding * 0.03));
 
   const cashStart = Number(current_cash);
   const burnRate = calculatedBurnRate;
@@ -4108,6 +4251,13 @@ app.post('/api/prospects/:id/notes', authMiddleware, async (req, res) => {
   const { id } = req.params;
   try {
     const { text } = req.body;
+    const { data: prospect } = await supabase
+      .from('prospects')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', req.user.userId)
+      .maybeSingle();
+    if (!prospect) return res.status(404).json({ error: 'Prospect not found' });
     const { data, error } = await supabase
       .from('prospect_notes')
       .insert([{ prospect_id: id, text }])
@@ -4163,7 +4313,7 @@ app.get('/api/cash-forecast/:userId', requireOwner, async (req, res) => {
 // DB MIGRATION (safe to call multiple times)
 // ============================================
 
-app.post('/api/migrate', authMiddleware, async (req, res) => {
+app.post('/api/migrate', requireAdmin, async (req, res) => {
   const dbUrl = process.env.DATABASE_URL;
   if (!dbUrl) {
     return res.status(400).json({
@@ -4324,8 +4474,9 @@ async function groqChat(messages, tools, toolChoice = 'auto') {
 }
 
 app.post('/api/ai-chat', authMiddleware, async (req, res) => {
-  const { user_id, messages, business_name } = req.body;
-  if (!user_id || !messages) return res.status(400).json({ error: 'Missing user_id or messages' });
+  const { messages, business_name } = req.body;
+  const user_id = authenticatedUserId(req);
+  if (!user_id || !messages) return res.status(400).json({ error: 'Missing messages' });
 
   // Pre-fetch top 5 overdue invoices so first response is instant and data-aware
   let overdueContext = '';
@@ -4414,14 +4565,14 @@ Summarise actions clearly after doing them.${voiceContext}${overdueContext}`;
         case 'mark_invoice_paid': {
           let inv;
           if (args.invoice_id) {
-            const { data } = await supabase.from('invoices').select('id,customer_name,invoice_amount').eq('id',args.invoice_id).single();
+            const { data } = await supabase.from('invoices').select('id,customer_name,invoice_amount').eq('id',args.invoice_id).eq('user_id',user_id).single();
             inv = data;
           } else if (args.customer_name) {
             const { data } = await supabase.from('invoices').select('id,customer_name,invoice_amount').eq('user_id',user_id).ilike('customer_name',`%${args.customer_name}%`).eq('payment_status','Pending').order('days_overdue',{ascending:false}).limit(1);
             inv = data?.[0];
           }
           if (!inv) return { error: 'Invoice not found' };
-          await supabase.from('invoices').update({ payment_status:'Paid', payment_date:new Date().toISOString().split('T')[0], payment_amount:inv.invoice_amount }).eq('id',inv.id);
+          await supabase.from('invoices').update({ payment_status:'Paid', payment_date:new Date().toISOString().split('T')[0], payment_amount:inv.invoice_amount }).eq('id',inv.id).eq('user_id',user_id);
           actions.push(`✅ Marked ${inv.customer_name} invoice (₹${Number(inv.invoice_amount).toLocaleString('en-IN')}) as paid`);
           return { success:true, message:`Marked ${inv.customer_name} as paid`, amount:inv.invoice_amount };
         }
@@ -4443,7 +4594,7 @@ Summarise actions clearly after doing them.${voiceContext}${overdueContext}`;
           if (!p) return { error: `Prospect "${args.prospect_name}" not found` };
           const updates = { status:args.status, updated_at:new Date() };
           if (args.status==='trial') { updates.trial_start_date=new Date().toISOString().split('T')[0]; const e=new Date(); e.setDate(e.getDate()+14); updates.trial_end_date=e.toISOString().split('T')[0]; }
-          await supabase.from('prospects').update(updates).eq('id',p.id);
+          await supabase.from('prospects').update(updates).eq('id',p.id).eq('user_id',user_id);
           actions.push(`🔄 Moved ${p.name} → ${args.status}`);
           return { success:true, message:`${p.name} moved to ${args.status}` };
         }
@@ -4826,6 +4977,112 @@ app.post('/api/collections/bulk-remind', authMiddleware, async (req, res) => {
   }
 });
 
+// Collections Summary Engine
+app.get('/api/collections/summary/:userId', requireOwner, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    await ensureConnectedBusinessData(userId);
+    const summary = await calculateCollectionsSummary(userId);
+    res.json({ success: true, summary });
+  } catch (error) {
+    console.error('[collections summary endpoint]', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Collections Chronological Activity Timeline
+app.get('/api/collections/timeline/:userId', requireOwner, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    // Fetch calls, invoices, and activity logs
+    const [callsRes, invoicesRes, logsRes] = await Promise.all([
+      supabase.from('call_logs').select('*').eq('user_id', userId).order('called_at', { ascending: false }),
+      supabase.from('invoices').select('*').eq('user_id', userId).order('invoice_date', { ascending: false }),
+      supabase.from('activity_logs').select('*').eq('user_id', userId).order('created_at', { ascending: false }).limit(50),
+    ]);
+
+    const calls = callsRes.data || [];
+    const invoices = invoicesRes.data || [];
+    const logs = logsRes.data || [];
+
+    const timeline = [];
+
+    // Map calls to timeline entries
+    calls.forEach(c => {
+      timeline.push({
+        id: `call_${c.id}`,
+        type: 'call',
+        title: `Call with ${c.customer_name}`,
+        description: c.notes || (c.did_pick_up ? 'Called, customer picked up.' : 'Called, no answer.'),
+        date: c.called_at,
+        metadata: {
+          did_pick_up: c.did_pick_up,
+          promised_payment_date: c.promised_payment_date,
+          promised_amount: c.promised_amount,
+          amount: c.amount,
+          phone: c.customer_phone
+        }
+      });
+    });
+
+    // Map invoices (creation and paid state) to timeline entries
+    invoices.forEach(inv => {
+      // Creation
+      timeline.push({
+        id: `inv_create_${inv.id}`,
+        type: 'invoice_created',
+        title: `Invoice #${inv.invoice_number || 'INV'} Created`,
+        description: `Created invoice for ${inv.customer_name} of ₹${Number(inv.invoice_amount).toLocaleString('en-IN')}`,
+        date: inv.invoice_date,
+        metadata: {
+          customer_name: inv.customer_name,
+          invoice_amount: inv.invoice_amount,
+          due_date: inv.due_date
+        }
+      });
+
+      // Payments
+      if (inv.payment_status === 'Paid' && inv.payment_date) {
+        timeline.push({
+          id: `inv_pay_${inv.id}`,
+          type: 'payment_received',
+          title: `Payment Received from ${inv.customer_name}`,
+          description: `Received ₹${Number(inv.invoice_amount).toLocaleString('en-IN')} for invoice #${inv.invoice_number || 'INV'}`,
+          date: inv.payment_date,
+          metadata: {
+            customer_name: inv.customer_name,
+            amount: inv.invoice_amount,
+            method: inv.payment_method
+          }
+        });
+      }
+    });
+
+    // Map collections activity logs
+    logs.forEach(l => {
+      if (['reminder_sent', 'dunning_triggered', 'whatsapp_sent'].includes(l.action)) {
+        timeline.push({
+          id: `log_${l.id}`,
+          type: 'reminder_sent',
+          title: `WhatsApp Reminder Sent`,
+          description: l.metadata?.message || `Sent reminder message to customer.`,
+          date: l.created_at,
+          metadata: l.metadata
+        });
+      }
+    });
+
+    // Sort all events by date descending
+    timeline.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+    res.json({ success: true, timeline: timeline.slice(0, 100) });
+  } catch (error) {
+    console.error('[collections timeline endpoint]', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ============================================
 // RAZORPAY BILLING
 // ============================================
@@ -4974,8 +5231,9 @@ app.get('/api/dunning/:userId', requireOwner, async (req, res) => {
 
 app.post('/api/dunning', authMiddleware, async (req, res) => {
   try {
-    const { user_id, name, trigger_day, action, tone, enabled } = req.body;
-    if (!user_id || !trigger_day || !action) return res.status(400).json({ error: 'Missing required fields' });
+    const user_id = req.user.userId;
+    const { name, trigger_day, action, tone, enabled } = req.body;
+    if (!trigger_day || !action) return res.status(400).json({ error: 'Missing required fields' });
     const { data, error } = await supabase.from('dunning_rules')
       .insert([{ user_id, name: name || `Day ${trigger_day} Follow-Up`, trigger_day, action, tone: tone || 'gentle', enabled: enabled !== false }])
       .select();
@@ -4989,9 +5247,10 @@ app.post('/api/dunning', authMiddleware, async (req, res) => {
 app.patch('/api/dunning/:id', authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
-    const updates = { ...req.body, updated_at: new Date() };
-    const { data, error } = await supabase.from('dunning_rules').update(updates).eq('id', id).select();
+    const updates = { ...pickAllowed(req.body, ['name', 'trigger_day', 'action', 'tone', 'enabled']), updated_at: new Date() };
+    const { data, error } = await supabase.from('dunning_rules').update(updates).eq('id', id).eq('user_id', req.user.userId).select();
     if (error) throw error;
+    if (!data?.length) return res.status(404).json({ error: 'Rule not found' });
     res.json({ success: true, rule: data[0] });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
@@ -5000,7 +5259,7 @@ app.patch('/api/dunning/:id', authMiddleware, async (req, res) => {
 
 app.delete('/api/dunning/:id', authMiddleware, async (req, res) => {
   try {
-    const { error } = await supabase.from('dunning_rules').delete().eq('id', req.params.id);
+    const { error } = await supabase.from('dunning_rules').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     if (error) throw error;
     res.json({ success: true });
   } catch (error) {
@@ -5166,7 +5425,7 @@ async function makeAutoCall(userId, invoice) {
       to: toPhone,
       from: process.env.TWILIO_PHONE_NUMBER,
       twiml: `<Response><Say voice="Polly.Aditi" language="hi-IN">${safeScript}</Say><Pause length="2"/>${payPrompt}<Say voice="Polly.Aditi" language="hi-IN">Payment ke liye please call wapas karein ya WhatsApp karein. Dhanyavaad.</Say></Response>`,
-      statusCallback: `${process.env.RAILWAY_PUBLIC_URL || 'https://vantro-flow-backend-production.up.railway.app'}/api/voice/status`,
+      statusCallback: `${process.env.RAILWAY_PUBLIC_URL || 'https://vantro-flow-backend-production.up.railway.app'}/api/voice/status?uid=${encodeURIComponent(userId)}`,
       statusCallbackEvent: ['completed'],
       timeout: 30,
     });
@@ -6002,7 +6261,7 @@ app.post('/api/voice/call', authMiddleware, async (req, res) => {
       to: toPhone,
       from: process.env.TWILIO_PHONE_NUMBER,
       twiml: `<Response><Say voice="Polly.Aditi" language="hi-IN">${safeScript}</Say><Pause length="2"/><Say voice="Polly.Aditi" language="hi-IN">Payment ke liye please call wapas karein ya WhatsApp karein. Dhanyavaad.</Say></Response>`,
-      statusCallback: `${process.env.RAILWAY_PUBLIC_URL || 'https://vantro-flow-backend-production.up.railway.app'}/api/voice/status`,
+      statusCallback: `${process.env.RAILWAY_PUBLIC_URL || 'https://vantro-flow-backend-production.up.railway.app'}/api/voice/status?uid=${encodeURIComponent(userId)}`,
       statusCallbackEvent: ['completed'],
       timeout: 30,
     });
@@ -6017,12 +6276,21 @@ app.post('/api/voice/call', authMiddleware, async (req, res) => {
 // Twilio status webhook
 app.post('/api/voice/status', async (req, res) => {
   try {
+    const voiceSecret = process.env.VOICE_WEBHOOK_SECRET;
+    if (voiceSecret) {
+      const provided = req.headers['x-vantro-webhook-secret'] || req.query.secret;
+      if (provided !== voiceSecret) return res.sendStatus(403);
+    }
+    const userId = req.query.uid;
     const { CallStatus, CallDuration, To } = req.body;
     const phone = (To || '').replace(/^\+91/, '').replace(/\D/g, '');
-    if (phone) {
+    if (phone && userId) {
       await supabase.from('call_logs')
         .update({ did_pick_up: CallStatus === 'completed', call_duration_minutes: Math.ceil(parseInt(CallDuration || '0') / 60) })
-        .eq('customer_phone', phone).order('created_at', { ascending: false }).limit(1);
+        .eq('user_id', userId)
+        .eq('customer_phone', phone)
+        .order('created_at', { ascending: false })
+        .limit(1);
     }
   } catch (_) {}
   res.sendStatus(200);
@@ -6115,7 +6383,7 @@ app.post('/api/payments/webhook', async (req, res) => {
         // Find the invoice that has this payment_link_id (use payment_status, not status)
         const { data: invoices } = await supabase
           .from('invoices')
-          .select('id, user_id, customer_name, customer_phone, invoice_amount, payment_status')
+          .select('id, user_id, customer_name, customer_phone, invoice_amount, invoice_number, payment_status')
           .eq('payment_status', 'Pending')
           .eq('payment_link_id', paymentLinkId)
           .limit(1);
@@ -6131,19 +6399,30 @@ app.post('/api/payments/webhook', async (req, res) => {
         payment_amount: amountPaid,
         payment_id: paymentId,
       })
-      .eq('id', inv.id);
+      .eq('id', inv.id)
+      .eq('user_id', inv.user_id)
+      .eq('payment_status', 'Pending');
 
     // Add to transactions table for unified ledger
-    await supabase.from('bank_transactions').insert([{
-      user_id: inv.user_id,
-      txn_date: new Date().toISOString().split('T')[0],
-      description: `Payment received from ${inv.customer_name} for invoice ${inv.invoice_number || inv.id}`.trim(),
-      amount: amountPaid,
-      type: 'credit',
-      status: 'matched',
-      matched_type: 'invoice',
-      matched_id: String(inv.id),
-    }]);
+    const { data: existingTxn } = await supabase
+      .from('bank_transactions')
+      .select('id')
+      .eq('user_id', inv.user_id)
+      .eq('matched_type', 'invoice')
+      .eq('matched_id', String(inv.id))
+      .maybeSingle();
+    if (!existingTxn) {
+      await supabase.from('bank_transactions').insert([{
+        user_id: inv.user_id,
+        txn_date: new Date().toISOString().split('T')[0],
+        description: `Payment received from ${inv.customer_name} for invoice ${inv.invoice_number || inv.id}`.trim(),
+        amount: amountPaid,
+        type: 'credit',
+        status: 'matched',
+        matched_type: 'invoice',
+        matched_id: String(inv.id),
+      }]);
+    }
 
     // Send push notification to the business owner
           await sendPushToUser(
@@ -6222,6 +6501,12 @@ app.post('/api/webhooks/whatsapp-inbound', async (req, res) => {
   try {
     res.sendStatus(200); // Acknowledge immediately (Interakt/WATI require fast 200)
 
+    const webhookSecret = process.env.WHATSAPP_WEBHOOK_SECRET;
+    if (webhookSecret) {
+      const provided = req.headers['x-vantro-webhook-secret'] || req.query.secret;
+      if (provided !== webhookSecret) return;
+    }
+
     const body = req.body;
 
     // ── Normalise across Interakt & WATI formats ──────────────────
@@ -6267,7 +6552,8 @@ app.post('/api/webhooks/whatsapp-inbound', async (req, res) => {
     await supabase
       .from('invoices')
       .update({ snooze_until: snoozeUntil })
-      .eq('id', inv.id);
+      .eq('id', inv.id)
+      .eq('user_id', inv.user_id);
 
     console.log(`[WA-inbound] Snoozed invoice ${inv.id} (${inv.customer_name}) until ${snoozeUntil} — reply: "${messageText.slice(0, 60)}"`);
   } catch (err) {
@@ -6352,7 +6638,7 @@ Vantro ne aapke liye auto-reminders queue kar diye hain. App kholein aur ek clic
 // RECONCILIATION & BACKFILL
 // ============================================
 
-app.post('/api/reconcile/backfill', authMiddleware, async (req, res) => {
+app.post('/api/reconcile/backfill', requireAdmin, async (req, res) => {
   const { dryRun = 'true' } = req.query;
   const isDryRun = dryRun === 'true';
   const userId = req.user.userId;
@@ -6497,7 +6783,7 @@ app.post('/api/reconcile/backfill', authMiddleware, async (req, res) => {
   }
 });
 
-app.post('/api/invoices/migrate', authMiddleware, async (req, res) => {
+app.post('/api/invoices/migrate', requireAdmin, async (req, res) => {
   try {
     const pool2 = getPool();
     await pool2.query(`
@@ -6515,7 +6801,7 @@ app.post('/api/invoices/migrate', authMiddleware, async (req, res) => {
   }
 });
 
-app.post('/api/transactions/migrate', authMiddleware, async (req, res) => {
+app.post('/api/transactions/migrate', requireAdmin, async (req, res) => {
   try {
     await ensureTransactionsTable();
     res.json({ success: true, storage: 'transactions+bank_transactions' });
@@ -6793,8 +7079,10 @@ app.post('/api/orders', authMiddleware, async (req, res) => {
 app.patch('/api/orders/:id', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
+    const updates = pickAllowed(req.body, ['customer_name', 'customer_phone', 'delivery_address', 'items', 'total_amount', 'delivery_time', 'special_instructions', 'worker_id', 'status']);
+    updates.updated_at = new Date();
     const { data, error } = await supabase.from('orders')
-      .update({ ...req.body, updated_at: new Date() })
+      .update(updates)
       .eq('id', req.params.id).eq('user_id', userId).select().single();
     if (error) throw error;
     res.json({ success: true, order: data });
@@ -6836,8 +7124,9 @@ app.post('/api/workers', authMiddleware, async (req, res) => {
 
 app.patch('/api/workers/:id', authMiddleware, async (req, res) => {
   try {
+    const updates = pickAllowed(req.body, ['name', 'phone', 'role', 'is_active']);
     const { data, error } = await supabase.from('workers')
-      .update(req.body).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
+      .update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
     res.json({ success: true, worker: data });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
@@ -6942,6 +7231,11 @@ app.post('/api/vocabulary/seed', authMiddleware, async (req, res) => {
 //   https://vantro-flow-backend-production.up.railway.app/api/voice/inbound?uid=USER_ID
 app.post('/api/voice/inbound', async (req, res) => {
   try {
+    const voiceSecret = process.env.VOICE_WEBHOOK_SECRET;
+    if (voiceSecret) {
+      const provided = req.headers['x-vantro-webhook-secret'] || req.query.secret;
+      if (provided !== voiceSecret) return res.sendStatus(403);
+    }
     const userId = req.query.uid;
     let greeting = 'Vantro Business';
     if (userId) {
@@ -6966,6 +7260,12 @@ app.post('/api/voice/inbound', async (req, res) => {
 // STEP 2 — Twilio POSTs here when recording is ready
 app.post('/api/voice/recording', async (req, res) => {
   res.sendStatus(200); // Respond immediately — process async
+
+  const voiceSecret = process.env.VOICE_WEBHOOK_SECRET;
+  if (voiceSecret) {
+    const provided = req.headers['x-vantro-webhook-secret'] || req.query.secret;
+    if (provided !== voiceSecret) return;
+  }
 
   const userId = req.query.uid;
   const { RecordingUrl, RecordingSid, From: callerPhone } = req.body;
@@ -7139,8 +7439,10 @@ app.post('/api/expenses', authMiddleware, async (req, res) => {
 
 app.patch('/api/expenses/:id', authMiddleware, async (req, res) => {
   try {
+    const updates = pickAllowed(req.body, ['description', 'amount', 'category', 'notes', 'expense_date']);
+    if (updates.amount !== undefined) updates.amount = parseFloat(updates.amount);
     const { data, error } = await supabase.from('expenses')
-      .update(req.body).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
+      .update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
     res.json({ success: true, expense: data });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
@@ -7730,7 +8032,12 @@ app.post('/api/bills', authMiddleware, async (req, res) => {
 
 app.patch('/api/bills/:id', authMiddleware, async (req, res) => {
   try {
-    const { data, error } = await supabase.from('bills').update(req.body).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
+    const updates = pickAllowed(req.body, [
+      'customer_name', 'customer_phone', 'customer_email', 'customer_gstin',
+      'invoice_date', 'due_date', 'items', 'subtotal', 'tax_amount',
+      'total_amount', 'status', 'notes', 'paid_at'
+    ]);
+    const { data, error } = await supabase.from('bills').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
     res.json({ success: true, bill: data });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
@@ -8499,7 +8806,7 @@ app.patch('/api/payment-plans/:id/installment', authMiddleware, async (req, res)
     installments[installment_index].paid = true;
     installments[installment_index].paid_at = paid_at || new Date().toISOString();
     const allPaid = installments.every(i => i.paid);
-    const { data, error } = await supabase.from('payment_plans').update({ installments, status: allPaid ? 'completed' : 'active', updated_at: new Date() }).eq('id', req.params.id).select().single();
+    const { data, error } = await supabase.from('payment_plans').update({ installments, status: allPaid ? 'completed' : 'active', updated_at: new Date() }).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
     res.json({ success: true, plan: data });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -8546,7 +8853,7 @@ app.patch('/api/disputes/:id', authMiddleware, async (req, res) => {
     updates.updated_at = new Date();
     if (updates.status === 'resolved') {
       updates.resolved_at = new Date();
-      const { data: dispute } = await supabase.from('disputes').select('invoice_id').eq('id', req.params.id).single();
+      const { data: dispute } = await supabase.from('disputes').select('invoice_id').eq('id', req.params.id).eq('user_id', req.user.userId).single();
       if (dispute?.invoice_id) await supabase.from('invoices').update({ dunning_paused: false }).eq('id', dispute.invoice_id).eq('user_id', req.user.userId);
     }
     const { data, error } = await supabase.from('disputes').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
