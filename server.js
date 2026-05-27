@@ -105,13 +105,25 @@ app.use((req, res, next) => {
     let data = '';
     req.setEncoding('utf8');
     req.on('data', chunk => { data += chunk; });
-    req.on('end', () => { req.rawBody = data; next(); });
+    req.on('end', () => {
+      req.rawBody = data;
+      try {
+        req.body = data ? JSON.parse(data) : {};
+      } catch (_) {
+        req.body = {};
+      }
+      next();
+    });
   } else {
     next();
   }
 });
 
-app.use(express.json({ limit: '10mb' }));
+const jsonParser = express.json({ limit: '10mb' });
+app.use((req, res, next) => {
+  if (req.path === '/api/payments/webhook') return next();
+  return jsonParser(req, res, next);
+});
 app.use(express.urlencoded({ extended: true })); // Twilio webhooks send form-encoded
 
 // ── Security headers (helmet-equivalent, no extra dependency) ─────────────────
