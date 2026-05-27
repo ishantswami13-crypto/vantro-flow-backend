@@ -6451,6 +6451,9 @@ async function sendPushToUser(userId, title, body, data = {}) {
 // IMPORTANT: Raw body captured by middleware above for HMAC verification
 app.post('/api/payments/webhook', async (req, res) => {
     try {
+      const signature = req.headers['x-razorpay-signature'];
+      if (!signature) return res.status(400).json({ error: 'Invalid signature' });
+
       const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
       if (!secret) {
         if (!ALLOW_UNSIGNED_WEBHOOKS) return res.status(503).json({ error: 'Webhook verification is not configured' });
@@ -6459,8 +6462,6 @@ app.post('/api/payments/webhook', async (req, res) => {
 
       // Verify signature using raw body
       const rawBody = req.rawBody !== undefined ? req.rawBody : JSON.stringify(req.body || {});
-      const signature = req.headers['x-razorpay-signature'];
-      if (!signature) return res.status(400).json({ error: 'Invalid signature' });
       const expectedSig = crypto
         .createHmac('sha256', secret)
         .update(rawBody)
