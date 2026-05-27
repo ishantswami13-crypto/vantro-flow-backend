@@ -1708,22 +1708,37 @@ app.get('/api/analytics/:userId', requireOwner, async (req, res) => {
 
 // --- Products ---
 
+async function sendInventoryForUser(userId, res) {
+  await ensureConnectedBusinessData(userId);
+  const [{ data: products }, { data: movements }, summary] = await Promise.all([
+    supabase.from('products').select('*').eq('user_id', userId).order('name'),
+    supabase.from('stock_movements').select('*').eq('user_id', userId).order('moved_at', { ascending: false }).limit(50),
+    calculateInventorySummary(userId)
+  ]);
+
+  res.json({
+    success: true,
+    products: products || [],
+    movements: movements || [],
+    summary
+  });
+}
+
+app.get('/api/inventory', authMiddleware, async (req, res) => {
+  try {
+    const userId = authenticatedUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Invalid token payload' });
+    await sendInventoryForUser(userId, res);
+  } catch (error) {
+    console.error('[inventory alias endpoint]', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.get('/api/inventory/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
-    await ensureConnectedBusinessData(userId);
-    const [{ data: products }, { data: movements }, summary] = await Promise.all([
-      supabase.from('products').select('*').eq('user_id', userId).order('name'),
-      supabase.from('stock_movements').select('*').eq('user_id', userId).order('moved_at', { ascending: false }).limit(50),
-      calculateInventorySummary(userId)
-    ]);
-
-    res.json({
-      success: true,
-      products: products || [],
-      movements: movements || [],
-      summary
-    });
+    await sendInventoryForUser(userId, res);
   } catch (error) {
     console.error('[inventory list endpoint]', error);
     res.status(500).json({ error: 'Internal server error' });
