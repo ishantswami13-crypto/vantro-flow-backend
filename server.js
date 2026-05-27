@@ -1851,9 +1851,25 @@ function normalizePurchaseItem(item) {
 }
 
 function getPurchaseItems(purchase) {
-  return parseJsonArray(purchase?.items)
+  const items = parseJsonArray(purchase?.items)
     .map(normalizePurchaseItem)
     .filter((item) => item.description && item.description !== 'Item');
+
+  if (items.length === 0 && purchase && (purchase.amount > 0 || purchase.total_amount > 0)) {
+    const amt = parseFloat(purchase.amount || purchase.total_amount || 0);
+    const desc = purchase.description || purchase.notes || 
+      (purchase.supplier_name ? `Material: ${purchase.supplier_name}` : null) || 
+      (purchase.customer_name ? `Product: ${purchase.customer_name}` : null) || 
+      'General Item';
+    items.push({
+      description: normalizePartyName(desc),
+      hsn_sac: null,
+      qty: 1,
+      price: amt,
+      amount: amt
+    });
+  }
+  return items;
 }
 
 async function syncInventoryFromPurchase(userId, purchase) {
@@ -2066,6 +2082,40 @@ async function ensureConnectedBusinessData(userId) {
         description: `Auto-backfill: Payment from ${inv.customer_name} for inv ${inv.invoice_number || inv.id}`,
         amount: toMoney(inv.payment_amount || inv.invoice_amount),
         type: 'credit', status: 'matched', matched_type: 'invoice', matched_id: String(inv.id),
+      }]);
+    }
+
+    // 3a. BACKFILL PAID/PARTIAL SALES TO BANK TRANSACTIONS
+    const { data: bTxnsSales } = await supabase.from('bank_transactions').select('matched_id').eq('user_id', userId).eq('matched_type', 'sale');
+    const matchedSaleIds = new Set((bTxnsSales || []).map(t => String(t.matched_id)));
+
+    for (const s of (sales || [])) {
+      const paidAmt = toMoney(s.paid_amount || (s.status === 'paid' ? s.amount : 0));
+      if (paidAmt <= 0) continue;
+      if (matchedSaleIds.has(String(s.id))) continue;
+      await supabase.from('bank_transactions').insert([{
+        user_id: userId,
+        txn_date: s.sale_date || new Date().toISOString().split('T')[0],
+        description: `Auto-backfill: Payment from ${s.customer_name} for sale ${s.invoice_number || s.id}`,
+        amount: paidAmt,
+        type: 'credit', status: 'matched', matched_type: 'sale', matched_id: String(s.id),
+      }]);
+    }
+
+    // 3b. BACKFILL PAID/PARTIAL PURCHASES TO BANK TRANSACTIONS
+    const { data: bTxnsPurchases } = await supabase.from('bank_transactions').select('matched_id').eq('user_id', userId).eq('matched_type', 'purchase');
+    const matchedPurchaseIds = new Set((bTxnsPurchases || []).map(t => String(t.matched_id)));
+
+    for (const p of (purchases || [])) {
+      const paidAmt = toMoney(p.paid_amount || (p.status === 'paid' ? p.amount : 0));
+      if (paidAmt <= 0) continue;
+      if (matchedPurchaseIds.has(String(p.id))) continue;
+      await supabase.from('bank_transactions').insert([{
+        user_id: userId,
+        txn_date: p.purchase_date || new Date().toISOString().split('T')[0],
+        description: `Auto-backfill: Payment to ${p.supplier_name} for purchase ${p.bill_number || p.id}`,
+        amount: paidAmt,
+        type: 'debit', status: 'matched', matched_type: 'purchase', matched_id: String(p.id),
       }]);
     }
 
