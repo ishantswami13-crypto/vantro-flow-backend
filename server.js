@@ -611,13 +611,27 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.get('/api/auth/me', authMiddleware, async (req, res) => {
   try {
+    const tokenUserId = req.user?.userId || req.user?.id || null;
+    if (!tokenUserId) {
+      return res.status(401).json({ error: 'Invalid token payload' });
+    }
+
     const { data, error } = await supabase
       .from('users')
       .select('id, email, phone, business_name, plan, gstin, created_at, industry, business_size, gst_registered, has_workers, owner_name, city, onboarding_done')
-      .eq('id', req.user.userId)
+      .eq('id', tokenUserId)
       .single();
     if (error || !data) return res.status(404).json({ error: 'User not found' });
-    res.json({ success: true, user: data });
+
+    const user = {
+      ...data,
+      id: data.id,
+      userId: data.id,
+      name: data.owner_name || data.business_name || data.email || 'User',
+      businessId: data.id,
+    };
+
+    res.json({ success: true, user });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
   }
