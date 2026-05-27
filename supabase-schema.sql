@@ -279,12 +279,63 @@ CREATE TABLE IF NOT EXISTS team_members (
 );
 CREATE INDEX IF NOT EXISTS idx_team_members_owner_id ON team_members(owner_id);
 
+-- ─── BANK LEDGER / TRANSACTIONS ─────────────────────────────
+CREATE TABLE IF NOT EXISTS transactions (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id          UUID REFERENCES users(id) ON DELETE CASCADE,
+  type             TEXT NOT NULL CHECK (type IN ('in','out')),
+  category         TEXT NOT NULL,
+  amount           NUMERIC(14,2) NOT NULL DEFAULT 0,
+  description      TEXT,
+  party_name       TEXT,
+  transaction_date DATE NOT NULL DEFAULT CURRENT_DATE,
+  payment_method   TEXT DEFAULT 'UPI',
+  reference        TEXT,
+  notes            TEXT,
+  created_at       TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_txn_user ON transactions(user_id);
+CREATE INDEX IF NOT EXISTS idx_txn_date ON transactions(transaction_date DESC);
+
+CREATE TABLE IF NOT EXISTS bank_accounts (
+  id             BIGSERIAL PRIMARY KEY,
+  user_id        UUID REFERENCES users(id) ON DELETE CASCADE,
+  bank_name      TEXT NOT NULL,
+  account_last4  TEXT,
+  account_type   TEXT DEFAULT 'current',
+  nickname       TEXT,
+  ifsc           TEXT,
+  is_active      BOOLEAN DEFAULT TRUE,
+  created_at     TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_bank_accounts_user ON bank_accounts(user_id);
+
+CREATE TABLE IF NOT EXISTS bank_transactions (
+  id            BIGSERIAL PRIMARY KEY,
+  user_id       UUID REFERENCES users(id) ON DELETE CASCADE,
+  account_id    BIGINT REFERENCES bank_accounts(id) ON DELETE SET NULL,
+  txn_date      DATE NOT NULL DEFAULT CURRENT_DATE,
+  description   TEXT,
+  amount        NUMERIC(14,2) NOT NULL DEFAULT 0,
+  type          TEXT NOT NULL CHECK (type IN ('credit','debit')),
+  status        TEXT NOT NULL DEFAULT 'unmatched',
+  matched_type  TEXT,
+  matched_id    TEXT,
+  created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_bank_transactions_user ON bank_transactions(user_id);
+CREATE INDEX IF NOT EXISTS idx_bank_transactions_date ON bank_transactions(user_id, txn_date DESC);
+CREATE INDEX IF NOT EXISTS idx_bank_transactions_status ON bank_transactions(user_id, status);
+
 -- ─── RLS for new tables (disabled for now) ───────────────────
 ALTER TABLE payment_plans  DISABLE ROW LEVEL SECURITY;
 ALTER TABLE disputes       DISABLE ROW LEVEL SECURITY;
 ALTER TABLE ca_partners    DISABLE ROW LEVEL SECURITY;
 ALTER TABLE referral_rewards DISABLE ROW LEVEL SECURITY;
 ALTER TABLE team_members   DISABLE ROW LEVEL SECURITY;
+ALTER TABLE transactions   DISABLE ROW LEVEL SECURITY;
+ALTER TABLE bank_accounts  DISABLE ROW LEVEL SECURITY;
+ALTER TABLE bank_transactions DISABLE ROW LEVEL SECURITY;
 
 -- Done! ✓
 SELECT 'Schema migration complete' AS status;

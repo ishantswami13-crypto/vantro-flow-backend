@@ -167,6 +167,8 @@ function getPool() {
 async function ensureTransactionsTable() {
   const pool2 = getPool();
   await pool2.query(`
+    CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
     CREATE TABLE IF NOT EXISTS transactions (
       id UUID PRIMARY KEY,
       user_id UUID NOT NULL,
@@ -195,6 +197,36 @@ async function ensureTransactionsTable() {
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
     CREATE INDEX IF NOT EXISTS idx_txn_user ON transactions(user_id);
     CREATE INDEX IF NOT EXISTS idx_txn_date ON transactions(transaction_date DESC);
+
+    CREATE TABLE IF NOT EXISTS bank_accounts (
+      id BIGSERIAL PRIMARY KEY,
+      user_id UUID NOT NULL,
+      bank_name TEXT NOT NULL,
+      account_last4 TEXT,
+      account_type TEXT DEFAULT 'current',
+      nickname TEXT,
+      ifsc TEXT,
+      is_active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_bank_accounts_user ON bank_accounts(user_id);
+
+    CREATE TABLE IF NOT EXISTS bank_transactions (
+      id BIGSERIAL PRIMARY KEY,
+      user_id UUID NOT NULL,
+      account_id BIGINT REFERENCES bank_accounts(id) ON DELETE SET NULL,
+      txn_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      description TEXT,
+      amount NUMERIC(14,2) NOT NULL DEFAULT 0,
+      type TEXT NOT NULL CHECK (type IN ('credit','debit')),
+      status TEXT NOT NULL DEFAULT 'unmatched',
+      matched_type TEXT,
+      matched_id TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_bank_transactions_user ON bank_transactions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_bank_transactions_date ON bank_transactions(user_id, txn_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_bank_transactions_status ON bank_transactions(user_id, status);
   `);
 }
 
@@ -3796,7 +3828,54 @@ CREATE TABLE IF NOT EXISTS prospect_notes (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_prospects_user_id ON prospects(user_id);
-CREATE INDEX IF NOT EXISTS idx_prospect_notes_prospect_id ON prospect_notes(prospect_id);`
+CREATE INDEX IF NOT EXISTS idx_prospect_notes_prospect_id ON prospect_notes(prospect_id);
+
+CREATE TABLE IF NOT EXISTS transactions (
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL,
+  type VARCHAR(10) NOT NULL,
+  category VARCHAR(80) NOT NULL,
+  amount DECIMAL(14,2) NOT NULL,
+  description TEXT,
+  party_name VARCHAR(240),
+  transaction_date DATE NOT NULL DEFAULT CURRENT_DATE,
+  payment_method VARCHAR(50) DEFAULT 'UPI',
+  reference VARCHAR(240),
+  notes TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_txn_user ON transactions(user_id);
+CREATE INDEX IF NOT EXISTS idx_txn_date ON transactions(transaction_date DESC);
+
+CREATE TABLE IF NOT EXISTS bank_accounts (
+  id BIGSERIAL PRIMARY KEY,
+  user_id UUID NOT NULL,
+  bank_name TEXT NOT NULL,
+  account_last4 TEXT,
+  account_type TEXT DEFAULT 'current',
+  nickname TEXT,
+  ifsc TEXT,
+  is_active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_bank_accounts_user ON bank_accounts(user_id);
+
+CREATE TABLE IF NOT EXISTS bank_transactions (
+  id BIGSERIAL PRIMARY KEY,
+  user_id UUID NOT NULL,
+  account_id BIGINT REFERENCES bank_accounts(id) ON DELETE SET NULL,
+  txn_date DATE NOT NULL DEFAULT CURRENT_DATE,
+  description TEXT,
+  amount NUMERIC(14,2) NOT NULL DEFAULT 0,
+  type TEXT NOT NULL CHECK (type IN ('credit','debit')),
+  status TEXT NOT NULL DEFAULT 'unmatched',
+  matched_type TEXT,
+  matched_id TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_bank_transactions_user ON bank_transactions(user_id);
+CREATE INDEX IF NOT EXISTS idx_bank_transactions_date ON bank_transactions(user_id, txn_date DESC);
+CREATE INDEX IF NOT EXISTS idx_bank_transactions_status ON bank_transactions(user_id, status);`
     });
   }
 
@@ -3835,9 +3914,10 @@ CREATE INDEX IF NOT EXISTS idx_prospect_notes_prospect_id ON prospect_notes(pros
 
     await client.query(`CREATE INDEX IF NOT EXISTS idx_prospects_user_id ON prospects(user_id)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_prospect_notes_prospect_id ON prospect_notes(prospect_id)`);
+    await ensureTransactionsTable();
 
     await client.end();
-    res.json({ success: true, message: '✅ Migration complete — prospects & prospect_notes tables created' });
+    res.json({ success: true, message: '✅ Migration complete — prospects, ledger and bank tables created' });
   } catch (err) {
     if (client) await client.end().catch(() => {});
     res.status(500).json({ error: 'Internal server error' });
@@ -5900,7 +5980,17 @@ app.post('/api/invoices/migrate', authMiddleware, async (req, res) => {
 });
 
 app.post('/api/transactions/migrate', authMiddleware, async (req, res) => {
-  res.json({ success: true, storage: 'bank_transactions' });
+  try {
+    await ensureTransactionsTable();
+    res.json({ success: true, storage: 'transactions+bank_transactions' });
+  } catch (err) {
+    console.error('[transactions migrate]', err);
+    res.status(503).json({
+      success: false,
+      error: err.message || 'Ledger database migration failed',
+      instructions: 'Set DATABASE_URL in Railway to the Supabase Postgres URI so Vantro can create ledger tables automatically.',
+    });
+  }
 });
 
 // GET all transactions for a user
@@ -8492,6 +8582,7 @@ async function runAutoMigrations() {
       CREATE INDEX IF NOT EXISTS idx_inv_phone         ON invoices(customer_phone)      WHERE customer_phone IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_inv_source        ON invoices(user_id, source_type, source_id) WHERE source_type IS NOT NULL;
     `);
+    await ensureTransactionsTable();
     console.log('[migrate] Auto-migration completed successfully');
   } catch (err) {
     console.error('[migrate] Auto-migration error (non-fatal):', err.message);
