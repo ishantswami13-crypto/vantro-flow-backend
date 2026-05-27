@@ -488,6 +488,7 @@ app.post('/api/auth/login', async (req, res) => {
     const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
     res.json({ success: true, token, user });
   } catch (error) {
+    console.error('[login]', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1443,7 +1444,24 @@ app.get('/api/analytics/:userId', requireOwner, async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('[analytics]', error);
+    res.json({
+      success: true,
+      analytics: {
+        total_outstanding: 0,
+        total_payable: 0,
+        total_recovered: 0,
+        recovery_rate: 0,
+        total_invoices: 0,
+        paid_invoices: 0,
+        pending_invoices: 0,
+        calls_made: 0,
+        total_customers: 0,
+        total_suppliers: 0,
+        monthly_trend: [],
+        top_customers: []
+      }
+    });
   }
 });
 
@@ -1609,6 +1627,110 @@ function parseJsonArray(value) {
   }
 }
 
+function normalizePurchaseItem(item) {
+  const source = item && typeof item === 'object' ? item : {};
+  const qty = toMoney(source.qty ?? source.quantity ?? source.units ?? 0);
+  const rate = toMoney(source.price ?? source.rate ?? source.unit_price ?? 0);
+  const amount = toMoney(source.amount ?? source.line_total ?? (qty && rate ? qty * rate : 0));
+  return {
+    description: normalizePartyName(source.description || source.name || source.item || source.product_name || 'Item'),
+    hsn_sac: cleanScanString(source.hsn_sac || source.hsn || source.hsn_code),
+    qty,
+    unit: cleanScanString(source.unit || source.per || source.uom) || 'pcs',
+    price: rate,
+    rate,
+    amount,
+  };
+}
+
+function getPurchaseItems(purchase) {
+  return parseJsonArray(purchase?.items)
+    .map(normalizePurchaseItem)
+    .filter((item) => item.description && item.description !== 'Item');
+}
+
+async function syncInventoryFromPurchase(userId, purchase) {
+  const items = getPurchaseItems(purchase);
+  if (!items.length) return [];
+
+  const synced = [];
+  for (const item of items) {
+    const qty = toMoney(item.qty);
+    if (!qty || qty <= 0) continue;
+    const productName = item.description;
+    const unitPrice = toMoney(item.price || item.rate || (item.amount && qty ? item.amount / qty : 0));
+    const sku = item.hsn_sac || null;
+
+    try {
+      let { data: product, error: productError } = await supabase
+        .from('products')
+        .select('*')
+        .eq('user_id', userId)
+        .ilike('name', productName)
+        .maybeSingle();
+
+      if (productError) {
+        console.warn('[inventory sync product lookup]', productError.message);
+        continue;
+      }
+
+      if (!product) {
+        const inserted = await supabase
+          .from('products')
+          .insert([{
+            user_id: userId,
+            name: productName,
+            sku,
+            description: `Auto-added from purchase ${purchase.bill_number || purchase.id || ''}`.trim(),
+            unit_price: unitPrice,
+            unit: item.unit || 'pcs',
+            current_stock: qty,
+            low_stock_alert: 1,
+            category: 'Purchased Goods',
+          }])
+          .select()
+          .single();
+        if (inserted.error) {
+          console.warn('[inventory sync product insert]', inserted.error.message);
+          continue;
+        }
+        product = inserted.data;
+      } else {
+        const nextStock = toMoney(product.current_stock) + qty;
+        const update = { current_stock: nextStock, updated_at: new Date() };
+        if (unitPrice > 0) update.unit_price = unitPrice;
+        if (sku && !product.sku) update.sku = sku;
+        if (item.unit && (!product.unit || product.unit === 'unit')) update.unit = item.unit;
+        const { error: updateError } = await supabase
+          .from('products')
+          .update(update)
+          .eq('id', product.id)
+          .eq('user_id', userId);
+        if (updateError) {
+          console.warn('[inventory sync product update]', updateError.message);
+          continue;
+        }
+      }
+
+      const { error: movementError } = await supabase.from('stock_movements').insert([{
+        user_id: userId,
+        product_id: product.id,
+        movement_type: 'in',
+        quantity: qty,
+        unit_cost: unitPrice || null,
+        reference: purchase.bill_number || String(purchase.id || ''),
+        notes: `Auto-stocked from purchase bill ${purchase.bill_number || purchase.id || ''}`.trim(),
+      }]);
+      if (movementError) console.warn('[inventory sync movement]', movementError.message);
+      synced.push({ product_id: product.id, name: productName, quantity: qty });
+    } catch (err) {
+      console.warn('[inventory sync]', err.message || err);
+    }
+  }
+
+  return synced;
+}
+
 function calculateDaysOverdue(dateValue, isPaid = false) {
   if (isPaid || !dateValue) return 0;
   const due = new Date(dateValue);
@@ -1735,7 +1857,9 @@ async function buildKhataEntries(userId, partyName = null) {
     getReceivableRows(userId),
     getPayableRows(userId),
   ]);
-  if (manualError) throw manualError;
+  if (manualError) {
+    console.warn('[khata] manual entries unavailable; continuing with sales/purchases:', manualError.message || manualError);
+  }
 
   const targetKey = partyName ? normalizePartyKey(partyName) : null;
   const rows = [];
@@ -1758,7 +1882,7 @@ async function buildKhataEntries(userId, partyName = null) {
     });
   };
 
-  (manualEntries || []).forEach((entry) => addRow({
+  (manualError ? [] : manualEntries || []).forEach((entry) => addRow({
     id: entry.id,
     customer_name: normalizePartyName(entry.customer_name),
     customer_phone: entry.customer_phone || null,
@@ -2087,7 +2211,7 @@ app.get('/api/suppliers/:userId', requireOwner, async (req, res) => {
         .order('name'),
       supabase
         .from('purchases')
-        .select('supplier_name, supplier_phone, supplier_gstin, amount, paid_amount, status, purchase_date')
+        .select('*')
         .eq('user_id', userId),
     ]);
     if (error) throw error;
@@ -2103,6 +2227,7 @@ app.get('/api/suppliers/:userId', requireOwner, async (req, res) => {
           outstanding_amount: 0,
           purchase_count: 0,
           last_purchase_date: null,
+          purchases: [],
         };
       }
       const total = toMoney(purchase.amount);
@@ -2110,6 +2235,26 @@ app.get('/api/suppliers/:userId', requireOwner, async (req, res) => {
       payableBySupplier[key].total_payable += total;
       payableBySupplier[key].outstanding_amount += Math.max(total - paid, 0);
       payableBySupplier[key].purchase_count += 1;
+      payableBySupplier[key].purchases.push({
+        id: purchase.id,
+        bill_number: purchase.bill_number || null,
+        purchase_date: purchase.purchase_date || purchase.created_at || null,
+        due_date: purchase.due_date || null,
+        status: purchase.status || (paid >= total ? 'paid' : paid > 0 ? 'partial' : 'unpaid'),
+        total_amount: total,
+        amount: total,
+        paid_amount: paid,
+        outstanding_amount: Math.max(total - paid, 0),
+        subtotal: toMoney(purchase.subtotal),
+        gst_type: purchase.gst_type || null,
+        gst_rate: toMoney(purchase.gst_rate),
+        gst_amount: toMoney(purchase.gst_amount),
+        cgst_amount: toMoney(purchase.cgst_amount),
+        sgst_amount: toMoney(purchase.sgst_amount),
+        igst_amount: toMoney(purchase.igst_amount),
+        notes: purchase.notes || null,
+        items: getPurchaseItems(purchase),
+      });
       if (
         purchase.purchase_date &&
         (!payableBySupplier[key].last_purchase_date || purchase.purchase_date > payableBySupplier[key].last_purchase_date)
@@ -2127,6 +2272,7 @@ app.get('/api/suppliers/:userId', requireOwner, async (req, res) => {
       outstanding_amount: Math.round((payableBySupplier[normalizePartyKey(supplier.name)]?.outstanding_amount || 0) * 100) / 100,
       purchase_count: payableBySupplier[normalizePartyKey(supplier.name)]?.purchase_count || 0,
       last_purchase_date: payableBySupplier[normalizePartyKey(supplier.name)]?.last_purchase_date || null,
+      purchases: payableBySupplier[normalizePartyKey(supplier.name)]?.purchases || [],
       inferred_from_purchases: false,
     });
     });
@@ -2147,12 +2293,14 @@ app.get('/api/suppliers/:userId', requireOwner, async (req, res) => {
         outstanding_amount: Math.round(totals.outstanding_amount * 100) / 100,
         purchase_count: totals.purchase_count,
         last_purchase_date: totals.last_purchase_date,
+        purchases: totals.purchases || [],
         inferred_from_purchases: true,
       });
     });
 
     res.json({ success: true, suppliers });
   } catch (error) {
+    console.error('[suppliers list]', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2180,6 +2328,7 @@ app.post('/api/suppliers', authMiddleware, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, supplier: data });
   } catch (error) {
+    console.error('[suppliers create]', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2212,6 +2361,7 @@ app.post('/api/suppliers/:supplierId', authMiddleware, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, supplier: data });
   } catch (error) {
+    console.error('[suppliers update]', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -3363,7 +3513,10 @@ app.get('/api/prospects/:userId', requireOwner, async (req, res) => {
     });
 
     res.json({ success: true, prospects: [...Object.values(customerMap), ...prospects] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) {
+    console.error('[prospects list]', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 app.post('/api/prospects', authMiddleware, async (req, res) => {
@@ -3503,7 +3656,28 @@ app.get('/api/cash-forecast/:userId', requireOwner, async (req, res) => {
       scenarios,
       days: n
     });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) {
+    console.error('[cash forecast]', err);
+    const n = Number(days) || 30;
+    const cashStart = Number(current_cash) || 0;
+    const curve = Array.from({ length: n + 1 }, (_, day) => ({ day, cash: cashStart }));
+    res.json({
+      success: true,
+      cashStart,
+      burnRate: 0,
+      avgDailyCollections: 0,
+      totalOutstanding: 0,
+      totalPayable: 0,
+      totalOverdue30: 0,
+      topOutstanding: [],
+      scenarios: {
+        pessimistic: { dailyInflow: 0, curve, endCash: cashStart, runwayDays: 999 },
+        expected: { dailyInflow: 0, curve, endCash: cashStart, runwayDays: 999 },
+        optimistic: { dailyInflow: 0, curve, endCash: cashStart, runwayDays: 999 },
+      },
+      days: n
+    });
+  }
 });
 
 // ============================================
@@ -5725,6 +5899,66 @@ app.post('/api/transactions', authMiddleware, async (req, res) => {
   } catch (err) { console.error('[transactions POST]', err); res.status(500).json({ success: false, error: 'Internal server error' }); }
 });
 
+app.post('/api/transactions/scan', authMiddleware, async (req, res) => {
+  try {
+    const { image, image_base64, file, mimeType = 'image/jpeg' } = req.body;
+    const payload = image || image_base64 || file;
+    if (!payload) return res.status(400).json({ success: false, error: 'image or file is required' });
+
+    const prompt = `You are a finance OCR assistant for Indian MSME bank ledgers.
+
+Read this receipt, payment screenshot, bank statement page, cash memo, cheque, UPI proof, invoice, or PDF page.
+Decide whether money entered the business or left the business.
+
+Return ONLY valid JSON:
+{
+  "type": "in or out",
+  "amount": number,
+  "party_name": "person/company paid by or received from",
+  "category": "Customer Payment, Supplier Payment, Worker Salary, Rent, Utilities, Raw Materials, Logistics / Transport, Maintenance, Marketing, Tax / GST, Loan / Credit, Refund Received, Other Income, Other Expense",
+  "transaction_date": "YYYY-MM-DD or null",
+  "payment_method": "UPI, Cash, Bank Transfer, Cheque, NEFT/RTGS, Card or Other",
+  "reference": "UTR, cheque no, invoice no, bill no, transaction id or null",
+  "description": "short human readable summary",
+  "confidence": number_between_0_and_1
+}
+
+Rules:
+- If this is a purchase bill, supplier invoice, outgoing payment proof, or expense receipt, type is "out".
+- If this is a customer payment receipt, sale invoice payment proof, deposit, or credit received, type is "in".
+- Amount must be the final transaction/grand total amount, without commas or currency symbols.
+- If unsure, choose the most likely direction and set confidence below 0.7.`;
+
+    const { parsed, rawText, provider, model, providersTried } = await runVisionExtraction({
+      prompt,
+      image: payload,
+      mimeType,
+      maxTokens: 900,
+    });
+
+    const typeRaw = cleanScanString(pickScanValue(parsed, ['type', 'direction', 'money_flow'])) || 'out';
+    const type = /in|receive|credit|deposit/i.test(typeRaw) && !/out|debit|paid|expense/i.test(typeRaw) ? 'in' : 'out';
+    const amount = parseScanNumber(pickScanValue(parsed, ['amount', 'total_amount', 'grand_total', 'paid_amount', 'transaction_amount'])) || 0;
+    const fallbackCategory = type === 'in' ? 'Customer Payment' : 'Supplier Payment';
+    const data = {
+      type,
+      category: cleanScanString(pickScanValue(parsed, ['category'])) || fallbackCategory,
+      amount,
+      party_name: cleanScanString(pickScanValue(parsed, ['party_name', 'paid_to', 'paid_by', 'supplier_name', 'customer_name', 'merchant_name'])),
+      transaction_date: parseScanDate(pickScanValue(parsed, ['transaction_date', 'date', 'payment_date', 'bill_date'])) || new Date().toISOString().split('T')[0],
+      payment_method: cleanScanString(pickScanValue(parsed, ['payment_method', 'method', 'mode'])) || 'UPI',
+      reference: cleanScanString(pickScanValue(parsed, ['reference', 'utr', 'transaction_id', 'invoice_no', 'bill_number', 'cheque_no'])),
+      description: cleanScanString(pickScanValue(parsed, ['description', 'summary', 'notes'])) || (type === 'in' ? 'Money received' : 'Money paid'),
+      confidence: parseScanNumber(pickScanValue(parsed, ['confidence'])) || 0.65,
+    };
+
+    if (!data.amount) return res.status(422).json({ success: false, error: 'Could not identify transaction amount', _debug: rawText?.substring(0, 300), _provider: provider });
+    res.json({ success: true, data, _provider: provider, _model: model, _providers_tried: providersTried });
+  } catch (err) {
+    sendVisionError(res, err, 'Transaction');
+  }
+});
+
 // GET financial summary with category breakdown
 app.get('/api/financial-summary/:userId', requireOwner, async (req, res) => {
   const { userId } = req.params;
@@ -6824,7 +7058,9 @@ app.delete('/api/bills/:id', authMiddleware, async (req, res) => {
     }
     if (invoiceDelete.error) console.warn('Bill receivable delete sync failed:', invoiceDelete.error.message);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // GSTR-1 export data
@@ -6861,7 +7097,10 @@ app.get('/api/khata', authMiddleware, async (req, res) => {
   try {
     const entries = await buildKhataEntries(req.user.userId);
     res.json({ success: true, customers: summarizeKhataEntries(entries) });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) {
+    console.error('[khata list]', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 app.get('/api/khata/:customer', authMiddleware, async (req, res) => {
@@ -6873,7 +7112,10 @@ app.get('/api/khata/:customer', authMiddleware, async (req, res) => {
       return { ...e, running_balance: balance };
     });
     res.json({ success: true, entries, balance });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) {
+    console.error('[khata detail]', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 app.post('/api/khata/entry', authMiddleware, async (req, res) => {
@@ -6958,8 +7200,11 @@ app.post('/api/purchases', authMiddleware, async (req, res) => {
     }]).select().single();
 
     if (error) throw error;
-    const supplier = await ensureSupplierFromPurchase(req.user.userId, data);
-    res.json({ success: true, purchase: { ...data, total_amount: parseFloat(data.amount) }, supplier });
+    const [supplier, inventory] = await Promise.all([
+      ensureSupplierFromPurchase(req.user.userId, data),
+      items !== undefined ? syncInventoryFromPurchase(req.user.userId, data) : Promise.resolve([]),
+    ]);
+    res.json({ success: true, purchase: { ...data, total_amount: parseFloat(data.amount) }, supplier, inventory });
   } catch (err) {
     console.error('Purchase create error:', err.message);
     res.status(500).json({ error: 'Internal server error', detail: err.message });
@@ -7001,8 +7246,11 @@ app.patch('/api/purchases/:id', authMiddleware, async (req, res) => {
 
     const { data, error } = await supabase.from('purchases').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
-    const supplier = await ensureSupplierFromPurchase(req.user.userId, data);
-    res.json({ success: true, purchase: { ...data, total_amount: parseFloat(data.amount) }, supplier });
+    const [supplier, inventory] = await Promise.all([
+      ensureSupplierFromPurchase(req.user.userId, data),
+      items !== undefined ? syncInventoryFromPurchase(req.user.userId, data) : Promise.resolve([]),
+    ]);
+    res.json({ success: true, purchase: { ...data, total_amount: parseFloat(data.amount) }, supplier, inventory });
   } catch (err) {
     console.error('Purchase patch error:', err.message);
     res.status(500).json({ error: 'Internal server error', detail: err.message });
@@ -7181,7 +7429,9 @@ app.delete('/api/sales/:id', authMiddleware, async (req, res) => {
     await supabase.from('sales').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     if (sale) await deleteReceivableForSale(req.user.userId, sale.id, sale.invoice_number);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // Sales Bill Scanner — AI extracts sale/invoice data from photo using vision provider fallback
