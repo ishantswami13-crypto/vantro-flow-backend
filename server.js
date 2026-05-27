@@ -198,6 +198,56 @@ async function ensureTransactionsTable() {
   `);
 }
 
+function ledgerTypeToBankType(type) {
+  return type === 'in' ? 'credit' : 'debit';
+}
+
+function bankTypeToLedgerType(type) {
+  return type === 'credit' ? 'in' : 'out';
+}
+
+function composeLedgerDescription({ party_name, description, reference, category }) {
+  return [party_name, reference, description || category].filter(Boolean).join(' · ');
+}
+
+function mapBankTransactionToLedger(row) {
+  const ledgerType = bankTypeToLedgerType(row.type);
+  const parts = String(row.description || '').split(' · ').map(part => part.trim()).filter(Boolean);
+  const reference = parts.find(part => /^(Receipt|Payment)\s+#/i.test(part)) || '';
+  const partyName = parts[0] && parts[0] !== reference ? parts[0] : '';
+
+  return {
+    id: String(row.id),
+    user_id: row.user_id,
+    type: ledgerType,
+    category: ledgerType === 'in' ? 'Customer Payment' : 'Supplier Payment',
+    amount: Number(row.amount || 0),
+    party_name: partyName,
+    description: parts.filter(part => part !== partyName && part !== reference).join(' · ') || row.description || '',
+    transaction_date: row.txn_date || row.transaction_date || row.created_at,
+    payment_method: 'Bank Transfer',
+    reference,
+    created_at: row.created_at,
+  };
+}
+
+function buildLedgerSummary(transactions) {
+  const now = new Date();
+  const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  return transactions.reduce((summary, txn) => {
+    const amount = Number(txn.amount || 0);
+    if (txn.type === 'in') summary.totalIn += amount;
+    if (txn.type === 'out') summary.totalOut += amount;
+    if (String(txn.transaction_date || '').startsWith(currentMonth)) {
+      if (txn.type === 'in') summary.monthIn += amount;
+      if (txn.type === 'out') summary.monthOut += amount;
+    }
+    summary.balance = summary.totalIn - summary.totalOut;
+    summary.monthBalance = summary.monthIn - summary.monthOut;
+    return summary;
+  }, { totalIn: 0, totalOut: 0, balance: 0, monthIn: 0, monthOut: 0, monthBalance: 0 });
+}
+
 // Razorpay instance (initialised lazily so missing keys don't crash startup)
 let razorpay = null;
 if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
@@ -5850,13 +5900,7 @@ app.post('/api/invoices/migrate', authMiddleware, async (req, res) => {
 });
 
 app.post('/api/transactions/migrate', authMiddleware, async (req, res) => {
-  try {
-    await ensureTransactionsTable();
-    res.json({ success: true });
-  } catch (err) {
-    console.error('[transactions migrate]', err);
-    res.status(500).json({ success: false, error: err.message || 'Ledger database migration failed' });
-  }
+  res.json({ success: true, storage: 'bank_transactions' });
 });
 
 // GET all transactions for a user
@@ -5864,42 +5908,22 @@ app.get('/api/transactions/:userId', requireOwner, async (req, res) => {
   const { userId } = req.params;
   const { type, category, limit = 200 } = req.query;
   try {
-    await ensureTransactionsTable();
-    let q = `SELECT * FROM transactions WHERE user_id = $1`;
-    const params = [userId];
-    if (type && type !== 'all') { q += ` AND type = $${params.length + 1}`; params.push(type); }
-    if (category && category !== 'all') { q += ` AND category = $${params.length + 1}`; params.push(category); }
-    q += ` ORDER BY transaction_date DESC, created_at DESC LIMIT $${params.length + 1}`;
-    params.push(parseInt(limit));
+    let q = supabase
+      .from('bank_transactions')
+      .select('*')
+      .eq('user_id', userId)
+      .order('txn_date', { ascending: false })
+      .limit(parseInt(limit));
 
-    const { data: rows, error } = await supabase.rpc ? await (async () => {
-      const r = await supabase.from('transactions').select('*').eq('user_id', userId).order('transaction_date', { ascending: false }).limit(parseInt(limit));
-      return r;
-    })() : { data: [], error: null };
+    if (type && type !== 'all') q = q.eq('type', ledgerTypeToBankType(type));
 
-    // Use raw pg for transactions table (reuse module-level pool)
-    const pool2 = getPool();
-    const result = await pool2.query(q, params);
+    const { data, error } = await q;
+    if (error) throw error;
 
-    // Summary
-    const sumRes = await pool2.query(
-      `SELECT type, SUM(amount) as total FROM transactions WHERE user_id = $1 GROUP BY type`,
-      [userId]
-    );
-    const monthRes = await pool2.query(
-      `SELECT type, SUM(amount) as total FROM transactions WHERE user_id = $1 AND DATE_TRUNC('month', transaction_date) = DATE_TRUNC('month', CURRENT_DATE) GROUP BY type`,
-      [userId]
-    );
+    let transactions = (data || []).map(mapBankTransactionToLedger);
+    if (category && category !== 'all') transactions = transactions.filter(txn => txn.category === category);
 
-    const totalIn  = parseFloat(sumRes.rows.find(r => r.type === 'in')?.total  || 0);
-    const totalOut = parseFloat(sumRes.rows.find(r => r.type === 'out')?.total || 0);
-    const monthIn  = parseFloat(monthRes.rows.find(r => r.type === 'in')?.total  || 0);
-    const monthOut = parseFloat(monthRes.rows.find(r => r.type === 'out')?.total || 0);
-
-    res.json({
-      transactions: result.rows,
-      summary: { totalIn, totalOut, balance: totalIn - totalOut, monthIn, monthOut, monthBalance: monthIn - monthOut }
-    });
+    res.json({ transactions, summary: buildLedgerSummary(transactions) });
   } catch (err) {
     console.error('[transactions GET]', err);
     res.status(500).json({ error: err.message || 'Internal server error' });
@@ -5911,7 +5935,6 @@ app.post('/api/transactions', authMiddleware, async (req, res) => {
   const { type, category, amount, description, party_name, transaction_date, payment_method, reference, notes } = req.body;
   const user_id = req.user.userId;
   try {
-    await ensureTransactionsTable();
     const normalizedType = type === 'in' ? 'in' : type === 'out' ? 'out' : null;
     const numericAmount = Number.parseFloat(String(amount ?? '').replace(/[₹,\s]/g, ''));
     if (!normalizedType) return res.status(400).json({ success: false, error: 'type must be in or out' });
@@ -5919,14 +5942,23 @@ app.post('/api/transactions', authMiddleware, async (req, res) => {
       return res.status(400).json({ success: false, error: 'amount must be greater than zero' });
     }
 
-    const pool2 = getPool();
-    const result = await pool2.query(
-      `INSERT INTO transactions (id,user_id,type,category,amount,description,party_name,transaction_date,payment_method,reference,notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
-      [crypto.randomUUID(), user_id, normalizedType, category || (normalizedType === 'in' ? 'Customer Payment' : 'Supplier Payment'), numericAmount, description, party_name,
-       transaction_date || new Date().toISOString().split('T')[0], payment_method || 'UPI', reference, notes]
-    );
-    res.json({ success: true, transaction: result.rows[0] });
+    const payload = {
+      user_id,
+      txn_date: transaction_date || new Date().toISOString().split('T')[0],
+      description: composeLedgerDescription({ party_name, reference, description: notes || description, category }),
+      amount: numericAmount,
+      type: ledgerTypeToBankType(normalizedType),
+      status: 'unmatched',
+    };
+
+    const { data, error } = await supabase
+      .from('bank_transactions')
+      .insert([payload])
+      .select()
+      .single();
+    if (error) throw error;
+
+    res.json({ success: true, transaction: mapBankTransactionToLedger(data) });
   } catch (err) {
     console.error('[transactions POST]', err);
     res.status(500).json({ success: false, error: err.message || 'Internal server error' });
