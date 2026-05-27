@@ -51,6 +51,19 @@ const supabase = createClient(
   process.env.SUPABASE_KEY
 );
 
+function isMissingSchemaError(error) {
+  const code = error?.code || '';
+  const message = String(error?.message || '').toLowerCase();
+  return (
+    code === '42P01' ||
+    code === '42703' ||
+    code === 'PGRST204' ||
+    message.includes('does not exist') ||
+    message.includes('could not find') ||
+    message.includes('schema cache')
+  );
+}
+
 // Middleware
 const extraOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim()).filter(Boolean)
@@ -4744,10 +4757,21 @@ app.get('/api/billing/history', authMiddleware, async (req, res) => {
 
 app.get('/api/settings', authMiddleware, async (req, res) => {
   try {
-    const { data, error } = await supabase.from('users')
-      .select('id, email, phone, business_name, gstin, plan, whatsapp_phone, whatsapp_token, logo_url, address, business_address, created_at, owner_name, city, voice_style, ai_persona, upi_id, invoice_prefix, industry, interakt_api_key, wati_api_url, wati_token, wa_provider, razorpay_key_id, automation_enabled')
-      .eq('id', req.user.userId).single();
+    const fullColumns = 'id, email, phone, business_name, gstin, plan, whatsapp_phone, whatsapp_token, logo_url, address, business_address, created_at, owner_name, city, voice_style, ai_persona, upi_id, invoice_prefix, industry, interakt_api_key, wati_api_url, wati_token, wa_provider, razorpay_key_id, automation_enabled';
+    const coreColumns = 'id, email, phone, business_name, plan, created_at';
+    let { data, error } = await supabase.from('users')
+      .select(fullColumns)
+      .eq('id', req.user.userId).maybeSingle();
+
+    if (error && isMissingSchemaError(error)) {
+      console.warn('[settings] optional columns unavailable, falling back to core columns:', error.message);
+      ({ data, error } = await supabase.from('users')
+        .select(coreColumns)
+        .eq('id', req.user.userId).maybeSingle());
+    }
+
     if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'User not found' });
     // Mask secrets — only return whether they are set, not the actual values
     const settings = { ...data };
     if (settings.interakt_api_key) settings.interakt_api_key = '••••••••';
@@ -4755,6 +4779,7 @@ app.get('/api/settings', authMiddleware, async (req, res) => {
     // razorpay_key_id is safe to return (public key), razorpay_key_secret never stored per-user
     res.json({ success: true, settings });
   } catch (error) {
+    console.error('[settings get]', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -7487,9 +7512,18 @@ app.get('/api/bills', authMiddleware, async (req, res) => {
     if (from) q = q.gte('bill_date', from);
     if (to) q = q.lte('bill_date', to);
     const { data, error } = await q;
-    if (error) throw error;
+    if (error) {
+      if (isMissingSchemaError(error)) {
+        console.warn('[bills list] table/columns unavailable, returning empty list:', error.message);
+        return res.json({ success: true, bills: [] });
+      }
+      throw error;
+    }
     res.json({ success: true, bills: data || [] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) {
+    console.error('[bills list]', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 app.post('/api/bills', authMiddleware, async (req, res) => {
@@ -7681,7 +7715,13 @@ app.get('/api/purchases', authMiddleware, async (req, res) => {
     let q = supabase.from('purchases').select('*').eq('user_id', userId).order('purchase_date', { ascending: false });
     if (status) q = q.eq('status', status);
     const { data, error } = await q;
-    if (error) throw error;
+    if (error) {
+      if (isMissingSchemaError(error)) {
+        console.warn('[purchases list] table/columns unavailable, returning empty list:', error.message);
+        return res.json({ success: true, purchases: [] });
+      }
+      throw error;
+    }
     const purchases = (data || []).map(p => ({ ...p, total_amount: parseFloat(p.amount) || 0 }));
     res.json({ success: true, purchases });
   } catch (err) {
