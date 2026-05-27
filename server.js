@@ -164,6 +164,40 @@ function getPool() {
   return pgPool;
 }
 
+async function ensureTransactionsTable() {
+  const pool2 = getPool();
+  await pool2.query(`
+    CREATE TABLE IF NOT EXISTS transactions (
+      id UUID PRIMARY KEY,
+      user_id UUID NOT NULL,
+      type VARCHAR(10) NOT NULL,
+      category VARCHAR(80) NOT NULL,
+      amount DECIMAL(14,2) NOT NULL,
+      description TEXT,
+      party_name VARCHAR(240),
+      transaction_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      payment_method VARCHAR(50) DEFAULT 'UPI',
+      reference VARCHAR(240),
+      notes TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS id UUID;
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS user_id UUID;
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS type VARCHAR(10);
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS category VARCHAR(80);
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS amount DECIMAL(14,2);
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS description TEXT;
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS party_name VARCHAR(240);
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS transaction_date DATE DEFAULT CURRENT_DATE;
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payment_method VARCHAR(50) DEFAULT 'UPI';
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS reference VARCHAR(240);
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS notes TEXT;
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+    CREATE INDEX IF NOT EXISTS idx_txn_user ON transactions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_txn_date ON transactions(transaction_date DESC);
+  `);
+}
+
 // Razorpay instance (initialised lazily so missing keys don't crash startup)
 let razorpay = null;
 if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
@@ -5817,27 +5851,12 @@ app.post('/api/invoices/migrate', authMiddleware, async (req, res) => {
 
 app.post('/api/transactions/migrate', authMiddleware, async (req, res) => {
   try {
-    const pool2 = getPool();
-    await pool2.query(`
-      CREATE TABLE IF NOT EXISTS transactions (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        user_id UUID,
-        type VARCHAR(10) NOT NULL CHECK (type IN ('in','out')),
-        category VARCHAR(60) NOT NULL,
-        amount DECIMAL(14,2) NOT NULL,
-        description TEXT,
-        party_name VARCHAR(200),
-        transaction_date DATE NOT NULL DEFAULT CURRENT_DATE,
-        payment_method VARCHAR(50) DEFAULT 'UPI',
-        reference VARCHAR(200),
-        notes TEXT,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
-      CREATE INDEX IF NOT EXISTS idx_txn_user ON transactions(user_id);
-      CREATE INDEX IF NOT EXISTS idx_txn_date ON transactions(transaction_date DESC);
-    `);
+    await ensureTransactionsTable();
     res.json({ success: true });
-  } catch (err) { console.error('[migrate]', err); res.status(500).json({ success: false, error: 'Internal server error' }); }
+  } catch (err) {
+    console.error('[transactions migrate]', err);
+    res.status(500).json({ success: false, error: err.message || 'Ledger database migration failed' });
+  }
 });
 
 // GET all transactions for a user
@@ -5845,6 +5864,7 @@ app.get('/api/transactions/:userId', requireOwner, async (req, res) => {
   const { userId } = req.params;
   const { type, category, limit = 200 } = req.query;
   try {
+    await ensureTransactionsTable();
     let q = `SELECT * FROM transactions WHERE user_id = $1`;
     const params = [userId];
     if (type && type !== 'all') { q += ` AND type = $${params.length + 1}`; params.push(type); }
@@ -5880,7 +5900,10 @@ app.get('/api/transactions/:userId', requireOwner, async (req, res) => {
       transactions: result.rows,
       summary: { totalIn, totalOut, balance: totalIn - totalOut, monthIn, monthOut, monthBalance: monthIn - monthOut }
     });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) {
+    console.error('[transactions GET]', err);
+    res.status(500).json({ error: err.message || 'Internal server error' });
+  }
 });
 
 // POST add a transaction
@@ -5888,15 +5911,26 @@ app.post('/api/transactions', authMiddleware, async (req, res) => {
   const { type, category, amount, description, party_name, transaction_date, payment_method, reference, notes } = req.body;
   const user_id = req.user.userId;
   try {
+    await ensureTransactionsTable();
+    const normalizedType = type === 'in' ? 'in' : type === 'out' ? 'out' : null;
+    const numericAmount = Number.parseFloat(String(amount ?? '').replace(/[₹,\s]/g, ''));
+    if (!normalizedType) return res.status(400).json({ success: false, error: 'type must be in or out' });
+    if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+      return res.status(400).json({ success: false, error: 'amount must be greater than zero' });
+    }
+
     const pool2 = getPool();
     const result = await pool2.query(
-      `INSERT INTO transactions (user_id,type,category,amount,description,party_name,transaction_date,payment_method,reference,notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-      [user_id, type, category, parseFloat(amount), description, party_name,
+      `INSERT INTO transactions (id,user_id,type,category,amount,description,party_name,transaction_date,payment_method,reference,notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+      [crypto.randomUUID(), user_id, normalizedType, category || (normalizedType === 'in' ? 'Customer Payment' : 'Supplier Payment'), numericAmount, description, party_name,
        transaction_date || new Date().toISOString().split('T')[0], payment_method || 'UPI', reference, notes]
     );
     res.json({ success: true, transaction: result.rows[0] });
-  } catch (err) { console.error('[transactions POST]', err); res.status(500).json({ success: false, error: 'Internal server error' }); }
+  } catch (err) {
+    console.error('[transactions POST]', err);
+    res.status(500).json({ success: false, error: err.message || 'Internal server error' });
+  }
 });
 
 app.post('/api/transactions/scan', authMiddleware, async (req, res) => {
