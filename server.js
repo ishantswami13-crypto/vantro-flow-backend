@@ -1506,23 +1506,58 @@ app.get('/api/analytics/:userId', requireOwner, async (req, res) => {
     const paidInvoices = receivables.filter(inv => inv.outstanding_amount <= 0);
     const pendingInvoices = receivables.filter(inv => inv.outstanding_amount > 0);
 
-    // Monthly recovery for last 6 months
+    // Monthly business movement for last 6 months
     const monthly = {};
     const now = new Date();
     for (let i = 5; i >= 0; i--) {
       const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
       const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-      monthly[key] = { month: key, recovered: 0, invoices_paid: 0 };
+      monthly[key] = {
+        month: key,
+        recovered: 0,
+        invoices_paid: 0,
+        sales_booked: 0,
+        purchases_booked: 0,
+        payables_paid: 0,
+        net_booked: 0,
+        cash_net: 0,
+      };
     }
-    paidInvoices.forEach(inv => {
-      const date = inv.payment_date || inv.invoice_date;
+    receivables.forEach(inv => {
+      const bookedKey = (inv.invoice_date || inv.due_date || '').substring(0, 7);
+      if (monthly[bookedKey]) monthly[bookedKey].sales_booked += Number(inv.amount || 0);
+
+      const date = inv.payment_date || (inv.status === 'Paid' ? inv.invoice_date : null);
       if (!date) return;
       const key = date.substring(0, 7);
       if (monthly[key]) {
         monthly[key].recovered += Number(inv.paid_amount || inv.amount);
-        monthly[key].invoices_paid += 1;
+        if (Number(inv.paid_amount || inv.amount) > 0) monthly[key].invoices_paid += 1;
       }
     });
+    payables.forEach(purchase => {
+      const bookedKey = (purchase.purchase_date || purchase.due_date || '').substring(0, 7);
+      if (monthly[bookedKey]) monthly[bookedKey].purchases_booked += Number(purchase.amount || 0);
+
+      const paidKey = (purchase.status === 'paid' ? (purchase.purchase_date || purchase.due_date || '') : '').substring(0, 7);
+      if (monthly[paidKey]) monthly[paidKey].payables_paid += Number(purchase.paid_amount || purchase.amount || 0);
+    });
+    Object.values(monthly).forEach(row => {
+      row.net_booked = row.sales_booked - row.purchases_booked;
+      row.cash_net = row.recovered - row.payables_paid;
+    });
+
+    const supplierMap = {};
+    payables.forEach(purchase => {
+      if (!supplierMap[purchase.supplier_name]) {
+        supplierMap[purchase.supplier_name] = { name: purchase.supplier_name, amount: 0, outstanding: 0 };
+      }
+      supplierMap[purchase.supplier_name].amount += Number(purchase.amount || 0);
+      supplierMap[purchase.supplier_name].outstanding += Number(purchase.outstanding_amount || 0);
+    });
+    const topSuppliers = Object.values(supplierMap)
+      .sort((a, b) => b.outstanding - a.outstanding || b.amount - a.amount)
+      .slice(0, 5);
 
     // Top customers by outstanding amount
     const customerMap = {};
@@ -1537,7 +1572,11 @@ app.get('/api/analytics/:userId', requireOwner, async (req, res) => {
 
     const totalOutstanding = pendingInvoices.reduce((s, i) => s + Number(i.outstanding_amount), 0);
     const totalRecovered = receivables.reduce((s, i) => s + Number(i.paid_amount || 0), 0);
+    const salesBooked = receivables.reduce((s, i) => s + Number(i.amount || 0), 0);
+    const purchasesBooked = payables.reduce((s, p) => s + Number(p.amount || 0), 0);
     const totalPayable = payables.reduce((s, p) => s + Number(p.outstanding_amount || 0), 0);
+    const payablesPaid = payables.reduce((s, p) => s + Number(p.paid_amount || 0), 0);
+    const grossMargin = salesBooked > 0 ? ((salesBooked - purchasesBooked) / salesBooked) * 100 : 0;
     const recoveryRate = receivables.length > 0
       ? ((paidInvoices.length / receivables.length) * 100).toFixed(1)
       : 0;
@@ -1548,6 +1587,12 @@ app.get('/api/analytics/:userId', requireOwner, async (req, res) => {
         total_outstanding: totalOutstanding,
         total_payable: totalPayable,
         total_recovered: totalRecovered,
+        sales_booked: salesBooked,
+        purchases_booked: purchasesBooked,
+        payables_paid: payablesPaid,
+        gross_margin_pct: Number(grossMargin.toFixed(1)),
+        booked_net: salesBooked - purchasesBooked,
+        cash_net: totalRecovered - payablesPaid,
         recovery_rate: recoveryRate,
         total_invoices: receivables.length,
         paid_invoices: paidInvoices.length,
@@ -1556,7 +1601,8 @@ app.get('/api/analytics/:userId', requireOwner, async (req, res) => {
         total_customers: new Set(receivables.map((i) => i.customer_name)).size,
         total_suppliers: new Set(payables.map((p) => p.supplier_name)).size,
         monthly_trend: Object.values(monthly),
-        top_customers: topCustomers
+        top_customers: topCustomers,
+        top_suppliers: topSuppliers,
       }
     });
   } catch (error) {
