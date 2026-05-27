@@ -1893,6 +1893,59 @@ async function syncInventoryFromPurchase(userId, purchase) {
   return synced;
 }
 
+async function syncInventoryFromSale(userId, sale) {
+  const items = getPurchaseItems(sale); // Works for sales too as structure is similar
+  if (!items.length) return [];
+
+  const synced = [];
+  for (const item of items) {
+    const qty = toMoney(item.qty);
+    if (!qty || qty <= 0) continue;
+    const productName = item.description;
+
+    try {
+      let { data: product, error: productError } = await supabase
+        .from('products')
+        .select('*')
+        .eq('user_id', userId)
+        .ilike('name', productName)
+        .maybeSingle();
+
+      if (productError || !product) {
+        // If product doesn't exist, we don't auto-create on sale usually, 
+        // but we might want to log it as out-of-stock movement if it's a known product
+        if (productError) console.warn('[inventory sale sync lookup]', productError.message);
+        continue;
+      }
+
+      const nextStock = toMoney(product.current_stock) - qty;
+      const { error: updateError } = await supabase
+        .from('products')
+        .update({ current_stock: nextStock, updated_at: new Date() })
+        .eq('id', product.id)
+        .eq('user_id', userId);
+
+      if (updateError) {
+        console.warn('[inventory sale sync update]', updateError.message);
+        continue;
+      }
+
+      await supabase.from('stock_movements').insert([{
+        user_id: userId,
+        product_id: product.id,
+        movement_type: 'out',
+        quantity: qty,
+        reference: sale.invoice_number || String(sale.id || ''),
+        notes: `Sold in invoice ${sale.invoice_number || sale.id || ''}`.trim(),
+      }]);
+      synced.push({ product_id: product.id, name: productName, quantity: qty });
+    } catch (err) {
+      console.warn('[inventory sale sync]', err.message || err);
+    }
+  }
+  return synced;
+}
+
 function calculateDaysOverdue(dateValue, isPaid = false) {
   if (isPaid || !dateValue) return 0;
   const due = new Date(dateValue);
@@ -5794,17 +5847,29 @@ app.post('/api/payments/webhook', async (req, res) => {
         if (invoices && invoices.length > 0) {
           const inv = invoices[0];
 
-          // Mark as paid
-          await supabase.from('invoices')
-            .update({
-              payment_status: 'Paid',
-              payment_date: new Date().toISOString().split('T')[0],
-              payment_amount: amountPaid,
-              payment_id: paymentId,
-            })
-            .eq('id', inv.id);
+    // Mark as paid
+    await supabase.from('invoices')
+      .update({
+        payment_status: 'Paid',
+        payment_date: new Date().toISOString().split('T')[0],
+        payment_amount: amountPaid,
+        payment_id: paymentId,
+      })
+      .eq('id', inv.id);
 
-          // Send push notification to the business owner
+    // Add to transactions table for unified ledger
+    await supabase.from('bank_transactions').insert([{
+      user_id: inv.user_id,
+      txn_date: new Date().toISOString().split('T')[0],
+      description: `Payment received from ${inv.customer_name} for invoice ${inv.invoice_number || inv.id}`.trim(),
+      amount: amountPaid,
+      type: 'credit',
+      status: 'matched',
+      matched_type: 'invoice',
+      matched_id: String(inv.id),
+    }]);
+
+    // Send push notification to the business owner
           await sendPushToUser(
             inv.user_id,
             `💰 Payment Received!`,
@@ -7548,6 +7613,10 @@ app.post('/api/sales', authMiddleware, async (req, res) => {
       subtotal: subtotal || null,
     }]).select().single();
     if (error) throw error;
+    
+    // Trigger inventory sync
+    await syncInventoryFromSale(req.user.userId, data);
+    
     const receivable = await syncReceivableFromSale(req.user.userId, data);
     let sale = data;
     if (!sale.invoice_number && receivable?.invoice_number) {
