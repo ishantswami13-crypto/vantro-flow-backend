@@ -24,7 +24,13 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const app = express();
 app.set('trust proxy', 1); // Railway sits behind a proxy — needed for express-rate-limit to see real IP
 const PORT = process.env.PORT || 3001;
-const IS_PRODUCTION = process.env.NODE_ENV === 'production' || Boolean(process.env.RAILWAY_ENVIRONMENT);
+const IS_PRODUCTION = process.env.NODE_ENV === 'production' || Boolean(
+  process.env.RAILWAY_ENVIRONMENT ||
+  process.env.RAILWAY_SERVICE_NAME ||
+  process.env.RAILWAY_PROJECT_ID ||
+  process.env.RAILWAY_PUBLIC_URL
+);
+const ALLOW_UNSIGNED_WEBHOOKS = process.env.ALLOW_UNSIGNED_WEBHOOKS === 'true' && !IS_PRODUCTION;
 
 // ── In-memory OTP store (keyed by userId) ──────────────────────────────────
 // Structure: Map<userId, { code: string, expiresAt: number, attempts: number }>
@@ -6374,7 +6380,7 @@ app.post('/api/voice/status', async (req, res) => {
   try {
     const voiceSecret = process.env.VOICE_WEBHOOK_SECRET;
     const provided = req.headers['x-vantro-webhook-secret'] || req.query.secret;
-    if (!voiceSecret && IS_PRODUCTION) return res.sendStatus(403);
+    if (!voiceSecret && !ALLOW_UNSIGNED_WEBHOOKS) return res.sendStatus(403);
     if (voiceSecret && !timingSafeEqualString(provided, voiceSecret)) return res.sendStatus(403);
     const userId = req.query.uid;
     const { CallStatus, CallDuration, To } = req.body;
@@ -6447,13 +6453,14 @@ app.post('/api/payments/webhook', async (req, res) => {
     try {
       const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
       if (!secret) {
-        if (IS_PRODUCTION) return res.status(503).json({ error: 'Webhook verification is not configured' });
-        return res.sendStatus(200); // Local/dev: not configured, ignore.
+        if (!ALLOW_UNSIGNED_WEBHOOKS) return res.status(503).json({ error: 'Webhook verification is not configured' });
+        return res.sendStatus(200); // Explicit local/dev opt-in only.
       }
 
       // Verify signature using raw body
-      const rawBody = req.rawBody || JSON.stringify(req.body);
+      const rawBody = req.rawBody !== undefined ? req.rawBody : JSON.stringify(req.body || {});
       const signature = req.headers['x-razorpay-signature'];
+      if (!signature) return res.status(400).json({ error: 'Invalid signature' });
       const expectedSig = crypto
         .createHmac('sha256', secret)
         .update(rawBody)
@@ -6609,7 +6616,7 @@ app.post('/api/webhooks/whatsapp-inbound', async (req, res) => {
 
     const webhookSecret = process.env.WHATSAPP_WEBHOOK_SECRET;
     const provided = req.headers['x-vantro-webhook-secret'] || req.query.secret;
-    if (!webhookSecret && IS_PRODUCTION) return;
+    if (!webhookSecret && !ALLOW_UNSIGNED_WEBHOOKS) return;
     if (webhookSecret && !timingSafeEqualString(provided, webhookSecret)) return;
 
     const body = req.body;
@@ -7345,7 +7352,7 @@ app.post('/api/voice/inbound', async (req, res) => {
   try {
     const voiceSecret = process.env.VOICE_WEBHOOK_SECRET;
     const provided = req.headers['x-vantro-webhook-secret'] || req.query.secret;
-    if (!voiceSecret && IS_PRODUCTION) return res.sendStatus(403);
+    if (!voiceSecret && !ALLOW_UNSIGNED_WEBHOOKS) return res.sendStatus(403);
     if (voiceSecret && !timingSafeEqualString(provided, voiceSecret)) return res.sendStatus(403);
     const userId = req.query.uid;
     let greeting = 'Vantro Business';
@@ -7374,7 +7381,7 @@ app.post('/api/voice/recording', async (req, res) => {
 
   const voiceSecret = process.env.VOICE_WEBHOOK_SECRET;
   const provided = req.headers['x-vantro-webhook-secret'] || req.query.secret;
-  if (!voiceSecret && IS_PRODUCTION) return;
+  if (!voiceSecret && !ALLOW_UNSIGNED_WEBHOOKS) return;
   if (voiceSecret && !timingSafeEqualString(provided, voiceSecret)) return;
 
   const userId = req.query.uid;
