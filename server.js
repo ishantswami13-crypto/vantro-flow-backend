@@ -1492,6 +1492,7 @@ app.get('/api/metrics/:userId', requireOwner, async (req, res) => {
 app.get('/api/analytics/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
+    await ensureConnectedBusinessData(userId);
 
     await syncExistingSalesReceivables(userId);
 
@@ -1636,6 +1637,7 @@ app.get('/api/analytics/:userId', requireOwner, async (req, res) => {
 app.get('/api/inventory/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
+    await ensureConnectedBusinessData(userId);
     const [{ data: products }, { data: movements }] = await Promise.all([
       supabase.from('products').select('*').eq('user_id', userId).order('name'),
       supabase.from('stock_movements').select('*').eq('user_id', userId).order('moved_at', { ascending: false }).limit(50)
@@ -1944,6 +1946,101 @@ async function syncInventoryFromSale(userId, sale) {
     }
   }
   return synced;
+}
+
+// ─── Automated Reconciliation Logic ──────────────────────────────────────────
+const RECONCILE_THROTTLE_MS = 5 * 60 * 1000; // 5 minutes
+const lastReconciled = {}; // userId -> timestamp
+
+async function ensureConnectedBusinessData(userId) {
+  if (!userId) return;
+  const now = Date.now();
+  if (lastReconciled[userId] && (now - lastReconciled[userId] < RECONCILE_THROTTLE_MS)) {
+    return; // Already ran recently
+  }
+
+  console.log(`[Auto-Reconcile] Starting for user ${userId}...`);
+  lastReconciled[userId] = now;
+
+  try {
+    // 1. BACKFILL PURCHASES
+    const { data: purchases } = await supabase.from('purchases').select('*').eq('user_id', userId);
+    const { data: pMovements } = await supabase.from('stock_movements').select('reference').eq('user_id', userId).not('reference', 'is', null);
+    const movementRefs = new Set((pMovements || []).map(m => m.reference));
+
+    for (const p of (purchases || [])) {
+      const ref = p.bill_number || String(p.id);
+      if (movementRefs.has(ref)) continue;
+      const items = getPurchaseItems(p);
+      if (!items.length) continue;
+
+      for (const item of items) {
+        const qty = toMoney(item.qty);
+        if (qty <= 0) continue;
+        let { data: product } = await supabase.from('products').select('id').eq('user_id', userId).ilike('name', item.description).maybeSingle();
+        if (!product) {
+          const { data: newProd } = await supabase.from('products').insert([{ user_id: userId, name: item.description, current_stock: 0 }]).select().single();
+          product = newProd;
+        }
+        await supabase.from('stock_movements').insert([{
+          user_id: userId, product_id: product.id, movement_type: 'in', quantity: qty,
+          unit_cost: toMoney(item.unit_price) || null, reference: ref,
+          notes: `Auto-backfilled from purchase ${ref}`
+        }]);
+      }
+    }
+
+    // 2. BACKFILL SALES
+    const { data: sales } = await supabase.from('sales').select('*').eq('user_id', userId);
+    for (const s of (sales || [])) {
+      const ref = s.invoice_number || String(s.id);
+      if (movementRefs.has(ref)) continue;
+      const items = getPurchaseItems(s);
+      if (!items.length) continue;
+      for (const item of items) {
+        const qty = toMoney(item.qty);
+        if (qty <= 0) continue;
+        let { data: product } = await supabase.from('products').select('id').eq('user_id', userId).ilike('name', item.description).maybeSingle();
+        if (product) {
+          await supabase.from('stock_movements').insert([{
+            user_id: userId, product_id: product.id, movement_type: 'out', quantity: qty,
+            reference: ref, notes: `Auto-backfilled from sale ${ref}`
+          }]);
+        }
+      }
+    }
+
+    // 3. BACKFILL PAID INVOICES
+    const { data: invoices } = await supabase.from('invoices').select('*').eq('user_id', userId).eq('payment_status', 'Paid');
+    const { data: bTxns } = await supabase.from('bank_transactions').select('matched_id').eq('user_id', userId).eq('matched_type', 'invoice');
+    const matchedIds = new Set((bTxns || []).map(t => String(t.matched_id)));
+
+    for (const inv of (invoices || [])) {
+      if (matchedIds.has(String(inv.id))) continue;
+      await supabase.from('bank_transactions').insert([{
+        user_id: userId,
+        txn_date: inv.payment_date || inv.invoice_date || new Date().toISOString().split('T')[0],
+        description: `Auto-backfill: Payment from ${inv.customer_name} for inv ${inv.invoice_number || inv.id}`,
+        amount: toMoney(inv.payment_amount || inv.invoice_amount),
+        type: 'credit', status: 'matched', matched_type: 'invoice', matched_id: String(inv.id),
+      }]);
+    }
+
+    // 4. RECALCULATE STOCK
+    const { data: products } = await supabase.from('products').select('id, name').eq('user_id', userId);
+    for (const prod of (products || [])) {
+      const { data: movements } = await supabase.from('stock_movements').select('movement_type, quantity').eq('product_id', prod.id);
+      let stock = 0;
+      (movements || []).forEach(m => {
+        if (m.movement_type === 'in') stock += toMoney(m.quantity);
+        else stock -= toMoney(m.quantity);
+      });
+      await supabase.from('products').update({ current_stock: stock, updated_at: new Date() }).eq('id', prod.id);
+    }
+    console.log(`[Auto-Reconcile] Completed for user ${userId}.`);
+  } catch (err) {
+    console.error(`[Auto-Reconcile] Error for user ${userId}:`, err.message);
+  }
 }
 
 function calculateDaysOverdue(dateValue, isPaid = false) {
@@ -3795,6 +3892,7 @@ app.get('/api/cash-forecast/:userId', requireOwner, async (req, res) => {
   const { current_cash = 0, days = 30 } = req.query;
 
   try {
+    await ensureConnectedBusinessData(userId);
     await syncExistingSalesReceivables(userId);
 
     const [receivables, payables] = await Promise.all([
@@ -6258,6 +6356,7 @@ app.get('/api/transactions/:userId', requireOwner, async (req, res) => {
   const { userId } = req.params;
   const { type, category, limit = 200 } = req.query;
   try {
+    await ensureConnectedBusinessData(userId);
     let q = supabase
       .from('bank_transactions')
       .select('*')
@@ -7562,8 +7661,10 @@ app.delete('/api/khata/entry/:id', authMiddleware, async (req, res) => {
 
 app.get('/api/purchases', authMiddleware, async (req, res) => {
   try {
+    const userId = req.user.userId;
+    await ensureConnectedBusinessData(userId);
     const { status } = req.query;
-    let q = supabase.from('purchases').select('*').eq('user_id', req.user.userId).order('purchase_date', { ascending: false });
+    let q = supabase.from('purchases').select('*').eq('user_id', userId).order('purchase_date', { ascending: false });
     if (status) q = q.eq('status', status);
     const { data, error } = await q;
     if (error) throw error;
@@ -7731,8 +7832,10 @@ Rules: numbers without rupee symbol or commas (147630 not 1,47,630). Dates as YY
 
 app.get('/api/sales', authMiddleware, async (req, res) => {
   try {
+    const userId = req.user.userId;
+    await ensureConnectedBusinessData(userId);
     const { status } = req.query;
-    let q = supabase.from('sales').select('*').eq('user_id', req.user.userId).order('sale_date', { ascending: false });
+    let q = supabase.from('sales').select('*').eq('user_id', userId).order('sale_date', { ascending: false });
     if (status) q = q.eq('status', status);
     const { data, error } = await q;
     if (error) throw error;
