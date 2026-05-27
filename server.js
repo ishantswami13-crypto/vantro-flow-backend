@@ -629,12 +629,26 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
       return res.status(401).json({ error: 'Invalid token payload' });
     }
 
-    const { data, error } = await supabase
+    const fullColumns = 'id, email, phone, business_name, plan, gstin, created_at, industry, business_size, gst_registered, has_workers, owner_name, city, onboarding_done';
+    const coreColumns = 'id, email, phone, business_name, plan, created_at';
+
+    let { data, error } = await supabase
       .from('users')
-      .select('id, email, phone, business_name, plan, gstin, created_at, industry, business_size, gst_registered, has_workers, owner_name, city, onboarding_done')
+      .select(fullColumns)
       .eq('id', tokenUserId)
-      .single();
-    if (error || !data) return res.status(404).json({ error: 'User not found' });
+      .maybeSingle();
+
+    if (error && isMissingSchemaError(error)) {
+      console.warn('[auth me] optional columns unavailable, falling back to core columns:', error.message);
+      ({ data, error } = await supabase
+        .from('users')
+        .select(coreColumns)
+        .eq('id', tokenUserId)
+        .maybeSingle());
+    }
+
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'User not found' });
 
     const user = {
       ...data,
@@ -646,6 +660,7 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
 
     res.json({ success: true, user });
   } catch (error) {
+    console.error('[auth me]', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1212,6 +1227,7 @@ app.get('/api/invoices/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
 
+    await ensureConnectedBusinessData(userId);
     await syncExistingSalesReceivables(userId);
 
     const { data, error } = await supabase
