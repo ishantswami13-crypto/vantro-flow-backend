@@ -6072,6 +6072,155 @@ Vantro ne aapke liye auto-reminders queue kar diye hain. App kholein aur ek clic
 
 // Create transactions table
 // Add snooze_until + reminder tracking columns to invoices
+// ============================================
+// RECONCILIATION & BACKFILL
+// ============================================
+
+app.post('/api/reconcile/backfill', authMiddleware, async (req, res) => {
+  const { dryRun = 'true' } = req.query;
+  const isDryRun = dryRun === 'true';
+  const userId = req.user.userId;
+
+  try {
+    const report = {
+      purchasesBackfilled: [],
+      salesBackfilled: [],
+      paymentsBackfilled: [],
+      productsRecalculated: [],
+      skippedDuplicates: 0,
+      counts: {
+        purchases: 0,
+        sales: 0,
+        payments: 0,
+      },
+      isDryRun
+    };
+
+    // 1. BACKFILL PURCHASES -> INVENTORY
+    const { data: purchases } = await supabase.from('purchases').select('*').eq('user_id', userId);
+    const { data: pMovements } = await supabase.from('stock_movements').select('reference').eq('user_id', userId).not('reference', 'is', null);
+    const movementRefs = new Set((pMovements || []).map(m => m.reference));
+
+    for (const p of (purchases || [])) {
+      const ref = p.bill_number || String(p.id);
+      if (movementRefs.has(ref)) {
+        report.skippedDuplicates++;
+        continue;
+      }
+
+      const items = getPurchaseItems(p);
+      if (!items.length) continue;
+
+      if (!isDryRun) {
+        // Find or create products and add movements
+        for (const item of items) {
+          const qty = toMoney(item.qty);
+          if (qty <= 0) continue;
+          
+          let { data: product } = await supabase.from('products').select('id').eq('user_id', userId).ilike('name', item.description).maybeSingle();
+          if (!product) {
+             const { data: newProd } = await supabase.from('products').insert([{ user_id: userId, name: item.description, current_stock: 0 }]).select().single();
+             product = newProd;
+          }
+
+          await supabase.from('stock_movements').insert([{
+            user_id: userId,
+            product_id: product.id,
+            movement_type: 'in',
+            quantity: qty,
+            unit_cost: toMoney(item.unit_price) || null,
+            reference: ref,
+            notes: `Backfilled from purchase ${ref}`.trim(),
+          }]);
+        }
+      }
+      report.purchasesBackfilled.push({ id: p.id, ref });
+      report.counts.purchases++;
+    }
+
+    // 2. BACKFILL SALES -> INVENTORY
+    const { data: sales } = await supabase.from('sales').select('*').eq('user_id', userId);
+    for (const s of (sales || [])) {
+      const ref = s.invoice_number || String(s.id);
+      if (movementRefs.has(ref)) {
+        report.skippedDuplicates++;
+        continue;
+      }
+
+      const items = getPurchaseItems(s);
+      if (!items.length) continue;
+
+      if (!isDryRun) {
+        for (const item of items) {
+          const qty = toMoney(item.qty);
+          if (qty <= 0) continue;
+
+          let { data: product } = await supabase.from('products').select('id').eq('user_id', userId).ilike('name', item.description).maybeSingle();
+          if (product) {
+            await supabase.from('stock_movements').insert([{
+              user_id: userId,
+              product_id: product.id,
+              movement_type: 'out',
+              quantity: qty,
+              reference: ref,
+              notes: `Backfilled from sale ${ref}`.trim(),
+            }]);
+          }
+        }
+      }
+      report.salesBackfilled.push({ id: s.id, ref });
+      report.counts.sales++;
+    }
+
+    // 3. BACKFILL PAID INVOICES -> LEDGER
+    const { data: invoices } = await supabase.from('invoices').select('*').eq('user_id', userId).eq('payment_status', 'Paid');
+    const { data: bTxns } = await supabase.from('bank_transactions').select('matched_id').eq('user_id', userId).eq('matched_type', 'invoice');
+    const matchedIds = new Set((bTxns || []).map(t => String(t.matched_id)));
+
+    for (const inv of (invoices || [])) {
+      if (matchedIds.has(String(inv.id))) {
+        report.skippedDuplicates++;
+        continue;
+      }
+
+      if (!isDryRun) {
+        await supabase.from('bank_transactions').insert([{
+          user_id: userId,
+          txn_date: inv.payment_date || inv.invoice_date || new Date().toISOString().split('T')[0],
+          description: `Backfill: Payment from ${inv.customer_name} for inv ${inv.invoice_number || inv.id}`.trim(),
+          amount: toMoney(inv.payment_amount || inv.invoice_amount),
+          type: 'credit',
+          status: 'matched',
+          matched_type: 'invoice',
+          matched_id: String(inv.id),
+        }]);
+      }
+      report.paymentsBackfilled.push({ id: inv.id, inv: inv.invoice_number });
+      report.counts.payments++;
+    }
+
+    // 4. RECALCULATE PRODUCT STOCK
+    if (!isDryRun) {
+      const { data: products } = await supabase.from('products').select('id, name').eq('user_id', userId);
+      for (const prod of (products || [])) {
+        const { data: movements } = await supabase.from('stock_movements').select('movement_type, quantity').eq('product_id', prod.id);
+        let stock = 0;
+        (movements || []).forEach(m => {
+          if (m.movement_type === 'in') stock += toMoney(m.quantity);
+          else stock -= toMoney(m.quantity);
+        });
+        await supabase.from('products').update({ current_stock: stock, updated_at: new Date() }).eq('id', prod.id);
+        report.productsRecalculated.push({ name: prod.name, new_stock: stock });
+      }
+    }
+
+    res.json({ success: true, report });
+  } catch (err) {
+    console.error('[reconcile/backfill]', err);
+    res.status(500).json({ error: 'Internal server error', detail: err.message });
+  }
+});
+
 app.post('/api/invoices/migrate', authMiddleware, async (req, res) => {
   try {
     const pool2 = getPool();
