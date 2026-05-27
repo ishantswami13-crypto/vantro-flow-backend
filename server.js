@@ -2136,6 +2136,147 @@ async function ensureConnectedBusinessData(userId) {
   }
 }
 
+// ─── Core Activity Logging and Notification Helpers ──────────────────────────
+async function createActivityLog(userId, action, metadata = {}) {
+  try {
+    await supabase.from('activity_logs').insert([{
+      user_id: userId,
+      action,
+      metadata: typeof metadata === 'object' ? JSON.stringify(metadata) : metadata
+    }]);
+  } catch (err) {
+    console.warn('[activity_log] Failed to create log:', err.message);
+  }
+}
+
+async function createNotification(userId, type, message) {
+  try {
+    await supabase.from('notifications').insert([{
+      user_id: userId,
+      type,
+      message
+    }]);
+  } catch (err) {
+    console.warn('[notifications] Failed to create notification:', err.message);
+  }
+}
+
+// ─── Shared Business Context Helper ──────────────────────────────────────────
+async function getBusinessContext(userId) {
+  const { data: user } = await supabase.from('users').select('id, email, business_name, plan').eq('id', userId).maybeSingle();
+  return {
+    success: true,
+    user: user || null
+  };
+}
+
+// ─── Shared Inventory Summary Service ─────────────────────────────────────────
+async function calculateInventorySummary(userId) {
+  const { data: products } = await supabase.from('products').select('*').eq('user_id', userId).order('name');
+  const safeProducts = products || [];
+  const totalValue = safeProducts.reduce((sum, p) => sum + Number(p.current_stock || 0) * Number(p.unit_price || 0), 0);
+  const lowStock = safeProducts.filter(p => p.current_stock > 0 && p.current_stock <= p.low_stock_alert);
+  const outOfStock = safeProducts.filter(p => p.current_stock === 0);
+
+  return {
+    total_products: safeProducts.length,
+    total_value: totalValue,
+    low_stock_count: lowStock.length,
+    out_of_stock_count: outOfStock.length,
+    low_stock_items: lowStock,
+    out_of_stock_items: outOfStock
+  };
+}
+
+// ─── Shared Collections Summary Service ───────────────────────────────────────
+async function calculateCollectionsSummary(userId) {
+  const { data: invoices } = await supabase.from('invoices').select('*').eq('user_id', userId);
+  const safeInvoices = invoices || [];
+  const totalOutstanding = safeInvoices.reduce(
+    (sum, inv) => sum + (inv.payment_status === 'Pending' ? calculateOutstanding(inv.invoice_amount, inv.payment_amount) : 0),
+    0
+  );
+  return {
+    total_outstanding: totalOutstanding,
+    total_customers: new Set(safeInvoices.map(inv => inv.customer_name)).size,
+    most_overdue_days: Math.max(...safeInvoices.map(inv => inv.days_overdue || 0), 0)
+  };
+}
+
+// ─── Shared Cash Flow Forecast Service ────────────────────────────────────────
+async function calculateCashFlowForecast(userId, current_cash = 0, days = 30) {
+  const [receivables, payables] = await Promise.all([
+    getReceivableRows(userId),
+    getPayableRows(userId),
+  ]);
+
+  const thirtyDaysAgo = new Date(); thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+  const recentPurchases = payables.filter((p) => p.purchase_date && p.purchase_date >= thirtyDaysAgo.toISOString().split('T')[0]);
+  const purchaseTotal = recentPurchases.reduce((s, p) => s + Number(p.amount || 0), 0);
+  const totalPayable = payables.reduce((s, p) => s + Number(p.outstanding_amount || 0), 0);
+  const calculatedBurnRate = recentPurchases.length > 0 ? Math.round(purchaseTotal / 30) : Math.round(totalPayable / 30);
+
+  const paid = receivables.filter(i => i.paid_amount > 0);
+  const paidLast90 = paid.filter((i) => {
+    if (!i.payment_date) return true;
+    const d = new Date(i.payment_date);
+    const ninetyDaysAgo = new Date(); ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
+    return !Number.isNaN(d.getTime()) && d >= ninetyDaysAgo;
+  });
+  const totalRecovered = paidLast90.reduce((s, i) => s + Number(i.paid_amount || 0), 0);
+  const pending = receivables.filter(i => i.outstanding_amount > 0);
+  const totalOutstanding = pending.reduce((s, i) => s + Number(i.outstanding_amount), 0);
+  const totalOverdue30 = pending.filter(i => Number(i.days_overdue) >= 30).reduce((s, i) => s + Number(i.outstanding_amount), 0);
+
+  const avgDailyCollections = paidLast90.length > 0 ? Math.round(totalRecovered / 90) : Math.round(totalOutstanding * 0.03);
+
+  const cashStart = Number(current_cash);
+  const burnRate = calculatedBurnRate;
+  const n = Number(days);
+
+  const buildCurve = (inflow) => {
+    const curve = [];
+    let cash = cashStart;
+    for (let d = 0; d <= n; d++) {
+      curve.push({ day: d, cash: Math.max(0, Math.round(cash)) });
+      cash += inflow - burnRate;
+    }
+    return curve;
+  };
+
+  const scenarios = {
+    pessimistic: { dailyInflow: Math.round(avgDailyCollections * 0.5) },
+    expected:    { dailyInflow: Math.round(avgDailyCollections * 0.8) },
+    optimistic:  { dailyInflow: Math.round(avgDailyCollections * 0.95) },
+  };
+
+  Object.keys(scenarios).forEach(k => {
+    const { dailyInflow } = scenarios[k];
+    const netDaily = dailyInflow - burnRate;
+    scenarios[k].curve = buildCurve(dailyInflow);
+    scenarios[k].endCash = Math.max(0, Math.round(cashStart + netDaily * n));
+    scenarios[k].runwayDays = netDaily >= 0 ? 999 : Math.floor(cashStart / Math.abs(netDaily));
+  });
+
+  return {
+    cashStart,
+    burnRate,
+    avgDailyCollections,
+    totalOutstanding,
+    totalPayable,
+    totalOverdue30,
+    topOutstanding: pending
+      .sort((a, b) => b.outstanding_amount - a.outstanding_amount)
+      .slice(0, 5)
+      .map((i) => ({
+        name: i.customer_name,
+        amount: i.outstanding_amount,
+        days_overdue: i.days_overdue,
+      })),
+    scenarios
+  };
+}
+
 function calculateDaysOverdue(dateValue, isPaid = false) {
   if (isPaid || !dateValue) return 0;
   const due = new Date(dateValue);
@@ -3988,82 +4129,14 @@ app.get('/api/cash-forecast/:userId', requireOwner, async (req, res) => {
     await ensureConnectedBusinessData(userId);
     await syncExistingSalesReceivables(userId);
 
-    const [receivables, payables] = await Promise.all([
-      getReceivableRows(userId),
-      getPayableRows(userId),
-    ]);
-
-    const thirtyDaysAgo = new Date(); thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-    const recentPurchases = payables.filter((p) => p.purchase_date && p.purchase_date >= thirtyDaysAgo.toISOString().split('T')[0]);
-    const purchaseTotal = recentPurchases.reduce((s, p) => s + Number(p.amount || 0), 0);
-    const totalPayable = payables.reduce((s, p) => s + Number(p.outstanding_amount || 0), 0);
-    const calculatedBurnRate = recentPurchases.length > 0 ? Math.round(purchaseTotal / 30) : Math.round(totalPayable / 30);
-
-    const paid = receivables.filter(i => i.paid_amount > 0);
-    const paidLast90 = paid.filter((i) => {
-      if (!i.payment_date) return true;
-      const d = new Date(i.payment_date);
-      const ninetyDaysAgo = new Date(); ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
-      return !Number.isNaN(d.getTime()) && d >= ninetyDaysAgo;
-    });
-    const totalRecovered = paidLast90.reduce((s, i) => s + Number(i.paid_amount || 0), 0);
-    const pending = receivables.filter(i => i.outstanding_amount > 0);
-    const totalOutstanding = pending.reduce((s, i) => s + Number(i.outstanding_amount), 0);
-    const totalOverdue30 = pending.filter(i => Number(i.days_overdue) >= 30)
-      .reduce((s, i) => s + Number(i.outstanding_amount), 0);
-
-    // Average daily collections over last 90 days (or estimate from outstanding if not enough data)
-    const avgDailyCollections = paidLast90.length > 0 ? Math.round(totalRecovered / 90) : Math.round(totalOutstanding * 0.03);
-
-    const cashStart = Number(current_cash);
-    const burnRate = calculatedBurnRate;
-    const n = Number(days);
-
-    const buildCurve = (inflow) => {
-      const curve = [];
-      let cash = cashStart;
-      for (let d = 0; d <= n; d++) {
-        curve.push({ day: d, cash: Math.max(0, Math.round(cash)) });
-        cash += inflow - burnRate;
-      }
-      return curve;
-    };
-
-    const scenarios = {
-      pessimistic: { dailyInflow: Math.round(avgDailyCollections * 0.5) },
-      expected:    { dailyInflow: Math.round(avgDailyCollections * 0.8) },
-      optimistic:  { dailyInflow: Math.round(avgDailyCollections * 0.95) },
-    };
-
-    Object.keys(scenarios).forEach(k => {
-      const { dailyInflow } = scenarios[k];
-      const netDaily = dailyInflow - burnRate;
-      scenarios[k].curve = buildCurve(dailyInflow);
-      scenarios[k].endCash = Math.max(0, Math.round(cashStart + netDaily * n));
-      scenarios[k].runwayDays = netDaily >= 0 ? 999 : Math.floor(cashStart / Math.abs(netDaily));
-    });
-
+    const forecast = await calculateCashFlowForecast(userId, current_cash, days);
     res.json({
       success: true,
-      cashStart,
-      burnRate,
-      avgDailyCollections,
-      totalOutstanding,
-      totalPayable,
-      totalOverdue30,
-      topOutstanding: pending
-        .sort((a, b) => b.outstanding_amount - a.outstanding_amount)
-        .slice(0, 5)
-        .map((i) => ({
-          name: i.customer_name,
-          amount: i.outstanding_amount,
-          days_overdue: i.days_overdue,
-        })),
-      scenarios,
-      days: n
+      ...forecast,
+      days: Number(days)
     });
   } catch (err) {
-    console.error('[cash forecast]', err);
+    console.error('[cash forecast error]', err);
     const n = Number(days) || 30;
     const cashStart = Number(current_cash) || 0;
     const curve = Array.from({ length: n + 1 }, (_, day) => ({ day, cash: cashStart }));
@@ -9068,6 +9141,29 @@ async function runAutoMigrations() {
       CREATE INDEX IF NOT EXISTS idx_inv_user_status   ON invoices(user_id, payment_status);
       CREATE INDEX IF NOT EXISTS idx_inv_phone         ON invoices(customer_phone)      WHERE customer_phone IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_inv_source        ON invoices(user_id, source_type, source_id) WHERE source_type IS NOT NULL;
+
+      -- ── activity_logs table (create if missing) ──────────────────────────
+      CREATE TABLE IF NOT EXISTS public.activity_logs (
+        id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id     UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+        action      TEXT NOT NULL,
+        metadata    JSONB DEFAULT '{}',
+        created_at  TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_activity_logs_user ON public.activity_logs(user_id);
+      CREATE INDEX IF NOT EXISTS idx_activity_logs_created ON public.activity_logs(user_id, created_at DESC);
+
+      -- ── notifications table (create if missing) ─────────────────────────
+      CREATE TABLE IF NOT EXISTS public.notifications (
+        id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id     UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+        type        TEXT NOT NULL,
+        message     TEXT NOT NULL,
+        read        BOOLEAN DEFAULT FALSE,
+        created_at  TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_notifications_user ON public.notifications(user_id);
+      CREATE INDEX IF NOT EXISTS idx_notifications_created ON public.notifications(user_id, created_at DESC);
     `);
     await ensureTransactionsTable();
     console.log('[migrate] Auto-migration completed successfully');
