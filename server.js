@@ -24,6 +24,7 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const app = express();
 app.set('trust proxy', 1); // Railway sits behind a proxy — needed for express-rate-limit to see real IP
 const PORT = process.env.PORT || 3001;
+const IS_PRODUCTION = process.env.NODE_ENV === 'production' || Boolean(process.env.RAILWAY_ENVIRONMENT);
 
 // ── In-memory OTP store (keyed by userId) ──────────────────────────────────
 // Structure: Map<userId, { code: string, expiresAt: number, attempts: number }>
@@ -68,24 +69,29 @@ function isMissingSchemaError(error) {
 const extraOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim()).filter(Boolean)
   : [];
+const allowedOrigins = new Set([
+  'https://vantro-flow-frontend.vercel.app',
+  'http://localhost:3000',
+  'http://localhost:3001',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:3001',
+  ...extraOrigins,
+]);
 
-app.use(cors({
+const corsOptions = {
   origin: (origin, callback) => {
     // Allow requests with no origin (mobile apps, Postman, server-to-server)
     if (!origin) return callback(null, true);
-    // Allow localhost dev
-    if (origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1')) return callback(null, true);
-    // Allow all Vercel preview and production URLs
-    if (origin.endsWith('.vercel.app')) return callback(null, true);
-    // Allow any explicitly listed extra origins
-    if (extraOrigins.includes(origin)) return callback(null, true);
+    if (allowedOrigins.has(origin)) return callback(null, true);
     callback(new Error(`CORS: origin ${origin} not allowed`));
   },
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
-}));
-app.options('*', cors());
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 
 // Raw body preservation for Razorpay webhook (must come BEFORE express.json)
 app.use((req, res, next) => {
@@ -121,18 +127,38 @@ app.use((req, res, next) => {
   next();
 });
 
-// Rate limiting — auth: 8 attempts/15 min, api: 120/min
+const rateLimitMessage = { success: false, error: 'Too many requests. Please try again later.' };
+function makeLimiter({ windowMs, max, skipSuccessfulRequests = false }) {
+  return rateLimit({
+    windowMs,
+    max,
+    message: rateLimitMessage,
+    standardHeaders: true,
+    legacyHeaders: false,
+    skipSuccessfulRequests,
+  });
+}
+
+// Rate limiting — layered: auth + general API + heavier abuse-prone endpoints.
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 8,
-  message: { error: 'Too many login attempts. Try again in 15 minutes.' },
+  message: rateLimitMessage,
   standardHeaders: true,
   legacyHeaders: false,
   skipSuccessfulRequests: true, // only count failed attempts
 });
-const apiLimiter = rateLimit({ windowMs: 60 * 1000, max: 120, message: { error: 'Rate limit exceeded' } });
+const apiLimiter = makeLimiter({ windowMs: 60 * 1000, max: 120 });
+const uploadLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, max: 20 });
+const aiLimiter = makeLimiter({ windowMs: 10 * 60 * 1000, max: 40 });
+const publicBillLimiter = makeLimiter({ windowMs: 10 * 60 * 1000, max: 80 });
+const heavyReadLimiter = makeLimiter({ windowMs: 5 * 60 * 1000, max: 90 });
 app.use('/api/auth', authLimiter);
 app.use('/api', apiLimiter);
+app.use(['/api/upload-csv', '/api/import/excel', '/api/scan-document', '/api/purchases/scan', '/api/sales/scan', '/api/transactions/scan', '/api/ai/extract-voice'], uploadLimiter);
+app.use(['/api/ai-chat', '/api/ml/briefing', '/api/ai/brain', '/api/ai/call-script', '/api/ai/bulk-whatsapp'], aiLimiter);
+app.use('/api/bills/public', publicBillLimiter);
+app.use(['/api/analytics', '/api/cash-forecast', '/api/reports/export', '/api/reconcile/backfill'], heavyReadLimiter);
 
 // JWT middleware — attach user to req if token valid
 function authMiddleware(req, res, next) {
@@ -186,6 +212,36 @@ function pickAllowed(source, allowed) {
     if (source[key] !== undefined) out[key] = source[key];
     return out;
   }, {});
+}
+
+function timingSafeEqualString(a, b) {
+  const left = Buffer.from(String(a || ''));
+  const right = Buffer.from(String(b || ''));
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+function getPublicLinkSecret() {
+  return process.env.PUBLIC_LINK_SECRET || JWT_SECRET;
+}
+
+function signPublicBillToken(billId, expiresAtMs) {
+  const payload = Buffer.from(JSON.stringify({ billId: String(billId), exp: Number(expiresAtMs) }), 'utf8').toString('base64url');
+  const sig = crypto.createHmac('sha256', getPublicLinkSecret()).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
+}
+
+function verifyPublicBillToken(token, billId) {
+  if (!token || typeof token !== 'string') return false;
+  const [payload, sig] = token.split('.');
+  if (!payload || !sig) return false;
+  const expected = crypto.createHmac('sha256', getPublicLinkSecret()).update(payload).digest('base64url');
+  if (!timingSafeEqualString(sig, expected)) return false;
+  try {
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    return String(data.billId) === String(billId) && Number(data.exp) > Date.now();
+  } catch {
+    return false;
+  }
 }
 
 // Module-level pg pool — reused across all requests (avoids per-request connection churn)
@@ -1421,6 +1477,14 @@ app.post('/api/mark-paid', authMiddleware, async (req, res) => {
     if (error) throw error;
 
     const inv = data[0];
+    if (inv) {
+      await createActivityLog(userId, 'invoice_marked_paid', {
+        entityType: 'invoice',
+        entityId: inv.id,
+        source: 'api',
+        amount: payment_amount || inv.invoice_amount || null,
+      });
+    }
     // Payment celebration WhatsApp to owner
     try {
       const { data: owner } = await supabase.from('users').select('phone, business_name, owner_name').eq('id', req.user.userId).single();
@@ -1757,6 +1821,11 @@ app.post('/api/products', authMiddleware, async (req, res) => {
       .select();
 
     if (error) throw error;
+    await createActivityLog(userId, 'product_created', {
+      entityType: 'product',
+      entityId: data[0]?.id,
+      source: 'api',
+    });
     res.json({ success: true, product: data[0] });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
@@ -1777,6 +1846,11 @@ app.post('/api/products/:productId', authMiddleware, async (req, res) => {
 
     if (error) throw error;
     if (!data?.length) return res.status(404).json({ error: 'Product not found' });
+    await createActivityLog(req.user.userId, 'product_updated', {
+      entityType: 'product',
+      entityId: productId,
+      source: 'api',
+    });
     res.json({ success: true, product: data[0] });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
@@ -1826,6 +1900,13 @@ app.post('/api/stock/move', authMiddleware, async (req, res) => {
 
     if (movErr) throw movErr;
     if (updateErr) throw updateErr;
+    await createActivityLog(userId, 'stock_movement_created', {
+      entityType: 'product',
+      entityId: product_id,
+      source: 'api',
+      movementType: movement_type,
+      quantity: qty,
+    });
 
     res.json({ success: true, movement: movement[0], new_stock: newStock });
   } catch (error) {
@@ -6292,10 +6373,9 @@ app.post('/api/voice/call', authMiddleware, async (req, res) => {
 app.post('/api/voice/status', async (req, res) => {
   try {
     const voiceSecret = process.env.VOICE_WEBHOOK_SECRET;
-    if (voiceSecret) {
-      const provided = req.headers['x-vantro-webhook-secret'] || req.query.secret;
-      if (provided !== voiceSecret) return res.sendStatus(403);
-    }
+    const provided = req.headers['x-vantro-webhook-secret'] || req.query.secret;
+    if (!voiceSecret && IS_PRODUCTION) return res.sendStatus(403);
+    if (voiceSecret && !timingSafeEqualString(provided, voiceSecret)) return res.sendStatus(403);
     const userId = req.query.uid;
     const { CallStatus, CallDuration, To } = req.body;
     const phone = (To || '').replace(/^\+91/, '').replace(/\D/g, '');
@@ -6366,7 +6446,10 @@ async function sendPushToUser(userId, title, body, data = {}) {
 app.post('/api/payments/webhook', async (req, res) => {
     try {
       const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
-      if (!secret) return res.sendStatus(200); // not configured, ignore
+      if (!secret) {
+        if (IS_PRODUCTION) return res.status(503).json({ error: 'Webhook verification is not configured' });
+        return res.sendStatus(200); // Local/dev: not configured, ignore.
+      }
 
       // Verify signature using raw body
       const rawBody = req.rawBody || JSON.stringify(req.body);
@@ -6376,7 +6459,7 @@ app.post('/api/payments/webhook', async (req, res) => {
         .update(rawBody)
         .digest('hex');
 
-      if (signature !== expectedSig) {
+      if (!timingSafeEqualString(signature, expectedSig)) {
         console.warn('Razorpay webhook: invalid signature');
         return res.status(400).json({ error: 'Invalid signature' });
       }
@@ -6438,6 +6521,14 @@ app.post('/api/payments/webhook', async (req, res) => {
         matched_id: String(inv.id),
       }]);
     }
+    await createActivityLog(inv.user_id, 'payment_webhook_processed', {
+      entityType: 'invoice',
+      entityId: inv.id,
+      source: 'razorpay_webhook',
+      paymentLinkId,
+      paymentId,
+      amount: amountPaid,
+    });
 
     // Send push notification to the business owner
           await sendPushToUser(
@@ -6517,10 +6608,9 @@ app.post('/api/webhooks/whatsapp-inbound', async (req, res) => {
     res.sendStatus(200); // Acknowledge immediately (Interakt/WATI require fast 200)
 
     const webhookSecret = process.env.WHATSAPP_WEBHOOK_SECRET;
-    if (webhookSecret) {
-      const provided = req.headers['x-vantro-webhook-secret'] || req.query.secret;
-      if (provided !== webhookSecret) return;
-    }
+    const provided = req.headers['x-vantro-webhook-secret'] || req.query.secret;
+    if (!webhookSecret && IS_PRODUCTION) return;
+    if (webhookSecret && !timingSafeEqualString(provided, webhookSecret)) return;
 
     const body = req.body;
 
@@ -6885,6 +6975,13 @@ app.post('/api/transactions', authMiddleware, async (req, res) => {
       .select()
       .single();
     if (error) throw error;
+    await createActivityLog(user_id, 'ledger_transaction_created', {
+      entityType: 'bank_transaction',
+      entityId: data.id,
+      source: 'api',
+      amount: numericAmount,
+      type: normalizedType,
+    });
 
     res.json({ success: true, transaction: mapBankTransactionToLedger(data) });
   } catch (err) {
@@ -7247,10 +7344,9 @@ app.post('/api/vocabulary/seed', authMiddleware, async (req, res) => {
 app.post('/api/voice/inbound', async (req, res) => {
   try {
     const voiceSecret = process.env.VOICE_WEBHOOK_SECRET;
-    if (voiceSecret) {
-      const provided = req.headers['x-vantro-webhook-secret'] || req.query.secret;
-      if (provided !== voiceSecret) return res.sendStatus(403);
-    }
+    const provided = req.headers['x-vantro-webhook-secret'] || req.query.secret;
+    if (!voiceSecret && IS_PRODUCTION) return res.sendStatus(403);
+    if (voiceSecret && !timingSafeEqualString(provided, voiceSecret)) return res.sendStatus(403);
     const userId = req.query.uid;
     let greeting = 'Vantro Business';
     if (userId) {
@@ -7277,10 +7373,9 @@ app.post('/api/voice/recording', async (req, res) => {
   res.sendStatus(200); // Respond immediately — process async
 
   const voiceSecret = process.env.VOICE_WEBHOOK_SECRET;
-  if (voiceSecret) {
-    const provided = req.headers['x-vantro-webhook-secret'] || req.query.secret;
-    if (provided !== voiceSecret) return;
-  }
+  const provided = req.headers['x-vantro-webhook-secret'] || req.query.secret;
+  if (!voiceSecret && IS_PRODUCTION) return;
+  if (voiceSecret && !timingSafeEqualString(provided, voiceSecret)) return;
 
   const userId = req.query.uid;
   const { RecordingUrl, RecordingSid, From: callerPhone } = req.body;
@@ -7951,12 +8046,32 @@ app.get('/api/user/features', authMiddleware, async (req, res) => {
 // GST BILLS / INVOICES
 // ============================================
 
-// Public endpoint — no auth — for sharing invoice URL
+// Public endpoint for invoice sharing. Signed links are supported with ?token=...
+// Legacy unsigned links remain allowed unless REQUIRE_SIGNED_PUBLIC_BILLS=true.
 app.get('/api/bills/public/:id', async (req, res) => {
   try {
-    const { data, error } = await supabase.from('bills').select('*, users(business_name, gstin, city, business_address, owner_name)').eq('id', req.params.id).single();
+    const token = req.query.token;
+    const requireSigned = process.env.REQUIRE_SIGNED_PUBLIC_BILLS === 'true';
+    if (token && !verifyPublicBillToken(token, req.params.id)) return res.status(403).json({ error: 'Invalid or expired link' });
+    if (!token && requireSigned) return res.status(403).json({ error: 'Signed link required' });
+    if (!token) {
+      res.setHeader('Deprecation', 'true');
+      res.setHeader('Warning', '299 - Unsigned public bill links are deprecated');
+    }
+
+    const { data, error } = await supabase
+      .from('bills')
+      .select('id, user_id, bill_number, customer_name, customer_phone, customer_email, customer_gstin, invoice_date, due_date, items, subtotal, tax_amount, total_amount, status, notes, paid_at, created_at, users(business_name, gstin, city, business_address, owner_name)')
+      .eq('id', req.params.id)
+      .single();
     if (error || !data) return res.status(404).json({ error: 'Invoice not found' });
-    res.json({ success: true, bill: data });
+    const { user_id, ...publicBill } = data;
+    await createActivityLog(user_id, 'public_bill_accessed', {
+      entityType: 'bill',
+      entityId: req.params.id,
+      source: token ? 'signed_public_link' : 'legacy_public_link',
+    });
+    res.json({ success: true, bill: publicBill });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
@@ -8236,6 +8351,12 @@ app.post('/api/purchases', authMiddleware, async (req, res) => {
       ensureSupplierFromPurchase(req.user.userId, data),
       items !== undefined ? syncInventoryFromPurchase(req.user.userId, data) : Promise.resolve([]),
     ]);
+    await createActivityLog(req.user.userId, 'purchase_created', {
+      entityType: 'purchase',
+      entityId: data.id,
+      source: 'api',
+      amount: finalAmount,
+    });
     res.json({ success: true, purchase: { ...data, total_amount: parseFloat(data.amount) }, supplier, inventory });
   } catch (err) {
     console.error('Purchase create error:', err.message);
@@ -8282,6 +8403,12 @@ app.patch('/api/purchases/:id', authMiddleware, async (req, res) => {
       ensureSupplierFromPurchase(req.user.userId, data),
       items !== undefined ? syncInventoryFromPurchase(req.user.userId, data) : Promise.resolve([]),
     ]);
+    await createActivityLog(req.user.userId, 'purchase_updated', {
+      entityType: 'purchase',
+      entityId: req.params.id,
+      source: 'api',
+      amount: newAmount,
+    });
     res.json({ success: true, purchase: { ...data, total_amount: parseFloat(data.amount) }, supplier, inventory });
   } catch (err) {
     console.error('Purchase patch error:', err.message);
@@ -8396,6 +8523,12 @@ app.post('/api/sales', authMiddleware, async (req, res) => {
         .single();
       if (!updatedSale.error && updatedSale.data) sale = updatedSale.data;
     }
+    await createActivityLog(req.user.userId, 'sale_created', {
+      entityType: 'sale',
+      entityId: sale.id,
+      source: 'api',
+      amount: finalAmount,
+    });
     res.json({ success: true, sale: { ...sale, total_amount: parseFloat(sale.amount) }, receivable });
   } catch (err) { res.status(500).json({ error: err.message || 'Internal server error' }); }
 });
@@ -8452,6 +8585,12 @@ app.patch('/api/sales/:id', authMiddleware, async (req, res) => {
         .single();
       if (!updatedSale.error && updatedSale.data) sale = updatedSale.data;
     }
+    await createActivityLog(req.user.userId, 'sale_updated', {
+      entityType: 'sale',
+      entityId: req.params.id,
+      source: 'api',
+      amount: finalAmount,
+    });
     res.json({ success: true, sale: { ...sale, total_amount: parseFloat(sale.amount) }, receivable });
   } catch (err) { res.status(500).json({ error: err.message || 'Internal server error' }); }
 });
@@ -8669,6 +8808,13 @@ app.post('/api/bank/transactions', authMiddleware, async (req, res) => {
       .select()
       .single();
     if (error) throw error;
+    await createActivityLog(req.user.userId, 'bank_transaction_created', {
+      entityType: 'bank_transaction',
+      entityId: data.id,
+      source: 'api',
+      amount: parseFloat(amount),
+      type,
+    });
     res.json({ success: true, transaction: data });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
@@ -8712,6 +8858,13 @@ app.post('/api/bank/match', authMiddleware, async (req, res) => {
         }]);
       }
     }
+    await createActivityLog(req.user.userId, 'bank_transaction_matched', {
+      entityType: 'bank_transaction',
+      entityId: transaction_id,
+      source: 'api',
+      matchType: match_type,
+      matchId: String(match_id),
+    });
     res.json({ success: true, message: 'Matched and marked as paid' });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
