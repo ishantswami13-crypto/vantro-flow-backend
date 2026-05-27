@@ -446,7 +446,7 @@ app.post('/api/auth/verify-otp', async (req, res) => {
 
     // Issue real 7-day session token
     const { data: user } = await supabase.from('users').select('id, email, phone, business_name, plan, created_at').eq('id', decoded.userId).single();
-    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
 
     res.json({ success: true, token, user });
   } catch (err) {
@@ -485,7 +485,7 @@ app.post('/api/auth/login', async (req, res) => {
     if (!valid) return res.status(401).json({ error: 'Invalid email or password' });
 
     const { password_hash, ...user } = data;
-    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ success: true, token, user });
   } catch (error) {
     console.error('[login]', error);
