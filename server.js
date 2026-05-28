@@ -24,6 +24,40 @@ const JWT_SECRET = process.env.JWT_SECRET;
 
 const app = express();
 app.set('trust proxy', 1); // Railway sits behind a proxy — needed for express-rate-limit to see real IP
+
+// Request ID & structured logging middleware
+app.use((req, res, next) => {
+  const requestId = req.headers['x-request-id'] || crypto.randomUUID();
+  req.requestId = requestId;
+  res.setHeader('X-Request-ID', requestId);
+
+  // Capture request start metadata
+  const startHrTime = process.hrtime();
+
+  res.on('finish', () => {
+    const elapsedHrTime = process.hrtime(startHrTime);
+    const durationMs = (elapsedHrTime[0] * 1000 + elapsedHrTime[1] / 1e6).toFixed(2);
+
+    const logData = {
+      requestId: req.requestId,
+      method: req.method,
+      path: req.path,
+      status: res.statusCode,
+      userId: req.user?.userId || req.user?.id || null,
+      businessId: req.user?.businessId || null,
+      durationMs: parseFloat(durationMs)
+    };
+
+    if (res.statusCode >= 400) {
+      logData.error = res.statusMessage || 'HTTP Error';
+    }
+
+    console.log(`[API_REQUEST] ${JSON.stringify(logData)}`);
+  });
+
+  next();
+});
+
 const PORT = process.env.PORT || 3001;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production' || Boolean(
   process.env.RAILWAY_ENVIRONMENT ||
@@ -10193,14 +10227,27 @@ async function runAutoMigrations() {
 
 app.use((err, req, res, next) => {
   if (!err) return next();
+  const requestId = req.requestId || crypto.randomUUID();
+
   if (err instanceof multer.MulterError || err.code === 'UNSUPPORTED_FILE_TYPE') {
     return res.status(400).json({
       success: false,
       error: err.code === 'LIMIT_FILE_SIZE' ? 'File is too large' : err.message || 'Invalid upload',
+      requestId
     });
   }
-  console.error('[unhandled middleware error]', err.message || err);
-  res.status(500).json({ success: false, error: 'Internal server error' });
+
+  // Log unhandled error with requestId
+  console.error(`[unhandled middleware error] Request ID: ${requestId}`, {
+    message: err.message || err,
+    stack: IS_PRODUCTION ? undefined : err.stack
+  });
+
+  res.status(500).json({
+    success: false,
+    error: 'Internal server error',
+    requestId
+  });
 });
 
 app.listen(PORT, () => {
