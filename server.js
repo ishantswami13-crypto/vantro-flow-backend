@@ -893,6 +893,9 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
     if (error) throw error;
     if (!data) return res.status(404).json({ error: 'User not found' });
 
+    // Auto-reconcile and connect business data
+    await ensureConnectedBusinessData(tokenUserId);
+
     const user = {
       ...data,
       id: data.id,
@@ -1644,6 +1647,38 @@ app.post('/api/mark-paid', authMiddleware, async (req, res) => {
         amount: payment_amount || inv.invoice_amount || null,
       });
     }
+    
+    // Sync Bank Transaction (Credit)
+    try {
+      // Find a default bank account or create one
+      let { data: bankAccount } = await supabase.from('bank_accounts').select('id').eq('user_id', userId).limit(1).single();
+      if (!bankAccount) {
+        const { data: newAcc } = await supabase.from('bank_accounts').insert([{
+          user_id: userId,
+          account_name: 'Main Business Account',
+          account_type: 'checking',
+          currency: 'INR',
+          balance: 0
+        }]).select('id').single();
+        bankAccount = newAcc;
+      }
+      if (bankAccount) {
+        await supabase.from('bank_transactions').insert([{
+          user_id: userId,
+          bank_account_id: bankAccount.id,
+          txn_date: inv.payment_date || inv.created_at || new Date().toISOString(),
+          amount: parseFloat(inv.payment_amount || inv.invoice_amount || 0),
+          type: 'credit',
+          description: `Payment for Invoice #${inv.invoice_number || inv.id}`,
+          status: 'matched',
+          matched_type: 'invoice',
+          matched_id: inv.id
+        }]);
+      }
+    } catch (btErr) { console.error('Bank transaction sync error:', btErr.message); }
+
+    // Log activity
+    await createActivityLog(userId, 'invoice_paid', { invoice_id: inv.id, amount: inv.payment_amount || inv.invoice_amount, customer: inv.customer_name });
     // Payment celebration WhatsApp to owner
     try {
       const { data: owner } = await supabase.from('users').select('phone, business_name, owner_name').eq('id', req.user.userId).single();
@@ -1655,9 +1690,9 @@ app.post('/api/mark-paid', authMiddleware, async (req, res) => {
       }
     } catch (waErr) { console.error('Celebration WA error:', waErr.message); }
 
-    res.json({ success: true, invoice: inv });
+    res.json({ success: true, data: inv });
   } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
@@ -1790,138 +1825,14 @@ app.get('/api/analytics/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
     await ensureConnectedBusinessData(userId);
-
-    await syncExistingSalesReceivables(userId);
-
-    const [receivables, payables, { data: callLogs }] = await Promise.all([
-      getReceivableRows(userId),
-      getPayableRows(userId),
-      supabase.from('call_logs').select('*').eq('user_id', userId)
-    ]);
-
-    const safeCallLogs = callLogs || [];
-
-    const paidInvoices = receivables.filter(inv => inv.outstanding_amount <= 0);
-    const pendingInvoices = receivables.filter(inv => inv.outstanding_amount > 0);
-
-    // Monthly business movement for last 6 months
-    const monthly = {};
-    const now = new Date();
-    for (let i = 5; i >= 0; i--) {
-      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-      monthly[key] = {
-        month: key,
-        recovered: 0,
-        invoices_paid: 0,
-        sales_booked: 0,
-        purchases_booked: 0,
-        payables_paid: 0,
-        net_booked: 0,
-        cash_net: 0,
-      };
-    }
-    receivables.forEach(inv => {
-      const bookedKey = (inv.invoice_date || inv.due_date || '').substring(0, 7);
-      if (monthly[bookedKey]) monthly[bookedKey].sales_booked += Number(inv.amount || 0);
-
-      const date = inv.payment_date || (inv.status === 'Paid' ? inv.invoice_date : null);
-      if (!date) return;
-      const key = date.substring(0, 7);
-      if (monthly[key]) {
-        monthly[key].recovered += Number(inv.paid_amount || inv.amount);
-        if (Number(inv.paid_amount || inv.amount) > 0) monthly[key].invoices_paid += 1;
-      }
-    });
-    payables.forEach(purchase => {
-      const bookedKey = (purchase.purchase_date || purchase.due_date || '').substring(0, 7);
-      if (monthly[bookedKey]) monthly[bookedKey].purchases_booked += Number(purchase.amount || 0);
-
-      const paidKey = (purchase.status === 'paid' ? (purchase.purchase_date || purchase.due_date || '') : '').substring(0, 7);
-      if (monthly[paidKey]) monthly[paidKey].payables_paid += Number(purchase.paid_amount || purchase.amount || 0);
-    });
-    Object.values(monthly).forEach(row => {
-      row.net_booked = row.sales_booked - row.purchases_booked;
-      row.cash_net = row.recovered - row.payables_paid;
-    });
-
-    const supplierMap = {};
-    payables.forEach(purchase => {
-      if (!supplierMap[purchase.supplier_name]) {
-        supplierMap[purchase.supplier_name] = { name: purchase.supplier_name, amount: 0, outstanding: 0 };
-      }
-      supplierMap[purchase.supplier_name].amount += Number(purchase.amount || 0);
-      supplierMap[purchase.supplier_name].outstanding += Number(purchase.outstanding_amount || 0);
-    });
-    const topSuppliers = Object.values(supplierMap)
-      .sort((a, b) => b.outstanding - a.outstanding || b.amount - a.amount)
-      .slice(0, 5);
-
-    // Top customers by outstanding amount
-    const customerMap = {};
-    pendingInvoices.forEach(inv => {
-      if (!customerMap[inv.customer_name]) customerMap[inv.customer_name] = 0;
-      customerMap[inv.customer_name] += Number(inv.outstanding_amount);
-    });
-    const topCustomers = Object.entries(customerMap)
-      .map(([name, amount]) => ({ name, amount }))
-      .sort((a, b) => b.amount - a.amount)
-      .slice(0, 5);
-
-    const totalOutstanding = pendingInvoices.reduce((s, i) => s + Number(i.outstanding_amount), 0);
-    const totalRecovered = receivables.reduce((s, i) => s + Number(i.paid_amount || 0), 0);
-    const salesBooked = receivables.reduce((s, i) => s + Number(i.amount || 0), 0);
-    const purchasesBooked = payables.reduce((s, p) => s + Number(p.amount || 0), 0);
-    const totalPayable = payables.reduce((s, p) => s + Number(p.outstanding_amount || 0), 0);
-    const payablesPaid = payables.reduce((s, p) => s + Number(p.paid_amount || 0), 0);
-    const grossMargin = salesBooked > 0 ? ((salesBooked - purchasesBooked) / salesBooked) * 100 : 0;
-    const recoveryRate = receivables.length > 0
-      ? ((paidInvoices.length / receivables.length) * 100).toFixed(1)
-      : 0;
-
+    const analytics = await calculateAnalyticsSummary(userId);
     res.json({
       success: true,
-      analytics: {
-        total_outstanding: totalOutstanding,
-        total_payable: totalPayable,
-        total_recovered: totalRecovered,
-        sales_booked: salesBooked,
-        purchases_booked: purchasesBooked,
-        payables_paid: payablesPaid,
-        gross_margin_pct: Number(grossMargin.toFixed(1)),
-        booked_net: salesBooked - purchasesBooked,
-        cash_net: totalRecovered - payablesPaid,
-        recovery_rate: recoveryRate,
-        total_invoices: receivables.length,
-        paid_invoices: paidInvoices.length,
-        pending_invoices: pendingInvoices.length,
-        calls_made: safeCallLogs.length,
-        total_customers: new Set(receivables.map((i) => i.customer_name)).size,
-        total_suppliers: new Set(payables.map((p) => p.supplier_name)).size,
-        monthly_trend: Object.values(monthly),
-        top_customers: topCustomers,
-        top_suppliers: topSuppliers,
-      }
+      analytics
     });
   } catch (error) {
     console.error('[analytics]', error);
-    res.json({
-      success: true,
-      analytics: {
-        total_outstanding: 0,
-        total_payable: 0,
-        total_recovered: 0,
-        recovery_rate: 0,
-        total_invoices: 0,
-        paid_invoices: 0,
-        pending_invoices: 0,
-        calls_made: 0,
-        total_customers: 0,
-        total_suppliers: 0,
-        monthly_trend: [],
-        top_customers: []
-      }
-    });
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
@@ -2450,13 +2361,358 @@ async function createNotification(userId, type, message) {
 }
 
 // ─── Shared Business Context Helper ──────────────────────────────────────────
-async function getBusinessContext(userId) {
-  const { data: user } = await supabase.from('users').select('id, email, business_name, plan').eq('id', userId).maybeSingle();
+function getBusinessContext(req) {
+  if (!req.user || !req.user.userId) {
+    console.warn('[getBusinessContext] Warning: Request has no verified user session.');
+    return { userId: null, businessId: null, email: null, role: 'guest' };
+  }
+  const userId = req.user.userId;
+  const email = req.user.email || null;
+  const businessId = req.user.businessId || userId;
+  const role = req.user.role || 'owner';
+  return { userId, businessId, email, role };
+}
+
+// ─── Shared Ledger Summary Service ───────────────────────────────────────────
+async function calculateLedgerSummary(userId) {
+  const { data, error } = await supabase
+    .from('bank_transactions')
+    .select('*')
+    .eq('user_id', userId);
+  if (error) throw error;
+  const transactions = (data || []).map(mapBankTransactionToLedger);
+  return buildLedgerSummary(transactions);
+}
+
+// ─── Shared Analytics Summary Service ────────────────────────────────────────
+async function calculateAnalyticsSummary(userId) {
+  await syncExistingSalesReceivables(userId);
+
+  const [receivables, payables, { data: callLogs }] = await Promise.all([
+    getReceivableRows(userId),
+    getPayableRows(userId),
+    supabase.from('call_logs').select('*').eq('user_id', userId)
+  ]);
+
+  const safeCallLogs = callLogs || [];
+  const paidInvoices = receivables.filter(inv => inv.outstanding_amount <= 0);
+  const pendingInvoices = receivables.filter(inv => inv.outstanding_amount > 0);
+
+  // Monthly business movement for last 6 months
+  const monthly = {};
+  const now = new Date();
+  for (let i = 5; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    monthly[key] = {
+      month: key,
+      recovered: 0,
+      invoices_paid: 0,
+      sales_booked: 0,
+      purchases_booked: 0,
+      payables_paid: 0,
+      net_booked: 0,
+      cash_net: 0,
+    };
+  }
+  receivables.forEach(inv => {
+    const bookedKey = (inv.invoice_date || inv.due_date || '').substring(0, 7);
+    if (monthly[bookedKey]) monthly[bookedKey].sales_booked += Number(inv.amount || 0);
+
+    const date = inv.payment_date || (inv.status === 'Paid' ? inv.invoice_date : null);
+    if (!date) return;
+    const key = date.substring(0, 7);
+    if (monthly[key]) {
+      monthly[key].recovered += Number(inv.paid_amount || inv.amount);
+      if (Number(inv.paid_amount || inv.amount) > 0) monthly[key].invoices_paid += 1;
+    }
+  });
+  payables.forEach(purchase => {
+    const bookedKey = (purchase.purchase_date || purchase.due_date || '').substring(0, 7);
+    if (monthly[bookedKey]) monthly[bookedKey].purchases_booked += Number(purchase.amount || 0);
+
+    const paidKey = (purchase.status === 'paid' ? (purchase.purchase_date || purchase.due_date || '') : '').substring(0, 7);
+    if (monthly[paidKey]) monthly[paidKey].payables_paid += Number(purchase.paid_amount || purchase.amount || 0);
+  });
+  Object.values(monthly).forEach(row => {
+    row.net_booked = row.sales_booked - row.purchases_booked;
+    row.cash_net = row.recovered - row.payables_paid;
+  });
+
+  const supplierMap = {};
+  payables.forEach(purchase => {
+    if (!supplierMap[purchase.supplier_name]) {
+      supplierMap[purchase.supplier_name] = { name: purchase.supplier_name, amount: 0, outstanding: 0 };
+    }
+    supplierMap[purchase.supplier_name].amount += Number(purchase.amount || 0);
+    supplierMap[purchase.supplier_name].outstanding += Number(purchase.outstanding_amount || 0);
+  });
+  const topSuppliers = Object.values(supplierMap)
+    .sort((a, b) => b.outstanding - a.outstanding || b.amount - a.amount)
+    .slice(0, 5);
+
+  const customerMap = {};
+  pendingInvoices.forEach(inv => {
+    if (!customerMap[inv.customer_name]) customerMap[inv.customer_name] = 0;
+    customerMap[inv.customer_name] += Number(inv.outstanding_amount);
+  });
+  const topCustomers = Object.entries(customerMap)
+    .map(([name, amount]) => ({ name, amount }))
+    .sort((a, b) => b.amount - a.amount)
+    .slice(0, 5);
+
+  const totalOutstanding = pendingInvoices.reduce((s, i) => s + Number(i.outstanding_amount), 0);
+  const totalRecovered = receivables.reduce((s, i) => s + Number(i.paid_amount || 0), 0);
+  const salesBooked = receivables.reduce((s, i) => s + Number(i.amount || 0), 0);
+  const purchasesBooked = payables.reduce((s, p) => s + Number(p.amount || 0), 0);
+  const totalPayable = payables.reduce((s, p) => s + Number(p.outstanding_amount || 0), 0);
+  const payablesPaid = payables.reduce((s, p) => s + Number(p.paid_amount || 0), 0);
+  const grossMargin = salesBooked > 0 ? ((salesBooked - purchasesBooked) / salesBooked) * 100 : 0;
+  const recoveryRate = receivables.length > 0
+    ? ((paidInvoices.length / receivables.length) * 100).toFixed(1)
+    : 0;
+
   return {
-    success: true,
-    user: user || null
+    total_outstanding: totalOutstanding,
+    total_payable: totalPayable,
+    total_recovered: totalRecovered,
+    sales_booked: salesBooked,
+    purchases_booked: purchasesBooked,
+    payables_paid: payablesPaid,
+    gross_margin_pct: Number(grossMargin.toFixed(1)),
+    booked_net: salesBooked - purchasesBooked,
+    cash_net: totalRecovered - payablesPaid,
+    recovery_rate: recoveryRate,
+    total_invoices: receivables.length,
+    paid_invoices: paidInvoices.length,
+    pending_invoices: pendingInvoices.length,
+    calls_made: safeCallLogs.length,
+    total_customers: new Set(receivables.map((i) => i.customer_name)).size,
+    total_suppliers: new Set(payables.map((p) => p.supplier_name)).size,
+    monthly_trend: Object.values(monthly),
+    top_customers: topCustomers,
+    top_suppliers: topSuppliers,
   };
 }
+
+// ─── Shared Control Room Summary Service ─────────────────────────────────────
+async function calculateDashboardControlRoom(userId) {
+  const [metricsRes, analytics, inventory, collections, ledgerData] = await Promise.all([
+    supabase.from('users').select('id, business_name, owner_name, email').eq('id', userId).maybeSingle(),
+    calculateAnalyticsSummary(userId).catch(() => ({})),
+    calculateInventorySummary(userId).catch(() => ({})),
+    calculateCollectionsSummary(userId).catch(() => ({})),
+    calculateLedgerSummary(userId).catch(() => ({ balance: 0 })),
+  ]);
+
+  const [recentLogsRes, recentNotificationsRes] = await Promise.all([
+    supabase.from('activity_logs').select('*').eq('user_id', userId).order('created_at', { ascending: false }).limit(5),
+    supabase.from('notifications').select('*').eq('user_id', userId).order('created_at', { ascending: false }).limit(5)
+  ]);
+
+  const actions = [];
+  if (collections?.buckets?.overdue_60_plus > 0) {
+    actions.push({
+      id: 'action_critical_debt',
+      type: 'high_priority',
+      title: 'Action Required: High Debt Risk',
+      description: `₹${Number(collections.buckets.overdue_60_plus).toLocaleString('en-IN')} has been outstanding for more than 60 days. Run a reminder campaign now.`,
+      action_url: '/collections'
+    });
+  }
+  
+  if (inventory?.low_stock_count > 0) {
+    actions.push({
+      id: 'action_low_stock',
+      type: 'medium_priority',
+      title: 'Inventory Alert: Low Stock Items',
+      description: `${inventory.low_stock_count} products have dropped below their low-stock thresholds. Restock soon to prevent order delays.`,
+      action_url: '/inventory'
+    });
+  }
+
+  if (ledgerData?.balance < 0) {
+    actions.push({
+      id: 'action_negative_cash',
+      type: 'high_priority',
+      title: 'Cash Flow Warning: Negative Balance',
+      description: 'Your mapped bank ledger reports a negative overall balance. Check for pending collections.',
+      action_url: '/ledger'
+    });
+  }
+
+  if (actions.length === 0) {
+    actions.push({
+      id: 'action_all_clear',
+      type: 'low_priority',
+      title: 'All Operations Healthy',
+      description: 'Zero critical cash or inventory issues flagged. Keep up the great business momentum!',
+      action_url: '/dashboard'
+    });
+  }
+
+  return {
+    business: metricsRes.data || null,
+    metrics: {
+      total_outstanding: collections?.total_outstanding || 0,
+      total_payable: analytics?.total_payable || 0,
+      ledger_balance: ledgerData?.balance || 0,
+      inventory_value: inventory?.total_value || 0,
+    },
+    critical_actions: actions,
+    recent_activity: recentLogsRes.data || [],
+    recent_notifications: recentNotificationsRes.data || [],
+    collections_summary: collections,
+    inventory_summary: inventory,
+  };
+}
+
+// ─── Shared Customer Timeline Service ────────────────────────────────────────
+async function getCustomerTimeline(userId, customerId) {
+  const [invoicesRes, callsRes, logsRes] = await Promise.all([
+    supabase.from('invoices').select('*').eq('user_id', userId).eq('customer_name', customerId),
+    supabase.from('call_logs').select('*').eq('user_id', userId).eq('customer_name', customerId),
+    supabase.from('activity_logs').select('*').eq('user_id', userId).order('created_at', { ascending: false }).limit(100),
+  ]);
+
+  const invoices = invoicesRes.data || [];
+  const calls = callsRes.data || [];
+  const logs = logsRes.data || [];
+
+  const timeline = [];
+
+  calls.forEach(c => {
+    timeline.push({
+      id: `call_${c.id}`,
+      type: 'call',
+      title: `Call with ${c.customer_name}`,
+      description: c.notes || (c.did_pick_up ? 'Called, customer picked up.' : 'Called, no answer.'),
+      date: c.called_at,
+      metadata: {
+        did_pick_up: c.did_pick_up,
+        promised_payment_date: c.promised_payment_date,
+        promised_amount: c.promised_amount,
+        amount: c.amount,
+        phone: c.customer_phone
+      }
+    });
+  });
+
+  invoices.forEach(inv => {
+    timeline.push({
+      id: `inv_create_${inv.id}`,
+      type: 'invoice_created',
+      title: `Invoice #${inv.invoice_number || 'INV'} Created`,
+      description: `Created invoice for ${inv.customer_name} of ₹${Number(inv.invoice_amount).toLocaleString('en-IN')}`,
+      date: inv.invoice_date || inv.created_at,
+      metadata: {
+        customer_name: inv.customer_name,
+        invoice_amount: inv.invoice_amount,
+        due_date: inv.due_date
+      }
+    });
+
+    if (inv.payment_status === 'Paid' && inv.payment_date) {
+      timeline.push({
+        id: `inv_pay_${inv.id}`,
+        type: 'payment_received',
+        title: `Payment Received from ${inv.customer_name}`,
+        description: `Received ₹${Number(inv.invoice_amount).toLocaleString('en-IN')} for invoice #${inv.invoice_number || 'INV'}`,
+        date: inv.payment_date,
+        metadata: {
+          customer_name: inv.customer_name,
+          amount: inv.invoice_amount,
+          method: inv.payment_method
+        }
+      });
+    }
+  });
+
+  logs.forEach(l => {
+    let meta = {};
+    try {
+      meta = typeof l.metadata === 'string' ? JSON.parse(l.metadata || '{}') : l.metadata || {};
+    } catch (_) {}
+    if (meta.customer_name === customerId || meta.customerName === customerId) {
+      timeline.push({
+        id: `log_${l.id}`,
+        type: 'activity',
+        title: l.action.replace(/_/g, ' ').toUpperCase(),
+        description: meta.message || `Activity logged: ${l.action}`,
+        date: l.created_at,
+        metadata: meta
+      });
+    }
+  });
+
+  timeline.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+  return timeline;
+}
+
+// ─── Shared Supplier Timeline Service ────────────────────────────────────────
+async function getSupplierTimeline(userId, supplierId) {
+  const [purchasesRes, logsRes] = await Promise.all([
+    supabase.from('purchases').select('*').eq('user_id', userId).eq('supplier_name', supplierId),
+    supabase.from('activity_logs').select('*').eq('user_id', userId).order('created_at', { ascending: false }).limit(100),
+  ]);
+
+  const purchases = purchasesRes.data || [];
+  const logs = logsRes.data || [];
+
+  const timeline = [];
+
+  purchases.forEach(p => {
+    timeline.push({
+      id: `purchase_create_${p.id}`,
+      type: 'purchase_created',
+      title: `Purchase Bill #${p.bill_number || 'BILL'} Created`,
+      description: `Recorded purchase from ${p.supplier_name} of ₹${Number(p.amount).toLocaleString('en-IN')}`,
+      date: p.purchase_date || p.created_at,
+      metadata: {
+        supplier_name: p.supplier_name,
+        amount: p.amount,
+        status: p.status,
+        due_date: p.due_date
+      }
+    });
+
+    if (p.status === 'paid' && p.purchase_date) {
+      timeline.push({
+        id: `purchase_pay_${p.id}`,
+        type: 'payment_made',
+        title: `Payment Made to ${p.supplier_name}`,
+        description: `Paid ₹${Number(p.paid_amount || p.amount).toLocaleString('en-IN')} for bill #${p.bill_number || 'BILL'}`,
+        date: p.purchase_date,
+        metadata: {
+          supplier_name: p.supplier_name,
+          amount: p.paid_amount || p.amount,
+          status: p.status
+        }
+      });
+    }
+  });
+
+  logs.forEach(l => {
+    let meta = {};
+    try {
+      meta = typeof l.metadata === 'string' ? JSON.parse(l.metadata || '{}') : l.metadata || {};
+    } catch (_) {}
+    if (meta.supplier_name === supplierId || meta.supplierName === supplierId) {
+      timeline.push({
+        id: `log_${l.id}`,
+        type: 'activity',
+        title: l.action.replace(/_/g, ' ').toUpperCase(),
+        description: meta.message || `Activity logged: ${l.action}`,
+        date: l.created_at,
+        metadata: meta
+      });
+    }
+  });
+
+  timeline.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+  return timeline;
+}
+
 
 // ─── Shared Inventory Summary Service ─────────────────────────────────────────
 async function calculateInventorySummary(userId) {
