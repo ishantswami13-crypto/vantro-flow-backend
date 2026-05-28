@@ -1677,8 +1677,12 @@ app.post('/api/mark-paid', authMiddleware, async (req, res) => {
       }
     } catch (btErr) { console.error('Bank transaction sync error:', btErr.message); }
 
-    // Log activity
-    await createActivityLog(userId, 'invoice_paid', { invoice_id: inv.id, amount: inv.payment_amount || inv.invoice_amount, customer: inv.customer_name });
+    // Emit invoice.paid business event
+    await emitBusinessEvent(userId, 'invoice.paid', {
+      invoice: inv,
+      amount: inv.payment_amount || inv.invoice_amount,
+      customer: inv.customer_name
+    });
     // Payment celebration WhatsApp to owner
     try {
       const { data: owner } = await supabase.from('users').select('phone, business_name, owner_name').eq('id', req.user.userId).single();
@@ -1770,6 +1774,18 @@ app.post('/api/call/:callId/update', authMiddleware, async (req, res) => {
     res.json({ success: true, log: data[0] });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/business/control-room', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    await ensureConnectedBusinessData(userId);
+    const data = await calculateDashboardControlRoom(userId);
+    res.json({ success: true, ...data });
+  } catch (error) {
+    console.error('[business control room endpoint]', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
@@ -2357,6 +2373,59 @@ async function createNotification(userId, type, message) {
     }]);
   } catch (err) {
     console.warn('[notifications] Failed to create notification:', err.message);
+  }
+}
+
+// ─── Business Event Engine Layer ─────────────────────────────────────────────
+const businessEvents = new (require('events').EventEmitter)();
+
+async function emitBusinessEvent(userId, eventType, payload = {}) {
+  try {
+    console.log(`[Event Engine] Emitting '${eventType}' for user ${userId}`);
+    
+    // Log event in database ActivityLog
+    await createActivityLog(userId, eventType, {
+      source: 'event_engine',
+      ...payload
+    }).catch(err => console.warn('[Event Engine] Activity log failed:', err.message));
+
+    // Emit event to node process listener
+    businessEvents.emit(eventType, { userId, payload });
+
+    // Trigger connected updates automatically
+    safelyRunConnectedUpdates(userId, eventType, payload).catch(err => {
+      console.error(`[Event Engine] Connected updates failed for '${eventType}':`, err.message);
+    });
+  } catch (err) {
+    console.error('[Event Engine] Fatal emit error:', err.message);
+  }
+}
+
+async function safelyRunConnectedUpdates(userId, eventType, payload) {
+  // Always trigger core automated reconciliation in background to ensure integrity
+  await ensureConnectedBusinessData(userId);
+
+  switch (eventType) {
+    case 'sale.created':
+    case 'sale.updated':
+      if (payload.sale) {
+        await syncReceivableFromSale(userId, payload.sale).catch(() => {});
+        await syncInventoryFromSale(userId, payload.sale).catch(() => {});
+      }
+      break;
+
+    case 'purchase.created':
+    case 'purchase.updated':
+      if (payload.purchase) {
+        await ensureSupplierFromPurchase(userId, payload.purchase).catch(() => {});
+        await syncInventoryFromPurchase(userId, payload.purchase).catch(() => {});
+      }
+      break;
+
+    case 'invoice.paid':
+    case 'payment.received':
+      // Handled directly via bank_transactions matching or mark-paid sync
+      break;
   }
 }
 
@@ -5757,6 +5826,24 @@ app.get('/api/dunning/:userId', requireOwner, async (req, res) => {
   }
 });
 
+app.get('/api/dunning/logs/:userId', requireOwner, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { data, error } = await supabase
+      .from('activity_logs')
+      .select('*')
+      .eq('user_id', userId)
+      .in('action', ['reminder_sent', 'dunning_triggered', 'whatsapp_sent'])
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    res.json({ success: true, logs: data || [] });
+  } catch (error) {
+    console.error('[dunning logs endpoint]', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.post('/api/dunning', authMiddleware, async (req, res) => {
   try {
     const user_id = req.user.userId;
@@ -8792,11 +8879,10 @@ app.post('/api/purchases', authMiddleware, async (req, res) => {
       ensureSupplierFromPurchase(req.user.userId, data),
       items !== undefined ? syncInventoryFromPurchase(req.user.userId, data) : Promise.resolve([]),
     ]);
-    await createActivityLog(req.user.userId, 'purchase_created', {
-      entityType: 'purchase',
-      entityId: data.id,
-      source: 'api',
+    await emitBusinessEvent(req.user.userId, 'purchase.created', {
+      purchase: data,
       amount: finalAmount,
+      supplier_name,
     });
     res.json({ success: true, purchase: { ...data, total_amount: parseFloat(data.amount) }, supplier, inventory });
   } catch (err) {
@@ -8844,10 +8930,8 @@ app.patch('/api/purchases/:id', authMiddleware, async (req, res) => {
       ensureSupplierFromPurchase(req.user.userId, data),
       items !== undefined ? syncInventoryFromPurchase(req.user.userId, data) : Promise.resolve([]),
     ]);
-    await createActivityLog(req.user.userId, 'purchase_updated', {
-      entityType: 'purchase',
-      entityId: req.params.id,
-      source: 'api',
+    await emitBusinessEvent(req.user.userId, 'purchase.updated', {
+      purchase: data,
       amount: newAmount,
     });
     res.json({ success: true, purchase: { ...data, total_amount: parseFloat(data.amount) }, supplier, inventory });
@@ -8860,10 +8944,8 @@ app.patch('/api/purchases/:id', authMiddleware, async (req, res) => {
 app.delete('/api/purchases/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('purchases').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
-    await createActivityLog(req.user.userId, 'purchase_deleted', {
-      entityType: 'purchase',
-      entityId: req.params.id,
-      source: 'api',
+    await emitBusinessEvent(req.user.userId, 'purchase.deleted', {
+      purchaseId: req.params.id,
     });
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
@@ -8971,11 +9053,10 @@ app.post('/api/sales', authMiddleware, async (req, res) => {
         .single();
       if (!updatedSale.error && updatedSale.data) sale = updatedSale.data;
     }
-    await createActivityLog(req.user.userId, 'sale_created', {
-      entityType: 'sale',
-      entityId: sale.id,
-      source: 'api',
+    await emitBusinessEvent(req.user.userId, 'sale.created', {
+      sale: sale,
       amount: finalAmount,
+      customer_name,
     });
     res.json({ success: true, sale: { ...sale, total_amount: parseFloat(sale.amount) }, receivable });
   } catch (err) { res.status(500).json({ error: err.message || 'Internal server error' }); }
@@ -9033,10 +9114,8 @@ app.patch('/api/sales/:id', authMiddleware, async (req, res) => {
         .single();
       if (!updatedSale.error && updatedSale.data) sale = updatedSale.data;
     }
-    await createActivityLog(req.user.userId, 'sale_updated', {
-      entityType: 'sale',
-      entityId: req.params.id,
-      source: 'api',
+    await emitBusinessEvent(req.user.userId, 'sale.updated', {
+      sale: sale,
       amount: finalAmount,
     });
     res.json({ success: true, sale: { ...sale, total_amount: parseFloat(sale.amount) }, receivable });
@@ -9053,10 +9132,8 @@ app.delete('/api/sales/:id', authMiddleware, async (req, res) => {
       .single();
     await supabase.from('sales').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     if (sale) await deleteReceivableForSale(req.user.userId, sale.id, sale.invoice_number);
-    await createActivityLog(req.user.userId, 'sale_deleted', {
-      entityType: 'sale',
-      entityId: req.params.id,
-      source: 'api',
+    await emitBusinessEvent(req.user.userId, 'sale.deleted', {
+      saleId: req.params.id,
     });
     res.json({ success: true });
   } catch (err) {
