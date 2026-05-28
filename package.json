@@ -8,7 +8,8 @@
     "dev": "nodemon server.js",
     "check": "node --check server.js",
     "security:audit": "npm audit --audit-level=high",
-    "security:cross-user": "node scripts/cross-user-security-test.js"
+    "security:cross-user": "node scripts/cross-user-security-test.js",
+    "security:smoke": "node scripts/security-smoke-test.js"
   },
   "engines": {
     "node": ">=18.0.0"

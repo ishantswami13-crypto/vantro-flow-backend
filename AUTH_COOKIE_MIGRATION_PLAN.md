@@ -84,5 +84,7 @@ The backend now has optional dual-mode auth behind `ENABLE_AUTH_COOKIES=true`.
 - Unsafe cookie-auth requests require `x-csrf-token`.
 - `/api/auth/logout` clears the auth cookies.
 - Production should use `SameSite=None; Secure` while Vercel and Railway are on different domains.
+- Cookie max age is configurable with `ACCESS_TOKEN_HOURS` and defaults to 12 hours for the optional cookie path.
+- Bearer token responses remain for legacy frontend compatibility until localStorage migration is complete.
 
 Frontend migration is still required before enabling cookie auth broadly in production.

@@ -2,9 +2,9 @@
 
 ## Security Score
 
-Current score: 72/100.
+Current score: 80/100.
 
-This is materially safer than the initial state because backend auth, route ownership, route compatibility, throttling, webhook hardening, CORS tightening, and audit hooks now exist. It is not yet fintech-complete until RLS, cookie auth, dependency remediation, signed-link enforcement, and cross-user staging tests are complete.
+This is materially safer than the initial state because backend auth, route ownership, route compatibility, throttling, webhook hardening, CORS tightening, anti-cache controls, upload validation, CI checks, and audit hooks now exist. It is not yet fintech-complete until RLS, cookie auth rollout, dependency remediation, signed-link enforcement, and cross-user staging tests are complete.
 
 ## Layers Added
 
@@ -16,6 +16,10 @@ This is materially safer than the initial state because backend auth, route owne
 - Production rejection of unsigned/misconfigured webhook paths.
 - Timing-safe HMAC comparison for webhook and public link signatures.
 - Financial/business audit logging for key write paths.
+- Private API no-store cache protection.
+- Hardened upload validation and spreadsheet row limits.
+- Production suppression of raw scan debug payloads.
+- Backup/restore and incident response playbooks.
 
 ## Auth Status
 
@@ -51,7 +55,23 @@ General API, auth, upload, AI, public bill, and heavy endpoints are rate limited
 
 ## Headers and CORS
 
-Manual API security headers are present. CORS is no longer wildcard for all Vercel domains; production frontend and localhost dev are explicitly allowed, with optional `ALLOWED_ORIGINS`.
+Manual API security headers are present. CORS is no longer wildcard for all Vercel domains; production frontend and localhost dev are explicitly allowed, with optional `ALLOWED_ORIGINS`. Credentialed CORS is now tied to cookie-auth rollout.
+
+## Cache Security
+
+Private API responses now set `Cache-Control: no-store, no-cache, must-revalidate, private`, `Pragma: no-cache`, `Expires: 0`, and `Surrogate-Control: no-store`. This reduces browser, CDN, and shared-proxy leakage risk for financial/business JSON.
+
+## Upload Security
+
+Multer uploads are memory-only, 5 MB capped, single-file only, and restricted to CSV/XLS/XLSX extension and MIME combinations. Spreadsheet/CSV imports are capped at 5000 rows. Image/PDF scan payloads are type and size checked before AI/OCR processing.
+
+## Logging Safety
+
+Production scan endpoints no longer return raw OCR/AI debug text, and raw scan logging is dev-only. Remaining log hardening should continue route by route, especially around cron jobs and user-visible names/phone numbers.
+
+## Backup and Incident Response
+
+See `BACKUP_RESTORE_PLAN.md` and `INCIDENT_RESPONSE_PLAYBOOK.md`. No production backup configuration was changed automatically.
 
 ## Dependency Risks
 
@@ -67,6 +87,7 @@ See `SECURITY_CI_PLAN.md`. Add blocking syntax/build checks first; make dependen
 - Valid cross-user staging test matrix not executed.
 - JWT still readable by JavaScript.
 - Public bill signed links are not yet mandatory unless `REQUIRE_SIGNED_PUBLIC_BILLS=true`.
+- Production RLS SQL exists but has not been applied.
 
 ## Remaining High Risks
 
@@ -83,6 +104,7 @@ See `SECURITY_CI_PLAN.md`. Add blocking syntax/build checks first; make dependen
 4. Enforce signed public bill links.
 5. Enable GitHub secret scanning/push protection.
 6. Add CI build/syntax checks.
+7. Verify backup/restore drill in staging.
 
 ## Before Payments
 

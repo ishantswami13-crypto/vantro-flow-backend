@@ -12,6 +12,7 @@ const cron = require('node-cron');
 const rateLimit = require('express-rate-limit');
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
+const path = require('path');
 const webpush = require('web-push');
 const { createClient } = require('@supabase/supabase-js');
 
@@ -93,7 +94,8 @@ const corsOptions = {
   },
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token'],
-  credentials: true,
+  credentials: process.env.ENABLE_AUTH_COOKIES === 'true',
+  maxAge: 600,
 };
 
 app.use(cors(corsOptions));
@@ -140,8 +142,23 @@ app.use((req, res, next) => {
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   // Restrict browser features
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('X-DNS-Prefetch-Control', 'off');
   // Remove server fingerprint
   res.removeHeader('X-Powered-By');
+  next();
+});
+
+function setNoStoreHeaders(res) {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.setHeader('Surrogate-Control', 'no-store');
+}
+
+app.use('/api', (req, res, next) => {
+  setNoStoreHeaders(res);
   next();
 });
 
@@ -226,6 +243,12 @@ function appendSetCookie(res, cookie) {
   res.setHeader('Set-Cookie', Array.isArray(existing) ? [...existing, cookie] : [existing, cookie]);
 }
 
+function sessionCookieMaxAgeSeconds() {
+  const hours = Number(process.env.ACCESS_TOKEN_HOURS || 12);
+  const safeHours = Number.isFinite(hours) && hours > 0 && hours <= 24 * 30 ? hours : 12;
+  return Math.round(safeHours * 60 * 60);
+}
+
 function setSessionCookies(res, token) {
   if (!COOKIE_AUTH_ENABLED) return null;
   const csrf = crypto.randomBytes(24).toString('hex');
@@ -233,7 +256,7 @@ function setSessionCookies(res, token) {
     path: '/',
     secure: COOKIE_AUTH_SECURE,
     sameSite: process.env.COOKIE_AUTH_SAMESITE || 'None',
-    maxAge: 30 * 24 * 60 * 60,
+    maxAge: sessionCookieMaxAgeSeconds(),
   };
   appendSetCookie(res, serializeCookie(ACCESS_COOKIE_NAME, token, { ...cookieBase, httpOnly: true }));
   appendSetCookie(res, serializeCookie(CSRF_COOKIE_NAME, csrf, { ...cookieBase, httpOnly: false }));
@@ -485,9 +508,33 @@ if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
   razorpay = new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET });
 }
 
+const ALLOWED_UPLOAD_EXTENSIONS = new Set(['.csv', '.xls', '.xlsx']);
+const ALLOWED_UPLOAD_MIME_TYPES = new Set([
+  'text/csv',
+  'text/plain',
+  'application/csv',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/octet-stream',
+]);
+
+function isAllowedUpload(file) {
+  const ext = path.extname(file.originalname || '').toLowerCase();
+  const mime = String(file.mimetype || '').toLowerCase();
+  return ALLOWED_UPLOAD_EXTENSIONS.has(ext) && ALLOWED_UPLOAD_MIME_TYPES.has(mime);
+}
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024, files: 1 },
+  fileFilter: (req, file, cb) => {
+    if (!isAllowedUpload(file)) {
+      const err = new Error('Unsupported file type');
+      err.code = 'UNSUPPORTED_FILE_TYPE';
+      return cb(err);
+    }
+    cb(null, true);
+  },
 });
 
 // Web Push — VAPID
@@ -979,7 +1026,7 @@ app.post('/api/upload-csv', authMiddleware, upload.single('file'), async (req, r
 
     const invoices = [];
     const csvContent = req.file.buffer.toString('utf-8');
-    const rows = csvContent.split('\n').slice(1); // Skip header
+    const rows = csvContent.split('\n').slice(1, 5001); // Skip header and cap import size
 
     for (const row of rows) {
       if (!row.trim()) continue;
@@ -1208,7 +1255,7 @@ app.post('/api/import/excel', authMiddleware, upload.single('file'), async (req,
       // Parse Excel
       try {
         const XLSX = require('xlsx');
-        const wb = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
+        const wb = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true, sheetRows: 5001 });
         const ws = wb.Sheets[wb.SheetNames[0]];
         rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
       } catch (e) {
@@ -1227,6 +1274,7 @@ app.post('/api/import/excel', authMiddleware, upload.single('file'), async (req,
         return obj;
       });
     }
+    if (rows.length > 5000) return res.status(400).json({ error: 'File has too many rows. Please import 5000 rows or fewer.' });
 
     // Smart column detection — try many possible header names
     const findCol = (obj, candidates) => {
@@ -1973,6 +2021,11 @@ app.post('/api/products/:productId/delete', authMiddleware, async (req, res) => 
     const { productId } = req.params;
     const { error } = await supabase.from('products').delete().eq('id', productId).eq('user_id', req.user.userId);
     if (error) throw error;
+    await createActivityLog(req.user.userId, 'product_deleted', {
+      entityType: 'product',
+      entityId: productId,
+      source: 'api',
+    });
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
@@ -3666,6 +3719,16 @@ function splitDataUrl(dataUrl) {
   return { mimeType: match[1], base64: match[2] };
 }
 
+function validateScanImagePayload(image, mimeType = 'image/jpeg') {
+  const allowed = new Set(['image/jpeg', 'image/png', 'image/webp', 'application/pdf']);
+  const safeMime = String(mimeType || '').toLowerCase();
+  if (!allowed.has(safeMime)) return { valid: false, error: 'Unsupported document type' };
+  const { base64 } = splitDataUrl(image);
+  const approxBytes = Math.ceil(String(base64 || '').length * 0.75);
+  if (approxBytes > 5 * 1024 * 1024) return { valid: false, error: 'Document is too large' };
+  return { valid: true };
+}
+
 function getConfiguredVisionProviders() {
   const rawOrder = cleanScanString(process.env.SCAN_AI_PROVIDERS);
   const order = rawOrder
@@ -4198,6 +4261,8 @@ app.post('/api/scan-document', authMiddleware, async (req, res) => {
   const { image_base64, image, mimeType = 'image/jpeg', scan_type } = req.body; // scan_type: 'invoice' | 'supplier'
   const scanImage = image_base64 || image;
   if (!scanImage) return res.status(400).json({ error: 'No image provided' });
+  const validation = validateScanImagePayload(scanImage, mimeType);
+  if (!validation.valid) return res.status(400).json({ error: validation.error });
 
   const invoicePrompt = `You are an expert OCR system for Indian GST invoices, bills, and challans.
 
@@ -4240,7 +4305,7 @@ Rules: numbers only, no currency symbols or commas. Dates must be YYYY-MM-DD.`;
     const extracted = scan_type === 'supplier'
       ? normalizeSupplierExtraction(parsed)
       : normalizeScanExtraction(parsed, 'invoice');
-    res.json({ success: true, extracted, data: extracted, _debug: rawText.substring(0, 300) });
+    res.json({ success: true, extracted, data: extracted, _debug: IS_PRODUCTION ? undefined : rawText.substring(0, 300) });
   } catch (err) {
     sendVisionError(res, err, 'Document');
   }
@@ -7108,6 +7173,8 @@ app.post('/api/transactions/scan', authMiddleware, async (req, res) => {
     const { image, image_base64, file, mimeType = 'image/jpeg' } = req.body;
     const payload = image || image_base64 || file;
     if (!payload) return res.status(400).json({ success: false, error: 'image or file is required' });
+    const validation = validateScanImagePayload(payload, mimeType);
+    if (!validation.valid) return res.status(400).json({ success: false, error: validation.error });
 
     const prompt = `You are a finance OCR assistant for Indian MSME bank ledgers.
 
@@ -7156,7 +7223,7 @@ Rules:
       confidence: parseScanNumber(pickScanValue(parsed, ['confidence'])) || 0.65,
     };
 
-    if (!data.amount) return res.status(422).json({ success: false, error: 'Could not identify transaction amount', _debug: rawText?.substring(0, 300), _provider: provider });
+    if (!data.amount) return res.status(422).json({ success: false, error: 'Could not identify transaction amount', _debug: IS_PRODUCTION ? undefined : rawText?.substring(0, 300), _provider: provider });
     res.json({ success: true, data, _provider: provider, _model: model, _providers_tried: providersTried });
   } catch (err) {
     sendVisionError(res, err, 'Transaction');
@@ -8309,6 +8376,11 @@ app.delete('/api/bills/:id', authMiddleware, async (req, res) => {
         .eq('invoice_number', bill.bill_number);
     }
     if (invoiceDelete.error) console.warn('Bill receivable delete sync failed:', invoiceDelete.error.message);
+    await createActivityLog(req.user.userId, 'bill_deleted', {
+      entityType: 'bill',
+      entityId: req.params.id,
+      source: 'api',
+    });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Internal server error' });
@@ -8532,6 +8604,11 @@ app.patch('/api/purchases/:id', authMiddleware, async (req, res) => {
 app.delete('/api/purchases/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('purchases').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
+    await createActivityLog(req.user.userId, 'purchase_deleted', {
+      entityType: 'purchase',
+      entityId: req.params.id,
+      source: 'api',
+    });
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
@@ -8541,6 +8618,8 @@ app.post('/api/purchases/scan', authMiddleware, async (req, res) => {
   try {
     const { image, mimeType = 'image/jpeg' } = req.body;
     if (!image) return res.status(400).json({ error: 'image is required' });
+    const validation = validateScanImagePayload(image, mimeType);
+    if (!validation.valid) return res.status(400).json({ error: validation.error });
 
     const prompt = `You are an expert OCR system for Indian purchase bills, tax invoices, and challans.
 
@@ -8573,9 +8652,9 @@ Rules: numbers without rupee symbol or commas (147630 not 1,47,630). Dates as YY
 
     const { rawText, parsed, provider, model, providersTried } = await runVisionExtraction({ prompt, image, mimeType, maxTokens: 1600 });
     const extracted = normalizeScanExtraction(parsed, 'purchase');
-    console.log('=== PURCHASES SCAN RAW ===', JSON.stringify({ provider, model, raw: rawText.substring(0, 500), extracted_keys: Object.keys(extracted) }));
+    if (!IS_PRODUCTION) console.log('=== PURCHASES SCAN RAW ===', JSON.stringify({ provider, model, raw: rawText.substring(0, 120), extracted_keys: Object.keys(extracted) }));
 
-    res.json({ success: true, data: extracted, _debug: rawText.substring(0, 300), _provider: provider, _providers_tried: providersTried });
+    res.json({ success: true, data: extracted, _debug: IS_PRODUCTION ? undefined : rawText.substring(0, 300), _provider: provider, _providers_tried: providersTried });
   } catch (err) {
     sendVisionError(res, err, 'Purchase bill');
   }
@@ -8718,6 +8797,11 @@ app.delete('/api/sales/:id', authMiddleware, async (req, res) => {
       .single();
     await supabase.from('sales').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     if (sale) await deleteReceivableForSale(req.user.userId, sale.id, sale.invoice_number);
+    await createActivityLog(req.user.userId, 'sale_deleted', {
+      entityType: 'sale',
+      entityId: req.params.id,
+      source: 'api',
+    });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Internal server error' });
@@ -8729,6 +8813,8 @@ app.post('/api/sales/scan', authMiddleware, async (req, res) => {
   try {
     const { image, mimeType = 'image/jpeg' } = req.body;
     if (!image) return res.status(400).json({ error: 'image is required' });
+    const validation = validateScanImagePayload(image, mimeType);
+    if (!validation.valid) return res.status(400).json({ error: validation.error });
 
     const prompt = `You are an expert OCR system for Indian tax invoices and GST bills.
 
@@ -8762,8 +8848,8 @@ Rules: numbers without rupee symbol or commas (147630 not 1,47,630). Dates as YY
 
     const { rawText, parsed, provider, model, providersTried } = await runVisionExtraction({ prompt, image, mimeType, maxTokens: 1600 });
     const extracted = normalizeScanExtraction(parsed, 'sale');
-    console.log('=== SALES SCAN RAW ===', JSON.stringify({ provider, model, raw: rawText.substring(0, 500), extracted_keys: Object.keys(extracted) }));
-    res.json({ success: true, data: extracted, _debug: rawText.substring(0, 300), _provider: provider, _providers_tried: providersTried });
+    if (!IS_PRODUCTION) console.log('=== SALES SCAN RAW ===', JSON.stringify({ provider, model, raw: rawText.substring(0, 120), extracted_keys: Object.keys(extracted) }));
+    res.json({ success: true, data: extracted, _debug: IS_PRODUCTION ? undefined : rawText.substring(0, 300), _provider: provider, _providers_tried: providersTried });
   } catch (err) {
     sendVisionError(res, err, 'Sales bill');
   }
@@ -8884,6 +8970,11 @@ app.delete('/api/bank/accounts/:id', authMiddleware, async (req, res) => {
       .eq('id', req.params.id)
       .eq('user_id', req.user.userId);
     if (error) throw error;
+    await createActivityLog(req.user.userId, 'bank_account_deleted', {
+      entityType: 'bank_account',
+      entityId: req.params.id,
+      source: 'api',
+    });
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
@@ -9004,6 +9095,11 @@ app.delete('/api/bank/transactions/:id', authMiddleware, async (req, res) => {
       .eq('id', req.params.id)
       .eq('user_id', req.user.userId);
     if (error) throw error;
+    await createActivityLog(req.user.userId, 'bank_transaction_deleted', {
+      entityType: 'bank_transaction',
+      entityId: req.params.id,
+      source: 'api',
+    });
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
@@ -9761,6 +9857,18 @@ async function runAutoMigrations() {
     if (client) client.release();
   }
 }
+
+app.use((err, req, res, next) => {
+  if (!err) return next();
+  if (err instanceof multer.MulterError || err.code === 'UNSUPPORTED_FILE_TYPE') {
+    return res.status(400).json({
+      success: false,
+      error: err.code === 'LIMIT_FILE_SIZE' ? 'File is too large' : err.message || 'Invalid upload',
+    });
+  }
+  console.error('[unhandled middleware error]', err.message || err);
+  res.status(500).json({ success: false, error: 'Internal server error' });
+});
 
 app.listen(PORT, () => {
   console.log(`✅ Vantro Flow Backend running on port ${PORT}`);

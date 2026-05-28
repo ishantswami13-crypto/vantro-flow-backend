@@ -16,6 +16,12 @@ Updated: 2026-05-28
 - RLS rollout SQL added at `supabase-rls-rollout.sql`, but it has not been applied.
 - GitHub Actions security baseline added.
 - Webhook secret rollout checklist added.
+- Private API no-store cache headers are applied to `/api`.
+- Security headers include frame, MIME sniffing, HSTS, referrer, permissions, cross-origin resource, opener, and DNS-prefetch controls.
+- Uploads are memory-only, authenticated, size-limited, extension/MIME checked, and row-limited for spreadsheet/CSV imports.
+- Production scan responses suppress raw OCR/AI debug text.
+- Financial delete paths now create audit-log attempts for products, bills, purchases, sales, and bank transactions.
+- Backup/restore, incident response, and security verification command docs are present.
 
 ## Not Done Automatically
 
@@ -24,6 +30,7 @@ Updated: 2026-05-28
 - No secrets were rotated or written.
 - No frontend token-storage migration was made.
 - No breaking dependency upgrades were applied.
+- Public bill signed links remain backward-compatible until `REQUIRE_SIGNED_PUBLIC_BILLS=true`.
 
 ## Required Production Steps
 
@@ -39,3 +46,4 @@ npm run security:cross-user
 3. Configure Railway webhook secrets from `WEBHOOK_SECRET_ROLLOUT.md`.
 4. Enable `ENABLE_AUTH_COOKIES=true` only after the frontend sends `credentials: "include"` and `x-csrf-token` for unsafe cookie-auth requests.
 5. Plan dependency upgrades in a staging branch because the current audit fixes require major or breaking upgrades.
+6. Review `BACKUP_RESTORE_PLAN.md` and `INCIDENT_RESPONSE_PLAYBOOK.md` before production migrations.

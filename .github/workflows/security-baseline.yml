@@ -28,9 +28,9 @@ jobs:
       - name: Ensure env files are not tracked
         shell: bash
         run: |
-          tracked="$(git ls-files '.env' '.env.*' ':!:*.example')"
+          tracked="$(git ls-files '.env' '.env.*' '*.pem' '*.key' '*.p12' '*.pfx' '*.secret' 'secrets/*' 'service-account*.json' ':!:*.example')"
           if [ -n "$tracked" ]; then
-            echo "Tracked env files are not allowed:"
+            echo "Tracked secret-like files are not allowed:"
             echo "$tracked"
             exit 1
           fi
