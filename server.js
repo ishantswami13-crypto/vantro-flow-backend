@@ -16,12 +16,71 @@ const path = require('path');
 const webpush = require('web-push');
 const { createClient } = require('@supabase/supabase-js');
 
-if (!process.env.JWT_SECRET) {
-  console.error('FATAL: JWT_SECRET environment variable is not set. Refusing to start.');
-  process.exit(1);
-}
-const JWT_SECRET = process.env.JWT_SECRET;
+function validateSecurityEnvironment() {
+  const status = {
+    JWT_SECRET: !!process.env.JWT_SECRET,
+    SUPABASE_URL: !!process.env.SUPABASE_URL,
+    SUPABASE_SERVICE_ROLE_KEY: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
+    DATABASE_URL: !!process.env.DATABASE_URL,
+    METRICS_TOKEN: !!process.env.METRICS_TOKEN,
+    RAZORPAY_WEBHOOK_SECRET: !!process.env.RAZORPAY_WEBHOOK_SECRET,
+    VOICE_WEBHOOK_SECRET: !!process.env.VOICE_WEBHOOK_SECRET,
+    PUBLIC_LINK_SECRET: !!process.env.PUBLIC_LINK_SECRET,
+    ENABLE_AUTH_COOKIES: process.env.ENABLE_AUTH_COOKIES === 'true',
+    NODE_ENV: process.env.NODE_ENV || 'development'
+  };
 
+  console.log('[SECURITY] Environment Validation Status:', JSON.stringify(status));
+
+  if (!process.env.JWT_SECRET) {
+    console.error('[FATAL] JWT_SECRET is missing. Refusing to start.');
+    process.exit(1);
+  }
+}
+
+validateSecurityEnvironment();
+
+function getSecret(name) {
+  // Centralized secret access - allows future migration to AWS Secrets Manager/Vault
+  const val = process.env[name];
+  if (!val && process.env.NODE_ENV === 'production' && ['JWT_SECRET', 'SUPABASE_SERVICE_ROLE_KEY'].includes(name)) {
+    console.error(`[FATAL] Missing critical secret: ${name}`);
+    process.exit(1);
+  }
+  return val;
+}
+
+const JWT_SECRET = getSecret('JWT_SECRET');
+
+const promClient = require('prom-client');
+const register = new promClient.Registry();
+promClient.collectDefaultMetrics({ register });
+const httpRequestDurationMicroseconds = new promClient.Histogram({
+  name: 'http_request_duration_seconds',
+  help: 'Duration of HTTP requests in seconds',
+  labelNames: ['method', 'normalized_route', 'status_code'],
+  buckets: [0.1, 0.3, 0.5, 0.7, 1, 3, 5, 7, 10]
+});
+const httpRequestsTotal = new promClient.Counter({
+  name: 'http_requests_total',
+  help: 'Total number of HTTP requests',
+  labelNames: ['method', 'normalized_route', 'status_code']
+});
+const httpErrorsTotal = new promClient.Counter({
+  name: 'http_errors_total',
+  help: 'Total number of HTTP errors',
+  labelNames: ['method', 'normalized_route', 'status_code']
+});
+register.registerMetric(httpRequestDurationMicroseconds);
+register.registerMetric(httpRequestsTotal);
+register.registerMetric(httpErrorsTotal);
+
+function normalizeRoute(path) {
+  return (path || '').replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ig, ':id')
+                     .replace(/\/\d+/g, '/:id');
+}
+
+const { safeLog } = require('./lib/observability/logger');
 const app = express();
 app.set('trust proxy', 1); // Railway sits behind a proxy — needed for express-rate-limit to see real IP
 
@@ -31,28 +90,39 @@ app.use((req, res, next) => {
   req.requestId = requestId;
   res.setHeader('X-Request-ID', requestId);
 
-  // Capture request start metadata
   const startHrTime = process.hrtime();
 
   res.on('finish', () => {
     const elapsedHrTime = process.hrtime(startHrTime);
     const durationMs = (elapsedHrTime[0] * 1000 + elapsedHrTime[1] / 1e6).toFixed(2);
+    
+    const normalizedRoute = normalizeRoute(req.path);
+    const status = res.statusCode;
+
+    const labels = { method: req.method, normalized_route: normalizedRoute, status_code: status };
+    httpRequestsTotal.inc(labels);
+    httpRequestDurationMicroseconds.observe(labels, parseFloat(durationMs) / 1000);
+    if (status >= 400) {
+      httpErrorsTotal.inc(labels);
+    }
 
     const logData = {
       requestId: req.requestId,
       method: req.method,
-      path: req.path,
-      status: res.statusCode,
+      route: normalizedRoute,
+      statusCode: status,
       userId: req.user?.userId || req.user?.id || null,
       businessId: req.user?.businessId || null,
       durationMs: parseFloat(durationMs)
     };
 
-    if (res.statusCode >= 400) {
-      logData.error = res.statusMessage || 'HTTP Error';
+    if (status >= 400) {
+      logData.errorName = res.statusMessage || 'HTTP Error';
+      logData.errorMessage = res.locals.errorMessage || 'Request failed';
+      safeLog('error', 'API Request Error', logData);
+    } else {
+      safeLog('info', 'API Request Success', logData);
     }
-
-    console.log(`[API_REQUEST] ${JSON.stringify(logData)}`);
   });
 
   next();
@@ -65,7 +135,7 @@ const IS_PRODUCTION = process.env.NODE_ENV === 'production' || Boolean(
   process.env.RAILWAY_PROJECT_ID ||
   process.env.RAILWAY_PUBLIC_URL
 );
-const ALLOW_UNSIGNED_WEBHOOKS = process.env.ALLOW_UNSIGNED_WEBHOOKS === 'true' && !IS_PRODUCTION;
+
 
 // ── In-memory OTP store (keyed by userId) ──────────────────────────────────
 // Structure: Map<userId, { code: string, expiresAt: number, attempts: number }>
@@ -395,6 +465,7 @@ function authMiddleware(req, res, next) {
     req.user = jwt.verify(token, JWT_SECRET);
     req.authSource = source;
     if (!requireCookieCsrf(req, res)) return;
+    setNoStoreHeaders(res);
     next();
   } catch {
     res.status(401).json({ error: 'Invalid or expired token' });
@@ -416,6 +487,7 @@ function requireOwner(req, res, next) {
   if (paramId && req.user.userId !== paramId) {
     return res.status(403).json({ error: 'Forbidden' });
   }
+  setNoStoreHeaders(res);
   next();
 }
 
@@ -452,7 +524,7 @@ function timingSafeEqualString(a, b) {
 }
 
 function getPublicLinkSecret() {
-  return process.env.PUBLIC_LINK_SECRET || JWT_SECRET;
+  return getSecret('PUBLIC_LINK_SECRET') || JWT_SECRET;
 }
 
 function signPublicBillToken(billId, expiresAtMs) {
@@ -4763,7 +4835,36 @@ Rules: numbers only, no currency symbols or commas. Dates must be YYYY-MM-DD.`;
 });
 
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'Backend is running', timestamp: new Date() });
+  res.json({
+    success: true,
+    status: 'alive',
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+    requestId: req.requestId
+  });
+});
+
+app.get('/api/ready', (req, res) => {
+  res.json({
+    success: true,
+    status: 'ready',
+    checks: {
+      database: process.env.DATABASE_URL ? 'ok' : 'missing',
+      authConfig: process.env.JWT_SECRET ? 'ok' : 'missing',
+      supabaseConfig: process.env.SUPABASE_URL ? 'ok' : 'missing',
+      metrics: process.env.METRICS_TOKEN ? 'ok' : 'missing'
+    },
+    requestId: req.requestId
+  });
+});
+
+app.get('/metrics', async (req, res) => {
+  const token = process.env.METRICS_TOKEN;
+  if (IS_PRODUCTION && (!token || req.headers.authorization !== `Bearer ${token}`)) {
+    return res.status(403).json({ error: 'Forbidden', requestId: req.requestId });
+  }
+  res.set('Content-Type', register.contentType);
+  res.send(await register.metrics());
 });
 
 // ============================================
@@ -7025,9 +7126,9 @@ app.post('/api/voice/call', authMiddleware, async (req, res) => {
 // Twilio status webhook
 app.post('/api/voice/status', async (req, res) => {
   try {
-    const voiceSecret = process.env.VOICE_WEBHOOK_SECRET;
+    const voiceSecret = getSecret('VOICE_WEBHOOK_SECRET');
     const provided = req.headers['x-vantro-webhook-secret'] || req.query.secret;
-    if (!voiceSecret && !ALLOW_UNSIGNED_WEBHOOKS) return res.sendStatus(403);
+    if (!voiceSecret) return res.sendStatus(403);
     if (voiceSecret && !timingSafeEqualString(provided, voiceSecret)) return res.sendStatus(403);
     const userId = req.query.uid;
     const { CallStatus, CallDuration, To } = req.body;
@@ -7101,10 +7202,9 @@ app.post('/api/payments/webhook', async (req, res) => {
       const signature = req.headers['x-razorpay-signature'];
       if (!signature) return res.status(400).json({ error: 'Invalid signature' });
 
-      const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
+      const secret = getSecret('RAZORPAY_WEBHOOK_SECRET');
       if (!secret) {
-        if (!ALLOW_UNSIGNED_WEBHOOKS) return res.status(503).json({ error: 'Webhook verification is not configured' });
-        return res.sendStatus(200); // Explicit local/dev opt-in only.
+        return res.status(503).json({ error: 'Webhook verification is not configured' });
       }
 
       // Verify signature using raw body
@@ -7262,9 +7362,9 @@ app.post('/api/webhooks/whatsapp-inbound', async (req, res) => {
   try {
     res.sendStatus(200); // Acknowledge immediately (Interakt/WATI require fast 200)
 
-    const webhookSecret = process.env.WHATSAPP_WEBHOOK_SECRET;
+    const webhookSecret = getSecret('WHATSAPP_WEBHOOK_SECRET');
     const provided = req.headers['x-vantro-webhook-secret'] || req.query.secret;
-    if (!webhookSecret && !ALLOW_UNSIGNED_WEBHOOKS) return;
+    if (!webhookSecret) return;
     if (webhookSecret && !timingSafeEqualString(provided, webhookSecret)) return;
 
     const body = req.body;
@@ -8000,9 +8100,9 @@ app.post('/api/vocabulary/seed', authMiddleware, async (req, res) => {
 //   https://vantro-flow-backend-production.up.railway.app/api/voice/inbound?uid=USER_ID
 app.post('/api/voice/inbound', async (req, res) => {
   try {
-    const voiceSecret = process.env.VOICE_WEBHOOK_SECRET;
+    const voiceSecret = getSecret('VOICE_WEBHOOK_SECRET');
     const provided = req.headers['x-vantro-webhook-secret'] || req.query.secret;
-    if (!voiceSecret && !ALLOW_UNSIGNED_WEBHOOKS) return res.sendStatus(403);
+    if (!voiceSecret) return res.sendStatus(403);
     if (voiceSecret && !timingSafeEqualString(provided, voiceSecret)) return res.sendStatus(403);
     const userId = req.query.uid;
     let greeting = 'Vantro Business';
@@ -8029,9 +8129,9 @@ app.post('/api/voice/inbound', async (req, res) => {
 app.post('/api/voice/recording', async (req, res) => {
   res.sendStatus(200); // Respond immediately — process async
 
-  const voiceSecret = process.env.VOICE_WEBHOOK_SECRET;
+  const voiceSecret = getSecret('VOICE_WEBHOOK_SECRET');
   const provided = req.headers['x-vantro-webhook-secret'] || req.query.secret;
-  if (!voiceSecret && !ALLOW_UNSIGNED_WEBHOOKS) return;
+  if (!voiceSecret) return;
   if (voiceSecret && !timingSafeEqualString(provided, voiceSecret)) return;
 
   const userId = req.query.uid;

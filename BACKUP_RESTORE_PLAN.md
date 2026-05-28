@@ -1,73 +1,14 @@
-# Backup And Restore Plan
+# Backup & Restore Plan
 
-Status: plan only. No production backup settings were changed by this document.
+## 1. Supabase Point-in-Time Recovery (PITR)
+- **Recommendation**: Upgrade the Supabase project to the Pro tier to enable PITR. This allows restoring the database to any minute within the last 7 days.
+- **Why**: Prevents catastrophic data loss from accidental `DELETE` without `WHERE` clauses, or bad migrations.
 
-## Backup Objectives
+## 2. Pre-Migration Backups
+- Before executing any schema changes (e.g., adding RLS, dropping columns), a manual logical backup (`pg_dump`) must be taken.
 
-- Protect customer, supplier, invoice, purchase, sale, ledger, bank transaction, inventory, and audit-log data.
-- Support point-in-time recovery for accidental deletes, bad deploys, security incidents, and failed migrations.
-- Keep backups encrypted and access-controlled.
-
-## Recommended Supabase/Postgres Setup
-
-- Enable daily automated backups at minimum.
-- Enable point-in-time recovery before onboarding real customers.
-- Take a manual backup before any schema migration, RLS rollout, auth migration, or financial reconciliation change.
-- Keep separate development, staging, and production projects/databases.
-- Restrict backup access to owners/admins only.
-
-## Critical Data To Verify
-
-- `users`
-- `invoices`
-- `bills`
-- `sales`
-- `purchases`
-- `products`
-- `stock_movements`
-- `transactions`
-- `bank_accounts`
-- `bank_transactions`
-- `customers` and `suppliers` if present
-- `activity_logs`
-- `notifications`
-- `payment_plans`
-- `disputes`
-- integration settings stored on `users`
-
-## Restore Drill
-
-1. Restore production backup into a staging database.
-2. Point a staging backend to the restored database.
-3. Run smoke checks:
-   - login
-   - `/api/auth/me`
-   - inventory
-   - sales
-   - purchases
-   - ledger
-   - analytics
-   - public signed bill link
-4. Run cross-user tests.
-5. Verify financial totals against pre-incident snapshots.
-
-## Before Migration Checklist
-
-- Confirm latest backup exists.
-- Export migration SQL.
-- Confirm rollback SQL exists.
-- Run migration on staging.
-- Run cross-user tests on staging.
-- Schedule production migration during low-traffic window.
-
-## Rollback Strategy
-
-- For code-only issues: redeploy previous Git commit.
-- For schema issues: apply rollback SQL only if reviewed and tested.
-- For data corruption: restore to staging, inspect, then plan targeted repair or full restore.
-
-## Access Control
-
-- Backup access should be limited to production owners.
-- Backup downloads should be encrypted at rest.
-- No backups should be committed to GitHub, shared by chat, or stored on developer desktops long-term.
+## 3. Restore Playbook (Full Disaster)
+1. Navigate to Supabase Dashboard -> Database -> Backups.
+2. Select the PITR point right before the incident occurred.
+3. Initiate restore.
+4. Notify users of the downtime and data window lost.
