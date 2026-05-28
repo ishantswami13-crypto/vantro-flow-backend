@@ -87,6 +87,42 @@ function verifyOTP(userId, code) {
   return { valid: true };
 }
 
+// ── In-memory User-Scoped Summary Cache ──────────────────────────────────────
+const summaryCache = new Map();
+
+function buildBusinessCacheKey(userId, module) {
+  if (!userId) throw new Error('userId is required for cache key');
+  return `biz:${userId}:${module}`;
+}
+
+function getCache(key) {
+  const entry = summaryCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    summaryCache.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+function setCache(key, value, ttlSeconds = 60) {
+  summaryCache.set(key, {
+    value,
+    expiresAt: Date.now() + (ttlSeconds * 1000)
+  });
+}
+
+function invalidateBusinessCache(userId) {
+  if (!userId) return;
+  const prefix = `biz:${userId}:`;
+  for (const key of summaryCache.keys()) {
+    if (key.startsWith(prefix)) {
+      summaryCache.delete(key);
+    }
+  }
+  console.log(`[Cache] Invalidated cache for user ${userId}`);
+}
+
 // Initialize Supabase
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -1814,8 +1850,16 @@ app.post('/api/call/:callId/update', authMiddleware, async (req, res) => {
 app.get('/api/business/control-room', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
+    const cacheKey = buildBusinessCacheKey(userId, 'control-room');
+    const cached = getCache(cacheKey);
+    if (cached) {
+      return res.json({ success: true, ...cached, _cached: true });
+    }
+
     await ensureConnectedBusinessData(userId);
     const data = await calculateDashboardControlRoom(userId);
+    setCache(cacheKey, data, 60); // 60s TTL
+
     res.json({ success: true, ...data });
   } catch (error) {
     console.error('[business control room endpoint]', error);
@@ -1874,8 +1918,16 @@ app.get('/api/metrics/:userId', requireOwner, async (req, res) => {
 app.get('/api/analytics/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
+    const cacheKey = buildBusinessCacheKey(userId, 'analytics');
+    const cached = getCache(cacheKey);
+    if (cached) {
+      return res.json({ success: true, analytics: cached, _cached: true });
+    }
+
     await ensureConnectedBusinessData(userId);
     const analytics = await calculateAnalyticsSummary(userId);
+    setCache(cacheKey, analytics, 60); // 60s TTL
+
     res.json({
       success: true,
       analytics
@@ -2416,7 +2468,10 @@ const businessEvents = new (require('events').EventEmitter)();
 async function emitBusinessEvent(userId, eventType, payload = {}) {
   try {
     console.log(`[Event Engine] Emitting '${eventType}' for user ${userId}`);
-    
+
+    // Invalidate user-scoped summary cache on write
+    invalidateBusinessCache(userId);
+
     // Log event in database ActivityLog
     await createActivityLog(userId, eventType, {
       source: 'event_engine',
@@ -4907,10 +4962,18 @@ app.get('/api/cash-forecast/:userId', requireOwner, async (req, res) => {
   const { current_cash = 0, days = 30 } = req.query;
 
   try {
+    const cacheKey = buildBusinessCacheKey(userId, `forecast:${current_cash}:${days}`);
+    const cached = getCache(cacheKey);
+    if (cached) {
+      return res.json({ success: true, ...cached, days: Number(days), _cached: true });
+    }
+
     await ensureConnectedBusinessData(userId);
     await syncExistingSalesReceivables(userId);
 
     const forecast = await calculateCashFlowForecast(userId, current_cash, days);
+    setCache(cacheKey, forecast, 60); // 60s TTL
+
     res.json({
       success: true,
       ...forecast,
