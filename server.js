@@ -253,15 +253,21 @@ app.use('/api', (req, res, next) => {
   next();
 });
 
-const rateLimitMessage = { success: false, error: 'Too many requests. Please try again later.' };
 function makeLimiter({ windowMs, max, skipSuccessfulRequests = false }) {
   return rateLimit({
     windowMs,
     max,
-    message: rateLimitMessage,
     standardHeaders: true,
     legacyHeaders: false,
     skipSuccessfulRequests,
+    handler: (req, res, next, options) => {
+      const requestId = req.requestId || crypto.randomUUID();
+      res.status(options.statusCode).json({
+        success: false,
+        error: 'Too many requests. Please try again later.',
+        requestId
+      });
+    }
   });
 }
 
@@ -269,10 +275,17 @@ function makeLimiter({ windowMs, max, skipSuccessfulRequests = false }) {
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 8,
-  message: rateLimitMessage,
   standardHeaders: true,
   legacyHeaders: false,
   skipSuccessfulRequests: true, // only count failed attempts
+  handler: (req, res, next, options) => {
+    const requestId = req.requestId || crypto.randomUUID();
+    res.status(options.statusCode).json({
+      success: false,
+      error: 'Too many failed login/verification attempts. Please try again in 15 minutes.',
+      requestId
+    });
+  }
 });
 const apiLimiter = makeLimiter({ windowMs: 60 * 1000, max: 120 });
 const uploadLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, max: 20 });
