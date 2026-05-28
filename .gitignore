@@ -4,8 +4,14 @@ node_modules/
 .env.production
 .env.development
 .env*.local
+!.env.example
 *.log
 *.pem
 *.key
+*.p12
+*.pfx
+*.secret
 secrets/
 service-account*.json
+.vercel/
+.railway/

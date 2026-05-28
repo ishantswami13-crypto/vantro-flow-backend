@@ -1,0 +1,36 @@
+name: Security Baseline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend-security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run check
+
+      - name: npm audit report
+        run: npm audit --audit-level=high
+        continue-on-error: true
+
+      - name: Ensure env files are not tracked
+        shell: bash
+        run: |
+          tracked="$(git ls-files '.env' '.env.*' ':!:*.example')"
+          if [ -n "$tracked" ]; then
+            echo "Tracked env files are not allowed:"
+            echo "$tracked"
+            exit 1
+          fi

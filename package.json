@@ -5,7 +5,10 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "nodemon server.js",
+    "check": "node --check server.js",
+    "security:audit": "npm audit --audit-level=high",
+    "security:cross-user": "node scripts/cross-user-security-test.js"
   },
   "engines": {
     "node": ">=18.0.0"

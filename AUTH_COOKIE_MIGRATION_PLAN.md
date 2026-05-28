@@ -73,3 +73,16 @@ Keep Bearer-token support until cookie sessions are stable. If cookie auth fails
 ## Risk Level
 
 Medium implementation risk, high security value. Do not attempt as an emergency patch without staging.
+
+## Implementation Status
+
+The backend now has optional dual-mode auth behind `ENABLE_AUTH_COOKIES=true`.
+
+- Login and OTP verification can set an HttpOnly access-token cookie.
+- A readable CSRF cookie is issued for double-submit CSRF protection.
+- Auth middleware accepts Bearer tokens first, then the cookie token when cookie auth is enabled.
+- Unsafe cookie-auth requests require `x-csrf-token`.
+- `/api/auth/logout` clears the auth cookies.
+- Production should use `SameSite=None; Secure` while Vercel and Railway are on different domains.
+
+Frontend migration is still required before enabling cookie auth broadly in production.

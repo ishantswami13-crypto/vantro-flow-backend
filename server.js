@@ -92,7 +92,7 @@ const corsOptions = {
     callback(new Error(`CORS: origin ${origin} not allowed`));
   },
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token'],
   credentials: true,
 };
 
@@ -179,11 +179,95 @@ app.use('/api/bills/public', publicBillLimiter);
 app.use(['/api/analytics', '/api/cash-forecast', '/api/reports/export', '/api/reconcile/backfill'], heavyReadLimiter);
 
 // JWT middleware — attach user to req if token valid
-function authMiddleware(req, res, next) {
+const ACCESS_COOKIE_NAME = process.env.ACCESS_COOKIE_NAME || 'vantro_access_token';
+const CSRF_COOKIE_NAME = process.env.CSRF_COOKIE_NAME || 'vantro_csrf';
+const COOKIE_AUTH_ENABLED = process.env.ENABLE_AUTH_COOKIES === 'true';
+const COOKIE_AUTH_SECURE = process.env.COOKIE_AUTH_SECURE !== 'false';
+
+function parseCookies(req) {
+  const safeDecode = (value) => {
+    try { return decodeURIComponent(value); } catch { return value; }
+  };
+  return String(req.headers.cookie || '')
+    .split(';')
+    .map(part => part.trim())
+    .filter(Boolean)
+    .reduce((cookies, part) => {
+      const idx = part.indexOf('=');
+      if (idx === -1) return cookies;
+      const key = safeDecode(part.slice(0, idx).trim());
+      const value = safeDecode(part.slice(idx + 1).trim());
+      cookies[key] = value;
+      return cookies;
+    }, {});
+}
+
+function getAuthToken(req) {
   const header = req.headers.authorization;
-  if (!header || !header.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing token' });
+  if (header?.startsWith('Bearer ')) return { token: header.slice(7), source: 'bearer' };
+  const cookieToken = parseCookies(req)[ACCESS_COOKIE_NAME];
+  if (COOKIE_AUTH_ENABLED && cookieToken) return { token: cookieToken, source: 'cookie' };
+  return { token: null, source: null };
+}
+
+function serializeCookie(name, value, options = {}) {
+  const parts = [`${encodeURIComponent(name)}=${encodeURIComponent(value)}`];
+  if (options.maxAge !== undefined) parts.push(`Max-Age=${options.maxAge}`);
+  if (options.httpOnly) parts.push('HttpOnly');
+  if (options.secure) parts.push('Secure');
+  if (options.sameSite) parts.push(`SameSite=${options.sameSite}`);
+  if (options.path) parts.push(`Path=${options.path}`);
+  return parts.join('; ');
+}
+
+function appendSetCookie(res, cookie) {
+  const existing = res.getHeader('Set-Cookie');
+  if (!existing) return res.setHeader('Set-Cookie', cookie);
+  res.setHeader('Set-Cookie', Array.isArray(existing) ? [...existing, cookie] : [existing, cookie]);
+}
+
+function setSessionCookies(res, token) {
+  if (!COOKIE_AUTH_ENABLED) return null;
+  const csrf = crypto.randomBytes(24).toString('hex');
+  const cookieBase = {
+    path: '/',
+    secure: COOKIE_AUTH_SECURE,
+    sameSite: process.env.COOKIE_AUTH_SAMESITE || 'None',
+    maxAge: 30 * 24 * 60 * 60,
+  };
+  appendSetCookie(res, serializeCookie(ACCESS_COOKIE_NAME, token, { ...cookieBase, httpOnly: true }));
+  appendSetCookie(res, serializeCookie(CSRF_COOKIE_NAME, csrf, { ...cookieBase, httpOnly: false }));
+  return csrf;
+}
+
+function clearSessionCookies(res) {
+  const cookieBase = {
+    path: '/',
+    secure: COOKIE_AUTH_SECURE,
+    sameSite: process.env.COOKIE_AUTH_SAMESITE || 'None',
+    maxAge: 0,
+  };
+  appendSetCookie(res, serializeCookie(ACCESS_COOKIE_NAME, '', { ...cookieBase, httpOnly: true }));
+  appendSetCookie(res, serializeCookie(CSRF_COOKIE_NAME, '', { ...cookieBase, httpOnly: false }));
+}
+
+function requireCookieCsrf(req, res) {
+  if (req.authSource !== 'cookie') return true;
+  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return true;
+  const csrfCookie = parseCookies(req)[CSRF_COOKIE_NAME];
+  const csrfHeader = req.headers['x-csrf-token'];
+  if (csrfCookie && csrfHeader && timingSafeEqualString(csrfCookie, csrfHeader)) return true;
+  res.status(403).json({ error: 'CSRF validation failed' });
+  return false;
+}
+
+function authMiddleware(req, res, next) {
+  const { token, source } = getAuthToken(req);
+  if (!token) return res.status(401).json({ error: 'Missing token' });
   try {
-    req.user = jwt.verify(header.slice(7), JWT_SECRET);
+    req.user = jwt.verify(token, JWT_SECRET);
+    req.authSource = source;
+    if (!requireCookieCsrf(req, res)) return;
     next();
   } catch {
     res.status(401).json({ error: 'Invalid or expired token' });
@@ -192,13 +276,15 @@ function authMiddleware(req, res, next) {
 
 // requireOwner — authenticates AND verifies the caller owns the :userId resource
 function requireOwner(req, res, next) {
-  const header = req.headers.authorization;
-  if (!header || !header.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing token' });
+  const { token, source } = getAuthToken(req);
+  if (!token) return res.status(401).json({ error: 'Missing token' });
   try {
-    req.user = jwt.verify(header.slice(7), JWT_SECRET);
+    req.user = jwt.verify(token, JWT_SECRET);
+    req.authSource = source;
   } catch {
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
+  if (!requireCookieCsrf(req, res)) return;
   const paramId = req.params.userId;
   if (paramId && req.user.userId !== paramId) {
     return res.status(403).json({ error: 'Forbidden' });
@@ -679,8 +765,9 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     // Issue real 7-day session token
     const { data: user } = await supabase.from('users').select('id, email, phone, business_name, plan, created_at').eq('id', decoded.userId).single();
     const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    const csrf_token = setSessionCookies(res, token);
 
-    res.json({ success: true, token, user });
+    res.json({ success: true, token, csrf_token, user });
   } catch (err) {
     res.status(400).json({ error: 'Invalid or expired token. Please sign up again.' });
   }
@@ -718,11 +805,17 @@ app.post('/api/auth/login', async (req, res) => {
 
     const { password_hash, ...user } = data;
     const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ success: true, token, user });
+    const csrf_token = setSessionCookies(res, token);
+    res.json({ success: true, token, csrf_token, user });
   } catch (error) {
     console.error('[login]', error);
     res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  clearSessionCookies(res);
+  res.json({ success: true });
 });
 
 app.get('/api/auth/me', authMiddleware, async (req, res) => {
