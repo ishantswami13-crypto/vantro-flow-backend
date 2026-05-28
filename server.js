@@ -81,6 +81,7 @@ function normalizeRoute(path) {
 }
 
 const { safeLog } = require('./lib/observability/logger');
+const { ErrorTaxonomy, SecurityEventTaxonomy, createErrorEvent, logErrorEvent, safeErrorResponse, logSecurityEvent } = require('./lib/observability/error-tracking');
 const app = express();
 app.set('trust proxy', 1); // Railway sits behind a proxy — needed for express-rate-limit to see real IP
 
@@ -319,6 +320,16 @@ function setNoStoreHeaders(res) {
 
 app.use('/api', (req, res, next) => {
   setNoStoreHeaders(res);
+  
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+    res.on('finish', () => {
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        const userId = req.user?.userId || req.user?.id;
+        if (userId) invalidateBusinessCache(userId);
+      }
+    });
+  }
+  
   next();
 });
 
@@ -464,6 +475,19 @@ function authMiddleware(req, res, next) {
     req.user = jwt.verify(token, JWT_SECRET);
     req.authSource = source;
     if (!requireCookieCsrf(req, res)) return;
+    
+    // --- SECURITY: Force identity fields to safe values ---
+    if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
+      const safeId = req.user.userId || req.user.id;
+      req.body.user_id = safeId;
+      req.body.userId = safeId;
+      if (req.user.businessId) req.body.business_id = req.user.businessId;
+      delete req.body.role;
+      delete req.body.plan;
+      delete req.body.subscription;
+    }
+    // ------------------------------------------------------
+    
     setNoStoreHeaders(res);
     next();
   } catch {
@@ -486,6 +510,19 @@ function requireOwner(req, res, next) {
   if (paramId && req.user.userId !== paramId) {
     return res.status(403).json({ error: 'Forbidden' });
   }
+
+  // --- SECURITY: Force identity fields to safe values ---
+  if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
+    const safeId = req.user.userId || req.user.id;
+    req.body.user_id = safeId;
+    req.body.userId = safeId;
+    if (req.user.businessId) req.body.business_id = req.user.businessId;
+    delete req.body.role;
+    delete req.body.plan;
+    delete req.body.subscription;
+  }
+  // ------------------------------------------------------
+
   setNoStoreHeaders(res);
   next();
 }
@@ -4831,6 +4868,10 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+app.get('/api/live', (req, res) => {
+  res.status(200).json({ status: 'live' });
+});
+
 app.get('/api/ready', (req, res) => {
   res.json({
     success: true,
@@ -4843,6 +4884,60 @@ app.get('/api/ready', (req, res) => {
     },
     requestId: req.requestId
   });
+});
+
+app.post('/api/client-errors', async (req, res) => {
+  const { path, message, error_id, browser_info, stack_hash, type = ErrorTaxonomy.CLIENT_UI_ERROR } = req.body;
+  
+  const event = createErrorEvent({
+    req,
+    source: 'frontend',
+    type,
+    severity: 'error',
+    safeMessage: message || 'Frontend Client Error',
+    metadata: { browser: browser_info, frontendPath: path }
+  });
+  
+  event.error_id = error_id || event.error_id; // trust frontend UUID for tracing
+  event.stack_hash = stack_hash || null;
+  
+  await logErrorEvent(event, supabase);
+  res.status(200).json({ success: true, logged: true });
+});
+
+// Admin error intelligence routes
+app.get('/api/admin/error-events', authMiddleware, adminOnly, async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 50;
+    const { data, error } = await supabase.from('error_events').select('*').order('created_at', { ascending: false }).limit(limit);
+    if (error) throw error;
+    res.json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch error events' });
+  }
+});
+
+app.patch('/api/admin/error-events/:id/resolve', authMiddleware, adminOnly, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('error_events').update({ resolved_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
+    if (error) throw error;
+    res.json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to resolve error event' });
+  }
+});
+
+app.get('/api/admin/error-summary', authMiddleware, adminOnly, async (req, res) => {
+  try {
+    // Very basic summary for dashboard
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const { count: totalErrors } = await supabase.from('error_events').select('*', { count: 'exact', head: true }).gte('created_at', today.toISOString());
+    const { count: criticalErrors } = await supabase.from('error_events').select('*', { count: 'exact', head: true }).gte('created_at', today.toISOString()).eq('severity', 'critical');
+    res.json({ success: true, summary: { totalErrors, criticalErrors } });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch summary' });
+  }
 });
 
 app.get('/metrics', async (req, res) => {
@@ -6673,6 +6768,19 @@ function adminOnly(req, res, next) {
     const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim());
     if (!ADMIN_EMAILS.includes(decoded.email)) return res.status(403).json({ error: 'Forbidden' });
     req.user = decoded;
+
+    // --- SECURITY: Force identity fields to safe values ---
+    if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
+      const safeId = req.user.userId || req.user.id;
+      req.body.user_id = safeId;
+      req.body.userId = safeId;
+      if (req.user.businessId) req.body.business_id = req.user.businessId;
+      delete req.body.role;
+      delete req.body.plan;
+      delete req.body.subscription;
+    }
+    // ------------------------------------------------------
+    
     next();
   } catch {
     res.status(401).json({ error: 'Invalid token' });
@@ -7203,6 +7311,7 @@ app.post('/api/payments/webhook', async (req, res) => {
 
       if (!timingSafeEqualString(signature, expectedSig)) {
         console.warn('Razorpay webhook: invalid signature');
+        logSecurityEvent(req, SecurityEventTaxonomy.WEBHOOK_SIGNATURE_FAILED, { provider: 'razorpay' });
         return res.status(400).json({ error: 'Invalid signature' });
       }
 
@@ -10400,29 +10509,30 @@ async function runAutoMigrations() {
   }
 }
 
-app.use((err, req, res, next) => {
+app.use(async (err, req, res, next) => {
   if (!err) return next();
-  const requestId = req.requestId || crypto.randomUUID();
-
+  
   if (err instanceof multer.MulterError || err.code === 'UNSUPPORTED_FILE_TYPE') {
-    return res.status(400).json({
-      success: false,
-      error: err.code === 'LIMIT_FILE_SIZE' ? 'File is too large' : err.message || 'Invalid upload',
-      requestId
+    const event = createErrorEvent({
+      req, err,
+      type: ErrorTaxonomy.FILE_UPLOAD_ERROR,
+      severity: 'warn',
+      safeMessage: err.code === 'LIMIT_FILE_SIZE' ? 'File is too large' : err.message || 'Invalid upload'
     });
+    await logErrorEvent(event, supabase);
+    logSecurityEvent(req, SecurityEventTaxonomy.FILE_UPLOAD_REJECTED, { code: err.code });
+    return safeErrorResponse(res, event);
   }
 
-  // Log unhandled error with requestId
-  console.error(`[unhandled middleware error] Request ID: ${requestId}`, {
-    message: err.message || err,
-    stack: IS_PRODUCTION ? undefined : err.stack
+  const event = createErrorEvent({
+    req, err,
+    type: ErrorTaxonomy.SERVER_ERROR,
+    severity: 'error',
+    safeMessage: 'Internal server error'
   });
-
-  res.status(500).json({
-    success: false,
-    error: 'Internal server error',
-    requestId
-  });
+  
+  await logErrorEvent(event, supabase);
+  safeErrorResponse(res, event);
 });
 
 app.listen(PORT, () => {

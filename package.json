@@ -7,7 +7,8 @@
     "start": "node server.js",
     "dev": "nodemon server.js",
     "check": "node --check server.js",
-    "security:secrets": "node scripts/security-secret-check.js",
+    "security:secrets": "node scripts/security-secret-scan.js",
+    "security:supply-chain": "npm audit --audit-level=high",
     "security:audit": "npm audit --audit-level=high",
     "security:cross-user": "node scripts/cross-user-security-test.js",
     "security:smoke": "node scripts/security-smoke-test.js"
