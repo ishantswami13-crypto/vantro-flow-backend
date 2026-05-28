@@ -10542,6 +10542,81 @@ app.patch('/api/ai-actions/:id', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// ── AI ACTIONS — COUNTS (for dashboard urgency strip) ────────────────────────
+app.get('/api/ai-actions/counts', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _isFE } = require('./lib/featureFlags');
+    if (!_isFE('ai_action_center')) return res.json({ urgent: 0, high: 0, total: 0 });
+    const userId = req.user.userId;
+    const { data, error } = await supabase
+      .from('ai_actions')
+      .select('priority')
+      .eq('user_id', userId)
+      .eq('status', 'pending');
+    if (error) throw error;
+    const rows = data || [];
+    const urgent = rows.filter(r => r.priority === 'urgent').length;
+    const high   = rows.filter(r => r.priority === 'high').length;
+    res.json({ urgent, high, total: rows.length });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── CUSTOMER SCORES (for collections + customers pages) ──────────────────────
+app.get('/api/customer-scores', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _isFE } = require('./lib/featureFlags');
+    if (!_isFE('customer_scoring')) return res.json({ scores: [] });
+    const userId = req.user.userId;
+    const { data, error } = await supabase
+      .from('customer_scores')
+      .select('customer_id, customer_name, score, tier, overdue_amount, max_delay_days')
+      .eq('user_id', userId)
+      .order('score', { ascending: true });
+    if (error) throw error;
+    res.json({ scores: data || [] });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── SEND WHATSAPP FOR AI ACTION ───────────────────────────────────────────────
+app.post('/api/ai-actions/:id/send-whatsapp', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _isFE } = require('./lib/featureFlags');
+    if (!_isFE('ai_message_drafts')) return res.status(403).json({ error: 'Feature not enabled' });
+    const userId = req.user.userId;
+    const { id } = req.params;
+
+    const { data: action, error: fetchErr } = await supabase
+      .from('ai_actions')
+      .select('*, customers(name, phone)')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+    if (fetchErr || !action) return res.status(404).json({ error: 'Action not found' });
+
+    const phone   = action.customers?.phone || null;
+    const message = action.recommended_message || action.description || action.title;
+
+    if (!phone)   return res.status(422).json({ error: 'No customer phone on record' });
+    if (!message) return res.status(422).json({ error: 'No message content to send' });
+    if (!process.env.TWILIO_WHATSAPP_NUMBER) {
+      return res.status(503).json({ error: 'WhatsApp not configured — set TWILIO_WHATSAPP_NUMBER in Railway' });
+    }
+
+    const sendResult = await sendWhatsAppMessage(phone, message);
+    if (!sendResult?.success) {
+      return res.status(502).json({ error: 'WhatsApp send failed', detail: sendResult });
+    }
+
+    await supabase
+      .from('ai_actions')
+      .update({ status: 'done', completed_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+      .eq('id', id)
+      .eq('user_id', userId);
+
+    res.json({ success: true, sid: sendResult.sid || null, provider: sendResult.provider });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
 // ── BROKEN PROMISE DETECTION CRON — daily 9am IST (3:30 UTC) ────────────────
 cron.schedule('30 3 * * *', async () => {
   const { isEnabled: _isFE } = require('./lib/featureFlags');
