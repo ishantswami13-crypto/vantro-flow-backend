@@ -82,6 +82,7 @@ function normalizeRoute(path) {
 
 const { safeLog } = require('./lib/observability/logger');
 const { ErrorTaxonomy, SecurityEventTaxonomy, createErrorEvent, logErrorEvent, safeErrorResponse, logSecurityEvent } = require('./lib/observability/error-tracking');
+const { isEnabled: isFeatureEnabled } = require('./lib/featureFlags'); // Vantro Cortex feature flags
 const app = express();
 app.set('trust proxy', 1); // Railway sits behind a proxy — needed for express-rate-limit to see real IP
 
@@ -1909,6 +1910,24 @@ app.post('/api/mark-paid', authMiddleware, async (req, res) => {
       }
     } catch (waErr) { console.error('Celebration WA error:', waErr.message); }
 
+    // ── Cortex: Cashflow confirm + customer score recalculation ───────────────
+    if (isFeatureEnabled('cortex_enabled') && inv) {
+      const _cfSvc = require('./lib/services/orchestrator/cashflow.service');
+      _cfSvc.confirmInflow(
+        req.user.userId,
+        inv.id,
+        parseFloat(payment_amount || inv.invoice_amount || 0),
+        payment_date || new Date().toISOString().split('T')[0]
+      ).catch(err => console.warn('[Cortex] confirmInflow failed:', err.message));
+
+      if (isFeatureEnabled('customer_scoring')) {
+        const _scoring = require('./lib/services/orchestrator/scoring.service');
+        _scoring.resolveCustomerId(req.user.userId, inv.customer_name, inv.customer_phone)
+          .then(cId => cId ? _scoring.recalculate(req.user.userId, cId) : null)
+          .catch(err => console.warn('[Cortex] scoring recalc failed:', err.message));
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
     res.json({ success: true, data: inv });
   } catch (error) {
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -2630,6 +2649,27 @@ async function emitBusinessEvent(userId, eventType, payload = {}) {
     safelyRunConnectedUpdates(userId, eventType, payload).catch(err => {
       console.error(`[Event Engine] Connected updates failed for '${eventType}':`, err.message);
     });
+
+    // ── Vantro Cortex: persist typed event to business_events ──────────────
+    // Lazy-required to avoid any startup failures if Cortex files are not yet deployed.
+    try {
+      const { isEnabled } = require('./lib/featureFlags');
+      if (isEnabled('cortex_enabled')) {
+        const eventSvc = require('./lib/services/orchestrator/event.service');
+        const { normalizeLegacyEventType } = eventSvc;
+        eventSvc.emit(userId, {
+          eventType:  normalizeLegacyEventType(eventType),
+          entityType: payload.entityType || null,
+          entityId:   payload.entityId   || null,
+          actorType:  'user',
+          actorId:    userId,
+          payload,
+        }).catch(err => console.warn('[Cortex] business_events persist failed:', err.message));
+      }
+    } catch (cortexErr) {
+      console.warn('[Cortex] Feature flag / event service load failed:', cortexErr.message);
+    }
+    // ── End Cortex ──────────────────────────────────────────────────────────
   } catch (err) {
     console.error('[Event Engine] Fatal emit error:', err.message);
   }
@@ -9169,6 +9209,15 @@ app.post('/api/purchases', authMiddleware, async (req, res) => {
     if (!supplier_name || !finalAmount) {
       return res.status(400).json({ error: 'supplier_name and total_amount are required' });
     }
+    // ── Cortex: Idempotency check ─────────────────────────────────────────────
+    if (isFeatureEnabled('cortex_enabled')) {
+      const _idemKey = req.headers['idempotency-key'];
+      if (_idemKey) {
+        const _cached = await require('./lib/services/orchestrator/idempotency.service').check(req.user.userId, _idemKey);
+        if (_cached) return res.json(_cached);
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
     const finalPaid  = parseFloat(paid_amount || 0);
     const autoStatus = finalPaid >= finalAmount ? 'paid' : finalPaid > 0 ? 'partial' : 'unpaid';
 
@@ -9205,6 +9254,20 @@ app.post('/api/purchases', authMiddleware, async (req, res) => {
       amount: finalAmount,
       supplier_name,
     });
+    // ── Cortex: Cashflow event + idempotency store ────────────────────────────
+    if (isFeatureEnabled('cortex_enabled')) {
+      require('./lib/services/orchestrator/cashflow.service')
+        .createFromPurchase(req.user.userId, data, finalAmount, finalPaid)
+        .catch(err => console.warn('[Cortex] purchase cashflow failed:', err.message));
+      const _idemKey = req.headers['idempotency-key'];
+      if (_idemKey) {
+        const _resp = { success: true, purchase: { ...data, total_amount: parseFloat(data.amount) }, supplier, inventory };
+        require('./lib/services/orchestrator/idempotency.service')
+          .set(req.user.userId, _idemKey, _resp)
+          .catch(() => {});
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
     res.json({ success: true, purchase: { ...data, total_amount: parseFloat(data.amount) }, supplier, inventory });
   } catch (err) {
     console.error('Purchase create error:', err.message);
@@ -9341,6 +9404,15 @@ app.post('/api/sales', authMiddleware, async (req, res) => {
             cgst_amount, sgst_amount, igst_amount, subtotal } = req.body;
     const finalAmount = parseFloat(total_amount || amount || 0);
     if (!customer_name || !finalAmount) return res.status(400).json({ error: 'customer_name and total_amount are required' });
+    // ── Cortex: Idempotency check ─────────────────────────────────────────────
+    if (isFeatureEnabled('cortex_enabled')) {
+      const _idemKey = req.headers['idempotency-key'];
+      if (_idemKey) {
+        const _cached = await require('./lib/services/orchestrator/idempotency.service').check(req.user.userId, _idemKey);
+        if (_cached) return res.json(_cached);
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
     const finalPaid = parseFloat(paid_amount || 0);
     const autoStatus = finalPaid >= finalAmount ? 'paid' : finalPaid > 0 ? 'partial' : 'unpaid';
     const { data, error } = await supabase.from('sales').insert([{
@@ -9376,6 +9448,20 @@ app.post('/api/sales', authMiddleware, async (req, res) => {
       amount: finalAmount,
       customer_name,
     });
+    // ── Cortex: Cashflow event + idempotency store ────────────────────────────
+    if (isFeatureEnabled('cortex_enabled')) {
+      require('./lib/services/orchestrator/cashflow.service')
+        .createFromSale(req.user.userId, sale, finalAmount, finalPaid)
+        .catch(err => console.warn('[Cortex] sale cashflow failed:', err.message));
+      const _idemKey = req.headers['idempotency-key'];
+      if (_idemKey) {
+        const _resp = { success: true, sale: { ...sale, total_amount: parseFloat(sale.amount) }, receivable };
+        require('./lib/services/orchestrator/idempotency.service')
+          .set(req.user.userId, _idemKey, _resp)
+          .catch(() => {});
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
     res.json({ success: true, sale: { ...sale, total_amount: parseFloat(sale.amount) }, receivable });
   } catch (err) { res.status(500).json({ error: err.message || 'Internal server error' }); }
 });
