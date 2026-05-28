@@ -123,6 +123,27 @@ function invalidateBusinessCache(userId) {
   console.log(`[Cache] Invalidated cache for user ${userId}`);
 }
 
+// Lightweight background cache warming helper
+function warmBusinessCache(userId) {
+  if (!userId) return;
+  
+  // Warm the control-room and analytics summaries asynchronously
+  Promise.all([
+    calculateDashboardControlRoom(userId).then(data => {
+      const cacheKey = buildBusinessCacheKey(userId, 'control-room');
+      setCache(cacheKey, data, 60);
+      console.log(`[Cache Warmer] Dashboard warmed for user ${userId}`);
+    }),
+    calculateAnalyticsSummary(userId).then(data => {
+      const cacheKey = buildBusinessCacheKey(userId, 'analytics');
+      setCache(cacheKey, data, 60);
+      console.log(`[Cache Warmer] Analytics warmed for user ${userId}`);
+    })
+  ]).catch(err => {
+    console.warn(`[Cache Warmer] Silent background warming error for user ${userId}:`, err.message);
+  });
+}
+
 // Initialize Supabase
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -973,6 +994,9 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
       name: data.owner_name || data.business_name || data.email || 'User',
       businessId: data.id,
     };
+
+    // Warm cache in the background (non-blocking)
+    warmBusinessCache(tokenUserId);
 
     res.json({ success: true, user });
   } catch (error) {
