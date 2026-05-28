@@ -10403,6 +10403,193 @@ ${sheetsHtml}
 });
 
 // ============================================
+// VANTRO CORTEX — MILESTONE C
+// Promises API + AI Actions API + Crons
+// ============================================
+
+// ── PROMISES ─────────────────────────────────────────────────────────────────
+
+app.get('/api/promises', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { status, customer_id, limit: lim = 50 } = req.query;
+    let query = supabase
+      .from('promises')
+      .select('*, customers(name, phone)')
+      .eq('user_id', userId)
+      .order('promised_date', { ascending: true })
+      .limit(Number(lim));
+    if (status) query = query.eq('status', status);
+    if (customer_id) query = query.eq('customer_id', customer_id);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ success: true, promises: data || [] });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/promises', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { customer_id, receivable_id, promised_amount, promised_date, promise_note } = req.body;
+    if (!customer_id || !promised_date) return res.status(400).json({ error: 'customer_id and promised_date are required' });
+    const { data, error } = await supabase.from('promises').insert([{
+      user_id: userId,
+      customer_id,
+      receivable_id: receivable_id || null,
+      promised_amount: promised_amount != null ? parseFloat(promised_amount) : null,
+      promised_date,
+      promise_note: promise_note || null,
+      status: 'active',
+      created_by: userId,
+    }]).select().single();
+    if (error) throw error;
+    if (isFeatureEnabled('cortex_enabled')) {
+      const { emitBusinessEvent } = require('./lib/events/EventEngine');
+      emitBusinessEvent(userId, 'PROMISE_CREATED', { promiseId: data.id, promised_date, promised_amount, customer_id });
+    }
+    res.status(201).json({ success: true, promise: data });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.patch('/api/promises/:id', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    const { status, promise_note, promised_date } = req.body;
+    const allowedStatuses = ['kept', 'broken', 'rescheduled', 'active'];
+    if (status && !allowedStatuses.includes(status)) return res.status(400).json({ error: 'Invalid status' });
+    const updates = {};
+    if (status) {
+      updates.status = status;
+      updates.resolved_at = ['kept', 'broken'].includes(status) ? new Date().toISOString() : null;
+    }
+    if (promise_note !== undefined) updates.promise_note = promise_note;
+    if (promised_date) updates.promised_date = promised_date;
+    const { data, error } = await supabase
+      .from('promises').update(updates).eq('id', id).eq('user_id', userId).select().single();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Promise not found' });
+    if (status && isFeatureEnabled('cortex_enabled')) {
+      const { emitBusinessEvent } = require('./lib/events/EventEngine');
+      emitBusinessEvent(userId, status === 'kept' ? 'PROMISE_KEPT' : status === 'broken' ? 'PROMISE_BROKEN' : 'PROMISE_RESCHEDULED',
+        { promiseId: id, customer_id: data.customer_id });
+    }
+    res.json({ success: true, promise: data });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── AI ACTIONS ───────────────────────────────────────────────────────────────
+
+app.get('/api/ai-actions', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { status = 'pending', priority, limit: lim = 50, offset: off = 0 } = req.query;
+    let query = supabase
+      .from('ai_actions')
+      .select('*, customers(name, phone)')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .range(Number(off), Number(off) + Number(lim) - 1);
+    if (status !== 'all') query = query.eq('status', status);
+    if (priority) query = query.eq('priority', priority);
+    const { data, error } = await query;
+    if (error) throw error;
+    // Priority counts for badge display
+    const { data: summary } = await supabase
+      .from('ai_actions').select('priority').eq('user_id', userId).eq('status', 'pending');
+    const counts = {};
+    (summary || []).forEach(r => { counts[r.priority] = (counts[r.priority] || 0) + 1; });
+    res.json({ success: true, actions: data || [], counts, total: (data || []).length });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.patch('/api/ai-actions/:id', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    const { status } = req.body;
+    const allowed = ['approved', 'rejected', 'done'];
+    if (!allowed.includes(status)) return res.status(400).json({ error: 'Invalid status. Must be: approved, rejected, done' });
+    const updates = { status, updated_at: new Date().toISOString() };
+    if (status === 'approved') { updates.approved_by = userId; updates.approved_at = new Date().toISOString(); }
+    if (status === 'done') updates.completed_at = new Date().toISOString();
+    const { data, error } = await supabase
+      .from('ai_actions').update(updates).eq('id', id).eq('user_id', userId).select().single();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Action not found' });
+    res.json({ success: true, action: data });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── BROKEN PROMISE DETECTION CRON — daily 9am IST (3:30 UTC) ────────────────
+cron.schedule('30 3 * * *', async () => {
+  const { isEnabled: _isFE } = require('./lib/featureFlags');
+  if (!_isFE('promise_checker')) return;
+  const { safeLog } = require('./lib/observability/logger');
+  safeLog('info', '[PromiseCron] Running broken promise detection');
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const { data: broken, error } = await supabase
+      .from('promises')
+      .update({ status: 'broken', resolved_at: new Date().toISOString() })
+      .eq('status', 'active')
+      .lt('promised_date', today)
+      .select('id, user_id, customer_id, promised_amount, promised_date');
+    if (error) { safeLog('error', '[PromiseCron] Update failed', { error: error.message }); return; }
+    if (!broken?.length) { safeLog('info', '[PromiseCron] No broken promises today'); return; }
+    safeLog('info', '[PromiseCron] Marked broken', { count: broken.length });
+    const { emitBusinessEvent } = require('./lib/events/EventEngine');
+    const { recalculate } = require('./lib/services/orchestrator/scoring.service');
+    for (const p of broken) {
+      try {
+        emitBusinessEvent(p.user_id, 'PROMISE_BROKEN', { promiseId: p.id, customer_id: p.customer_id, promised_date: p.promised_date });
+        if (_isFE('customer_scoring') && p.customer_id) await recalculate(p.user_id, p.customer_id).catch(() => {});
+      } catch (e) { safeLog('error', '[PromiseCron] Per-promise error', { error: e.message, promiseId: p.id }); }
+    }
+  } catch (err) { safeLog('error', '[PromiseCron] Fatal', { error: err.message }); }
+}, { timezone: 'UTC' });
+
+// ── DAILY OWNER BRIEFING CRON — 7am IST (1:30 UTC) ──────────────────────────
+cron.schedule('30 1 * * *', async () => {
+  const { isEnabled: _isFE } = require('./lib/featureFlags');
+  if (!_isFE('cortex_enabled')) return;
+  const { safeLog } = require('./lib/observability/logger');
+  safeLog('info', '[BriefingCron] Running daily owner briefing');
+  try {
+    const { data: users } = await supabase.from('users').select('id').limit(500);
+    if (!users?.length) return;
+    const today = new Date().toISOString().split('T')[0];
+    const { create: createAction } = require('./lib/services/orchestrator/action.service');
+    for (const user of users) {
+      try {
+        const [{ data: overdue }, { data: pendingActions }, { data: brokenToday }] = await Promise.all([
+          supabase.from('invoices').select('customer_name, invoice_amount, days_overdue').eq('user_id', user.id).eq('payment_status', 'Pending').order('days_overdue', { ascending: false }).limit(3),
+          supabase.from('ai_actions').select('id').eq('user_id', user.id).eq('status', 'pending'),
+          supabase.from('promises').select('id').eq('user_id', user.id).eq('status', 'broken').gte('resolved_at', today),
+        ]);
+        const pendingCount = pendingActions?.length || 0;
+        if (pendingCount === 0 && !overdue?.length) continue;
+        const descParts = [
+          overdue?.length ? `Top overdue: ${overdue[0].customer_name} (₹${Number(overdue[0].invoice_amount).toLocaleString('en-IN')}, ${overdue[0].days_overdue}d)` : null,
+          brokenToday?.length ? `${brokenToday.length} promise(s) broken today` : null,
+          pendingCount ? `${pendingCount} action(s) awaiting review` : null,
+        ].filter(Boolean);
+        await createAction(user.id, {
+          action_type:       'DAILY_OWNER_BRIEFING',
+          title:             `Daily Briefing — ${pendingCount} pending action${pendingCount !== 1 ? 's' : ''}`,
+          description:       descParts.join(' · '),
+          priority:          pendingCount >= 5 ? 'high' : 'medium',
+          suggested_by:      'system',
+          requires_approval: false,
+          risk_level:        'low',
+        });
+      } catch (e) { safeLog('error', '[BriefingCron] Per-user error', { error: e.message, userId: user.id }); }
+    }
+    safeLog('info', '[BriefingCron] Done');
+  } catch (err) { safeLog('error', '[BriefingCron] Fatal', { error: err.message }); }
+}, { timezone: 'UTC' });
+
+// ============================================
 // START SERVER
 // ============================================
 
