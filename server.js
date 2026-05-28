@@ -125,6 +125,15 @@ app.use((req, res, next) => {
     } else {
       safeLog('info', 'API Request Success', logData);
     }
+
+    if (parseFloat(durationMs) > 1000) {
+      safeLog('warn', '[SLOW_REQUEST]', {
+        route: normalizedRoute,
+        method: req.method,
+        latencyMs: parseFloat(durationMs),
+        requestId: req.requestId
+      });
+    }
   });
 
   next();
@@ -379,6 +388,18 @@ app.use(['/api/upload-csv', '/api/import/excel', '/api/scan-document', '/api/pur
 app.use(['/api/ai-chat', '/api/ml/briefing', '/api/ai/brain', '/api/ai/call-script', '/api/ai/bulk-whatsapp'], aiLimiter);
 app.use('/api/bills/public', publicBillLimiter);
 app.use(['/api/analytics', '/api/cash-forecast', '/api/reports/export', '/api/reconcile/backfill'], heavyReadLimiter);
+
+// Lightweight Performance Endpoint
+app.get('/api/performance/summary', requireAdmin, (req, res) => {
+  res.json({
+    success: true,
+    status: 'healthy',
+    metrics: {
+      uptime_seconds: process.uptime(),
+      memory_usage_mb: Math.round(process.memoryUsage().rss / 1024 / 1024)
+    }
+  });
+});
 
 // JWT middleware — attach user to req if token valid
 const ACCESS_COOKIE_NAME = process.env.ACCESS_COOKIE_NAME || 'vantro_access_token';
