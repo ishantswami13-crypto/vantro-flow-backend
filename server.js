@@ -215,10 +215,10 @@ function warmBusinessCache(userId) {
 }
 
 // Initialize Supabase
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_KEY
-);
+const { supabase } = require('./lib/config/supabaseClient');
+const { getBusinessContext } = require('./lib/businessContext');
+const salesService = require('./lib/services/SalesService');
+const purchaseService = require('./lib/services/PurchaseService');
 
 function isMissingSchemaError(error) {
   const code = error?.code || '';
@@ -2627,18 +2627,6 @@ async function safelyRunConnectedUpdates(userId, eventType, payload) {
   }
 }
 
-// ─── Shared Business Context Helper ──────────────────────────────────────────
-function getBusinessContext(req) {
-  if (!req.user || !req.user.userId) {
-    console.warn('[getBusinessContext] Warning: Request has no verified user session.');
-    return { userId: null, businessId: null, email: null, role: 'guest' };
-  }
-  const userId = req.user.userId;
-  const email = req.user.email || null;
-  const businessId = req.user.businessId || userId;
-  const role = req.user.role || 'owner';
-  return { userId, businessId, email, role };
-}
 
 // ─── Shared Ledger Summary Service ───────────────────────────────────────────
 async function calculateLedgerSummary(userId) {
@@ -9047,20 +9035,11 @@ app.delete('/api/khata/entry/:id', authMiddleware, async (req, res) => {
 
 app.get('/api/purchases', authMiddleware, async (req, res) => {
   try {
-    const userId = req.user.userId;
+    const { userId, businessId } = getBusinessContext(req);
     await ensureConnectedBusinessData(userId);
     const { status } = req.query;
-    let q = supabase.from('purchases').select('*').eq('user_id', userId).order('purchase_date', { ascending: false });
-    if (status) q = q.eq('status', status);
-    const { data, error } = await q;
-    if (error) {
-      if (isMissingSchemaError(error)) {
-        console.warn('[purchases list] table/columns unavailable, returning empty list:', error.message);
-        return res.json({ success: true, purchases: [] });
-      }
-      throw error;
-    }
-    const purchases = (data || []).map(p => ({ ...p, total_amount: parseFloat(p.amount) || 0 }));
+    
+    const purchases = await purchaseService.getPurchases(userId, businessId, { status });
     res.json({ success: true, purchases });
   } catch (err) {
     console.error('GET purchases error:', err.message);
@@ -9238,14 +9217,11 @@ Rules: numbers without rupee symbol or commas (147630 not 1,47,630). Dates as YY
 
 app.get('/api/sales', authMiddleware, async (req, res) => {
   try {
-    const userId = req.user.userId;
+    const { userId, businessId } = getBusinessContext(req);
     await ensureConnectedBusinessData(userId);
     const { status } = req.query;
-    let q = supabase.from('sales').select('*').eq('user_id', userId).order('sale_date', { ascending: false });
-    if (status) q = q.eq('status', status);
-    const { data, error } = await q;
-    if (error) throw error;
-    const sales = (data || []).map(s => ({ ...s, total_amount: parseFloat(s.amount) || 0 }));
+    
+    const sales = await salesService.getSales(userId, businessId, { status });
     res.json({ success: true, sales });
   } catch (err) { res.status(500).json({ error: err.message || 'Internal server error' }); }
 });

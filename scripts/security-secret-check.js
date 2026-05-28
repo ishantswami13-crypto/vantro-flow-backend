@@ -63,7 +63,7 @@ function checkFile(filePath) {
 
   const content = fs.readFileSync(filePath, 'utf8');
   for (const pattern of DANGEROUS_PATTERNS) {
-    if (pattern.test(content) && basename !== 'security-secret-check.js' && basename !== '.env.example' && basename !== 'frontend-env-guard.js' && basename !== 'server.js' && basename !== 'supabase-schema.sql') {
+    if (pattern.test(content) && basename !== 'security-secret-check.js' && basename !== '.env.example' && basename !== 'frontend-env-guard.js' && basename !== 'server.js' && basename !== 'supabase-schema.sql' && basename !== 'supabaseClient.js') {
       console.error(`[WARNING] Potential secret leak in ${filePath}: matched pattern ${pattern}`);
       hasError = true;
     }
