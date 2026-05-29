@@ -1951,6 +1951,27 @@ app.post('/api/mark-paid', authMiddleware, async (req, res) => {
           .then(cId => cId ? _scoring.recalculate(req.user.userId, cId) : null)
           .catch(err => console.warn('[Cortex] scoring recalc failed:', err.message));
       }
+
+      // Memory learning: customer paid → record payment behaviour
+      if (isFeatureEnabled('memory_enabled') && inv) {
+        setImmediate(async () => {
+          try {
+            const _scoring = require('./lib/services/orchestrator/scoring.service');
+            const cId = await _scoring.resolveCustomerId(req.user.userId, inv.customer_name, inv.customer_phone);
+            if (cId) {
+              await supabase.from('business_memory').upsert([{
+                user_id:      req.user.userId,
+                entity_type:  'customer',
+                entity_id:    cId,
+                memory_key:   'last_payment_at',
+                memory_value: { v: payment_date || new Date().toISOString().split('T')[0], amount: parseFloat(payment_amount || inv.invoice_amount || 0) },
+                source:       'payment_event',
+                updated_at:   new Date().toISOString(),
+              }], { onConflict: 'user_id,entity_type,entity_id,memory_key' });
+            }
+          } catch {}
+        });
+      }
     }
     // ─────────────────────────────────────────────────────────────────────────
     res.json({ success: true, data: inv });
@@ -10864,20 +10885,40 @@ app.get('/api/cortex/health', authMiddleware, async (req, res) => {
   try {
     const { FLAGS } = require('./lib/featureFlags');
     const userId = req.user.userId;
-    const [actionsResult, scoresResult, plansResult] = await Promise.all([
-      supabase.from('ai_actions').select('id', { count: 'exact', head: true }).eq('user_id', userId).eq('status', 'pending'),
+
+    const [actionsRes, scoresRes, plansRes, evalRes, memRes] = await Promise.all([
+      supabase.from('ai_actions').select('priority, status').eq('user_id', userId).in('status', ['pending', 'done']).limit(200),
       supabase.from('customer_scores').select('id', { count: 'exact', head: true }).eq('user_id', userId),
-      supabase.from('ai_plans').select('id', { count: 'exact', head: true }).eq('user_id', userId).eq('status', 'active').then ?
-        supabase.from('ai_plans').select('id', { count: 'exact', head: true }).eq('user_id', userId).eq('status', 'active') :
-        Promise.resolve({ count: 0, error: null }),
+      supabase.from('ai_plans').select('id', { count: 'exact', head: true }).eq('user_id', userId).eq('status', 'active'),
+      supabase.from('ai_actions').select('outcome').eq('user_id', userId).not('outcome', 'is', null).limit(100),
+      supabase.from('business_memory').select('id', { count: 'exact', head: true }).eq('user_id', userId),
     ]);
+
+    const actions     = actionsRes.data  || [];
+    const evalActions = evalRes.data     || [];
+
+    const pendingByPriority = { urgent: 0, high: 0, medium: 0, low: 0 };
+    actions.filter(a => a.status === 'pending').forEach(a => { pendingByPriority[a.priority] = (pendingByPriority[a.priority] || 0) + 1; });
+
+    const effectiveCount   = evalActions.filter(a => a.outcome === 'effective').length;
+    const ineffectiveCount = evalActions.filter(a => a.outcome === 'ineffective').length;
+    const effectivenessRate = evalActions.length > 0
+      ? Math.round((effectiveCount / evalActions.length) * 100)
+      : null;
+
     res.json({
       success: true,
       flags: FLAGS,
       stats: {
-        pending_actions:  actionsResult.count  || 0,
-        customer_scores:  scoresResult.count   || 0,
-        active_plans:     plansResult.count    || 0,
+        pending_actions:     actions.filter(a => a.status === 'pending').length,
+        pending_by_priority: pendingByPriority,
+        customer_scores:     scoresRes.count  || 0,
+        active_plans:        plansRes.count   || 0,
+        memory_entries:      memRes.count     || 0,
+        evaluated_actions:   evalActions.length,
+        effectiveness_rate:  effectivenessRate, // null if not enough data
+        effective_count:     effectiveCount,
+        ineffective_count:   ineffectiveCount,
       },
     });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
@@ -10968,6 +11009,26 @@ cron.schedule('45 1 * * *', async () => {
     }
     _log('info', '[AgentsCron] Done');
   } catch (err) { _log('error', '[AgentsCron] Fatal', { error: err.message }); }
+}, { timezone: 'UTC' });
+
+// ── EVALUATION CRON — daily 10am IST (4:30 UTC) ─────────────────────────────
+cron.schedule('30 4 * * *', async () => {
+  const { isEnabled: _isFE } = require('./lib/featureFlags');
+  if (!_isFE('cortex_enabled')) return;
+  const { safeLog: _log } = require('./lib/observability/logger');
+  _log('info', '[EvalCron] Running action effectiveness evaluation');
+  try {
+    const { run: evalRun } = require('./lib/services/agents/evaluationAgent');
+    const { data: users } = await supabase.from('users').select('id').limit(500);
+    let totalEvaluated = 0;
+    for (const user of (users || [])) {
+      try {
+        const r = await evalRun(user.id);
+        totalEvaluated += r.evaluated || 0;
+      } catch {}
+    }
+    _log('info', '[EvalCron] Done', { totalEvaluated });
+  } catch (err) { _log('error', '[EvalCron] Fatal', { error: err.message }); }
 }, { timezone: 'UTC' });
 
 // ── DATA QUALITY CRON — weekly Sundays 8am IST (2:30 UTC) ───────────────────
