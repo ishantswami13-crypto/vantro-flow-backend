@@ -5,8 +5,8 @@
 
 use crate::scoring::calculate_customer_risk_score;
 use crate::types::{
-    CashflowSimulationInput, CashflowSimulationResult,
-    CreditSaleSimulationInput, CustomerMetrics, RiskLevel, SimulationResult,
+    CashflowSimulationInput, CashflowSimulationResult, CreditSaleSimulationInput, CustomerMetrics,
+    RiskLevel, SimulationResult,
 };
 
 // ─── Credit-sale simulation ─────────────────────────────────────────────────
@@ -37,7 +37,11 @@ pub fn simulate_credit_sale(input: &CreditSaleSimulationInput) -> SimulationResu
         reasons.push(format!(
             "{} promise{} broken",
             input.broken_promises,
-            if input.broken_promises > 1 { "s were" } else { " was" }
+            if input.broken_promises > 1 {
+                "s were"
+            } else {
+                " was"
+            }
         ));
     }
     reasons.push(format!(
@@ -57,13 +61,13 @@ pub fn simulate_credit_sale(input: &CreditSaleSimulationInput) -> SimulationResu
 
     // Use the scoring engine for a quick risk snapshot
     let pseudo_metrics = CustomerMetrics {
-        total_overdue:   input.overdue_amount,
-        max_delay_days:  input.average_delay_days,
-        avg_delay_days:  input.average_delay_days,
+        total_overdue: input.overdue_amount,
+        max_delay_days: input.average_delay_days,
+        avg_delay_days: input.average_delay_days,
         broken_promises: input.broken_promises,
-        kept_promises:   0,
-        calls_total:     0,
-        calls_picked:    0,
+        kept_promises: 0,
+        calls_total: 0,
+        calls_picked: 0,
     };
     let base_score = calculate_customer_risk_score(&pseudo_metrics);
 
@@ -84,10 +88,16 @@ pub fn simulate_credit_sale(input: &CreditSaleSimulationInput) -> SimulationResu
         || input.new_sale_amount > 50_000.0;
 
     let recommendation = match risk_level {
-        RiskLevel::Low    => "Safe to proceed with credit sale.".to_string(),
-        RiskLevel::Medium => "Proceed with caution; consider asking for advance payment.".to_string(),
-        RiskLevel::High   => "Require owner approval or take advance before new credit sale.".to_string(),
-        RiskLevel::Critical => "Do not extend credit — collect outstanding before new sale.".to_string(),
+        RiskLevel::Low => "Safe to proceed with credit sale.".to_string(),
+        RiskLevel::Medium => {
+            "Proceed with caution; consider asking for advance payment.".to_string()
+        }
+        RiskLevel::High => {
+            "Require owner approval or take advance before new credit sale.".to_string()
+        }
+        RiskLevel::Critical => {
+            "Do not extend credit — collect outstanding before new sale.".to_string()
+        }
     };
 
     SimulationResult {
@@ -124,7 +134,8 @@ pub fn simulate_cashflow_gap(input: &CashflowSimulationInput) -> CashflowSimulat
             net
         ));
     }
-    if input.expected_outflow_7d > input.expected_inflow_7d * 2.0 && input.expected_inflow_7d > 0.0 {
+    if input.expected_outflow_7d > input.expected_inflow_7d * 2.0 && input.expected_inflow_7d > 0.0
+    {
         reasons.push("Outflows are more than 2× inflows — severe cashflow pressure.".to_string());
     }
 
@@ -166,13 +177,13 @@ mod tests {
 
     fn spec_input() -> CreditSaleSimulationInput {
         CreditSaleSimulationInput {
-            customer_id:         "cus_123".to_string(),
-            new_sale_amount:     50_000.0,
+            customer_id: "cus_123".to_string(),
+            new_sale_amount: 50_000.0,
             current_outstanding: 72_000.0,
-            overdue_amount:      40_000.0,
-            broken_promises:     3,
-            average_delay_days:  18.0,
-            credit_limit:        100_000.0,
+            overdue_amount: 40_000.0,
+            broken_promises: 3,
+            average_delay_days: 18.0,
+            credit_limit: 100_000.0,
         }
     }
 
@@ -193,7 +204,11 @@ mod tests {
     fn test_spec_score_at_least_80() {
         let r = simulate_credit_sale(&spec_input());
         // spec says output score: 86 — our formula will be close (≥78)
-        assert!(r.score >= 78, "score should be high for spec example, got {}", r.score);
+        assert!(
+            r.score >= 78,
+            "score should be high for spec example, got {}",
+            r.score
+        );
     }
 
     #[test]
@@ -203,20 +218,20 @@ mod tests {
         let all = r.reasons.join(" ");
         assert!(all.contains("72"), "should mention outstanding amount");
         assert!(all.contains("40"), "should mention overdue amount");
-        assert!(all.contains("3"),  "should mention broken promises");
+        assert!(all.contains("3"), "should mention broken promises");
         assert!(all.contains("122"), "should mention projected exposure");
     }
 
     #[test]
     fn test_safe_sale_low_risk() {
         let input = CreditSaleSimulationInput {
-            customer_id:         "c1".to_string(),
-            new_sale_amount:     5_000.0,
+            customer_id: "c1".to_string(),
+            new_sale_amount: 5_000.0,
             current_outstanding: 0.0,
-            overdue_amount:      0.0,
-            broken_promises:     0,
-            average_delay_days:  0.0,
-            credit_limit:        100_000.0,
+            overdue_amount: 0.0,
+            broken_promises: 0,
+            average_delay_days: 0.0,
+            credit_limit: 100_000.0,
         };
         let r = simulate_credit_sale(&input);
         assert_eq!(r.risk_level, RiskLevel::Low);
@@ -226,9 +241,9 @@ mod tests {
     #[test]
     fn test_cashflow_healthy() {
         let input = CashflowSimulationInput {
-            expected_inflow_7d:  50_000.0,
+            expected_inflow_7d: 50_000.0,
             expected_outflow_7d: 30_000.0,
-            current_balance:     20_000.0,
+            current_balance: 20_000.0,
         };
         let r = simulate_cashflow_gap(&input);
         assert!(r.gap <= 0.0);
@@ -238,9 +253,9 @@ mod tests {
     #[test]
     fn test_cashflow_critical() {
         let input = CashflowSimulationInput {
-            expected_inflow_7d:  5_000.0,
+            expected_inflow_7d: 5_000.0,
             expected_outflow_7d: 90_000.0,
-            current_balance:     1_000.0,
+            current_balance: 1_000.0,
         };
         let r = simulate_cashflow_gap(&input);
         assert_eq!(r.risk_level, RiskLevel::Critical);

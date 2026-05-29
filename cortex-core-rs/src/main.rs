@@ -21,7 +21,7 @@ fn main() {
     if args.len() < 2 {
         let err = serde_json::to_string(&ErrorOutput {
             success: false,
-            error:   "Usage: cortex-core '<json>'".to_string(),
+            error: "Usage: cortex-core '<json>'".to_string(),
         })
         .unwrap_or_else(|_| r#"{"success":false,"error":"bad args"}"#.to_string());
         println!("{}", err);
@@ -33,7 +33,7 @@ fn main() {
     let result: DispatchOutput = match serde_json::from_str::<DispatchInput>(input_str) {
         Err(e) => DispatchOutput::Error(ErrorOutput {
             success: false,
-            error:   format!("JSON parse error: {}", e),
+            error: format!("JSON parse error: {}", e),
         }),
         Ok(cmd) => dispatch(cmd),
     };
@@ -62,8 +62,6 @@ fn dispatch(cmd: DispatchInput) -> DispatchOutput {
         DispatchInput::SimulateCashflowRisk(i) => {
             DispatchOutput::CashflowSim(simulate_cashflow_gap(&i))
         }
-        DispatchInput::EvaluatePolicy(i) => {
-            DispatchOutput::Policy(evaluate_action_policy(&i))
-        }
+        DispatchInput::EvaluatePolicy(i) => DispatchOutput::Policy(evaluate_action_policy(&i)),
     }
 }

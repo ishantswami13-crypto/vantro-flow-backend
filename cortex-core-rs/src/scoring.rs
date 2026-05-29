@@ -63,10 +63,7 @@ pub fn calculate_collection_priority_score(m: &CustomerMetrics) -> u8 {
 fn build_reasons(m: &CustomerMetrics, score: u8) -> Vec<String> {
     let mut reasons = Vec::new();
     if m.total_overdue > 0.0 {
-        reasons.push(format!(
-            "₹{:.0} overdue",
-            m.total_overdue
-        ));
+        reasons.push(format!("₹{:.0} overdue", m.total_overdue));
     }
     if m.max_delay_days > 0.0 {
         reasons.push(format!("up to {:.0} days late", m.max_delay_days));
@@ -90,13 +87,14 @@ fn build_reasons(m: &CustomerMetrics, score: u8) -> Vec<String> {
 
 /// Public entrypoint: full ScoreResult for a customer.
 pub fn score_customer(m: &CustomerMetrics) -> ScoreResult {
-    let credit_risk    = calculate_customer_risk_score(m);
-    let priority       = calculate_collection_priority_score(m);
-    let promise_rel    = calculate_promise_reliability_score(m.broken_promises, m.broken_promises + m.kept_promises);
-    let recovery_prob  = calculate_recovery_probability(credit_risk, promise_rel);
-    let risk_level     = RiskLevel::from_score(credit_risk);
-    let reasons        = build_reasons(m, credit_risk);
-    let score_reason   = if reasons.len() == 1 && reasons[0].starts_with("Scored") {
+    let credit_risk = calculate_customer_risk_score(m);
+    let priority = calculate_collection_priority_score(m);
+    let promise_rel =
+        calculate_promise_reliability_score(m.broken_promises, m.broken_promises + m.kept_promises);
+    let recovery_prob = calculate_recovery_probability(credit_risk, promise_rel);
+    let risk_level = RiskLevel::from_score(credit_risk);
+    let reasons = build_reasons(m, credit_risk);
+    let score_reason = if reasons.len() == 1 && reasons[0].starts_with("Scored") {
         reasons[0].clone()
     } else {
         format!("Scored {}/100: {}.", credit_risk, reasons.join(", "))
@@ -104,9 +102,9 @@ pub fn score_customer(m: &CustomerMetrics) -> ScoreResult {
 
     ScoreResult {
         success: true,
-        credit_risk_score:    credit_risk,
-        collection_priority:  priority,
-        promise_reliability:  promise_rel,
+        credit_risk_score: credit_risk,
+        collection_priority: priority,
+        promise_reliability: promise_rel,
         recovery_probability: recovery_prob,
         risk_level,
         reasons,
@@ -122,9 +120,13 @@ mod tests {
 
     fn metrics_zero() -> CustomerMetrics {
         CustomerMetrics {
-            total_overdue: 0.0, max_delay_days: 0.0, avg_delay_days: 0.0,
-            broken_promises: 0, kept_promises: 5,
-            calls_total: 10, calls_picked: 10,
+            total_overdue: 0.0,
+            max_delay_days: 0.0,
+            avg_delay_days: 0.0,
+            broken_promises: 0,
+            kept_promises: 5,
+            calls_total: 10,
+            calls_picked: 10,
         }
     }
 
@@ -138,10 +140,10 @@ mod tests {
     #[test]
     fn test_high_overdue_drives_score() {
         let mut m = metrics_zero();
-        m.total_overdue   = 80_000.0; // → 40 pts (capped)
-        m.max_delay_days  = 20.0;     // → 20 pts
-        m.broken_promises = 2;        // → 14 pts
-        // calls fine → 0 pts from response
+        m.total_overdue = 80_000.0; // → 40 pts (capped)
+        m.max_delay_days = 20.0; // → 20 pts
+        m.broken_promises = 2; // → 14 pts
+                               // calls fine → 0 pts from response
         let s = calculate_customer_risk_score(&m);
         assert_eq!(s, 74);
     }
@@ -150,13 +152,13 @@ mod tests {
     fn test_spec_example_simulate_scenario() {
         // Mirrors the spec example: current_outstanding=72000, broken_promises=3
         let m = CustomerMetrics {
-            total_overdue:   40_000.0,
-            max_delay_days:  18.0,
-            avg_delay_days:  18.0,
+            total_overdue: 40_000.0,
+            max_delay_days: 18.0,
+            avg_delay_days: 18.0,
             broken_promises: 3,
-            kept_promises:   0,
-            calls_total:     0,
-            calls_picked:    0,
+            kept_promises: 0,
+            calls_total: 0,
+            calls_picked: 0,
         };
         let s = calculate_customer_risk_score(&m);
         // expected: min(40,20)+min(18,20)+min(21,20)+10 = 20+18+20+10 = 68

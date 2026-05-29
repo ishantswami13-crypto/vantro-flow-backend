@@ -12,20 +12,37 @@ use crate::types::{PolicyDecision, PolicyInput};
 /// Phrases that must never appear in an outgoing message draft (case-insensitive).
 /// Mirrors policyGuard.service.js BLOCKED_PHRASES.
 const BLOCKED_PHRASES: &[&str] = &[
-    "legal action", "file case", "police", "fir", "court", "arrest", "lawyer",
-    "criminal", "fraud", "cheater", "threaten", "warning letter",
+    "legal action",
+    "file case",
+    "police",
+    "fir",
+    "court",
+    "arrest",
+    "lawyer",
+    "criminal",
+    "fraud",
+    "cheater",
+    "threaten",
+    "warning letter",
 ];
 
 /// Action types that are completely forbidden for AI/rule suggestions.
 const FORBIDDEN_TYPES: &[&str] = &[
-    "MARK_PAID", "CHANGE_AMOUNT", "OFFER_DISCOUNT", "DELETE_INVOICE",
+    "MARK_PAID",
+    "CHANGE_AMOUNT",
+    "OFFER_DISCOUNT",
+    "DELETE_INVOICE",
 ];
 
 /// Action types that always require owner approval.
 /// Mirrors policyGuard.service.js ALWAYS_REQUIRES_APPROVAL.
 const ALWAYS_REQUIRES_APPROVAL: &[&str] = &[
-    "SEND_FIRM_REMINDER", "CALL_CUSTOMER", "ESCALATE_TO_OWNER",
-    "STOP_CREDIT_WARNING", "CASHFLOW_RISK", "CREDIT_HOLD_SUGGESTED",
+    "SEND_FIRM_REMINDER",
+    "CALL_CUSTOMER",
+    "ESCALATE_TO_OWNER",
+    "STOP_CREDIT_WARNING",
+    "CASHFLOW_RISK",
+    "CREDIT_HOLD_SUGGESTED",
     "ASK_PARTIAL_PAYMENT",
 ];
 
@@ -57,11 +74,11 @@ pub fn evaluate_action_policy(input: &PolicyInput) -> PolicyDecision {
     // 3. If blocked — return immediately
     if !reasons.is_empty() {
         return PolicyDecision {
-            success:           true,
-            allowed:           false,
-            blocked:           true,
+            success: true,
+            allowed: false,
+            blocked: true,
             requires_approval: false,
-            block_reason:      Some(reasons.join("; ")),
+            block_reason: Some(reasons.join("; ")),
             reasons,
         };
     }
@@ -76,11 +93,11 @@ pub fn evaluate_action_policy(input: &PolicyInput) -> PolicyDecision {
     let requires_approval = always_needs || amount_over_threshold || high_risk || caller_requires;
 
     PolicyDecision {
-        success:           true,
-        allowed:           true,
-        blocked:           false,
+        success: true,
+        allowed: true,
+        blocked: false,
         requires_approval,
-        block_reason:      None,
+        block_reason: None,
         reasons,
     }
 }
@@ -93,11 +110,11 @@ mod tests {
 
     fn safe_input(action_type: &str) -> PolicyInput {
         PolicyInput {
-            action_type:         action_type.to_string(),
-            amount:              Some(1_000.0),
-            risk_level:          Some("low".to_string()),
+            action_type: action_type.to_string(),
+            amount: Some(1_000.0),
+            risk_level: Some("low".to_string()),
             recommended_message: Some("Kindly clear the payment this week.".to_string()),
-            requires_approval:   None,
+            requires_approval: None,
         }
     }
 
@@ -126,11 +143,11 @@ mod tests {
     #[test]
     fn test_legal_threat_blocked() {
         let i = PolicyInput {
-            action_type:         "SEND_FIRM_REMINDER".to_string(),
-            amount:              Some(5_000.0),
-            risk_level:          None,
+            action_type: "SEND_FIRM_REMINDER".to_string(),
+            amount: Some(5_000.0),
+            risk_level: None,
             recommended_message: Some("We will file a FIR if you don't pay.".to_string()),
-            requires_approval:   None,
+            requires_approval: None,
         };
         let d = evaluate_action_policy(&i);
         assert!(d.blocked, "FIR threat must be blocked");
@@ -139,11 +156,11 @@ mod tests {
     #[test]
     fn test_court_phrase_blocked() {
         let i = PolicyInput {
-            action_type:         "SEND_FIRM_REMINDER".to_string(),
-            amount:              Some(5_000.0),
-            risk_level:          None,
+            action_type: "SEND_FIRM_REMINDER".to_string(),
+            amount: Some(5_000.0),
+            risk_level: None,
             recommended_message: Some("We will take you to court.".to_string()),
-            requires_approval:   None,
+            requires_approval: None,
         };
         let d = evaluate_action_policy(&i);
         assert!(d.blocked);
@@ -152,25 +169,28 @@ mod tests {
     #[test]
     fn test_firm_reminder_always_requires_approval() {
         let i = PolicyInput {
-            action_type:         "SEND_FIRM_REMINDER".to_string(),
-            amount:              Some(1_000.0),
-            risk_level:          Some("low".to_string()),
+            action_type: "SEND_FIRM_REMINDER".to_string(),
+            amount: Some(1_000.0),
+            risk_level: Some("low".to_string()),
             recommended_message: Some("Kindly clear the amount.".to_string()),
-            requires_approval:   None,
+            requires_approval: None,
         };
         let d = evaluate_action_policy(&i);
         assert!(!d.blocked);
-        assert!(d.requires_approval, "SEND_FIRM_REMINDER must always require approval");
+        assert!(
+            d.requires_approval,
+            "SEND_FIRM_REMINDER must always require approval"
+        );
     }
 
     #[test]
     fn test_high_amount_requires_approval() {
         let i = PolicyInput {
-            action_type:         "SEND_POLITE_REMINDER".to_string(),
-            amount:              Some(75_000.0),
-            risk_level:          Some("low".to_string()),
+            action_type: "SEND_POLITE_REMINDER".to_string(),
+            amount: Some(75_000.0),
+            risk_level: Some("low".to_string()),
             recommended_message: Some("Please pay.".to_string()),
-            requires_approval:   None,
+            requires_approval: None,
         };
         let d = evaluate_action_policy(&i);
         assert!(!d.blocked);
@@ -180,11 +200,11 @@ mod tests {
     #[test]
     fn test_low_risk_polite_reminder_auto_safe() {
         let i = PolicyInput {
-            action_type:         "SEND_POLITE_REMINDER".to_string(),
-            amount:              Some(1_000.0),
-            risk_level:          Some("low".to_string()),
+            action_type: "SEND_POLITE_REMINDER".to_string(),
+            amount: Some(1_000.0),
+            risk_level: Some("low".to_string()),
             recommended_message: Some("Please pay when convenient.".to_string()),
-            requires_approval:   None,
+            requires_approval: None,
         };
         let d = evaluate_action_policy(&i);
         assert!(!d.blocked);
@@ -194,11 +214,11 @@ mod tests {
     #[test]
     fn test_fraud_phrase_blocked() {
         let i = PolicyInput {
-            action_type:         "SEND_FIRM_REMINDER".to_string(),
-            amount:              None,
-            risk_level:          None,
+            action_type: "SEND_FIRM_REMINDER".to_string(),
+            amount: None,
+            risk_level: None,
             recommended_message: Some("You are a fraud cheater.".to_string()),
-            requires_approval:   None,
+            requires_approval: None,
         };
         let d = evaluate_action_policy(&i);
         assert!(d.blocked);

@@ -12,7 +12,7 @@ impl fmt::Display for CortexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CortexError::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
-            CortexError::Json(e)           => write!(f, "JSON error: {}", e),
+            CortexError::Json(e) => write!(f, "JSON error: {}", e),
         }
     }
 }
