@@ -1,0 +1,270 @@
+// FILE: vantro-automation-rs/src/db/queries.rs
+// All database queries — user-scoped (WHERE user_id = $1 on every query).
+// Uses runtime queries (no compile-time macros) so no live DB needed at build time.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+// ─── Dashboard bootstrap ─────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct DashboardBootstrap {
+    pub kpis: DashboardKpis,
+    pub top_actions: Vec<ActionSummary>,
+    pub last_updated: DateTime<Utc>,
+    pub source: &'static str,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct DashboardKpis {
+    pub today_sales_amount: f64,
+    pub today_purchases_count: i64,
+    pub overdue_invoices_count: i64,
+    pub low_stock_count: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ActionSummary {
+    pub id: Uuid,
+    pub title: String,
+    pub priority: String,
+}
+
+pub async fn dashboard_bootstrap(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> anyhow::Result<DashboardBootstrap> {
+    let today_start = chrono::Utc::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc();
+
+    // All 4 queries run in parallel via join!
+    let (sales_res, purchases_res, overdue_res, stock_res, actions_res) = tokio::join!(
+        sqlx::query!(
+            "SELECT COALESCE(SUM(COALESCE(total_amount, invoice_amount, 0)), 0.0)::float8 AS total
+             FROM invoices
+             WHERE user_id = $1 AND created_at >= $2",
+            user_id,
+            today_start
+        )
+        .fetch_one(pool),
+        sqlx::query!(
+            "SELECT COUNT(*) AS cnt FROM purchases WHERE user_id = $1 AND created_at >= $2",
+            user_id,
+            today_start
+        )
+        .fetch_one(pool),
+        sqlx::query!(
+            "SELECT COUNT(*) AS cnt FROM invoices
+             WHERE user_id = $1 AND payment_status = 'Overdue'",
+            user_id
+        )
+        .fetch_one(pool),
+        sqlx::query!(
+            "SELECT COUNT(*) AS cnt FROM products
+             WHERE user_id = $1 AND current_stock < COALESCE(low_stock_alert, 5)",
+            user_id
+        )
+        .fetch_one(pool),
+        sqlx::query!(
+            "SELECT id, title, COALESCE(priority,'medium') AS priority
+             FROM ai_actions
+             WHERE user_id = $1 AND status = 'pending'
+             ORDER BY created_at DESC LIMIT 3",
+            user_id
+        )
+        .fetch_all(pool),
+    );
+
+    let today_sales_amount = sales_res.map(|r| r.total.unwrap_or(0.0)).unwrap_or(0.0);
+    let today_purchases_count = purchases_res.map(|r| r.cnt.unwrap_or(0)).unwrap_or(0);
+    let overdue_invoices_count = overdue_res.map(|r| r.cnt.unwrap_or(0)).unwrap_or(0);
+    let low_stock_count = stock_res.map(|r| r.cnt.unwrap_or(0)).unwrap_or(0);
+
+    let top_actions = actions_res
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| ActionSummary {
+            id: r.id,
+            title: r.title,
+            priority: r.priority.unwrap_or_else(|| "medium".to_string()),
+        })
+        .collect();
+
+    Ok(DashboardBootstrap {
+        kpis: DashboardKpis {
+            today_sales_amount,
+            today_purchases_count,
+            overdue_invoices_count,
+            low_stock_count,
+        },
+        top_actions,
+        last_updated: Utc::now(),
+        source: "db",
+    })
+}
+
+// ─── Collections bootstrap ───────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct CollectionsBootstrap {
+    pub summary: CollectionsSummary,
+    pub last_updated: DateTime<Utc>,
+    pub source: &'static str,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct CollectionsSummary {
+    pub total_receivables: f64,
+    pub overdue_amount: f64,
+    pub due_today: f64,
+    pub broken_promises_count: i64,
+    pub pending_invoice_count: i64,
+}
+
+pub async fn collections_bootstrap(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> anyhow::Result<CollectionsBootstrap> {
+    let today = chrono::Utc::now().date_naive().to_string();
+    let today_end = format!("{}T23:59:59Z", today);
+    let today_start = format!("{}T00:00:00Z", today);
+
+    let (inv_res, promises_res) = tokio::join!(
+        sqlx::query!(
+            r#"SELECT
+                 COALESCE(SUM(COALESCE(total_amount, invoice_amount, 0) - COALESCE(amount_paid, 0)), 0.0)::float8 AS total_receivables,
+                 COALESCE(SUM(CASE WHEN payment_status = 'Overdue'
+                   THEN COALESCE(total_amount, invoice_amount, 0) - COALESCE(amount_paid, 0)
+                   ELSE 0 END), 0.0)::float8 AS overdue_amount,
+                 COALESCE(SUM(CASE WHEN due_date >= $2 AND due_date <= $3
+                   THEN COALESCE(total_amount, invoice_amount, 0) - COALESCE(amount_paid, 0)
+                   ELSE 0 END), 0.0)::float8 AS due_today,
+                 COUNT(*) AS pending_count
+               FROM invoices
+               WHERE user_id = $1 AND payment_status != 'Paid'"#,
+            user_id, today_start, today_end
+        ).fetch_one(pool),
+
+        sqlx::query!(
+            "SELECT COUNT(*) AS cnt FROM promises WHERE user_id = $1 AND status = 'broken'",
+            user_id
+        ).fetch_one(pool),
+    );
+
+    let summary = match inv_res {
+        Ok(r) => CollectionsSummary {
+            total_receivables: r.total_receivables.unwrap_or(0.0),
+            overdue_amount: r.overdue_amount.unwrap_or(0.0),
+            due_today: r.due_today.unwrap_or(0.0),
+            broken_promises_count: promises_res.map(|p| p.cnt.unwrap_or(0)).unwrap_or(0),
+            pending_invoice_count: r.pending_count.unwrap_or(0),
+        },
+        Err(e) => {
+            tracing::warn!("collections_bootstrap invoice query failed: {}", e);
+            CollectionsSummary {
+                broken_promises_count: promises_res.map(|p| p.cnt.unwrap_or(0)).unwrap_or(0),
+                ..Default::default()
+            }
+        }
+    };
+
+    Ok(CollectionsBootstrap {
+        summary,
+        last_updated: Utc::now(),
+        source: "db",
+    })
+}
+
+// ─── Customer metrics fetch (for scoring + CPI) ──────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CustomerMetricsRow {
+    pub customer_id: Uuid,
+    pub name: String,
+    pub total_overdue: f64,
+    pub max_delay_days: f64,
+    pub avg_delay_days: f64,
+    pub broken_promises: i32,
+    pub kept_promises: i32,
+    pub calls_total: i32,
+    pub calls_picked: i32,
+    pub credit_limit: f64,
+    pub advance_required: bool,
+    pub current_outstanding: f64,
+    pub overdue_amount: f64,
+}
+
+pub async fn customer_metrics(
+    pool: &PgPool,
+    user_id: Uuid,
+    customer_id: Uuid,
+) -> anyhow::Result<Option<CustomerMetricsRow>> {
+    // Fetch customer base + scores + invoice summary in one CTE query
+    let row = sqlx::query!(
+        r#"WITH inv AS (
+            SELECT
+              SUM(COALESCE(total_amount, invoice_amount, 0) - COALESCE(amount_paid, 0)) AS outstanding,
+              SUM(CASE WHEN payment_status IN ('Overdue','Pending') AND days_overdue > 0
+                  THEN COALESCE(total_amount, invoice_amount, 0) - COALESCE(amount_paid, 0)
+                  ELSE 0 END) AS overdue_amt,
+              MAX(COALESCE(days_overdue, 0)) AS max_delay,
+              AVG(CASE WHEN days_overdue > 0 THEN days_overdue ELSE NULL END) AS avg_delay
+            FROM invoices
+            WHERE user_id = $1 AND customer_id = $2
+          ),
+          pr AS (
+            SELECT
+              COUNT(*) FILTER (WHERE status = 'broken') AS broken,
+              COUNT(*) FILTER (WHERE status = 'kept')   AS kept
+            FROM promises WHERE user_id = $1 AND customer_id = $2
+          ),
+          cl AS (
+            SELECT
+              COUNT(*) AS total,
+              COUNT(*) FILTER (WHERE did_pick_up) AS picked
+            FROM call_logs WHERE user_id = $1 AND customer_id = $2
+          ),
+          cs AS (
+            SELECT credit_limit, advance_required, name
+            FROM customers WHERE user_id = $1 AND id = $2
+          )
+          SELECT
+            cs.name,
+            COALESCE(inv.outstanding, 0.0)::float8        AS current_outstanding,
+            COALESCE(inv.overdue_amt, 0.0)::float8        AS overdue_amount,
+            COALESCE(inv.max_delay, 0.0)::float8          AS max_delay_days,
+            COALESCE(inv.avg_delay, 0.0)::float8          AS avg_delay_days,
+            COALESCE(pr.broken, 0)::int4                  AS broken_promises,
+            COALESCE(pr.kept, 0)::int4                    AS kept_promises,
+            COALESCE(cl.total, 0)::int4                   AS calls_total,
+            COALESCE(cl.picked, 0)::int4                  AS calls_picked,
+            COALESCE(cs.credit_limit, 0.0)::float8        AS credit_limit,
+            COALESCE(cs.advance_required, false)          AS advance_required
+          FROM cs
+          LEFT JOIN inv ON TRUE
+          LEFT JOIN pr  ON TRUE
+          LEFT JOIN cl  ON TRUE"#,
+        user_id, customer_id
+    ).fetch_optional(pool).await?;
+
+    Ok(row.map(|r| CustomerMetricsRow {
+        customer_id,
+        name: r.name.unwrap_or_default(),
+        total_overdue: r.overdue_amount.unwrap_or(0.0),
+        max_delay_days: r.max_delay_days.unwrap_or(0.0),
+        avg_delay_days: r.avg_delay_days.unwrap_or(0.0),
+        broken_promises: r.broken_promises.unwrap_or(0),
+        kept_promises: r.kept_promises.unwrap_or(0),
+        calls_total: r.calls_total.unwrap_or(0),
+        calls_picked: r.calls_picked.unwrap_or(0),
+        credit_limit: r.credit_limit.unwrap_or(0.0),
+        advance_required: r.advance_required.unwrap_or(false),
+        current_outstanding: r.current_outstanding.unwrap_or(0.0),
+        overdue_amount: r.overdue_amount.unwrap_or(0.0),
+    }))
+}

@@ -13,7 +13,26 @@
     "security:audit": "npm audit --audit-level=high",
     "security:cross-user": "node scripts/cross-user-security-test.js",
     "security:smoke": "node scripts/security-smoke-test.js",
-    "cortex:test": "node cortex-lab/run.js"
+    "cortex:test":         "node cortex-lab/run.js --mode=static",
+    "cortex:test:dry":     "node cortex-lab/run.js --mode=dry-run",
+    "cortex:test:live":    "node cortex-lab/run.js --mode=live",
+    "cortex:test:redteam": "node cortex-lab/run.js --mode=red-team",
+    "cortex:test:all":     "node cortex-lab/run.js --mode=all",
+    "cortex:harness:loop": "node cortex-lab/run.js --mode=all --loop",
+    "cortex:rust:build":   "cargo build --release -p cortex-core && node scripts/copy-cortex-binary.js",
+    "cortex:rust:test":    "cargo test -p cortex-core -- --nocapture",
+    "cortex:rust:check":   "cargo check -p cortex-core",
+    "cortex:rust:fmt":     "cargo fmt -p cortex-core -- --check",
+    "cortex:rust:clippy":  "cargo clippy -p cortex-core -- -D warnings",
+    "automation:build":    "cargo build --release -p vantro-automation && node scripts/copy-automation-binary.js",
+    "automation:test":     "cargo test -p vantro-automation -- --nocapture",
+    "automation:check":    "cargo check -p vantro-automation",
+    "automation:start":    "node scripts/start-automation-service.js",
+    "automation:dev":      "RUST_LOG=vantro_automation_rs=debug node scripts/start-automation-service.js",
+    "rust:test:all":       "cargo test -- --nocapture",
+    "rust:build:all":      "cargo build --release",
+    "rust:check:all":      "cargo check",
+    "perf:test":           "node performance-lab/run.js"
   },
   "engines": {
     "node": ">=18.0.0"

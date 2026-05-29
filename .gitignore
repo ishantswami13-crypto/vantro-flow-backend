@@ -15,3 +15,11 @@ secrets/
 service-account*.json
 .vercel/
 .railway/
+
+# Rust build output
+/target/
+cortex-core-rs/target/
+
+# Compiled binary (built by CI/Railway, do not commit)
+/bin/cortex-core
+/bin/cortex-core.exe

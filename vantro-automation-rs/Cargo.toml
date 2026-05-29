@@ -1,0 +1,59 @@
+[package]
+name        = "vantro-automation-rs"
+version     = "0.1.0"
+edition     = "2021"
+description = "Vantro Automation OS — high-performance Axum API service"
+
+# Pure-Rust lib: testable on any platform (no C dependencies).
+# Unit tests for cashops, cortex, cache live here.
+[lib]
+name = "vantro_automation_lib"
+path = "src/lib.rs"
+
+# Full Axum server binary — requires C toolchain (Linux/Railway NIXPACKS).
+# Build with: cargo build --release --features server -p vantro-automation-rs
+[[bin]]
+name              = "vantro-automation"
+path              = "src/main.rs"
+required-features = ["server"]
+
+# ── Pure-Rust dependencies (compile on any platform, no GCC/dlltool needed) ─
+[dependencies]
+serde            = { version = "1", features = ["derive"] }
+serde_json       = "1"
+# uuid without v4: avoids getrandom → avoids dlltool on Windows.
+# v4 (random UUIDs) is only needed in the server binary (behind `server` feature).
+uuid             = { version = "1", features = ["serde"] }
+# chrono without serde/no-std: pure Rust calendar arithmetic, no C.
+chrono           = { version = "0.4", default-features = false, features = ["std", "alloc", "serde"] }
+anyhow           = "1"
+thiserror        = "1"
+tracing          = "0.1"
+dashmap          = "5"
+
+# ── Server feature deps (need C toolchain — Linux/Railway only) ─────────────
+axum               = { version = "0.7", features = ["json", "macros", "tokio"], optional = true }
+tower              = { version = "0.4", optional = true }
+tower-http         = { version = "0.5", features = ["cors", "trace", "request-id", "timeout", "catch-panic"], optional = true }
+tokio              = { version = "1", features = ["full"], optional = true }
+sqlx               = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"], optional = true }
+rust_decimal       = { version = "1", features = ["serde-with-str"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
+jsonwebtoken       = { version = "9", optional = true }
+dotenvy            = { version = "0.15", optional = true }
+
+[features]
+# default = pure tests only (works on Windows without MinGW)
+default = []
+# server = full Axum + sqlx binary; requires Linux or properly configured MinGW
+server  = [
+  "dep:axum", "dep:tower", "dep:tower-http", "dep:tokio",
+  "dep:sqlx", "dep:rust_decimal", "dep:tracing-subscriber",
+  "dep:jsonwebtoken", "dep:dotenvy",
+]
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = true

@@ -1,0 +1,19 @@
+[package]
+name        = "cortex-core"
+version     = "0.1.0"
+edition     = "2021"
+description = "Vantro Cortex Core — deterministic scoring, simulation, and policy evaluation"
+
+[[bin]]
+name = "cortex-core"
+path = "src/main.rs"
+
+[dependencies]
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto       = "thin"
+codegen-units = 1
+strip     = true

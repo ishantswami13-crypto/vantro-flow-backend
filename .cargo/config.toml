@@ -1,0 +1,19 @@
+# .cargo/config.toml
+#
+# cortex-core-rs: builds and tests fully with x86_64-pc-windows-gnu (pure Rust deps, no Windows API).
+#
+# vantro-automation-rs (lib): cargo check --lib passes on Windows.
+# vantro-automation-rs (tests + bin): require a C linker toolchain.
+#   - Linux/Railway: native ld, works automatically.
+#   - Windows CI:    needs Visual Studio Build Tools or MSYS2 MinGW64.
+#   - Windows dev:   run `cargo check --lib` for type checking; run `cargo test` on CI.
+#
+# On Railway NIXPACKS (Linux): all of these are ignored; native linker is used.
+
+[target.x86_64-pc-windows-gnu]
+# No override needed — cortex-core-rs uses only pure Rust deps that work here.
+
+[build]
+# GNU target for developer Windows machines (works for cortex-core-rs).
+# vantro-automation-rs: use `cargo check --lib` on Windows, full build on Linux CI.
+target = "x86_64-pc-windows-gnu"

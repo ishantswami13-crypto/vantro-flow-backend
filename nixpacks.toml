@@ -1,0 +1,26 @@
+# nixpacks.toml — Main Node backend Railway service (vantro-flow-backend).
+#
+# Build scope: NODE-ONLY.
+#
+# Why this file is explicit despite the Rust workspace (cortex-core-rs,
+# vantro-automation-rs) living in the same repository:
+#
+#   The Rust workspace ships as a SEPARATE Railway service. Without an
+#   explicit nixpacks.toml here, NIXPACKS would auto-detect Cargo.toml at the
+#   repo root and start building the entire Rust workspace as part of every
+#   Node deploy. That would:
+#     1. double or triple build time for the Node service
+#     2. couple two services' lifecycles — a Rust build break would block
+#        Node deploys, which is the exact failure mode we are designing
+#        Option B (separate Rust service) to prevent
+#     3. risk sqlx::query! compile-time validation failing without a
+#        committed .sqlx/ offline cache or a DATABASE_URL at build time
+#
+# The dedicated Rust service will get its own nixpacks.toml at
+# `vantro-automation-rs/nixpacks.toml` in a later commit
+# (separate Railway service config) and will be invoked only by that service.
+
+providers = ["node"]
+
+[start]
+cmd = "node server.js"
