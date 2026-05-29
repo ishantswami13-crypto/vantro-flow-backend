@@ -1,0 +1,8 @@
+name: Smoke
+on: [push, pull_request]
+jobs:
+  hello:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print env
+        run: echo "smoke OK on $GITHUB_REF"
