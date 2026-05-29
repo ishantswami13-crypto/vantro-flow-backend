@@ -10569,11 +10569,44 @@ app.get('/api/customer-scores', authMiddleware, async (req, res) => {
     const userId = req.user.userId;
     const { data, error } = await supabase
       .from('customer_scores')
-      .select('customer_id, customer_name, score, tier, overdue_amount, max_delay_days')
+      .select('customer_id, credit_risk_score, collection_priority_score, max_delay_days, score_reason_json, customers(name)')
       .eq('user_id', userId)
-      .order('score', { ascending: true });
+      .order('credit_risk_score', { ascending: false });
     if (error) throw error;
-    res.json({ scores: data || [] });
+    const scores = (data || []).map(r => {
+      const raw = parseFloat(r.credit_risk_score || 0);
+      const tier = raw >= 70 ? 'HIGH_RISK' : raw >= 40 ? 'MEDIUM' : 'LOW';
+      const overdue = r.score_reason_json?.inputs?.totalOverdue || 0;
+      return {
+        customer_id:    r.customer_id,
+        customer_name:  r.customers?.name || 'Unknown',
+        score:          Math.round(raw),
+        tier,
+        overdue_amount: Math.round(overdue),
+        max_delay_days: r.max_delay_days || 0,
+      };
+    });
+    res.json({ scores });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── SCORE ALL CUSTOMERS (one-time backfill / manual re-score) ─────────────────
+app.post('/api/cortex/score-all', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _isFE } = require('./lib/featureFlags');
+    if (!_isFE('customer_scoring')) return res.json({ scored: 0, message: 'customer_scoring flag off' });
+    const userId = req.user.userId;
+    const { data: customers, error: cErr } = await supabase
+      .from('customers').select('id, name').eq('user_id', userId).eq('is_active', true).limit(200);
+    if (cErr) throw cErr;
+    const list = customers || [];
+    if (!list.length) return res.json({ scored: 0, message: 'No customers found' });
+    const { recalculate } = require('./lib/services/orchestrator/scoring.service');
+    let scored = 0;
+    for (const c of list) {
+      try { await recalculate(userId, c.id); scored++; } catch {}
+    }
+    res.json({ success: true, scored, total: list.length });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
