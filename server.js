@@ -42,12 +42,34 @@ validateSecurityEnvironment();
 
 function getSecret(name) {
   // Centralized secret access - allows future migration to AWS Secrets Manager/Vault
-  const val = process.env[name];
+  // Prioritize _CURRENT for zero-downtime rotation
+  const val = process.env[`${name}_CURRENT`] || process.env[name];
   if (!val && process.env.NODE_ENV === 'production' && ['JWT_SECRET', 'SUPABASE_SERVICE_ROLE_KEY'].includes(name)) {
     console.error(`[FATAL] Missing critical secret: ${name}`);
     process.exit(1);
   }
   return val;
+}
+
+function getPreviousSecret(name) {
+  return process.env[`${name}_PREVIOUS`] || null;
+}
+
+function verifyJWT(token) {
+  const currentSecret = getSecret('JWT_SECRET');
+  const previousSecret = getPreviousSecret('JWT_SECRET');
+  try {
+    return jwt.verify(token, currentSecret);
+  } catch (err) {
+    if (previousSecret) {
+      try {
+        return jwt.verify(token, previousSecret);
+      } catch (innerErr) {
+        throw innerErr;
+      }
+    }
+    throw err;
+  }
 }
 
 const JWT_SECRET = getSecret('JWT_SECRET');
@@ -498,7 +520,7 @@ function authMiddleware(req, res, next) {
   const { token, source } = getAuthToken(req);
   if (!token) return res.status(401).json({ error: 'Missing token' });
   try {
-    req.user = jwt.verify(token, JWT_SECRET);
+    req.user = verifyJWT(token);
     req.authSource = source;
     if (!requireCookieCsrf(req, res)) return;
     
@@ -526,7 +548,7 @@ function requireOwner(req, res, next) {
   const { token, source } = getAuthToken(req);
   if (!token) return res.status(401).json({ error: 'Missing token' });
   try {
-    req.user = jwt.verify(token, JWT_SECRET);
+    req.user = verifyJWT(token);
     req.authSource = source;
   } catch {
     return res.status(401).json({ error: 'Invalid or expired token' });
@@ -1012,7 +1034,7 @@ app.post('/api/auth/resend-otp', async (req, res) => {
   try {
     const header = req.headers.authorization;
     if (!header?.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing token' });
-    const decoded = jwt.verify(header.slice(7), JWT_SECRET);
+    const decoded = verifyJWT(header.slice(7));
     if (!decoded.preVerify) return res.status(400).json({ error: 'Invalid pre-verification token' });
 
     const { data: user } = await supabase.from('users').select('id, email, phone, business_name').eq('id', decoded.userId).single();
@@ -1035,7 +1057,7 @@ app.post('/api/auth/verify-otp', async (req, res) => {
   try {
     const header = req.headers.authorization;
     if (!header?.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing token' });
-    const decoded = jwt.verify(header.slice(7), JWT_SECRET);
+    const decoded = verifyJWT(header.slice(7));
     if (!decoded.preVerify) return res.status(400).json({ error: 'Invalid pre-verification token' });
 
     const { otp } = req.body;
@@ -6913,7 +6935,7 @@ function adminOnly(req, res, next) {
   const header = req.headers.authorization;
   if (!header || !header.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing token' });
   try {
-    const decoded = jwt.verify(header.slice(7), JWT_SECRET);
+    const decoded = verifyJWT(header.slice(7));
     const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim());
     if (!ADMIN_EMAILS.includes(decoded.email)) return res.status(403).json({ error: 'Forbidden' });
     req.user = decoded;
@@ -7447,6 +7469,7 @@ app.post('/api/payments/webhook', async (req, res) => {
       if (!signature) return res.status(400).json({ error: 'Invalid signature' });
 
       const secret = getSecret('RAZORPAY_WEBHOOK_SECRET');
+      const prevSecret = getPreviousSecret('RAZORPAY_WEBHOOK_SECRET');
       if (!secret) {
         return res.status(503).json({ error: 'Webhook verification is not configured' });
       }
@@ -7458,7 +7481,16 @@ app.post('/api/payments/webhook', async (req, res) => {
         .update(rawBody)
         .digest('hex');
 
-      if (!timingSafeEqualString(signature, expectedSig)) {
+      let isValid = timingSafeEqualString(signature, expectedSig);
+      if (!isValid && prevSecret) {
+        const expectedSigPrev = crypto
+          .createHmac('sha256', prevSecret)
+          .update(rawBody)
+          .digest('hex');
+        isValid = timingSafeEqualString(signature, expectedSigPrev);
+      }
+
+      if (!isValid) {
         console.warn('Razorpay webhook: invalid signature');
         logSecurityEvent(req, SecurityEventTaxonomy.WEBHOOK_SIGNATURE_FAILED, { provider: 'razorpay' });
         return res.status(400).json({ error: 'Invalid signature' });
@@ -8375,9 +8407,16 @@ app.post('/api/voice/recording', async (req, res) => {
   res.sendStatus(200); // Respond immediately — process async
 
   const voiceSecret = getSecret('VOICE_WEBHOOK_SECRET');
+  const prevVoiceSecret = getPreviousSecret('VOICE_WEBHOOK_SECRET');
   const provided = req.headers['x-vantro-webhook-secret'] || req.query.secret;
   if (!voiceSecret) return;
-  if (voiceSecret && !timingSafeEqualString(provided, voiceSecret)) return;
+  
+  let isValid = timingSafeEqualString(provided, voiceSecret);
+  if (!isValid && prevVoiceSecret) {
+    isValid = timingSafeEqualString(provided, prevVoiceSecret);
+  }
+  
+  if (!isValid) return;
 
   const userId = req.query.uid;
   const { RecordingUrl, RecordingSid, From: callerPhone } = req.body;
@@ -11397,6 +11436,119 @@ async function runAutoMigrations() {
     if (client) client.release();
   }
 }
+
+// ── PERFORMANCE BOOTSTRAP ROUTES ─────────────────────────────────────────────
+app.get('/api/v1/dashboard/bootstrap', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const cacheKey = `user:${userId}:dashboard_bootstrap`;
+    
+    // Return cached summary if available (30s TTL)
+    const cached = CacheService.get(cacheKey);
+    if (cached) return res.json(cached);
+
+    // Parallel minimal DB queries for critical summary
+    const [
+      { count: salesCount, data: salesTotal },
+      { count: purchasesCount },
+      { count: overdueCount },
+      { count: lowStockCount },
+      { data: topActions }
+    ] = await Promise.all([
+      supabase.from('invoices').select('total_amount', { count: 'exact' }).eq('user_id', userId).gte('created_at', new Date(new Date().setHours(0,0,0,0)).toISOString()),
+      supabase.from('purchases').select('*', { count: 'exact', head: true }).eq('user_id', userId).gte('created_at', new Date(new Date().setHours(0,0,0,0)).toISOString()),
+      supabase.from('invoices').select('*', { count: 'exact', head: true }).eq('user_id', userId).eq('payment_status', 'Overdue'),
+      supabase.from('products').select('*', { count: 'exact', head: true }).eq('user_id', userId).lt('current_stock', 5), // Simplified low stock query
+      supabase.from('ai_actions').select('id, title, priority').eq('user_id', userId).eq('status', 'pending').order('created_at', { ascending: false }).limit(3)
+    ]);
+
+    const payload = {
+      kpis: {
+        todaySales: salesTotal?.reduce((sum, s) => sum + (s.total_amount || 0), 0) || 0,
+        todayPurchasesCount: purchasesCount || 0,
+        overdueInvoicesCount: overdueCount || 0,
+        lowStockCount: lowStockCount || 0
+      },
+      topActions: topActions || [],
+      lastUpdated: new Date().toISOString()
+    };
+
+    CacheService.set(cacheKey, payload, 30); // 30 second cache
+    res.json(payload);
+  } catch (err) {
+    console.error('[BOOTSTRAP_ERROR]', err);
+    res.status(500).json({ error: 'Failed to bootstrap dashboard' });
+  }
+});
+
+app.get('/api/v1/collections/bootstrap', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const cacheKey = `user:${userId}:collections_bootstrap`;
+    const cached = CacheService.get(cacheKey);
+    if (cached) return res.json(cached);
+
+    const [
+      { data: invoices },
+      { data: promises }
+    ] = await Promise.all([
+      supabase.from('invoices').select('total_amount, amount_paid, payment_status, due_date').eq('user_id', userId).not('payment_status', 'eq', 'Paid'),
+      supabase.from('promises').select('id', { count: 'exact', head: true }).eq('user_id', userId).eq('status', 'broken')
+    ]);
+
+    let totalReceivables = 0;
+    let overdueAmount = 0;
+    let dueToday = 0;
+    
+    const today = new Date().toISOString().split('T')[0];
+
+    (invoices || []).forEach(inv => {
+      const remaining = (inv.total_amount || 0) - (inv.amount_paid || 0);
+      totalReceivables += remaining;
+      if (inv.payment_status === 'Overdue') overdueAmount += remaining;
+      if (inv.due_date && inv.due_date.startsWith(today)) dueToday += remaining;
+    });
+
+    const payload = {
+      summary: {
+        totalReceivables,
+        overdueAmount,
+        dueToday,
+        brokenPromisesCount: promises?.length || 0
+      },
+      lastUpdated: new Date().toISOString()
+    };
+
+    CacheService.set(cacheKey, payload, 45); // 45 second cache
+    res.json(payload);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to bootstrap collections' });
+  }
+});
+
+
+// ── CORTEX ASYNC BACKGROUND ──────────────────────────────────────────────────
+app.post('/api/v1/cortex/refresh', authMiddleware, async (req, res) => {
+  try {
+    const { startCortexBackgroundRefresh } = require('./lib/cortex/backgroundJob');
+    const userId = req.user.userId;
+    const result = await startCortexBackgroundRefresh(userId);
+    
+    // Invalidate caches immediately so the next request pulls fresh or processing state
+    const CacheService = require('./lib/cache/cache.service');
+    CacheService.delByPrefix(`user:${userId}:`);
+    
+    res.status(202).json({ 
+      accepted: true, 
+      jobId: result.jobId, 
+      status: result.status,
+      message: "Cortex refresh started in background" 
+    });
+  } catch (err) {
+    console.error('[CORTEX_REFRESH_ERROR]', err);
+    res.status(500).json({ error: 'Failed to start Cortex refresh' });
+  }
+});
 
 app.use(async (err, req, res, next) => {
   if (!err) return next();
