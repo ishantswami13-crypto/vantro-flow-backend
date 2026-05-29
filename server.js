@@ -10818,6 +10818,19 @@ app.post('/api/cortex/memory', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// ── CORTEX: RUN ALL AGENTS (manual trigger / admin) ──────────────────────────
+app.post('/api/cortex/run-agents', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _isFE } = require('./lib/featureFlags');
+    if (!_isFE('cortex_enabled')) return res.json({ ran: [], created: 0, message: 'cortex_enabled flag off' });
+    const userId = req.user.userId;
+    const { agents } = req.body; // optional array of agent names to run
+    const { runAllAgents } = require('./lib/services/orchestrator/orchestrator.service');
+    const result = await runAllAgents(userId, agents || null);
+    res.json({ success: true, ...result });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
 // ── CORTEX: HEALTH ────────────────────────────────────────────────────────────
 app.get('/api/cortex/health', authMiddleware, async (req, res) => {
   try {
@@ -10908,6 +10921,41 @@ cron.schedule('30 1 * * *', async () => {
     }
     safeLog('info', '[BriefingCron] Done');
   } catch (err) { safeLog('error', '[BriefingCron] Fatal', { error: err.message }); }
+}, { timezone: 'UTC' });
+
+// ── AGENTS CRON — daily 7:15am IST (1:45 UTC) — runs after briefing ──────────
+cron.schedule('45 1 * * *', async () => {
+  const { isEnabled: _isFE } = require('./lib/featureFlags');
+  if (!_isFE('cortex_enabled')) return;
+  const { safeLog: _log } = require('./lib/observability/logger');
+  _log('info', '[AgentsCron] Running all agents');
+  try {
+    const { runAllAgents } = require('./lib/services/orchestrator/orchestrator.service');
+    const { data: users } = await supabase.from('users').select('id').limit(500);
+    for (const user of (users || [])) {
+      try {
+        // Skip briefing (already ran at 7am) and data_quality (weekly)
+        await runAllAgents(user.id, ['collections', 'credit_risk', 'cashflow', 'inventory']);
+      } catch (e) { _log('error', '[AgentsCron] Per-user error', { error: e.message, userId: user.id }); }
+    }
+    _log('info', '[AgentsCron] Done');
+  } catch (err) { _log('error', '[AgentsCron] Fatal', { error: err.message }); }
+}, { timezone: 'UTC' });
+
+// ── DATA QUALITY CRON — weekly Sundays 8am IST (2:30 UTC) ───────────────────
+cron.schedule('30 2 * * 0', async () => {
+  const { isEnabled: _isFE } = require('./lib/featureFlags');
+  if (!_isFE('cortex_enabled')) return;
+  const { safeLog: _log } = require('./lib/observability/logger');
+  _log('info', '[DataQualityCron] Running weekly data quality scan');
+  try {
+    const { runAllAgents } = require('./lib/services/orchestrator/orchestrator.service');
+    const { data: users } = await supabase.from('users').select('id').limit(500);
+    for (const user of (users || [])) {
+      try { await runAllAgents(user.id, ['data_quality']); } catch {}
+    }
+    _log('info', '[DataQualityCron] Done');
+  } catch (err) { _log('error', '[DataQualityCron] Fatal', { error: err.message }); }
 }, { timezone: 'UTC' });
 
 // ============================================
