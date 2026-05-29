@@ -75,7 +75,7 @@ pub struct PaymentBehaviorResult {
     pub owner_attention_required: bool,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum CollectionStrategy {
     PoliteReminder,
