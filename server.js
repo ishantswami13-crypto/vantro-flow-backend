@@ -2511,6 +2511,20 @@ async function syncInventoryFromSale(userId, sale) {
         notes: `Sold in invoice ${sale.invoice_number || sale.id || ''}`.trim(),
       }]);
       synced.push({ product_id: product.id, name: productName, quantity: qty });
+
+      // Emit LOW_STOCK_DETECTED if stock dropped to or below the reorder threshold
+      const minStock = product.low_stock_alert || product.reorder_level || 0;
+      if (minStock > 0 && nextStock <= minStock) {
+        setImmediate(() => {
+          emitBusinessEvent(userId, 'LOW_STOCK_DETECTED', {
+            entityType: 'product',
+            entityId:   product.id,
+            productName,
+            currentStock: nextStock,
+            minStock,
+          });
+        });
+      }
     } catch (err) {
       console.warn('[inventory sale sync]', err.message || err);
     }
@@ -2696,26 +2710,75 @@ async function emitBusinessEvent(userId, eventType, payload = {}) {
       console.error(`[Event Engine] Connected updates failed for '${eventType}':`, err.message);
     });
 
-    // ── Vantro Cortex: persist typed event to business_events ──────────────
-    // Lazy-required to avoid any startup failures if Cortex files are not yet deployed.
+    // ── Vantro Cortex: full pipeline — persist event → rules → actions → audit ─
+    // Fire-and-observe via setImmediate — never blocks response, never throws to caller.
     try {
-      const { isEnabled } = require('./lib/featureFlags');
-      if (isEnabled('cortex_enabled')) {
-        const eventSvc = require('./lib/services/orchestrator/event.service');
-        const { normalizeLegacyEventType } = eventSvc;
-        eventSvc.emit(userId, {
-          eventType:  normalizeLegacyEventType(eventType),
-          entityType: payload.entityType || null,
-          entityId:   payload.entityId   || null,
-          actorType:  'user',
-          actorId:    userId,
-          payload,
-        }).catch(err => console.warn('[Cortex] business_events persist failed:', err.message));
+      const { isEnabled: _cxEnabled } = require('./lib/featureFlags');
+      if (_cxEnabled('cortex_enabled')) {
+        setImmediate(async () => {
+          try {
+            const eventSvc       = require('./lib/services/orchestrator/event.service');
+            const rulesService   = require('./lib/services/orchestrator/rules.service');
+            const policyGuard    = require('./lib/services/orchestrator/policyGuard.service');
+            const actionService  = require('./lib/services/orchestrator/action.service');
+            const auditService   = require('./lib/services/orchestrator/audit.service');
+            const { isEnabled: _fe } = require('./lib/featureFlags');
+
+            const normalizedType = eventSvc.normalizeLegacyEventType(eventType);
+
+            // 1. Persist to business_events
+            const savedEvent = await eventSvc.emit(userId, {
+              eventType:  normalizedType,
+              entityType: payload.entityType || null,
+              entityId:   payload.entityId   || String(payload.sale?.id || payload.invoice?.id || payload.purchase?.id || payload.entityId || ''),
+              actorType:  'user',
+              actorId:    userId,
+              payload,
+            });
+
+            if (!savedEvent) return; // persistence failed — stop, don't run rules on nothing
+
+            // 2. Evaluate rules → persist actions through policyGuard
+            const rawActions = await rulesService.evaluate(userId, savedEvent);
+            for (const raw of rawActions) {
+              try {
+                const safe = await policyGuard.validate(raw, userId);
+                if (safe.status !== 'system_blocked') {
+                  await actionService.create(userId, safe);
+                }
+              } catch (actionErr) {
+                console.warn('[Cortex] action create failed:', actionErr.message, { actionType: raw.action_type });
+              }
+            }
+
+            // 3. Write Cortex audit log
+            auditService.log(userId, {
+              action:     normalizedType,
+              entityType: savedEvent.entity_type  || null,
+              entityId:   savedEvent.entity_id    || null,
+              newValue:   payload,
+            }).catch(() => {});
+
+            // 4. Trigger customer score recalc for sale/payment events
+            if (_fe('customer_scoring') && ['SALE_CREATED', 'SALE_UPDATED', 'INVOICE_PAID', 'PROMISE_BROKEN', 'PROMISE_KEPT'].includes(normalizedType)) {
+              const custName  = payload?.customer_name || payload?.sale?.customer_name || payload?.invoice?.customer_name;
+              const custPhone = payload?.customer_phone || payload?.sale?.customer_phone || payload?.invoice?.customer_phone;
+              if (custName) {
+                const scoring = require('./lib/services/orchestrator/scoring.service');
+                scoring.resolveCustomerId(userId, custName, custPhone)
+                  .then(cId => cId ? scoring.recalculate(userId, cId) : null)
+                  .catch(() => {});
+              }
+            }
+          } catch (pipelineErr) {
+            console.warn('[Cortex] pipeline error for', eventType, ':', pipelineErr.message);
+          }
+        });
       }
     } catch (cortexErr) {
-      console.warn('[Cortex] Feature flag / event service load failed:', cortexErr.message);
+      console.warn('[Cortex] pipeline setup failed:', cortexErr.message);
     }
-    // ── End Cortex ──────────────────────────────────────────────────────────
+    // ── End Cortex pipeline ─────────────────────────────────────────────────
   } catch (err) {
     console.error('[Event Engine] Fatal emit error:', err.message);
   }
