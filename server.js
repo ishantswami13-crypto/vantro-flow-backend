@@ -10630,6 +10630,101 @@ app.patch('/api/ai-actions/:id', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// ── CUSTOMER INTELLIGENCE (behavioral profile for customers page) ────────────
+// GET /api/customers/intelligence?name=X&phone=Y
+// Returns aggregated Cortex intelligence for a customer by name.
+// Used by the customer detail panel in the Customers page.
+app.get('/api/customers/intelligence', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { name, phone } = req.query;
+    if (!name) return res.status(400).json({ error: 'name is required' });
+
+    // Resolve customer UUID from Cortex customers table
+    const { recalculate, resolveCustomerId } = require('./lib/services/orchestrator/scoring.service');
+    const customerId = await resolveCustomerId(userId, name, phone || null);
+
+    // Parallel fetch all intelligence
+    const [scoreRes, promisesRes, actionsRes, invoicesRes, memoryRes] = await Promise.all([
+      // Score
+      customerId
+        ? supabase.from('customer_scores').select('*').eq('user_id', userId).eq('customer_id', customerId).maybeSingle()
+        : { data: null },
+
+      // Active promises
+      customerId
+        ? supabase.from('promises').select('promised_amount, promised_date, status, created_at').eq('user_id', userId).eq('customer_id', customerId).order('created_at', { ascending: false }).limit(10)
+        : { data: [] },
+
+      // Pending AI actions for this customer
+      customerId
+        ? supabase.from('ai_actions').select('action_type, title, priority, status, created_at').eq('user_id', userId).eq('customer_id', customerId).neq('status', 'expired').order('created_at', { ascending: false }).limit(10)
+        : supabase.from('ai_actions').select('action_type, title, priority, status, created_at').eq('user_id', userId).ilike('title', `%${name.split(' ')[0]}%`).neq('status', 'expired').limit(5),
+
+      // Recent invoices
+      supabase.from('invoices').select('id, invoice_amount, payment_status, due_date, days_overdue, created_at').eq('user_id', userId).ilike('customer_name', `%${name}%`).order('created_at', { ascending: false }).limit(10),
+
+      // Business memory
+      customerId
+        ? supabase.from('business_memory').select('memory_key, memory_value, updated_at').eq('user_id', userId).eq('entity_type', 'customer').eq('entity_id', customerId).order('updated_at', { ascending: false }).limit(20)
+        : { data: [] },
+    ]);
+
+    const score = scoreRes.data;
+    const promises = promisesRes.data || [];
+    const actions  = actionsRes.data  || [];
+    const invoices = invoicesRes.data  || [];
+    const memories = memoryRes.data   || [];
+
+    // Derive tier from score
+    const creditRiskScore = parseFloat(score?.credit_risk_score || 0);
+    const tier = creditRiskScore >= 70 ? 'HIGH_RISK' : creditRiskScore >= 40 ? 'MEDIUM' : 'LOW';
+
+    // Compute behavioral summary
+    const totalOutstanding = invoices.filter(i => i.payment_status === 'Pending').reduce((s, i) => s + parseFloat(i.invoice_amount || 0), 0);
+    const overdueCount = invoices.filter(i => i.payment_status === 'Pending' && i.days_overdue > 0).length;
+    const activePromises = promises.filter(p => p.status === 'active');
+    const brokenPromises = promises.filter(p => p.status === 'broken').length;
+    const pendingActions = actions.filter(a => a.status === 'pending' || a.status === 'approved');
+
+    // Credit recommendation
+    let creditRecommendation = 'OK to extend credit';
+    if (creditRiskScore >= 70) creditRecommendation = '⚠️ High risk — request advance payment';
+    else if (creditRiskScore >= 50) creditRecommendation = '⚡ Medium risk — reduce credit limit';
+    else if (brokenPromises >= 2) creditRecommendation = '⚠️ Broken promises — owner approval required';
+
+    res.json({
+      success:        true,
+      customer_id:    customerId,
+      name,
+      score: {
+        credit_risk_score:        Math.round(creditRiskScore),
+        collection_priority_score: Math.round(parseFloat(score?.collection_priority_score || 0)),
+        promise_reliability_score: Math.round(parseFloat(score?.promise_reliability_score || 100)),
+        average_delay_days:        Math.round(parseFloat(score?.average_delay_days || 0)),
+        max_delay_days:            score?.max_delay_days || 0,
+        broken_promise_count:      score?.broken_promise_count || 0,
+        tier,
+        credit_recommendation:     creditRecommendation,
+        last_calculated_at:        score?.last_calculated_at || null,
+      },
+      summary: {
+        total_outstanding: Math.round(totalOutstanding),
+        overdue_count:     overdueCount,
+        active_promises:   activePromises.length,
+        broken_promises:   brokenPromises,
+        pending_actions:   pendingActions.length,
+      },
+      promises: promises.slice(0, 5),
+      actions:  pendingActions.slice(0, 5),
+      invoices: invoices.slice(0, 5),
+      memories: memories.slice(0, 10),
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ── AI ACTIONS — COUNTS (for dashboard urgency strip) ────────────────────────
 app.get('/api/ai-actions/counts', authMiddleware, async (req, res) => {
   try {
