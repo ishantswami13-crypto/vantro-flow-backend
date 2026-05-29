@@ -68,12 +68,44 @@ jobs:
         run: cargo check --workspace --locked
 
       - name: cargo test --workspace --lib
-        run: cargo test --workspace --lib --locked
+        shell: bash
+        run: |
+          set +e
+          cargo test --workspace --lib --locked --no-fail-fast -- --test-threads=1 2>&1 | tee /tmp/test-lib.log
+          EXIT=${PIPESTATUS[0]}
+          if [ $EXIT -ne 0 ]; then
+            echo ""
+            echo "=== FAILED tests (lib) ==="
+            grep -E "^test .* \.\.\. FAILED$" /tmp/test-lib.log | while IFS= read -r line; do
+              name=$(echo "$line" | sed 's/^test \(.*\) \.\.\. FAILED$/\1/')
+              echo "::error title=lib test failed::$name"
+            done
+            echo ""
+            echo "=== panic / assertion context ==="
+            grep -nE "(^---- .* stdout|^thread .* panicked at|assertion .*failed|^test result|^failures:|^error\[E|^FAILED)" /tmp/test-lib.log | head -80
+          fi
+          exit $EXIT
 
       - name: cargo test --workspace --tests
         # Integration tests under each crate's tests/ directory, including
         # vantro-automation-rs/tests/policy_guard_fir_regression.rs.
-        run: cargo test --workspace --tests --locked
+        shell: bash
+        run: |
+          set +e
+          cargo test --workspace --tests --locked --no-fail-fast -- --test-threads=1 2>&1 | tee /tmp/test-tests.log
+          EXIT=${PIPESTATUS[0]}
+          if [ $EXIT -ne 0 ]; then
+            echo ""
+            echo "=== FAILED tests (integration) ==="
+            grep -E "^test .* \.\.\. FAILED$" /tmp/test-tests.log | while IFS= read -r line; do
+              name=$(echo "$line" | sed 's/^test \(.*\) \.\.\. FAILED$/\1/')
+              echo "::error title=integration test failed::$name"
+            done
+            echo ""
+            echo "=== panic / assertion context ==="
+            grep -nE "(^---- .* stdout|^thread .* panicked at|assertion .*failed|^test result|^failures:|^error\[E|^FAILED)" /tmp/test-tests.log | head -80
+          fi
+          exit $EXIT
 
       - name: Confirm policy_guard_fir_regression actually ran
         # Re-invoke the specific integration test target by name with
