@@ -73,21 +73,40 @@ jobs:
           set +e
           cargo test --workspace --lib --locked --no-fail-fast -- --test-threads=1 2>&1 | tee /tmp/test-lib.log
           EXIT=${PIPESTATUS[0]}
+          echo "cargo-test-lib-exit=$EXIT"
           if [ $EXIT -ne 0 ]; then
-            echo ""
-            echo "=== FAILED tests (lib) ==="
-            grep -E "^test .* \.\.\. FAILED$" /tmp/test-lib.log | while IFS= read -r line; do
-              name=$(echo "$line" | sed 's/^test \(.*\) \.\.\. FAILED$/\1/')
-              echo "::error title=lib test failed::$name"
-            done
-            echo ""
-            echo "=== rustc compile errors (if any) ==="
-            grep -E "^error(\[E[0-9]+\])?:" /tmp/test-lib.log | head -50 | while IFS= read -r line; do
-              echo "::error title=lib compile::$line"
-            done
-            echo ""
-            echo "=== context (tail of log, last 120 lines) ==="
-            tail -120 /tmp/test-lib.log | nl
+            echo "=== last 30 lines of /tmp/test-lib.log ==="
+            tail -30 /tmp/test-lib.log
+            # Surface compact failure-identifying lines as annotations.
+            # 1) Cargo "failures:" block — names of failing tests.
+            awk '/^failures:$/{f=1;next} f && /^test result:/{f=0} f && /^    [^ ]/{print}' /tmp/test-lib.log \
+              | head -10 \
+              | while IFS= read -r name; do
+                  echo "::error title=test-fail::${name## }"
+                done
+            # 2) rustc compile errors.
+            grep -E "^error(\[E[0-9]+\])?:" /tmp/test-lib.log | head -5 \
+              | while IFS= read -r line; do
+                  echo "::error title=compile::$line"
+                done
+            # 3) Final "test result:" tally.
+            grep "^test result:" /tmp/test-lib.log | tail -3 \
+              | while IFS= read -r line; do
+                  echo "::warning title=tally::$line"
+                done
+            # 4) Last resort: if NONE of the above matched, surface tail.
+            HAS_FAIL=$(awk '/^failures:$/{f=1;next} f && /^test result:/{f=0} f && /^    [^ ]/{print}' /tmp/test-lib.log | wc -l)
+            HAS_COMPILE=$(grep -cE "^error(\[E[0-9]+\])?:" /tmp/test-lib.log || true)
+            HAS_TALLY=$(grep -c "^test result:" /tmp/test-lib.log || true)
+            if [ "$HAS_FAIL" = "0" ] && [ "$HAS_COMPILE" = "0" ] && [ "$HAS_TALLY" = "0" ]; then
+              # Probably exited before printing any test output (e.g. linker error
+              # or a crate build failure with non-standard output). Emit the last
+              # 5 non-blank lines as annotations.
+              tail -50 /tmp/test-lib.log | grep -v '^$' | tail -5 \
+                | while IFS= read -r line; do
+                    echo "::error title=unknown-fail::$line"
+                  done
+            fi
           fi
           exit $EXIT
 
