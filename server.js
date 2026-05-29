@@ -10672,6 +10672,49 @@ app.post('/api/ai-actions/:id/send-whatsapp', authMiddleware, async (req, res) =
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// ── MANUAL BRIEFING TRIGGER (runs daily briefing logic now for the calling user) ─
+app.post('/api/cortex/run-briefing', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _isFE } = require('./lib/featureFlags');
+    if (!_isFE('cortex_enabled')) return res.json({ created: 0, message: 'cortex_enabled flag off' });
+    const { safeLog } = require('./lib/observability/logger');
+    const userId = req.user.userId;
+
+    const [
+      overdueResult,
+      brokenResult,
+      pendingResult,
+    ] = await Promise.all([
+      supabase.from('invoices').select('customer_name, invoice_amount, days_overdue').eq('user_id', userId).eq('payment_status', 'Pending').order('days_overdue', { ascending: false }).limit(1),
+      supabase.from('promises').select('id').eq('user_id', userId).eq('status', 'broken').gte('resolved_at', new Date(Date.now() - 86400000).toISOString()),
+      supabase.from('ai_actions').select('id').eq('user_id', userId).eq('status', 'pending'),
+    ]);
+
+    const overdue       = overdueResult.data || [];
+    const brokenToday   = brokenResult.data || [];
+    const pendingCount  = pendingResult.data?.length || 0;
+    const descParts = [
+      overdue[0] ? `Top overdue: ${overdue[0].customer_name} (₹${Number(overdue[0].invoice_amount).toLocaleString('en-IN')}, ${overdue[0].days_overdue}d)` : null,
+      brokenToday.length ? `${brokenToday.length} promise(s) broken recently` : null,
+      pendingCount ? `${pendingCount} action(s) awaiting review` : null,
+    ].filter(Boolean);
+
+    const { create: createAction } = require('./lib/services/orchestrator/action.service');
+    const action = await createAction(userId, {
+      action_type:       'DAILY_OWNER_BRIEFING',
+      title:             `Daily Briefing — ${pendingCount} pending action${pendingCount !== 1 ? 's' : ''}`,
+      description:       descParts.join(' · ') || 'Your business is on track.',
+      priority:          pendingCount >= 5 ? 'high' : pendingCount >= 2 ? 'medium' : 'low',
+      suggested_by:      'system',
+      requires_approval: false,
+      risk_level:        'low',
+    });
+
+    safeLog('info', '[ManualBriefing] Created via API', { userId, actionId: action?.id });
+    res.json({ success: true, created: 1, action });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
 // ── BROKEN PROMISE DETECTION CRON — daily 9am IST (3:30 UTC) ────────────────
 cron.schedule('30 3 * * *', async () => {
   const { isEnabled: _isFE } = require('./lib/featureFlags');
