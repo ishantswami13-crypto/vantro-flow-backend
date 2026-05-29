@@ -18,10 +18,13 @@ name: Rust Automation CI
 #     JWT_SECRET, or Supabase key in this workflow.
 
 on:
+  # Trigger on every push and every PR, regardless of branch.
+  # This is a verification gate — we want to know the state of every dev
+  # branch, not only main/dev. Branch filters would silently skip work-
+  # branch pushes (the failure mode this workflow already hit on its
+  # first attempt: a typo went undetected because the gate did not run).
   push:
-    branches: [ "main", "dev" ]
   pull_request:
-    branches: [ "main", "dev" ]
 
 # Cancel superseded runs on the same ref.
 concurrency:
@@ -233,7 +236,7 @@ jobs:
       - name: Fail if a required gate failed
         env:
           PURE: ${{ needs.verify-pure-rust.result }}
-          HARNESS: ${{ needs.verify-cortex-harness-offline.result }}
+          HARNESS: ${{ needs.verify-cortex-harness-static.result }}
         # verify-server-feature-build is informational while skipped; once
         # .sqlx lands, it will be needs-required by upgrading this list.
         run: |
