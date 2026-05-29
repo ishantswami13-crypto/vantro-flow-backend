@@ -10567,25 +10567,47 @@ app.get('/api/customer-scores', authMiddleware, async (req, res) => {
     const { isEnabled: _isFE } = require('./lib/featureFlags');
     if (!_isFE('customer_scoring')) return res.json({ scores: [] });
     const userId = req.user.userId;
-    const { data, error } = await supabase
-      .from('customer_scores')
-      .select('customer_id, credit_risk_score, collection_priority_score, max_delay_days, score_reason_json, customers(name)')
-      .eq('user_id', userId)
-      .order('credit_risk_score', { ascending: false });
-    if (error) throw error;
-    const scores = (data || []).map(r => {
-      const raw = parseFloat(r.credit_risk_score || 0);
-      const tier = raw >= 70 ? 'HIGH_RISK' : raw >= 40 ? 'MEDIUM' : 'LOW';
-      const overdue = r.score_reason_json?.inputs?.totalOverdue || 0;
-      return {
-        customer_id:    r.customer_id,
-        customer_name:  r.customers?.name || 'Unknown',
-        score:          Math.round(raw),
-        tier,
-        overdue_amount: Math.round(overdue),
-        max_delay_days: r.max_delay_days || 0,
-      };
-    });
+
+    const fetchScores = async () => {
+      const { data, error } = await supabase
+        .from('customer_scores')
+        .select('customer_id, credit_risk_score, collection_priority_score, max_delay_days, score_reason_json, customers(name)')
+        .eq('user_id', userId)
+        .order('credit_risk_score', { ascending: false });
+      if (error) throw error;
+      return (data || []).map(r => {
+        const raw = parseFloat(r.credit_risk_score || 0);
+        const tier = raw >= 70 ? 'HIGH_RISK' : raw >= 40 ? 'MEDIUM' : 'LOW';
+        const overdue = r.score_reason_json?.inputs?.totalOverdue || 0;
+        return {
+          customer_id:    r.customer_id,
+          customer_name:  r.customers?.name || 'Unknown',
+          score:          Math.round(raw),
+          tier,
+          overdue_amount: Math.round(overdue),
+          max_delay_days: r.max_delay_days || 0,
+        };
+      });
+    };
+
+    let scores = await fetchScores();
+
+    // Auto-backfill: if no scores yet, run scoring for all customers then return
+    if (scores.length === 0) {
+      try {
+        const { data: customers } = await supabase
+          .from('customers').select('id').eq('user_id', userId).eq('is_active', true).limit(100);
+        if (customers?.length) {
+          const { recalculate } = require('./lib/services/orchestrator/scoring.service');
+          await Promise.allSettled(customers.map(c => recalculate(userId, c.id)));
+          scores = await fetchScores();
+        }
+      } catch (backfillErr) {
+        const { safeLog } = require('./lib/observability/logger');
+        safeLog('warn', '[CustomerScores] Auto-backfill failed', { error: backfillErr.message });
+      }
+    }
+
     res.json({ scores });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
