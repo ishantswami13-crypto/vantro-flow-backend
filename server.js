@@ -262,6 +262,10 @@ const corsOptions = {
     if (!origin || allowedOrigins.has(origin)) {
       return callback(null, true);
     }
+    // Allow all Vercel preview deployments for the vantro-flow-frontend project
+    if (origin && /^https:\/\/vantro-flow-frontend[a-z0-9-]*\.vercel\.app$/.test(origin)) {
+      return callback(null, true);
+    }
     return callback(new Error("Not allowed by CORS"));
   },
   credentials: true,
