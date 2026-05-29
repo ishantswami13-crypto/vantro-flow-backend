@@ -10753,6 +10753,34 @@ app.post('/api/cortex/run-briefing', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// ── CORTEX: CASHFLOW WEEK PREVIEW ────────────────────────────────────────────
+app.get('/api/cortex/cashflow-week', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _isFE } = require('./lib/featureFlags');
+    const userId = req.user.userId;
+    const { getWeekForecast } = require('./lib/services/orchestrator/cashflow.service');
+    const forecast = await getWeekForecast(userId);
+
+    // Also fetch overdue payables total
+    const today = new Date().toISOString().split('T')[0];
+    const { data: payables } = await supabase
+      .from('purchases').select('total_amount, paid_amount')
+      .eq('user_id', userId).neq('status', 'paid').lt('due_date', today);
+
+    const overduePayables = (payables || []).reduce((s, p) => {
+      return s + Math.max(0, Number(p.total_amount || 0) - Number(p.paid_amount || 0));
+    }, 0);
+
+    res.json({
+      success:          true,
+      expected_inflow:  Math.round(forecast.expected_inflow),
+      expected_outflow: Math.round(forecast.expected_outflow),
+      net_gap:          Math.round(forecast.expected_inflow - forecast.expected_outflow),
+      overdue_payables: Math.round(overduePayables),
+    });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
 // ── CORTEX: SIMULATE (dry-run rule engine) ───────────────────────────────────
 app.post('/api/cortex/simulate', authMiddleware, async (req, res) => {
   try {
