@@ -10557,6 +10557,40 @@ app.get('/api/ai-actions/counts', authMiddleware, async (req, res) => {
     const rows = data || [];
     const urgent = rows.filter(r => r.priority === 'urgent').length;
     const high   = rows.filter(r => r.priority === 'high').length;
+
+    // Auto-seed: if no actions exist yet, create today's briefing in background
+    if (rows.length === 0 && _isFE('cortex_enabled')) {
+      setImmediate(async () => {
+        try {
+          const today = new Date().toISOString().split('T')[0];
+          const { data: existing } = await supabase
+            .from('ai_actions').select('id').eq('user_id', userId)
+            .eq('action_type', 'DAILY_OWNER_BRIEFING').gte('created_at', today).maybeSingle();
+          if (!existing) {
+            const { create: _createAction } = require('./lib/services/orchestrator/action.service');
+            const { data: overdue } = await supabase
+              .from('invoices').select('customer_name, invoice_amount, days_overdue')
+              .eq('user_id', userId).eq('payment_status', 'Pending')
+              .order('days_overdue', { ascending: false }).limit(3);
+            const overdueList = overdue || [];
+            const descParts = overdueList.length
+              ? [`${overdueList.length} overdue invoice${overdueList.length > 1 ? 's' : ''}`,
+                 `Top: ${overdueList[0].customer_name} (₹${Number(overdueList[0].invoice_amount).toLocaleString('en-IN')}, ${overdueList[0].days_overdue}d)`]
+              : ['No overdue invoices'];
+            await _createAction(userId, {
+              action_type:       'DAILY_OWNER_BRIEFING',
+              title:             overdueList.length ? `${overdueList.length} overdue invoice${overdueList.length > 1 ? 's' : ''} need attention` : 'Daily Briefing — all clear',
+              description:       descParts.join(' · '),
+              priority:          overdueList.some(i => i.days_overdue > 45) ? 'high' : 'medium',
+              suggested_by:      'system',
+              requires_approval: false,
+              risk_level:        'low',
+            });
+          }
+        } catch {}
+      });
+    }
+
     res.json({ urgent, high, total: rows.length });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
