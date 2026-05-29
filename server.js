@@ -42,12 +42,34 @@ validateSecurityEnvironment();
 
 function getSecret(name) {
   // Centralized secret access - allows future migration to AWS Secrets Manager/Vault
-  const val = process.env[name];
+  // Prioritize _CURRENT for zero-downtime rotation
+  const val = process.env[`${name}_CURRENT`] || process.env[name];
   if (!val && process.env.NODE_ENV === 'production' && ['JWT_SECRET', 'SUPABASE_SERVICE_ROLE_KEY'].includes(name)) {
     console.error(`[FATAL] Missing critical secret: ${name}`);
     process.exit(1);
   }
   return val;
+}
+
+function getPreviousSecret(name) {
+  return process.env[`${name}_PREVIOUS`] || null;
+}
+
+function verifyJWT(token) {
+  const currentSecret = getSecret('JWT_SECRET');
+  const previousSecret = getPreviousSecret('JWT_SECRET');
+  try {
+    return jwt.verify(token, currentSecret);
+  } catch (err) {
+    if (previousSecret) {
+      try {
+        return jwt.verify(token, previousSecret);
+      } catch (innerErr) {
+        throw innerErr;
+      }
+    }
+    throw err;
+  }
 }
 
 const JWT_SECRET = getSecret('JWT_SECRET');
@@ -498,7 +520,7 @@ function authMiddleware(req, res, next) {
   const { token, source } = getAuthToken(req);
   if (!token) return res.status(401).json({ error: 'Missing token' });
   try {
-    req.user = jwt.verify(token, JWT_SECRET);
+    req.user = verifyJWT(token);
     req.authSource = source;
     if (!requireCookieCsrf(req, res)) return;
     
@@ -526,7 +548,7 @@ function requireOwner(req, res, next) {
   const { token, source } = getAuthToken(req);
   if (!token) return res.status(401).json({ error: 'Missing token' });
   try {
-    req.user = jwt.verify(token, JWT_SECRET);
+    req.user = verifyJWT(token);
     req.authSource = source;
   } catch {
     return res.status(401).json({ error: 'Invalid or expired token' });
@@ -1012,7 +1034,7 @@ app.post('/api/auth/resend-otp', async (req, res) => {
   try {
     const header = req.headers.authorization;
     if (!header?.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing token' });
-    const decoded = jwt.verify(header.slice(7), JWT_SECRET);
+    const decoded = verifyJWT(header.slice(7));
     if (!decoded.preVerify) return res.status(400).json({ error: 'Invalid pre-verification token' });
 
     const { data: user } = await supabase.from('users').select('id, email, phone, business_name').eq('id', decoded.userId).single();
@@ -1035,7 +1057,7 @@ app.post('/api/auth/verify-otp', async (req, res) => {
   try {
     const header = req.headers.authorization;
     if (!header?.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing token' });
-    const decoded = jwt.verify(header.slice(7), JWT_SECRET);
+    const decoded = verifyJWT(header.slice(7));
     if (!decoded.preVerify) return res.status(400).json({ error: 'Invalid pre-verification token' });
 
     const { otp } = req.body;
@@ -6913,7 +6935,7 @@ function adminOnly(req, res, next) {
   const header = req.headers.authorization;
   if (!header || !header.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing token' });
   try {
-    const decoded = jwt.verify(header.slice(7), JWT_SECRET);
+    const decoded = verifyJWT(header.slice(7));
     const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim());
     if (!ADMIN_EMAILS.includes(decoded.email)) return res.status(403).json({ error: 'Forbidden' });
     req.user = decoded;
@@ -7447,6 +7469,7 @@ app.post('/api/payments/webhook', async (req, res) => {
       if (!signature) return res.status(400).json({ error: 'Invalid signature' });
 
       const secret = getSecret('RAZORPAY_WEBHOOK_SECRET');
+      const prevSecret = getPreviousSecret('RAZORPAY_WEBHOOK_SECRET');
       if (!secret) {
         return res.status(503).json({ error: 'Webhook verification is not configured' });
       }
@@ -7458,7 +7481,16 @@ app.post('/api/payments/webhook', async (req, res) => {
         .update(rawBody)
         .digest('hex');
 
-      if (!timingSafeEqualString(signature, expectedSig)) {
+      let isValid = timingSafeEqualString(signature, expectedSig);
+      if (!isValid && prevSecret) {
+        const expectedSigPrev = crypto
+          .createHmac('sha256', prevSecret)
+          .update(rawBody)
+          .digest('hex');
+        isValid = timingSafeEqualString(signature, expectedSigPrev);
+      }
+
+      if (!isValid) {
         console.warn('Razorpay webhook: invalid signature');
         logSecurityEvent(req, SecurityEventTaxonomy.WEBHOOK_SIGNATURE_FAILED, { provider: 'razorpay' });
         return res.status(400).json({ error: 'Invalid signature' });
@@ -8375,9 +8407,16 @@ app.post('/api/voice/recording', async (req, res) => {
   res.sendStatus(200); // Respond immediately — process async
 
   const voiceSecret = getSecret('VOICE_WEBHOOK_SECRET');
+  const prevVoiceSecret = getPreviousSecret('VOICE_WEBHOOK_SECRET');
   const provided = req.headers['x-vantro-webhook-secret'] || req.query.secret;
   if (!voiceSecret) return;
-  if (voiceSecret && !timingSafeEqualString(provided, voiceSecret)) return;
+  
+  let isValid = timingSafeEqualString(provided, voiceSecret);
+  if (!isValid && prevVoiceSecret) {
+    isValid = timingSafeEqualString(provided, prevVoiceSecret);
+  }
+  
+  if (!isValid) return;
 
   const userId = req.query.uid;
   const { RecordingUrl, RecordingSid, From: callerPhone } = req.body;

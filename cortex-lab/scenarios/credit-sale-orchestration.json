@@ -1,0 +1,37 @@
+{
+  "name": "credit-sale-orchestration",
+  "category": "orchestration",
+  "description": "Creating a credit sale must atomically produce: sale row, inventory reduction, receivable, expected cashflow inflow, business event, audit log, and a collection ai_action.",
+  "seed": {
+    "user_id": "TEST_USER_A",
+    "customers": [
+      { "id": "cust-1", "name": "Rahul Traders", "phone": "+919999900001", "credit_limit": 50000 }
+    ],
+    "products": [
+      { "id": "prod-1", "name": "Widget", "stock": 100, "reorder_level": 10 }
+    ]
+  },
+  "command": {
+    "type": "CREATE_SALE",
+    "payload": {
+      "customer_name": "Rahul Traders",
+      "amount": 12000,
+      "paid_amount": 0,
+      "items": [{ "product_id": "prod-1", "qty": 5, "unit_price": 2400 }],
+      "due_in_days": 15
+    }
+  },
+  "expected_events": [
+    "SALE_CREATED",
+    "STOCK_REDUCED",
+    "RECEIVABLE_CREATED",
+    "CASHFLOW_UPDATED"
+  ],
+  "expected_actions_min": 0,
+  "expected_db_changes": {
+    "invoices": { "min_new_rows": 1 },
+    "cashflow_events": { "min_new_rows": 1 }
+  },
+  "expected_blocked_actions": [],
+  "expected_policy_decisions_min": 0
+}
