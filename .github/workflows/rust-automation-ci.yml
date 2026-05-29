@@ -81,8 +81,13 @@ jobs:
               echo "::error title=lib test failed::$name"
             done
             echo ""
-            echo "=== panic / assertion context ==="
-            grep -nE "(^---- .* stdout|^thread .* panicked at|assertion .*failed|^test result|^failures:|^error\[E|^FAILED)" /tmp/test-lib.log | head -80
+            echo "=== rustc compile errors (if any) ==="
+            grep -E "^error(\[E[0-9]+\])?:" /tmp/test-lib.log | head -50 | while IFS= read -r line; do
+              echo "::error title=lib compile::$line"
+            done
+            echo ""
+            echo "=== context (tail of log, last 120 lines) ==="
+            tail -120 /tmp/test-lib.log | nl
           fi
           exit $EXIT
 
