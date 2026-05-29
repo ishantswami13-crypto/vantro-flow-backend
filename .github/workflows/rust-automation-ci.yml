@@ -1,35 +1,21 @@
 name: Rust Automation CI
 
 # Linux CI gate for the Vantro Automation RS + Cortex Core RS workspace.
-# Owns the verification of: format, type-check, unit tests, integration tests
-# (including the FIR policy-guard regression). Runs on every push and PR.
+# Verifies: format, type-check, unit tests, integration tests
+# (including the FIR policy-guard regression) and the offline Cortex
+# harness. Runs on every push and every pull request, on every branch.
 #
-# What this workflow does NOT do (and the reasons are honest, not hidden):
-#   - Does NOT build the `server` feature of vantro-automation-rs.
-#     That requires either a non-prod DATABASE_URL at build time OR a committed
-#     `.sqlx/` offline cache. Neither exists yet. The `verify-server-feature`
-#     job below is gated on `hashFiles('.sqlx/**')` and will only run once that
-#     cache is committed. It is NOT silently "passing" — it is skipped, and
-#     CI clearly reports the skipped status.
-#   - Does NOT run any live harness (cortex-lab --mode=live / --mode=dry-run).
-#     Those require a non-prod DB and seeded tenants — handled in a later
-#     commit (test env setup + Rust live harness integration).
-#   - Does NOT receive any production secrets. There is no DATABASE_URL,
-#     JWT_SECRET, or Supabase key in this workflow.
+# Intentional non-goals (do NOT silently expand into these):
+#   - server-feature build with sqlx::query! macros. That requires either
+#     a non-prod DATABASE_URL or a committed .sqlx/ offline cache, neither
+#     of which exists today. It is gated by a separate, future workflow
+#     commit that lands at the same time as the .sqlx/ cache.
+#   - live harness (cortex-lab --mode=live, --mode=dry-run). Those need a
+#     non-prod database and seeded tenants — separate, future commit.
+#   - any use of production secrets. No DATABASE_URL, JWT_SECRET, or
+#     Supabase key is referenced in this workflow.
 
-on:
-  # Trigger on every push and every PR, regardless of branch.
-  # This is a verification gate — we want to know the state of every dev
-  # branch, not only main/dev. Branch filters would silently skip work-
-  # branch pushes (the failure mode this workflow already hit on its
-  # first attempt: a typo went undetected because the gate did not run).
-  push:
-  pull_request:
-
-# Cancel superseded runs on the same ref.
-concurrency:
-  group: rust-automation-ci-${{ github.ref }}
-  cancel-in-progress: true
+on: [push, pull_request]
 
 permissions:
   contents: read
@@ -37,21 +23,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: short
-  # Workspace-relative builds — never reach a network database or production cache.
-  SQLX_OFFLINE: "true"
 
 jobs:
-  # ─────────────────────────────────────────────────────────────────────────
-  # Job 1 — Pure-Rust verification. Runs on Linux (native ld), default cargo
-  # config from .cargo/config.toml is overridden because that pins
-  # x86_64-pc-windows-gnu (a developer-Windows convenience). On Linux we want
-  # the native target.
-  # ─────────────────────────────────────────────────────────────────────────
   verify-pure-rust:
-    name: cargo fmt / check / test (pure-Rust, no server feature)
+    name: cargo fmt / check / test (pure-Rust)
     runs-on: ubuntu-latest
     timeout-minutes: 25
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -61,22 +38,16 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Override workspace target to native Linux
-        # The repo's .cargo/config.toml pins target = "x86_64-pc-windows-gnu".
-        # That is correct for Windows dev machines but wrong for Linux CI.
-        # We override by writing $CARGO_HOME/config.toml (higher precedence
-        # than the in-tree .cargo/config.toml is NOT true — in-tree wins —
-        # so instead we neutralise the [build] target by replacing the file.
-        # We only touch the runner's checkout, never the committed file.
+      - name: Override workspace cargo target for Linux runner
+        # The committed .cargo/config.toml pins target = x86_64-pc-windows-gnu
+        # for Windows developer machines. On Linux CI we want the host triple.
+        # Replace the file inside the runner checkout only; the committed
+        # version on disk is untouched.
         run: |
-          cat > .cargo/config.toml <<'EOF'
-          # Overridden in CI — Linux native target.
-          # The committed file pins x86_64-pc-windows-gnu for developer machines;
-          # on Linux CI we want the host triple to be selected automatically.
-          EOF
+          printf '# Overridden in CI — Linux host target.\n' > .cargo/config.toml
           cat .cargo/config.toml
 
-      - name: Cache cargo registry and target
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
@@ -87,7 +58,7 @@ jobs:
           restore-keys: |
             rust-pure-${{ runner.os }}-
 
-      - name: rustc version (for the log)
+      - name: rustc + cargo versions
         run: rustc --version && cargo --version
 
       - name: cargo fmt --check (workspace)
@@ -97,150 +68,35 @@ jobs:
         run: cargo check --workspace --locked
 
       - name: cargo test --workspace --lib
-        # Pure-Rust library tests for cashops, cortex (incl. policy_guard inline
-        # tests), cache, events, harness.
         run: cargo test --workspace --lib --locked
 
       - name: cargo test --workspace --tests
-        # Integration tests under each crate's tests/ directory.
-        # The FIR policy-guard regression lives at
+        # Integration tests under each crate's tests/ directory, including
         # vantro-automation-rs/tests/policy_guard_fir_regression.rs.
         run: cargo test --workspace --tests --locked
 
       - name: Confirm policy_guard_fir_regression actually ran
-        # Belt-and-suspenders: re-invoke the specific integration test target
-        # by name, with --nocapture, so the test names appear in CI logs as
-        # explicit evidence. If the test binary is renamed or the file is
-        # accidentally deleted, this step fails loudly instead of silently
-        # passing.
-        run: |
-          cargo test --locked -p vantro-automation-rs \
-            --test policy_guard_fir_regression -- --nocapture --test-threads=1
+        # Re-invoke the specific integration test target by name with
+        # --nocapture so individual test names appear in CI logs.
+        run: cargo test --locked -p vantro-automation-rs --test policy_guard_fir_regression -- --nocapture --test-threads=1
 
-  # ─────────────────────────────────────────────────────────────────────────
-  # Job 2 — Cortex Harness X static mode (no DB). The currently-tracked
-  # cortex-lab/run.js only supports the original static path; the newer
-  # mode-aware runner (red-team, dry-run, live) lives in the working tree
-  # and is not part of this commit's baseline. To avoid a fake pass we
-  # explicitly run only `cortex:test`, which the tracked runner executes
-  # correctly. Red-team and dry-run will be added here in the commit that
-  # lands the harness reorg.
-  # ─────────────────────────────────────────────────────────────────────────
   verify-cortex-harness-static:
     name: cortex-lab static (no DB)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs: verify-pure-rust
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node (LTS)
+      - name: Setup Node 18
         uses: actions/setup-node@v4
         with:
           node-version: "18"
           cache: "npm"
 
-      - name: Install Node deps (no dev)
+      - name: Install Node deps
         run: npm ci --omit=dev
 
       - name: cortex-lab static mode
         run: npm run cortex:test --silent
-
-  # ─────────────────────────────────────────────────────────────────────────
-  # Job 3 — Server-feature build (sqlx). BLOCKED until a non-prod
-  # `.sqlx/` offline cache is committed. This job is gated on the presence
-  # of that directory; it does NOT silently pass — it is explicitly skipped
-  # by GitHub Actions when the precondition is absent, and the workflow
-  # summary will show "skipped". When the SQLx prep commit lands, this job
-  # activates automatically.
-  # ─────────────────────────────────────────────────────────────────────────
-  verify-server-feature-build:
-    name: cargo build --features server (BLOCKED until .sqlx is committed)
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    needs: verify-pure-rust
-    if: ${{ hashFiles('.sqlx/**') != '' }}
-
-    env:
-      SQLX_OFFLINE: "true"
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain (stable)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Override workspace target to native Linux
-        run: |
-          cat > .cargo/config.toml <<'EOF'
-          # Overridden in CI — Linux native target.
-          EOF
-
-      - name: Cache cargo (server feature)
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: rust-server-${{ runner.os }}-${{ hashFiles('Cargo.lock', '.sqlx/**') }}
-          restore-keys: |
-            rust-server-${{ runner.os }}-
-
-      - name: cargo build --release --features server -p vantro-automation-rs
-        run: |
-          cargo build --release --locked \
-            --features server -p vantro-automation-rs
-
-  # ─────────────────────────────────────────────────────────────────────────
-  # Reporter — Final job summary so the user can see, at a glance, what
-  # passed, what skipped, and what is still gating production enablement.
-  # ─────────────────────────────────────────────────────────────────────────
-  status-summary:
-    name: CI summary
-    runs-on: ubuntu-latest
-    if: ${{ always() }}
-    needs: [verify-pure-rust, verify-cortex-harness-static, verify-server-feature-build]
-    steps:
-      - name: Print summary
-        env:
-          PURE: ${{ needs.verify-pure-rust.result }}
-          HARNESS: ${{ needs.verify-cortex-harness-static.result }}
-          SERVER: ${{ needs.verify-server-feature-build.result }}
-        run: |
-          {
-            echo "# Rust Automation CI — summary"
-            echo ""
-            echo "| Gate | Result |"
-            echo "|---|---|"
-            echo "| verify-pure-rust (fmt + check + tests + FIR regression) | $PURE |"
-            echo "| verify-cortex-harness-static (no DB) | $HARNESS |"
-            echo "| verify-server-feature-build (sqlx) | $SERVER |"
-            echo ""
-            if [ "$SERVER" = "skipped" ]; then
-              echo "> server-feature build is BLOCKED until a non-prod .sqlx/ offline"
-              echo "> cache is committed. This is not a fake pass — the job is"
-              echo "> explicitly skipped by GitHub Actions and reported as such."
-            fi
-            echo ""
-            echo "Production enablement of RUST_AUTOMATION_API_ENABLED requires:"
-            echo "- pure-Rust gate green (this workflow)"
-            echo "- server-feature build green (after .sqlx is committed)"
-            echo "- live harness on non-prod DB green (future workflow)"
-            echo "- fallback matrix green (future workflow)"
-            echo "- measured performance numbers within budget (future workflow)"
-          } >> "$GITHUB_STEP_SUMMARY"
-      - name: Fail if a required gate failed
-        env:
-          PURE: ${{ needs.verify-pure-rust.result }}
-          HARNESS: ${{ needs.verify-cortex-harness-static.result }}
-        # verify-server-feature-build is informational while skipped; once
-        # .sqlx lands, it will be needs-required by upgrading this list.
-        run: |
-          if [ "$PURE" != "success" ] || [ "$HARNESS" != "success" ]; then
-            echo "Required gate failed (pure=$PURE harness=$HARNESS)"
-            exit 1
-          fi
