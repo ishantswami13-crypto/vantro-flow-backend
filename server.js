@@ -10753,6 +10753,95 @@ app.post('/api/cortex/run-briefing', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// ── CORTEX: SIMULATE (dry-run rule engine) ───────────────────────────────────
+app.post('/api/cortex/simulate', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { eventType, payload = {} } = req.body;
+    if (!eventType) return res.status(400).json({ error: 'eventType required' });
+    const { simulate } = require('./lib/services/orchestrator/simulationEngine.service');
+    const result = await simulate(userId, eventType, payload);
+    res.json({ success: true, ...result });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── CORTEX: LIST AVAILABLE TOOLS ─────────────────────────────────────────────
+app.get('/api/cortex/tools', authMiddleware, async (req, res) => {
+  try {
+    const { FLAGS } = require('./lib/featureFlags');
+    const { getAvailable } = require('./lib/services/orchestrator/toolRegistry.service');
+    const tools = getAvailable(FLAGS);
+    res.json({ success: true, tools });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── CORTEX: MEMORY READ ───────────────────────────────────────────────────────
+app.get('/api/cortex/memory', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _isFE } = require('./lib/featureFlags');
+    if (!_isFE('memory_enabled')) return res.json({ memories: [] });
+    const userId = req.user.userId;
+    const { entityType, entityId, key } = req.query;
+    let q = supabase.from('business_memory')
+      .select('id, entity_type, entity_id, memory_key, memory_value, confidence, source, updated_at')
+      .eq('user_id', userId)
+      .order('updated_at', { ascending: false })
+      .limit(100);
+    if (entityType) q = q.eq('entity_type', entityType);
+    if (entityId)   q = q.eq('entity_id', entityId);
+    if (key)        q = q.eq('memory_key', key);
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json({ success: true, memories: data || [] });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── CORTEX: MEMORY WRITE ──────────────────────────────────────────────────────
+app.post('/api/cortex/memory', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _isFE } = require('./lib/featureFlags');
+    if (!_isFE('memory_enabled')) return res.status(403).json({ error: 'memory_enabled flag off' });
+    const userId = req.user.userId;
+    const { entityType = 'global', entityId = null, key, value, source = 'user_confirmed' } = req.body;
+    if (!key || value === undefined) return res.status(400).json({ error: 'key and value required' });
+    const { error } = await supabase.from('business_memory').upsert([{
+      user_id:      userId,
+      entity_type:  entityType,
+      entity_id:    entityId,
+      memory_key:   key,
+      memory_value: typeof value === 'object' ? value : { v: value },
+      source,
+      updated_at:   new Date().toISOString(),
+    }], { onConflict: 'user_id,entity_type,entity_id,memory_key' });
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── CORTEX: HEALTH ────────────────────────────────────────────────────────────
+app.get('/api/cortex/health', authMiddleware, async (req, res) => {
+  try {
+    const { FLAGS } = require('./lib/featureFlags');
+    const userId = req.user.userId;
+    const [actionsResult, scoresResult, plansResult] = await Promise.all([
+      supabase.from('ai_actions').select('id', { count: 'exact', head: true }).eq('user_id', userId).eq('status', 'pending'),
+      supabase.from('customer_scores').select('id', { count: 'exact', head: true }).eq('user_id', userId),
+      supabase.from('ai_plans').select('id', { count: 'exact', head: true }).eq('user_id', userId).eq('status', 'active').then ?
+        supabase.from('ai_plans').select('id', { count: 'exact', head: true }).eq('user_id', userId).eq('status', 'active') :
+        Promise.resolve({ count: 0, error: null }),
+    ]);
+    res.json({
+      success: true,
+      flags: FLAGS,
+      stats: {
+        pending_actions:  actionsResult.count  || 0,
+        customer_scores:  scoresResult.count   || 0,
+        active_plans:     plansResult.count    || 0,
+      },
+    });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
 // ── BROKEN PROMISE DETECTION CRON — daily 9am IST (3:30 UTC) ────────────────
 cron.schedule('30 3 * * *', async () => {
   const { isEnabled: _isFE } = require('./lib/featureFlags');
