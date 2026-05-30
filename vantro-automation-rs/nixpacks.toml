@@ -58,7 +58,15 @@ cmds = [
   #    something in the Railway/nixpacks build injects an EMPTY CARGO_TERM_COLOR,
   #    which makes cargo abort with "argument for --color must be auto, always,
   #    or never, but found ''". Pinning a valid value inline overrides it.
-  "SQLX_OFFLINE=true CARGO_TERM_COLOR=always cargo build --release --features server -p vantro-automation-rs",
+  #    --target x86_64-unknown-linux-musl produces a STATIC binary. nixpacks'
+  #    own setup phase installs the musl target + musl/musl.dev for exactly
+  #    this reason: the slim runtime stage is a plain ubuntu image that does
+  #    NOT contain the nix-store dynamic linker / glibc paths a default
+  #    (dynamic, gnu) build references -- running such a binary fails with
+  #    "cannot execute: required file not found". A static musl binary has no
+  #    external interpreter or shared-lib dependencies and runs in the slim
+  #    image as-is.
+  "SQLX_OFFLINE=true CARGO_TERM_COLOR=always cargo build --release --target x86_64-unknown-linux-musl --features server -p vantro-automation-rs",
 
   # 3. nixpacks auto-generates a slim runtime stage (stage-1) that runs
   #    `COPY --from=0 /app/bin/cortex-core`. It derived that binary name from
@@ -70,7 +78,7 @@ cmds = [
   #    path the runtime stage expects. The file named cortex-core here IS the
   #    vantro-automation Axum server -- only the path is what nixpacks happens
   #    to reference.
-  "mkdir -p bin && cp target/release/vantro-automation bin/cortex-core",
+  "mkdir -p bin && cp target/x86_64-unknown-linux-musl/release/vantro-automation bin/cortex-core",
 ]
 
 [start]
