@@ -38,10 +38,22 @@ cmds = [
 
   # 2. Build the release binary with the server feature (axum + sqlx + tokio).
   #    -p vantro-automation-rs selects the crate; the cortex-core binary is
-  #    NOT built here. SQLX_OFFLINE=true (above) makes this fully offline.
-  #    Output lands at target/release/vantro-automation (workspace shares
-  #    the root-level target/ directory).
-  "cargo build --release --features server -p vantro-automation-rs",
+  #    NOT built here. Output lands at target/release/vantro-automation
+  #    (workspace shares the root-level target/ directory).
+  #
+  #    SQLX_OFFLINE=true is set INLINE here (not only in [variables]) on
+  #    purpose: Railway injects the service's DATABASE_URL as a build-time
+  #    ARG/ENV. That URL points at postgres.railway.internal, which is only
+  #    resolvable on the PRIVATE network at RUNTIME -- it does NOT exist
+  #    during the build. If sqlx sees DATABASE_URL and is not forced offline,
+  #    the `query!` macros try to connect at compile time and the build dies
+  #    with "error communicating with database: failed to lookup address
+  #    information". The [variables] ENV alone proved insufficient (the
+  #    injected DATABASE_URL won the process env), so we pin the flag in the
+  #    exact shell that runs cargo -- this has highest precedence and forces
+  #    sqlx to read the committed .sqlx/ cache. The binary still connects to
+  #    Postgres normally at RUNTIME.
+  "SQLX_OFFLINE=true cargo build --release --features server -p vantro-automation-rs",
 ]
 
 [start]
