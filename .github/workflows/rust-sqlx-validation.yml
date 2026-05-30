@@ -194,12 +194,30 @@ jobs:
         # to keep CI build time reasonable. Railway production builds use
         # [profile.release] with full LTO -- that is NOT what this step tests.
         # This step only proves: "the code compiles against the offline cache."
+        #
+        # Diagnostic wrapper (same pattern as steps 12/13): disable ANSI and
+        # surface errors as annotations so a failure here shows the real cause
+        # rather than a bare "exit 101".
+        shell: bash
         env:
           SQLX_OFFLINE: "true"
+          CARGO_TERM_COLOR: never
         run: |
-          cargo build --profile ci-release \
-            --features server \
-            -p vantro-automation-rs
+          set +e
+          cargo build --profile ci-release --features server \
+            -p vantro-automation-rs --message-format=short 2>&1 | tee /tmp/cargo-build.log
+          EXIT=${PIPESTATUS[0]}
+          echo "cargo-build-exit=$EXIT"
+          if [ $EXIT -ne 0 ]; then
+            echo "=== build errors ==="
+            grep -E "^error|^warning\[|error:|undefined reference|linker|cannot find" /tmp/cargo-build.log | head -30 \
+              | while IFS= read -r line; do
+                  echo "::error title=ci-build::${line}"
+                done
+            echo "=== full output ==="
+            cat /tmp/cargo-build.log
+          fi
+          exit $EXIT
 
       - name: Upload .sqlx/ as artifact
         # Upload the generated offline cache for human review.
