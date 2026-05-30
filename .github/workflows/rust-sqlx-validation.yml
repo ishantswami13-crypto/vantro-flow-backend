@@ -188,21 +188,42 @@ jobs:
           find .sqlx -type f | wc -l
 
       - name: Diagnose .sqlx cache before offline build
-        # Belt-and-suspenders: confirm exactly what sqlx will find when
-        # SQLX_OFFLINE=true. Surfaces the absolute path, file list, and
-        # first 20 cache entries so we can tell whether the lookup root
-        # matches where cargo sqlx prepare wrote the files.
+        # DIAGNOSTIC ONLY. Emits the .sqlx inventory as GitHub annotations
+        # (::error / ::notice) so the query-file count is visible via the
+        # Actions API even when this step passes. This disambiguates:
+        #   A) .sqlx exists but cargo sqlx prepare wrote zero query-*.json, vs
+        #   B) query files exist but the offline build cannot locate them.
+        shell: bash
         run: |
           echo "=== pwd ==="
           pwd
-          echo "=== github.workspace ==="
-          echo "${{ github.workspace }}"
+          echo "=== cargo workspace_root ==="
+          if command -v jq >/dev/null 2>&1; then
+            cargo metadata --format-version=1 --no-deps | jq -r '.workspace_root'
+          else
+            echo "jq not available; printing raw metadata workspace_root field"
+            cargo metadata --format-version=1 --no-deps | grep -o '"workspace_root":"[^"]*"' | head -1
+          fi
           echo "=== ls -la .sqlx ==="
-          ls -la .sqlx || echo ".sqlx does not exist or is empty"
-          echo "=== .sqlx files (first 20) ==="
-          find .sqlx -maxdepth 1 -type f | head -20
-          echo "=== absolute path of .sqlx ==="
-          realpath .sqlx || echo "realpath not available"
+          ls -la .sqlx || true
+          echo "=== all files in .sqlx (maxdepth 1) ==="
+          find .sqlx -maxdepth 1 -type f -print | sort || true
+          echo "=== query-*.json count ==="
+          QCOUNT=$(find .sqlx -maxdepth 1 -type f -name "query-*.json" | wc -l | tr -d ' ')
+          echo "query_json_count=$QCOUNT"
+          echo "=== first 20 query-*.json filenames ==="
+          find .sqlx -maxdepth 1 -type f -name "query-*.json" | sort | head -20
+          # Surface the verdict as an annotation visible via the API.
+          if [ "$QCOUNT" = "0" ]; then
+            echo "::error title=SQLx cache empty::.sqlx exists but contains zero query-*.json files after prepare"
+          else
+            echo "::notice title=SQLx cache generated::Found $QCOUNT query cache files in .sqlx"
+            # Also emit each filename as a notice so they are visible via the API.
+            find .sqlx -maxdepth 1 -type f -name "query-*.json" -exec basename {} \; | sort | head -20 \
+              | while IFS= read -r fn; do
+                  echo "::notice title=sqlx-cache-file::${fn}"
+                done
+          fi
 
       - name: cargo build --profile ci-release --features server (offline)
         # Offline proof: compile the Axum server binary against the .sqlx/
@@ -239,6 +260,20 @@ jobs:
             cat /tmp/cargo-build.log
           fi
           exit $EXIT
+
+      - name: Upload .sqlx/ as debug artifact (always)
+        # DIAGNOSTIC: upload the generated cache regardless of whether the
+        # offline build step passed or failed, so we can inspect exactly what
+        # cargo sqlx prepare produced even when step 16 fails. This is separate
+        # from the production "sqlx-offline-cache" artifact below, which only
+        # uploads on full success.
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sqlx-debug-cache
+          path: .sqlx/
+          retention-days: 14
+          if-no-files-found: warn
 
       - name: Upload .sqlx/ as artifact
         # Upload the generated offline cache for human review.
