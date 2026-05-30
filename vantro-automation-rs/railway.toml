@@ -20,7 +20,11 @@ nixpacksConfigPath = "vantro-automation-rs/nixpacks.toml"
 
 [deploy]
 # Start the compiled Axum binary. Must match nixpacks.toml [start].
-startCommand = "./target/release/vantro-automation"
+# The slim runtime image (nixpacks stage-1) only contains /app/bin/cortex-core
+# -- that file IS the vantro-automation server (see nixpacks.toml build step 3
+# for why the path is named cortex-core). target/release/ does NOT exist in the
+# slim runtime image, so the start command must reference /app/bin/cortex-core.
+startCommand = "/app/bin/cortex-core"
 
 # Restart on crash, bounded. A Rust panic restarts THIS service only --
 # the Node backend is a separate service and is unaffected (the whole point

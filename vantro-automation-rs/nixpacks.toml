@@ -59,6 +59,18 @@ cmds = [
   #    which makes cargo abort with "argument for --color must be auto, always,
   #    or never, but found ''". Pinning a valid value inline overrides it.
   "SQLX_OFFLINE=true CARGO_TERM_COLOR=always cargo build --release --features server -p vantro-automation-rs",
+
+  # 3. nixpacks auto-generates a slim runtime stage (stage-1) that runs
+  #    `COPY --from=0 /app/bin/cortex-core`. It derived that binary name from
+  #    the FIRST workspace member (cortex-core-rs), NOT the crate we actually
+  #    build (-p vantro-automation-rs). Because our custom [phases.build]
+  #    replaced nixpacks' own "copy binary to bin/" step, /app/bin/cortex-core
+  #    is never produced and the image build dies with
+  #    "/app/bin/cortex-core: not found". Place our real binary at exactly the
+  #    path the runtime stage expects. The file named cortex-core here IS the
+  #    vantro-automation Axum server -- only the path is what nixpacks happens
+  #    to reference.
+  "mkdir -p bin && cp target/release/vantro-automation bin/cortex-core",
 ]
 
 [start]
@@ -66,4 +78,4 @@ cmds = [
 # (default 3002, see src/config.rs). Railway sets PORT; if you want the
 # service to honour Railway's $PORT, set RUST_AUTOMATION_PORT=$PORT in the
 # service env (see docs/rust-railway-deploy.md).
-cmd = "./target/release/vantro-automation"
+cmd = "/app/bin/cortex-core"
