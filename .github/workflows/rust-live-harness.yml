@@ -1,0 +1,151 @@
+name: Rust Live Harness
+
+# Vantro Harness X -- Rust live mode, fully self-contained in CI.
+# Boots the real Axum /api/v2 service against an ephemeral postgres:16 seeded
+# with two isolated tenants, then runs scripts/rust-live-harness.js against it.
+#
+# Non-prod by construction: the database is an ephemeral container, the JWT
+# secret is a throwaway test value, and the whole environment is destroyed when
+# the job ends. No production database, no production secret, no deploy.
+# RUST_AUTOMATION_API_ENABLED is irrelevant to the service process and stays
+# unset (the Node backend's flag is a separate concern).
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  rust-live-harness:
+    name: live /api/v2 harness (ephemeral PG + in-CI Rust service)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: vantro_harness
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd   "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout  5s
+          --health-retries  5
+
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/vantro_harness
+      JWT_SECRET: harness-only-test-secret-not-a-real-key-0123456789
+      SQLX_OFFLINE: "true"
+      RUST_AUTOMATION_PORT: "3002"
+      RUST_BASE_URL: http://localhost:3002
+      OWNER_A_ID: 11111111-1111-1111-1111-111111111111
+      OWNER_B_ID: 22222222-2222-2222-2222-222222222222
+      OWNER_A_CUSTOMER: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: short
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Guard - committed .sqlx/ cache must be present
+        run: |
+          COUNT=$(find .sqlx -maxdepth 1 -type f -name "query-*.json" 2>/dev/null | wc -l | tr -d ' ')
+          echo "committed .sqlx query files: $COUNT"
+          if [ "$COUNT" = "0" ]; then
+            echo "::error title=missing-sqlx-cache::No committed .sqlx cache; the offline service build cannot run."
+            exit 1
+          fi
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Node 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm"
+
+      - name: Override workspace cargo target for Linux runner
+        run: |
+          printf '# Overridden in CI -- Linux host target.\n' > .cargo/config.toml
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-live-${{ runner.os }}-${{ hashFiles('Cargo.lock', '.sqlx/**') }}
+          restore-keys: |
+            rust-live-${{ runner.os }}-
+
+      - name: Install Node deps (for the harness JWT signing)
+        run: npm ci
+
+      - name: Wait for Postgres
+        run: |
+          until pg_isready -h localhost -p 5432 -U postgres; do
+            echo "waiting for postgres..."; sleep 2;
+          done
+          echo "postgres ready"
+
+      - name: Apply schema + seed two isolated tenants
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/sqlx-test-schema.sql
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/harness-seed.sql
+          echo "=== row counts ==="
+          psql "$DATABASE_URL" -c "SELECT 'users' t, count(*) FROM users UNION ALL SELECT 'invoices', count(*) FROM invoices UNION ALL SELECT 'promises', count(*) FROM promises;"
+
+      - name: Build Rust service (offline, ci-release)
+        shell: bash
+        run: |
+          set +e
+          cargo build --profile ci-release --features server -p vantro-automation-rs \
+            --message-format=short 2>&1 | tee /tmp/build.log
+          EXIT=${PIPESTATUS[0]}
+          if [ $EXIT -ne 0 ]; then
+            grep -E "^error|error:|no cached data" /tmp/build.log | head -20 \
+              | while IFS= read -r l; do echo "::error title=build::$l"; done
+          fi
+          exit $EXIT
+
+      - name: Start Rust service (NODE_ENV=production -> real JWT auth, no bypass)
+        shell: bash
+        env:
+          NODE_ENV: production
+        run: |
+          nohup ./target/ci-release/vantro-automation > /tmp/rust-service.log 2>&1 &
+          echo $! > /tmp/rust.pid
+          echo "started vantro-automation pid=$(cat /tmp/rust.pid)"
+
+      - name: Wait for /health
+        shell: bash
+        run: |
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$RUST_BASE_URL/health" || true)
+            if [ "$CODE" = "200" ]; then echo "service healthy"; exit 0; fi
+            echo "health attempt $i: $CODE"; sleep 1;
+          done
+          echo "::error title=service-unhealthy::/health never returned 200"
+          echo "=== rust-service.log ==="; cat /tmp/rust-service.log || true
+          exit 1
+
+      - name: Run Rust live harness
+        run: node scripts/rust-live-harness.js
+
+      - name: Dump Rust service log (always)
+        if: ${{ always() }}
+        run: |
+          echo "=== rust-service.log ==="
+          cat /tmp/rust-service.log || true
+
+      - name: Stop Rust service (always)
+        if: ${{ always() }}
+        run: |
+          if [ -f /tmp/rust.pid ]; then kill "$(cat /tmp/rust.pid)" 2>/dev/null || true; fi
