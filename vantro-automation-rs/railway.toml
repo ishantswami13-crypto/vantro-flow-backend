@@ -1,0 +1,38 @@
+# railway.toml -- Vantro Automation RS (SEPARATE Railway service).
+#
+# Config-as-code for the SECOND Railway service ("vantro-automation").
+# The Node backend keeps using the repo-root railway.toml
+# (startCommand = "node server.js"); this file is selected ONLY by the Rust
+# service via its "Config Path" dashboard setting.
+#
+# How Railway uses this file:
+#   In the Rust service settings, set:
+#     Root Directory        : <repo root>
+#     Railway Config File    : vantro-automation-rs/railway.toml   <-- this file
+#   Railway then reads [build] / [deploy] below and the nixpacks config it
+#   points to. See docs/rust-railway-deploy.md.
+
+[build]
+builder = "NIXPACKS"
+# Point NIXPACKS at the Rust-only build config (not the repo-root Node one).
+# Path is relative to the repo root (the service Root Directory).
+nixpacksConfigPath = "vantro-automation-rs/nixpacks.toml"
+
+[deploy]
+# Start the compiled Axum binary. Must match nixpacks.toml [start].
+startCommand = "./target/release/vantro-automation"
+
+# Restart on crash, bounded. A Rust panic restarts THIS service only --
+# the Node backend is a separate service and is unaffected (the whole point
+# of Option B / separate-service isolation).
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+
+# Health gate: Railway waits for this path to return 2xx before routing
+# traffic / marking the deploy healthy. The Axum service exposes GET /health
+# (see src/api/health.rs) returning {"ok": true, ...}.
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+
+# NOTE: numReplicas / scaling is intentionally left at Railway defaults.
+# Do not scale the Rust service until it is enabled and load-verified.

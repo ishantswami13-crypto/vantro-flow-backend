@@ -1,0 +1,52 @@
+# nixpacks.toml -- Vantro Automation RS (SEPARATE Railway service).
+#
+# This file builds ONLY the Rust Axum server binary. It is the build config
+# for the second Railway service ("vantro-automation"), NOT the Node backend.
+# The Node backend uses the repo-root nixpacks.toml (providers = ["node"]).
+#
+# Railway wiring (set in the Railway dashboard for the Rust service):
+#   - Root Directory      : repo root  (the workspace Cargo.toml, Cargo.lock,
+#                            and the committed .sqlx/ cache all live at root)
+#   - Config-as-code path : vantro-automation-rs/railway.toml
+#     (that railway.toml points nixpacksConfigPath at THIS file)
+#
+# See docs/rust-railway-deploy.md for the full dashboard setup.
+
+# Install the Rust toolchain. NIXPACKS auto-detects Cargo.toml at the repo
+# root; "rust" is listed explicitly so the build never silently falls back to
+# a Node build of the same repo.
+providers = ["rust"]
+
+[variables]
+# Offline SQLx build: read query metadata from the committed .sqlx/ cache.
+# The binary connects to Postgres only at RUNTIME, never at build time.
+# This must be true -- without it the sqlx::query! macros try to reach a
+# database during compilation and the build fails.
+SQLX_OFFLINE = "true"
+# Keep cargo output quiet-ish and deterministic.
+CARGO_TERM_COLOR = "always"
+
+[phases.build]
+cmds = [
+  # 1. Neutralise the committed .cargo/config.toml.
+  #    It pins target = "x86_64-pc-windows-gnu" for Windows developer
+  #    machines. On Railway's Linux builders that would cross-compile to
+  #    Windows and fail (no windows linker). Overwrite it inside the
+  #    ephemeral build container only -- the committed file is untouched in
+  #    git. This mirrors exactly what the CI workflows do.
+  "printf '# Overridden by Railway nixpacks -- Linux host target.\\n' > .cargo/config.toml",
+
+  # 2. Build the release binary with the server feature (axum + sqlx + tokio).
+  #    -p vantro-automation-rs selects the crate; the cortex-core binary is
+  #    NOT built here. SQLX_OFFLINE=true (above) makes this fully offline.
+  #    Output lands at target/release/vantro-automation (workspace shares
+  #    the root-level target/ directory).
+  "cargo build --release --features server -p vantro-automation-rs",
+]
+
+[start]
+# Run the compiled Axum server. It binds 0.0.0.0:$RUST_AUTOMATION_PORT
+# (default 3002, see src/config.rs). Railway sets PORT; if you want the
+# service to honour Railway's $PORT, set RUST_AUTOMATION_PORT=$PORT in the
+# service env (see docs/rust-railway-deploy.md).
+cmd = "./target/release/vantro-automation"
