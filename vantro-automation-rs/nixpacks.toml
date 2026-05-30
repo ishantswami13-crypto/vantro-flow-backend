@@ -53,7 +53,12 @@ cmds = [
   #    exact shell that runs cargo -- this has highest precedence and forces
   #    sqlx to read the committed .sqlx/ cache. The binary still connects to
   #    Postgres normally at RUNTIME.
-  "SQLX_OFFLINE=true cargo build --release --features server -p vantro-automation-rs",
+  #    CARGO_TERM_COLOR=always is ALSO pinned inline for the same reason: the
+  #    [variables] block is not reliably applied to cargo's process env, and
+  #    something in the Railway/nixpacks build injects an EMPTY CARGO_TERM_COLOR,
+  #    which makes cargo abort with "argument for --color must be auto, always,
+  #    or never, but found ''". Pinning a valid value inline overrides it.
+  "SQLX_OFFLINE=true CARGO_TERM_COLOR=always cargo build --release --features server -p vantro-automation-rs",
 ]
 
 [start]
