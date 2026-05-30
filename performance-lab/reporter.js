@@ -27,8 +27,11 @@ function printConsole(summary) {
 
   for (const r of summary.results) {
     const tag  = r.skipped ? 'SKIP' : r.pass ? 'PASS' : 'FAIL';
-    const dur  = r.skipped ? '---           ' :
-                 (r.p50_ms != null ? `${r.p50_ms}ms p50`.padEnd(14) : `${r.durationMs}ms`.padEnd(14));
+    // Prefer the server-compute metric (display_ms) when the lab captured it;
+    // else wall-clock p50. Suffix marks which kind so remote runs aren't misread.
+    const dur  = r.skipped ? '---           '
+               : (r.display_ms != null ? `${r.display_ms}ms svr`.padEnd(14)
+                  : (r.p50_ms != null ? `${r.p50_ms}ms p50`.padEnd(14) : `${r.durationMs}ms`.padEnd(14)));
     const kb   = r.skipped ? '---   ' : `${((r.payloadBytes || 0) / 1024).toFixed(1)}KB`.padEnd(6);
     const note = r.skipped ? (r.skip_reason || '') : (r.budget_note || '');
     console.log(`  ${tag.padEnd(4)}  ${r.name.padEnd(38)}  ${dur}  ${kb}  ${note}`);

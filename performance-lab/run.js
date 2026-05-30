@@ -92,10 +92,24 @@ async function runRustEndpoints(results, skipped_explanations) {
       skipped_explanations.push({ test: sc.name, reason: 'Set PERF_TEST_TOKEN (non-prod JWT).' });
       continue;
     }
+    if (sc.requires_db && cfg.skipDb) {
+      results.push({ name: sc.name, skipped: true, skip_reason: 'staging DB not migrated (PERF_SKIP_DB=true)' });
+      skipped_explanations.push({ test: sc.name, reason: 'Staging Postgres has no schema. Apply migrations to the staging DB to measure this DB-backed endpoint.' });
+      continue;
+    }
 
     const url = `${cfg.rustBaseUrl}${sc.path}`;
     const res = await multiRun(url, { method: sc.method, token: sc.requires_auth ? cfg.testToken : null, body: sc.body }, cfg.iterations);
-    const budget = evalBudget(res.p50_ms, sc.target_ms, sc.acceptable_ms, sc.name);
+
+    // Judge the budget on the service's OWN reported compute time when present
+    // (server_ms_median) — it excludes network RTT, the only honest way to
+    // assess Rust compute from a remote runner. Wall-clock p50 is still recorded
+    // and shown, but over the public internet it reflects network latency, not
+    // Rust. Fall back to wall-clock only when the endpoint reports no durationMs.
+    const hasServer  = res.server_ms_median != null;
+    const metric     = hasServer ? res.server_ms_median : res.p50_ms;
+    const metricKind = hasServer ? 'server-compute' : 'wall-clock';
+    const budget = evalBudget(metric, sc.target_ms, sc.acceptable_ms, sc.name);
 
     const payloadKB = (res.payloadBytes || 0) / 1024;
     const sizeOk = payloadKB <= (sc.payload_max_kb || 500);
@@ -106,7 +120,11 @@ async function runRustEndpoints(results, skipped_explanations) {
       skipped: false,
       pass,
       ...res,
-      budget_note: budget.budget_note + (sizeOk ? '' : ` | payload ${payloadKB.toFixed(1)}KB exceeds ${sc.payload_max_kb}KB`),
+      metric_kind: metricKind,
+      display_ms: metric,
+      budget_note: `[${metricKind}] ` + budget.budget_note
+        + (sizeOk ? '' : ` | payload ${payloadKB.toFixed(1)}KB > ${sc.payload_max_kb}KB`)
+        + (hasServer ? ` | wall p50 ${res.p50_ms}ms (network-bound from remote)` : ''),
       critical_failure: !pass,
     });
   }
@@ -287,17 +305,18 @@ async function main() {
   //   - Any live test failed → NO
   //   - All live Rust + wrapper pass → YES (staging only)
   //   Production requires additional canary + soak steps regardless.
-  const wrapperFailed = results.some(r => !r.skipped && r.critical_failure);
-  const liveRustMeasured = results.some(
-    r => !r.skipped && RUST_SCENARIOS.some(s => s.name === r.name)
-  );
+  const WRAPPER_NAMES = new Set(WRAPPER_SCENARIOS.map(s => s.name));
+  const RUST_NAMES    = new Set(RUST_SCENARIOS.map(s => s.name));
+  const wrapperFailed    = results.some(r => !r.skipped && r.critical_failure && WRAPPER_NAMES.has(r.name));
+  const rustEndpointFailed = results.some(r => !r.skipped && r.critical_failure && RUST_NAMES.has(r.name));
+  const liveRustMeasured = results.some(r => !r.skipped && RUST_NAMES.has(r.name));
   let safe_to_enable_rust;
   if (wrapperFailed) {
-    safe_to_enable_rust = 'NO — Node wrapper contract failed (do not enable Rust flag)';
+    safe_to_enable_rust = 'NO — Node wrapper fallback contract failed (do not enable Rust flag)';
   } else if (!liveRustMeasured) {
     safe_to_enable_rust = 'NO — live Rust endpoints not yet measured (run with PERF_RUN_LIVE=true + PERF_RUST_BASE_URL)';
-  } else if (failed > 0) {
-    safe_to_enable_rust = 'NO — live endpoint failures detected (see above)';
+  } else if (rustEndpointFailed || failed > 0) {
+    safe_to_enable_rust = 'NO — one or more live Rust endpoints missed budget (see above)';
   } else {
     safe_to_enable_rust = 'YES (staging only; production requires 24h soak + canary — see docs/rust-staging-live-test.md)';
   }

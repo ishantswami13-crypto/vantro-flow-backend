@@ -28,6 +28,10 @@ const cfg = {
   timeoutMs:      parseInt(process.env.PERF_TIMEOUT_MS  || '3000',  10),
   iterations:     parseInt(process.env.PERF_ITERATIONS  || '5',     10),
   requireNonProd: process.env.PERF_REQUIRE_NON_PROD !== 'false',
+  // When the live target's DB has no schema (fresh staging Postgres with no
+  // migrations applied), DB-backed endpoints cannot be measured. Set
+  // PERF_SKIP_DB=true to mark those SKIPPED (not PASS, not FAIL) with a reason.
+  skipDb:         process.env.PERF_SKIP_DB === 'true',
 };
 
 if (cfg.requireNonProd) {
