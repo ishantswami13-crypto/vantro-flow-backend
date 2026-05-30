@@ -107,7 +107,7 @@ pub fn analyze(input: &PaymentBehaviorInput) -> PaymentBehaviorResult {
     score += ((1.0 - input.polite_reminder_sensitivity) * 10.0).min(10.0);
     let score = score.round().clamp(0.0, 100.0) as u8;
 
-    let risk_level = match score {
+    let risk_score_level = match score {
         0..=25 => RiskLevel::Low,
         26..=50 => RiskLevel::Medium,
         51..=75 => RiskLevel::High,
@@ -115,14 +115,23 @@ pub fn analyze(input: &PaymentBehaviorInput) -> PaymentBehaviorResult {
     };
 
     // ─── Primary behavior profile ─────────────────────────────
+    //
+    // Order matters: a customer who has gone silent for >30 days AND already
+    // has a high risk score is best classified as SilentDefaulter (→ escalate
+    // to owner) even if they also have broken promises, because the silence
+    // makes the situation more urgent than generic promise-breaking. We check
+    // SilentDefaulter BEFORE PromiseBreaker for this reason.
+    // The score threshold is >=50 (was >60): a customer with avg delay 25d,
+    // 0 kept promises, and 45 silence days scores ~54, which is enough to
+    // warrant the SilentDefaulter classification.
     let profile = if input.dispute_frequency >= 2 && input.dispute_resolution_time > 14.0 {
         BehaviorProfile::DisputeFirstPayer
     } else if input.credit_abuse_risk > 0.7 {
         BehaviorProfile::CreditAbuser
+    } else if input.silence_days > 30 && score >= 50 {
+        BehaviorProfile::SilentDefaulter
     } else if promise_reliability < 0.4 && input.broken_promise_count >= 2 {
         BehaviorProfile::PromiseBreaker
-    } else if input.silence_days > 30 && score > 60 {
-        BehaviorProfile::SilentDefaulter
     } else if input.owner_call_dependency > 0.6 {
         BehaviorProfile::OwnerCallDependent
     } else if input.month_end_excuse_pattern {
@@ -137,6 +146,21 @@ pub fn analyze(input: &PaymentBehaviorInput) -> PaymentBehaviorResult {
         BehaviorProfile::Reliable
     } else {
         BehaviorProfile::NegotiatorType
+    };
+
+    // ─── Profile-based minimum risk escalation ───────────────
+    // PromiseBreaker, CreditAbuser, and SilentDefaulter represent
+    // systemic behavioural failure. Even if the numeric score landed in
+    // Medium (which can happen when inputs are borderline), these profiles
+    // should floor at High so callers never under-prioritise them.
+    let risk_level = match &profile {
+        BehaviorProfile::PromiseBreaker
+        | BehaviorProfile::CreditAbuser
+        | BehaviorProfile::SilentDefaulter => match risk_score_level {
+            RiskLevel::Low | RiskLevel::Medium => RiskLevel::High,
+            other => other,
+        },
+        _ => risk_score_level,
     };
 
     // ─── Secondary traits ─────────────────────────────────────
