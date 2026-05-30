@@ -1,0 +1,177 @@
+name: Rust SQLx Validation
+
+# Validates every sqlx::query! macro in vantro-automation-rs against a real
+# Postgres schema using an ephemeral CI database. No production credentials
+# are used. The schema applied is db/sqlx-test-schema.sql -- a minimal
+# standalone DDL maintained separately from the production migrations.
+#
+# What this workflow proves when green:
+#   - Every sqlx::query! macro resolves against the expected table/column types.
+#   - cargo sqlx prepare --workspace generates a valid .sqlx/ offline cache.
+#   - The vantro-automation-rs server feature compiles against that cache.
+#   - The .sqlx/ artifact is uploaded for human review and commit.
+#
+# What this workflow does NOT do:
+#   - Does NOT connect to the production Supabase database.
+#   - Does NOT commit .sqlx/ automatically. A human must download the artifact,
+#     review it, and commit it as 'chore: add SQLx offline cache'.
+#   - Does NOT enable RUST_AUTOMATION_API_ENABLED.
+#   - Does NOT deploy anything.
+#   - Does NOT run live harness or integration tests against real data.
+#
+# After .sqlx/ is committed, the verify-server-feature-build job in
+# rust-automation-ci.yml will activate automatically (it is gated on
+# hashFiles('.sqlx/**') != '').
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  sqlx-validate-rust-server:
+    name: SQLx prepare + server-feature build (ephemeral Postgres)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER:     postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB:       vantro_sqlx_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd   "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout  5s
+          --health-retries  5
+
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/vantro_sqlx_test
+      SQLX_OFFLINE: "false"
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: short
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Override workspace cargo target for Linux runner
+        # The committed .cargo/config.toml pins target = x86_64-pc-windows-gnu.
+        # On Linux CI the native host triple must be used.
+        run: |
+          printf '# Overridden in CI -- Linux host target.\n' > .cargo/config.toml
+
+      - name: Cache cargo registry + build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-sqlx-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            rust-sqlx-${{ runner.os }}-
+
+      - name: Cache sqlx-cli binary
+        id: cache-sqlx-cli
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/sqlx
+          key: sqlx-cli-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install sqlx-cli (if not cached)
+        if: steps.cache-sqlx-cli.outputs.cache-hit != 'true'
+        # No --locked: sqlx-cli is not in the workspace Cargo.lock.
+        # No version pin: the sqlx library (0.8.x) is compatible with
+        # the latest sqlx-cli 0.8.x for the prepare command.
+        run: |
+          cargo install sqlx-cli \
+            --no-default-features \
+            --features rustls,postgres
+
+      - name: Wait for Postgres to be ready
+        run: |
+          until pg_isready -h localhost -p 5432 -U postgres; do
+            echo "waiting for postgres..."
+            sleep 2
+          done
+          echo "postgres is ready"
+
+      - name: Apply SQLx test schema
+        # This applies db/sqlx-test-schema.sql -- a minimal CI-only schema.
+        # It does NOT use production migrations or the full supabase-schema.sql.
+        # See db/sqlx-test-schema.sql for the rationale and column inventory.
+        run: |
+          psql "$DATABASE_URL" -f db/sqlx-test-schema.sql
+          echo "schema applied"
+
+      - name: Verify schema tables exist
+        # Belt-and-suspenders: confirm every table the Rust queries use was created.
+        run: |
+          TABLES="users customers invoices purchases products ai_actions promises call_logs"
+          for t in $TABLES; do
+            COUNT=$(psql "$DATABASE_URL" -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_name='$t' AND table_schema='public';" | tr -d ' ')
+            if [ "$COUNT" != "1" ]; then
+              echo "MISSING TABLE: $t"
+              exit 1
+            fi
+            echo "  table $t: OK"
+          done
+
+      - name: cargo sqlx prepare --workspace (generates .sqlx/ cache)
+        # Runs a check-build of the server feature so sqlx can introspect
+        # every query! macro against the live Postgres schema.
+        # The -- --features server passes the feature flag to the inner cargo
+        # invocation that sqlx-cli orchestrates.
+        run: |
+          cargo sqlx prepare --workspace -- --features server
+          echo "sqlx prepare complete"
+
+      - name: Verify .sqlx/ was generated
+        run: |
+          if [ ! -d .sqlx ]; then
+            echo "ERROR: .sqlx/ directory was not created by cargo sqlx prepare"
+            exit 1
+          fi
+          echo "=== .sqlx/ contents ==="
+          find .sqlx -type f | sort
+          echo "=== file count ==="
+          find .sqlx -type f | wc -l
+
+      - name: cargo build --profile ci-release --features server
+        # Verify the server feature compiles with SQLX_OFFLINE=true and the
+        # freshly generated .sqlx/ cache. Uses [profile.ci-release] from
+        # Cargo.toml (inherits release but skips LTO + uses 8 codegen-units)
+        # to keep CI build time reasonable. Railway production builds use
+        # [profile.release] with full LTO -- that is NOT what this step tests.
+        # This step only proves: "the code compiles against the offline cache."
+        env:
+          SQLX_OFFLINE: "true"
+        run: |
+          cargo build --profile ci-release \
+            --features server \
+            -p vantro-automation-rs
+
+      - name: Upload .sqlx/ as artifact
+        # Upload the generated offline cache for human review.
+        # A developer should:
+        #   1. Download this artifact from the CI run.
+        #   2. Unzip and inspect the JSON query metadata files.
+        #   3. Commit the .sqlx/ directory as:
+        #        chore: add SQLx offline cache for Rust automation
+        #   4. After that commit, the verify-server-feature-build job in
+        #      rust-automation-ci.yml will activate automatically.
+        # See docs/rust-sqlx-validation.md for the full process.
+        uses: actions/upload-artifact@v4
+        with:
+          name: sqlx-offline-cache
+          path: .sqlx/
+          retention-days: 14
+          if-no-files-found: error

@@ -1,5 +1,17 @@
 # Root workspace — makes `cargo build` discoverable by Railway NIXPACKS.
-# The only member is cortex-core-rs; all other Rust crates must be listed here.
+# The only members are cortex-core-rs and vantro-automation-rs.
 [workspace]
 members  = ["cortex-core-rs", "vantro-automation-rs"]
 resolver = "2"
+
+# ── CI build profile ────────────────────────────────────────────────────────
+# Used in GitHub Actions SQLx validation to produce a linkable binary faster
+# than [profile.release] (which has lto=thin + codegen-units=1).
+# Railway NIXPACKS always uses `--release`; this profile is for CI only.
+# Invoke with: cargo build --profile ci-release ...
+[profile.ci-release]
+inherits      = "release"
+opt-level     = 1          # faster compile, still checks unsafe
+lto           = false      # skip LTO → big speedup on CI
+codegen-units = 8          # parallelise across cores
+strip         = false      # easier debugging if CI binary is inspected
