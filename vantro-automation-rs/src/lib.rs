@@ -3,6 +3,7 @@
 // Modules here have ZERO C dependencies — testable on Windows, Linux, CI without toolchain.
 // The server binary (main.rs) adds axum/sqlx/tokio behind the `server` feature flag.
 
+pub mod agents;
 pub mod cache;
 pub mod cashops;
 pub mod cortex;
