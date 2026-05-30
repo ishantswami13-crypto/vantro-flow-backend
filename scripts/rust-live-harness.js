@@ -232,7 +232,17 @@ async function main() {
   {
     const r = await call('/api/v2/cortex/cost-route', {
       method: 'POST', token: TOKEN_A,
-      body: { task_type: 'score_customer', input_tokens_estimate: 100, output_tokens_estimate: 50, accuracy_required: 'medium' },
+      // is_cacheable + batch_eligible are required bool fields on CostRouteInput
+      // (no serde default) -- the real Node client always sends them. Omitting
+      // them yields 422. Match the client contract.
+      body: {
+        task_type: 'score_customer',
+        input_tokens_estimate: 100,
+        output_tokens_estimate: 50,
+        accuracy_required: 'medium',
+        is_cacheable: false,
+        batch_eligible: false,
+      },
     });
     const res = r.json && r.json.result;
     const ok = r.status === 200 && res && res.route_decision === 'rules_only' && res.estimated_cost_usd === 0;
