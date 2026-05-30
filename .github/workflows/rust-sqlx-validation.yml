@@ -164,16 +164,23 @@ jobs:
           cargo clean -p vantro-automation-rs
           echo "cleaned vantro-automation-rs build artifacts to force macro re-expansion"
 
-      - name: cargo sqlx prepare (generates .sqlx/ cache)
-        # Per-package prepare for the only crate that contains sqlx::query!
-        # macros (cortex-core has none). -- --features server enables the
-        # server feature so the bin (required-features = ["server"]) and its
-        # db::queries module compile, letting sqlx introspect all 8 queries
-        # against the live Postgres schema and write query-*.json files.
+      - name: cargo sqlx prepare --workspace (generates .sqlx/ cache)
+        # Workspace prepare. `cargo sqlx prepare` does NOT accept -p directly
+        # (it errors "unexpected argument '-p'"); package/cargo selectors must
+        # go AFTER `--`. --workspace is a valid sqlx flag and writes the merged
+        # .sqlx/ at the workspace root -- exactly where the offline build (step
+        # 16) looks. cortex-core has no sqlx macros, so the workspace prepare
+        # only produces cache entries for vantro-automation-rs.
+        #
+        # The preceding "Force-clean vantro-automation-rs" step is what makes
+        # this actually populate the cache: it guarantees the query! macros
+        # re-expand during this prepare's compile so query-*.json files are
+        # written. --features server enables the bin (required-features) and
+        # its db::queries module so all 8 queries are introspected.
         shell: bash
         run: |
           set +e
-          cargo sqlx prepare -p vantro-automation-rs -- --features server 2>&1 | tee /tmp/sqlx-prepare.log
+          cargo sqlx prepare --workspace -- --features server 2>&1 | tee /tmp/sqlx-prepare.log
           EXIT=${PIPESTATUS[0]}
           echo "sqlx-prepare-exit=$EXIT"
           if [ $EXIT -ne 0 ]; then
