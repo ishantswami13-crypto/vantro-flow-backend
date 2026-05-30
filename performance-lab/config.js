@@ -32,4 +32,16 @@ if (cfg.requireNonProd) {
   }
 }
 
+// If live mode is explicitly requested but no targets are configured, error
+// immediately rather than silently skipping everything.
+if (cfg.runLive && !cfg.rustBaseUrl && !cfg.nodeBaseUrl) {
+  console.error('[perf] ERROR: PERF_RUN_LIVE=true but neither PERF_RUST_BASE_URL nor PERF_NODE_BASE_URL is set. Nothing to test live. Set at least one base URL (non-prod).');
+  process.exit(1);
+}
+
+// Warn (not error) if live mode on but Rust URL specifically missing.
+if (cfg.runLive && !cfg.rustBaseUrl) {
+  console.warn('[perf] WARNING: PERF_RUN_LIVE=true but PERF_RUST_BASE_URL not set — Rust endpoint tests will be skipped. Set PERF_RUST_BASE_URL to a non-prod Rust sidecar URL to measure live.');
+}
+
 module.exports = cfg;

@@ -281,11 +281,26 @@ async function main() {
   const skipped  = results.filter(r => r.skipped).length;
   const critical = measured.filter(r => r.critical_failure).length;
 
-  // Rust can be safely enabled in staging when:
-  //   - All measured wrapper tests pass (Node fallback contract intact)
-  //   - No critical failures
+  // safe_to_enable_rust is conservative by design:
+  //   - Offline mode (live not measured) → always NO
+  //   - Wrapper contract failed → always NO (critical safety gate)
+  //   - Any live test failed → NO
+  //   - All live Rust + wrapper pass → YES (staging only)
+  //   Production requires additional canary + soak steps regardless.
   const wrapperFailed = results.some(r => !r.skipped && r.critical_failure);
-  const safe_to_enable_rust = !wrapperFailed && failed === 0 ? 'YES' : 'NO (see failures above)';
+  const liveRustMeasured = results.some(
+    r => !r.skipped && RUST_SCENARIOS.some(s => s.name === r.name)
+  );
+  let safe_to_enable_rust;
+  if (wrapperFailed) {
+    safe_to_enable_rust = 'NO — Node wrapper contract failed (do not enable Rust flag)';
+  } else if (!liveRustMeasured) {
+    safe_to_enable_rust = 'NO — live Rust endpoints not yet measured (run with PERF_RUN_LIVE=true + PERF_RUST_BASE_URL)';
+  } else if (failed > 0) {
+    safe_to_enable_rust = 'NO — live endpoint failures detected (see above)';
+  } else {
+    safe_to_enable_rust = 'YES (staging only; production requires 24h soak + canary — see docs/rust-staging-live-test.md)';
+  }
 
   // Recommendations
   const recs = [];
@@ -294,7 +309,9 @@ async function main() {
   for (const w of wrapperResults) {
     if (w.p50_ms > 300) recs.push(`${w.name}: p50=${w.p50_ms}ms — investigate Node overhead.`);
   }
-  if (failed === 0 && skipped > 0) recs.push('All measured tests passed. To measure Rust + Node live paths, set PERF_RUN_LIVE=true + PERF_RUST_BASE_URL + PERF_NODE_BASE_URL + PERF_TEST_TOKEN.');
+  if (!liveRustMeasured) {
+    recs.push('Live Rust endpoints not measured. Follow docs/rust-staging-live-test.md to deploy staging and run: PERF_RUN_LIVE=true PERF_RUST_BASE_URL=<staging> npm run perf:test');
+  }
   if (failed > 0) recs.push('Fix failed tests before enabling Rust in any environment.');
 
   const summary = {
