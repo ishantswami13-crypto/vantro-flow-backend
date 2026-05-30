@@ -1,0 +1,36 @@
+---
+name: Node — Rust fallback matrix + backend verification
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  node-fallback-gate:
+    name: "Node: rust fallback (8 cases) + check + cortex"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: npm
+
+      - name: Install Node deps
+        run: npm ci --omit=dev
+
+      - name: Rust fallback matrix (8 cases — must all pass)
+        run: npm run test:rust-fallback
+
+      - name: Server syntax check
+        run: npm run check
+
+      - name: Cortex harness static (no DB)
+        run: npm run cortex:test
+
+      - name: Secret scan
+        run: npm run security:secrets
+---

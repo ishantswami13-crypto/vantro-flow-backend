@@ -32,7 +32,8 @@
     "rust:test:all":       "cargo test -- --nocapture",
     "rust:build:all":      "cargo build --release",
     "rust:check:all":      "cargo check",
-    "perf:test":           "node performance-lab/run.js"
+    "perf:test":           "node performance-lab/run.js",
+    "test:rust-fallback":  "node scripts/test-rust-automation-fallback.js"
   },
   "engines": {
     "node": ">=18.0.0"
