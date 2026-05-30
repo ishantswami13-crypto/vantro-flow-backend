@@ -1,0 +1,47 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run cortex:test*)",
+      "Bash(npm run cortex:rust:*)",
+      "Bash(npm run automation:*)",
+      "Bash(npm run rust:*)",
+      "Bash(npm run security:smoke)",
+      "Bash(npm run security:secrets)",
+      "Bash(npm run security:cross-user)",
+      "Bash(npm run security:audit)",
+      "Bash(npm run perf:test)",
+      "Bash(npm run check)",
+      "Bash(npm run dev)",
+      "Bash(npm run start)",
+      "Bash(node --check server.js)",
+      "Bash(node cortex-lab/run.js*)",
+      "Bash(node scripts/security-smoke-test.js)",
+      "Bash(node scripts/security-secret-scan.js)",
+      "Bash(node scripts/cross-user-security-test.js)",
+      "Bash(node scripts/rust-live-harness.js)",
+      "Bash(node performance-lab/run.js)",
+      "Bash(cargo check*)",
+      "Bash(cargo test*)",
+      "Bash(cargo build*)",
+      "Bash(cargo fmt*)",
+      "Bash(cargo clippy*)",
+      "Bash(git log*)",
+      "Bash(git diff*)",
+      "Bash(git status)",
+      "Bash(git branch*)",
+      "Bash(git show*)",
+      "Read(I:/Vantro/vantro-flow-backend/**)",
+      "Read(I:/Vantro/vantro-flow-frontend/**)",
+      "Read(I:/Vantro/vantro-cortex-lab/**)"
+    ],
+    "deny": [
+      "Bash(rm -rf*)",
+      "Bash(*--force-push*)",
+      "Bash(git push --force*)",
+      "Bash(git reset --hard*)",
+      "Bash(*DROP TABLE*)",
+      "Bash(*DELETE FROM*)",
+      "Bash(*TRUNCATE*)"
+    ]
+  }
+}
