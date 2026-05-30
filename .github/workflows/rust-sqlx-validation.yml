@@ -83,18 +83,42 @@ jobs:
         id: cache-sqlx-cli
         uses: actions/cache@v4
         with:
-          path: ~/.cargo/bin/sqlx
-          key: sqlx-cli-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          # sqlx-cli installs TWO binaries: `sqlx` (standalone) and
+          # `cargo-sqlx` (the cargo subcommand that `cargo sqlx prepare`
+          # actually invokes). The previous cache only saved `sqlx`, so on a
+          # cache HIT the install step was skipped and `cargo-sqlx` was
+          # missing -> "error: no such command: sqlx". Both must be cached.
+          # Cache key bumped to -v2 to invalidate the old single-binary cache.
+          path: |
+            ~/.cargo/bin/sqlx
+            ~/.cargo/bin/cargo-sqlx
+          key: sqlx-cli-v2-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Install sqlx-cli (if not cached)
         if: steps.cache-sqlx-cli.outputs.cache-hit != 'true'
         # No --locked: sqlx-cli is not in the workspace Cargo.lock.
         # No version pin: the sqlx library (0.8.x) is compatible with
         # the latest sqlx-cli 0.8.x for the prepare command.
+        # Installs both `sqlx` and `cargo-sqlx` into ~/.cargo/bin.
         run: |
           cargo install sqlx-cli \
             --no-default-features \
             --features rustls,postgres
+          echo "installed binaries:"
+          ls -la ~/.cargo/bin/sqlx ~/.cargo/bin/cargo-sqlx
+
+      - name: Verify cargo-sqlx is available
+        # Guard against the cache-hit-missing-cargo-sqlx failure mode.
+        # If the cache restored only `sqlx` (old cache) or cargo-sqlx is
+        # otherwise absent, fail here with a clear message instead of a
+        # confusing "no such command" deep in the prepare step.
+        run: |
+          if ! command -v cargo-sqlx >/dev/null 2>&1; then
+            echo "::error title=sqlx-cli::cargo-sqlx binary not found on PATH; cache restored an incomplete sqlx-cli"
+            ls -la ~/.cargo/bin/ || true
+            exit 1
+          fi
+          cargo sqlx --version
 
       - name: Wait for Postgres to be ready
         run: |
