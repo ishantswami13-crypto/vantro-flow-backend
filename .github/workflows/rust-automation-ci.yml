@@ -167,10 +167,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: verify-pure-rust
-    # Activates only when the committed .sqlx/ offline cache exists. Before
-    # the cache was committed this job was absent; it is now a permanent gate.
-    # If .sqlx/ is ever deleted, this job auto-skips rather than failing.
-    if: ${{ hashFiles('.sqlx/**') != '' }}
+    # Permanent gate, active now that the .sqlx/ offline cache is committed.
+    # NOTE: this job intentionally does NOT use `if: hashFiles('.sqlx/**')`.
+    # hashFiles() is not reliably supported in a job-level `if:` (it evaluates
+    # before the runner checks out the repo) and caused the whole workflow to
+    # fail YAML validation at startup. Instead, a guard step below checks for
+    # the cache after checkout and fails with a clear message if it is missing.
     env:
       # Offline build: read query metadata from the committed .sqlx/ cache.
       # No database connection at build time. This mirrors the Railway
@@ -179,6 +181,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Guard - committed .sqlx/ cache must be present
+        # Clear, early failure if the offline cache was removed. Without this
+        # the cargo build would still fail, but with a less obvious
+        # "no cached data for this query" deep in the compile output.
+        run: |
+          COUNT=$(find .sqlx -maxdepth 1 -type f -name "query-*.json" 2>/dev/null | wc -l | tr -d ' ')
+          echo "committed .sqlx query files: $COUNT"
+          if [ "$COUNT" = "0" ]; then
+            echo "::error title=missing-sqlx-cache::No .sqlx/query-*.json files committed. Regenerate via the rust-sqlx-validation workflow and commit the offline cache before this gate can pass."
+            exit 1
+          fi
 
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
