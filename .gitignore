@@ -23,3 +23,21 @@ cortex-core-rs/target/
 # Compiled binary (built by CI/Railway, do not commit)
 /bin/cortex-core
 /bin/cortex-core.exe
+
+# Cortex Harness X — keep latest snapshots, ignore per-run artefacts
+cortex-lab/results/*
+!cortex-lab/results/.gitkeep
+!cortex-lab/results/latest.json
+cortex-lab/reports/*
+!cortex-lab/reports/.gitkeep
+!cortex-lab/reports/latest.md
+
+# Performance Lab — keep latest snapshots, ignore per-run artefacts
+performance-lab/results/*
+!performance-lab/results/.gitkeep
+!performance-lab/results/latest.json
+performance-lab/reports/*
+!performance-lab/reports/.gitkeep
+!performance-lab/reports/latest.md
+# Old single-file report from legacy run.js
+performance-lab/report.md

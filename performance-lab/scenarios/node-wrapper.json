@@ -1,0 +1,52 @@
+[
+  {
+    "id":          "wrapper_disabled",
+    "name":        "Wrapper: flag disabled fallback",
+    "mode":        "disabled",
+    "expected_code": "rust_disabled_fallback",
+    "expected_null": true,
+    "target_ms":   20,
+    "acceptable_ms": 50,
+    "note":        "RUST_AUTOMATION_API_ENABLED=false — should return null in microseconds"
+  },
+  {
+    "id":          "wrapper_missing_url",
+    "name":        "Wrapper: missing base URL fallback",
+    "mode":        "missing_url",
+    "expected_code": "rust_missing_base_url_fallback",
+    "expected_null": true,
+    "target_ms":   20,
+    "acceptable_ms": 50,
+    "note":        "flag=true but RUST_AUTOMATION_BASE_URL unset — should return null in microseconds"
+  },
+  {
+    "id":          "wrapper_conn_refused",
+    "name":        "Wrapper: connection refused fallback",
+    "mode":        "conn_refused",
+    "expected_code": "rust_connection_failed_fallback",
+    "expected_null": true,
+    "target_ms":   50,
+    "acceptable_ms": 300,
+    "note":        "TCP connection refused — OS rejects immediately; usually < 10ms"
+  },
+  {
+    "id":          "wrapper_timeout",
+    "name":        "Wrapper: timeout fallback (250ms override)",
+    "mode":        "timeout",
+    "expected_code": "rust_timeout_fallback",
+    "expected_null": true,
+    "target_ms":   260,
+    "acceptable_ms": 400,
+    "note":        "AbortController fires at 250ms test override; real prod budget is 8000ms"
+  },
+  {
+    "id":          "wrapper_valid_response",
+    "name":        "Wrapper: valid response overhead",
+    "mode":        "valid_response",
+    "expected_code": "rust_call_success",
+    "expected_null": false,
+    "target_ms":   20,
+    "acceptable_ms": 50,
+    "note":        "Round-trip to ephemeral localhost server — measures Node wrapper overhead excluding real Rust compute"
+  }
+]

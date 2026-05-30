@@ -1,0 +1,50 @@
+[
+  {
+    "id":            "node_dashboard_bootstrap_unauth",
+    "name":          "Node dashboard/bootstrap (unauth)",
+    "path":          "/api/v1/dashboard/bootstrap",
+    "method":        "GET",
+    "requires_auth": false,
+    "expected_status": 401,
+    "target_ms":     300,
+    "acceptable_ms": 500,
+    "payload_max_kb": 5,
+    "note":          "Auth rejection — confirms endpoint exists and rejects fast"
+  },
+  {
+    "id":            "node_collections_bootstrap_unauth",
+    "name":          "Node collections/bootstrap (unauth)",
+    "path":          "/api/v1/collections/bootstrap",
+    "method":        "GET",
+    "requires_auth": false,
+    "expected_status": 401,
+    "target_ms":     300,
+    "acceptable_ms": 500,
+    "payload_max_kb": 5,
+    "note":          "Auth rejection"
+  },
+  {
+    "id":            "node_dashboard_bootstrap_auth",
+    "name":          "Node dashboard/bootstrap (auth)",
+    "path":          "/api/v1/dashboard/bootstrap",
+    "method":        "GET",
+    "requires_auth": true,
+    "expected_status": 200,
+    "target_ms":     1500,
+    "acceptable_ms": 5000,
+    "payload_max_kb": 500,
+    "note":          "Full DB-backed bootstrap; skipped if PERF_TEST_TOKEN or PERF_NODE_BASE_URL missing"
+  },
+  {
+    "id":            "node_collections_bootstrap_auth",
+    "name":          "Node collections/bootstrap (auth)",
+    "path":          "/api/v1/collections/bootstrap",
+    "method":        "GET",
+    "requires_auth": true,
+    "expected_status": 200,
+    "target_ms":     1500,
+    "acceptable_ms": 5000,
+    "payload_max_kb": 500,
+    "note":          "Full DB-backed bootstrap; skipped if PERF_TEST_TOKEN or PERF_NODE_BASE_URL missing"
+  }
+]

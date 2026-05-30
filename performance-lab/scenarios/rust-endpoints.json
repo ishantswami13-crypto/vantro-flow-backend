@@ -1,0 +1,118 @@
+[
+  {
+    "id":            "rust_health",
+    "name":          "Rust /health",
+    "path":          "/health",
+    "method":        "GET",
+    "body":          null,
+    "requires_auth": false,
+    "requires_db":   false,
+    "target_ms":     50,
+    "acceptable_ms": 150,
+    "payload_max_kb": 1
+  },
+  {
+    "id":            "rust_score_customer",
+    "name":          "Rust score-customer",
+    "path":          "/api/v2/cortex/score-customer",
+    "method":        "POST",
+    "body":          { "customer_id": "perf-test-customer-001" },
+    "requires_auth": true,
+    "requires_db":   true,
+    "target_ms":     100,
+    "acceptable_ms": 250,
+    "payload_max_kb": 10
+  },
+  {
+    "id":            "rust_calculate_cpi",
+    "name":          "Rust calculate-cpi",
+    "path":          "/api/v2/cortex/calculate-cpi",
+    "method":        "POST",
+    "body":          { "customer_id": "perf-test-customer-001", "business_cash_pressure": 0.3 },
+    "requires_auth": true,
+    "requires_db":   true,
+    "target_ms":     100,
+    "acceptable_ms": 250,
+    "payload_max_kb": 10
+  },
+  {
+    "id":            "rust_simulate_credit_sale",
+    "name":          "Rust simulate-credit-sale",
+    "path":          "/api/v2/cortex/simulate-credit-sale",
+    "method":        "POST",
+    "body":          {
+      "customer_id":         "perf-test-customer-001",
+      "new_sale_amount":     50000,
+      "current_outstanding": 25000,
+      "overdue_amount":      10000,
+      "broken_promises":     1,
+      "average_delay_days":  15,
+      "credit_limit":        100000
+    },
+    "requires_auth": true,
+    "requires_db":   true,
+    "target_ms":     150,
+    "acceptable_ms": 300,
+    "payload_max_kb": 10
+  },
+  {
+    "id":            "rust_evaluate_policy",
+    "name":          "Rust evaluate-policy",
+    "path":          "/api/v2/cortex/evaluate-policy",
+    "method":        "POST",
+    "body":          {
+      "action_type":   "SEND_POLITE_REMINDER",
+      "amount":        50000,
+      "risk_level":    "medium",
+      "customer_id":   "perf-test-customer-001"
+    },
+    "requires_auth": true,
+    "requires_db":   false,
+    "target_ms":     50,
+    "acceptable_ms": 150,
+    "payload_max_kb": 5
+  },
+  {
+    "id":            "rust_cost_route",
+    "name":          "Rust cost-route",
+    "path":          "/api/v2/cortex/cost-route",
+    "method":        "POST",
+    "body":          {
+      "task_type":              "rule_evaluation",
+      "input_tokens_estimate":  100,
+      "output_tokens_estimate": 100,
+      "accuracy_required":      "medium",
+      "is_cacheable":           false,
+      "batch_eligible":         false
+    },
+    "requires_auth": true,
+    "requires_db":   false,
+    "target_ms":     50,
+    "acceptable_ms": 150,
+    "payload_max_kb": 5
+  },
+  {
+    "id":            "rust_dashboard_bootstrap",
+    "name":          "Rust dashboard/bootstrap",
+    "path":          "/api/v2/dashboard/bootstrap",
+    "method":        "GET",
+    "body":          null,
+    "requires_auth": true,
+    "requires_db":   true,
+    "target_ms":     200,
+    "acceptable_ms": 1500,
+    "payload_max_kb": 500
+  },
+  {
+    "id":            "rust_collections_bootstrap",
+    "name":          "Rust collections/bootstrap",
+    "path":          "/api/v2/collections/bootstrap",
+    "method":        "GET",
+    "body":          null,
+    "requires_auth": true,
+    "requires_db":   true,
+    "target_ms":     200,
+    "acceptable_ms": 1500,
+    "payload_max_kb": 500
+  }
+]
