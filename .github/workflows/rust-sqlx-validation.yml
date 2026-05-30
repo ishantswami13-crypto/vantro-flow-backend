@@ -130,9 +130,27 @@ jobs:
         # every query! macro against the live Postgres schema.
         # The -- --features server passes the feature flag to the inner cargo
         # invocation that sqlx-cli orchestrates.
+        shell: bash
         run: |
-          cargo sqlx prepare --workspace -- --features server
-          echo "sqlx prepare complete"
+          set +e
+          cargo sqlx prepare --workspace -- --features server 2>&1 | tee /tmp/sqlx-prepare.log
+          EXIT=${PIPESTATUS[0]}
+          echo "sqlx-prepare-exit=$EXIT"
+          if [ $EXIT -ne 0 ]; then
+            echo "=== last 60 lines of sqlx prepare output ==="
+            tail -60 /tmp/sqlx-prepare.log
+            # Surface key error lines as annotations
+            grep -E "^error|^thread|panicked|FAILED|could not|missing|no such" /tmp/sqlx-prepare.log | head -10 \
+              | while IFS= read -r line; do
+                  echo "::error title=sqlx-prepare::${line}"
+                done
+            # Also try just the last 5 non-blank lines as a fallback
+            tail -20 /tmp/sqlx-prepare.log | grep -v '^$' | tail -5 \
+              | while IFS= read -r line; do
+                  echo "::warning title=sqlx-tail::${line}"
+                done
+          fi
+          exit $EXIT
 
       - name: Verify .sqlx/ was generated
         run: |
