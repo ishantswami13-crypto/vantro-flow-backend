@@ -6,17 +6,33 @@ This file defines mandatory behavior rules for Claude Code when operating as Van
 
 ---
 
+## Rule 0 — Read Routing Files First
+
+Before anything else, read these files in order:
+1. `.claude/signal-map.md` — file-path based routing (highest precision)
+2. `.claude/risk-matrix.md` — calculate risk score
+3. `.claude/speed-tracks.md` — select FAST / STANDARD / ESCALATED
+4. `.claude/preflight.md` — run 10-point pre-flight
+5. `.claude/agent-router.md` — activate correct agents
+6. `.claude/agent-council.md` — collaborate and produce one plan
+
+Then proceed. Never skip this sequence for STANDARD or ESCALATED tasks.
+
+---
+
 ## Rule 1 — Inspect Before Implement
 
 **Claude Code must not implement first.**
 
 Before editing any file:
-1. Read the relevant files in the task domain
-2. Read `.claude/agent-router.md` to select agents
-3. Read `.claude/task-classifier.md` to classify the task
-4. Read `.claude/escalation-rules.md` if risk is high/critical
-5. Produce a safe plan
-6. Only then implement
+1. Run pre-flight (preflight.md)
+2. Calculate risk score (risk-matrix.md)
+3. Select speed track (speed-tracks.md)
+4. Read relevant files in the task domain
+5. Activate agents (agent-router.md via signal-map.md)
+6. Run agent council (agent-council.md) for STANDARD/ESCALATED
+7. Produce safe plan
+8. Only then implement
 
 No exceptions. A plan without inspection is not a plan.
 
@@ -132,6 +148,24 @@ Only use these words for verification status:
 | `BLOCKED` | Cannot run — dependency missing (e.g. live env not set up) |
 
 Never say "looks good", "should be fine", "probably passes". Run it. State the result.
+
+---
+
+## Rule 8a — "Done" Definition
+
+A task is **DONE** when ALL of the following are true:
+- [ ] Implementation matches the original intent (not scope-crept)
+- [ ] All selected proof gates have run and returned PASS (not SKIPPED)
+- [ ] `git diff --name-only` shows only the files that were supposed to change
+- [ ] No unintended files staged or committed
+- [ ] Final report output with risks remaining, safe to deploy, next action
+- [ ] If ESCALATED: escalation verdict issued with rollback plan
+
+A task is **NOT DONE** when:
+- A proof gate is FAIL and not yet fixed
+- Unrelated files are staged
+- The implementation drifted from the original plan
+- "I think it works" without running the proof gate
 
 ---
 

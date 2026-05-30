@@ -38,6 +38,27 @@ Before every meaningful task, Claude Code classifies the task and outputs a stru
 
 ---
 
+## Risk Score (from risk-matrix.md)
+
+Calculate numeric score before classifying. Score determines track:
+- **0–25** → FAST TRACK ⚡
+- **26–60** → STANDARD TRACK
+- **61+** → ESCALATED TRACK ⚠️
+
+Include the score in every classification output.
+
+---
+
+## Speed Track Summary
+
+| Track | Protocol | Agents | Proof Gates |
+|-------|---------|--------|------------|
+| FAST ⚡ | Classify → inspect 1-2 files → implement → 1 check | Lead only | `node --check` or `npm run lint` |
+| STANDARD | Full classify → agents → inspect → plan → implement → gates | 3-5 agents | 2-3 proof gates |
+| ESCALATED ⚠️ | All agents → deep inspect → peer review → plan → implement → all gates | 5-10 agents | All proof gates + escalation verdict |
+
+---
+
 ## Classification Output Template
 
 Claude Code must output this before starting any meaningful task:
@@ -51,14 +72,16 @@ Task:              [one-line description of what was asked]
 
 Primary domain:    [single domain from list above]
 Secondary domains: [additional domains, or "none"]
-Risk level:        [low / medium / high / critical]
+Risk score:        [numeric from risk-matrix.md]
+Speed track:       FAST ⚡ / STANDARD / ESCALATED ⚠️
+Risk level:        low / medium / high / critical
 
 Agents activated:
   ▶ [agent name]   ← lead
   ▶ [agent name]
   ▶ [agent name]
 
-Files to inspect:
+Files to inspect:  (from signal-map.md first, then domain)
   - [file path]
   - [file path]
 
@@ -71,11 +94,13 @@ Feature flags affected:
   or "none"
 
 Proof gates required:
-  - [command] — [what it verifies]
-  - [command] — [what it verifies]
+  - [command] — [what it verifies] — PASS / FAIL / SKIPPED / BLOCKED
+  - [command] — [what it verifies] — PASS / FAIL / SKIPPED / BLOCKED
 
 Escalation triggered:  YES / NO
-  If YES: reason + escalation-rules.md applies
+  If YES: reason + escalation-rules.md applies + peer review required
+
+22 June impact:    HELPS / NEUTRAL / HURTS — [reason]
 
 Safe plan: [2-3 sentence summary of smallest safe change]
 

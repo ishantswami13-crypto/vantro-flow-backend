@@ -4,10 +4,24 @@
 
 This file defines automatic routing rules. Claude Code must read this before every meaningful task and activate the correct specialist agents without waiting for the user to name them.
 
-**Default rule**: Every meaningful task automatically activates:
+## Routing Priority Order
+
+**Step 1 — File-path routing (highest precision)**: Read `.claude/signal-map.md`. If a file path is mentioned or implied, route from the file-path table. This is always more accurate than keyword matching.
+
+**Step 2 — Keyword routing**: If no file path is available, use the routing table below.
+
+**Step 3 — Risk scoring**: After routing, score the task using `.claude/risk-matrix.md` to select the correct speed track from `.claude/speed-tracks.md`.
+
+**Step 4 — Pre-flight**: Run `.claude/preflight.md` before any implementation.
+
+**Step 5 — Council protocol**: For STANDARD and ESCALATED tracks, follow `.claude/agent-council.md` for how agents collaborate and produce one consolidated plan.
+
+**Default rule**: Every STANDARD/ESCALATED task automatically activates:
 - `vantro-chief-architect`
 - `vantro-launch-readiness-officer`
 - `vantro-harness-x-verifier`
+
+FAST TRACK: domain lead only. No default agents required.
 
 Then add domain specialists based on task classification below.
 
@@ -224,9 +238,30 @@ VANTRO CODE OS — AGENTS ACTIVE
 
 ## Hard Routing Rules
 
-1. Never implement before inspecting relevant files
-2. Never edit without a safe plan
-3. Never skip Harness X for agent/AI/financial changes
-4. Never route Rust changes without `vantro-rust-systems-engineer`
-5. Never route WhatsApp/external-send changes without `vantro-compliance-risk-agent`
-6. Never mix agent activations with contradictory instructions — one consolidated plan
+1. **File paths before keywords** — signal-map.md takes priority over keyword routing
+2. **Risk score before track** — calculate risk-matrix.md score before selecting speed track
+3. **Pre-flight before implementation** — preflight.md runs before any file edit
+4. **Council before execution** — agent-council.md protocol for STANDARD/ESCALATED
+5. **Never implement before inspecting relevant files**
+6. **Never edit without a safe plan**
+7. **Never skip Harness X for agent/AI/financial changes**
+8. **Never route Rust changes without `vantro-rust-systems-engineer`**
+9. **Never route WhatsApp/external-send changes without `vantro-compliance-risk-agent`**
+10. **One consolidated plan** — agents do not produce contradictory instructions
+
+## What Makes Vantro Code OS Stronger Than a Third-Party Swarm
+
+| Generic Swarm | Vantro Code OS |
+|--------------|----------------|
+| Generic agents | MSME-specific domain agents |
+| No file awareness | Exact file-path routing (signal-map.md) |
+| No proof system | Harness X (cortex-lab) with 37 scenarios |
+| No deadline | 22 June locked into every decision |
+| No financial rules | Payment truth, idempotency, audit trail |
+| No safety gates | promptGuard + policyGuard on all AI |
+| No tenant isolation | user_id on every query, enforced |
+| No cost awareness | Cost engine, token budgets per agent |
+| Keyword-only routing | File-path + keyword + risk score routing |
+| No conflict resolution | Authority hierarchy + Security Sentinel veto |
+| One speed for all tasks | Three speed tracks (FAST/STANDARD/ESCALATED) |
+| No pre-flight | 10-point pre-flight before every task |

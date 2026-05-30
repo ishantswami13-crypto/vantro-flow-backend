@@ -2,11 +2,19 @@
 
 ## Auto-Agent Router — Read This First
 
-**Before every meaningful task, Claude Code must read:**
-- `.claude/agent-router.md` — which agents to activate
-- `.claude/task-classifier.md` — how to classify the task
-- `.claude/auto-agent-policy.md` — how to behave
-- `.claude/escalation-rules.md` — when to escalate
+**Before every meaningful task, Claude Code must read in this order:**
+
+1. `.claude/signal-map.md` — file-path based routing (highest precision)
+2. `.claude/risk-matrix.md` — calculate numeric risk score (0-100)
+3. `.claude/speed-tracks.md` — select FAST ⚡ / STANDARD / ESCALATED ⚠️
+4. `.claude/preflight.md` — run 10-point pre-flight checklist
+5. `.claude/agent-router.md` — activate correct agents for the domain
+6. `.claude/task-classifier.md` — output full classification brief
+7. `.claude/agent-council.md` — collaborate and produce ONE consolidated plan
+8. `.claude/escalation-rules.md` — if risk score ≥ 61 or trigger detected
+
+**Strengthened from a third-party swarm by:**
+file-path routing + numeric risk scoring + three speed tracks + pre-flight + Security Sentinel peer review + authority hierarchy + 22 June deadline in every decision
 
 **Claude Code must not wait for the user to name agents.** It must automatically route every task to the correct Vantro specialist agents based on file paths, task domain, risk level, and 22 June launch-readiness impact.
 
