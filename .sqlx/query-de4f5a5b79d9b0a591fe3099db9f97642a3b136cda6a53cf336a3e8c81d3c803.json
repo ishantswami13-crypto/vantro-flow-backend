@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(*) AS cnt FROM products\n             WHERE user_id = $1 AND current_stock < COALESCE(low_stock_alert, 5)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cnt",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "de4f5a5b79d9b0a591fe3099db9f97642a3b136cda6a53cf336a3e8c81d3c803"
+}

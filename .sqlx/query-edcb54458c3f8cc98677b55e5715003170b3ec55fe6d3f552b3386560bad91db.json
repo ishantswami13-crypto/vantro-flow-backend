@@ -1,0 +1,83 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH inv AS (\n            SELECT\n              SUM(COALESCE(total_amount, invoice_amount, 0) - COALESCE(amount_paid, 0)) AS outstanding,\n              SUM(CASE WHEN payment_status IN ('Overdue','Pending') AND days_overdue > 0\n                  THEN COALESCE(total_amount, invoice_amount, 0) - COALESCE(amount_paid, 0)\n                  ELSE 0 END) AS overdue_amt,\n              MAX(COALESCE(days_overdue, 0)) AS max_delay,\n              AVG(CASE WHEN days_overdue > 0 THEN days_overdue ELSE NULL END) AS avg_delay\n            FROM invoices\n            WHERE user_id = $1 AND customer_id = $2\n          ),\n          pr AS (\n            SELECT\n              COUNT(*) FILTER (WHERE status = 'broken') AS broken,\n              COUNT(*) FILTER (WHERE status = 'kept')   AS kept\n            FROM promises WHERE user_id = $1 AND customer_id = $2\n          ),\n          cl AS (\n            SELECT\n              COUNT(*) AS total,\n              COUNT(*) FILTER (WHERE did_pick_up) AS picked\n            FROM call_logs WHERE user_id = $1 AND customer_id = $2\n          ),\n          cs AS (\n            SELECT credit_limit, advance_required, name\n            FROM customers WHERE user_id = $1 AND id = $2\n          )\n          SELECT\n            cs.name,\n            COALESCE(inv.outstanding, 0.0)::float8        AS current_outstanding,\n            COALESCE(inv.overdue_amt, 0.0)::float8        AS overdue_amount,\n            COALESCE(inv.max_delay, 0.0)::float8          AS max_delay_days,\n            COALESCE(inv.avg_delay, 0.0)::float8          AS avg_delay_days,\n            COALESCE(pr.broken, 0)::int4                  AS broken_promises,\n            COALESCE(pr.kept, 0)::int4                    AS kept_promises,\n            COALESCE(cl.total, 0)::int4                   AS calls_total,\n            COALESCE(cl.picked, 0)::int4                  AS calls_picked,\n            COALESCE(cs.credit_limit, 0.0)::float8        AS credit_limit,\n            COALESCE(cs.advance_required, false)          AS advance_required\n          FROM cs\n          LEFT JOIN inv ON TRUE\n          LEFT JOIN pr  ON TRUE\n          LEFT JOIN cl  ON TRUE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "current_outstanding",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 2,
+        "name": "overdue_amount",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 3,
+        "name": "max_delay_days",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 4,
+        "name": "avg_delay_days",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 5,
+        "name": "broken_promises",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "kept_promises",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "calls_total",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "calls_picked",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 9,
+        "name": "credit_limit",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 10,
+        "name": "advance_required",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "edcb54458c3f8cc98677b55e5715003170b3ec55fe6d3f552b3386560bad91db"
+}
