@@ -5,15 +5,20 @@ name: Rust Automation CI
 # (including the FIR policy-guard regression) and the offline Cortex
 # harness. Runs on every push and every pull request, on every branch.
 #
+# Jobs:
+#   - verify-pure-rust              : fmt + check + unit/integration tests
+#   - verify-cortex-harness-static  : offline Cortex harness (no DB)
+#   - verify-server-feature-build   : offline server-feature build using the
+#       committed .sqlx/ cache (SQLX_OFFLINE=true). Gated on the cache being
+#       present; activated once .sqlx/ was committed.
+#
 # Intentional non-goals (do NOT silently expand into these):
-#   - server-feature build with sqlx::query! macros. That requires either
-#     a non-prod DATABASE_URL or a committed .sqlx/ offline cache, neither
-#     of which exists today. It is gated by a separate, future workflow
-#     commit that lands at the same time as the .sqlx/ cache.
 #   - live harness (cortex-lab --mode=live, --mode=dry-run). Those need a
-#     non-prod database and seeded tenants — separate, future commit.
+#     non-prod database and seeded tenants -- separate, future commit.
 #   - any use of production secrets. No DATABASE_URL, JWT_SECRET, or
-#     Supabase key is referenced in this workflow.
+#     Supabase key is referenced in this workflow. The server-feature build
+#     runs fully offline (SQLX_OFFLINE=true) against the committed .sqlx/
+#     metadata -- it never connects to any database.
 
 on: [push, pull_request]
 
@@ -44,7 +49,7 @@ jobs:
         # Replace the file inside the runner checkout only; the committed
         # version on disk is untouched.
         run: |
-          printf '# Overridden in CI — Linux host target.\n' > .cargo/config.toml
+          printf '# Overridden in CI -- Linux host target.\n' > .cargo/config.toml
           cat .cargo/config.toml
 
       - name: Cache cargo
@@ -78,7 +83,7 @@ jobs:
             echo "=== last 30 lines of /tmp/test-lib.log ==="
             tail -30 /tmp/test-lib.log
             # Surface compact failure-identifying lines as annotations.
-            # 1) Cargo "failures:" block — names of failing tests.
+            # 1) Cargo "failures:" block -- names of failing tests.
             awk '/^failures:$/{f=1;next} f && /^test result:/{f=0} f && /^    [^ ]/{print}' /tmp/test-lib.log \
               | head -10 \
               | while IFS= read -r name; do
@@ -156,3 +161,67 @@ jobs:
 
       - name: cortex-lab static mode
         run: npm run cortex:test --silent
+
+  verify-server-feature-build:
+    name: server-feature offline build (SQLX_OFFLINE=true)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: verify-pure-rust
+    # Activates only when the committed .sqlx/ offline cache exists. Before
+    # the cache was committed this job was absent; it is now a permanent gate.
+    # If .sqlx/ is ever deleted, this job auto-skips rather than failing.
+    if: ${{ hashFiles('.sqlx/**') != '' }}
+    env:
+      # Offline build: read query metadata from the committed .sqlx/ cache.
+      # No database connection at build time. This mirrors the Railway
+      # production build contract exactly.
+      SQLX_OFFLINE: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Override workspace cargo target for Linux runner
+        # The committed .cargo/config.toml pins x86_64-pc-windows-gnu for
+        # Windows dev machines; on Linux CI use the host triple. Only the
+        # ephemeral runner checkout is modified.
+        run: |
+          printf '# Overridden in CI -- Linux host target.\n' > .cargo/config.toml
+
+      - name: Cache cargo (server feature)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-server-${{ runner.os }}-${{ hashFiles('Cargo.lock', '.sqlx/**') }}
+          restore-keys: |
+            rust-server-${{ runner.os }}-
+
+      - name: cargo build --features server (offline, ci-release profile)
+        # Proves the Axum server binary compiles against the committed .sqlx/
+        # cache with SQLX_OFFLINE=true -- the exact contract Railway uses.
+        # Uses [profile.ci-release] (release minus LTO) for reasonable CI time.
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set +e
+          cargo build --profile ci-release --features server \
+            -p vantro-automation-rs --message-format=short 2>&1 | tee /tmp/server-build.log
+          EXIT=${PIPESTATUS[0]}
+          echo "server-build-exit=$EXIT"
+          if [ $EXIT -ne 0 ]; then
+            echo "=== build errors ==="
+            grep -E "^error|^warning\[|error:|SQLX_OFFLINE|no cached data|linker|cannot find" \
+              /tmp/server-build.log | head -30 \
+              | while IFS= read -r line; do
+                  echo "::error title=server-build::${line}"
+                done
+            echo "=== full output ==="
+            cat /tmp/server-build.log
+          fi
+          exit $EXIT
