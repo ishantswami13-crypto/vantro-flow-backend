@@ -20,7 +20,9 @@
 
 const jwt = require('jsonwebtoken');
 
-const BASE = process.env.RUST_BASE_URL || 'http://localhost:3002';
+// 127.0.0.1 not localhost: the Axum service binds 0.0.0.0 (IPv4); Node fetch
+// resolves localhost to ::1 (IPv6) first and would fail with "fetch failed".
+const BASE = process.env.RUST_BASE_URL || 'http://127.0.0.1:3002';
 const SECRET = process.env.JWT_SECRET || 'harness-test-secret';
 const OWNER_A = process.env.OWNER_A_ID || '11111111-1111-1111-1111-111111111111';
 const OWNER_B = process.env.OWNER_B_ID || '22222222-2222-2222-2222-222222222222';
