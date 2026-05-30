@@ -42,6 +42,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 jsonwebtoken       = { version = "9", optional = true }
 dotenvy            = { version = "0.15", optional = true }
 
+# ── Dev-only deps: make uuid directly usable from integration tests in tests/.
+# Same versions/features as the regular dependency (already in the tree, no new
+# download). uuid stays WITHOUT the `v4` feature so the pure tests need no
+# getrandom/dlltool on Windows; tests build UUIDs via Uuid::from_u128.
+[dev-dependencies]
+uuid = { version = "1", features = ["serde"] }
+
 [features]
 # default = pure tests only (works on Windows without MinGW)
 default = []

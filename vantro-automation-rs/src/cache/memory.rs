@@ -108,3 +108,79 @@ impl Default for MemoryCache {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── 3. Cross-user cache isolation (the crown-jewel safety test) ──
+
+    #[test]
+    fn set_then_get_same_key_roundtrips() {
+        let c = MemoryCache::new();
+        c.set("user:A:dashboard_bootstrap", &42i32, 60);
+        assert_eq!(c.get::<i32>("user:A:dashboard_bootstrap"), Some(42));
+    }
+
+    #[test]
+    fn user_b_cannot_read_user_a_value() {
+        let c = MemoryCache::new();
+        c.set("user:A:dashboard_bootstrap", &42i32, 60);
+        // Different key (user B) must miss -- no cross-tenant read.
+        assert_eq!(c.get::<i32>("user:B:dashboard_bootstrap"), None);
+    }
+
+    #[test]
+    fn two_users_keep_independent_values() {
+        let c = MemoryCache::new();
+        c.set("user:A:dashboard_bootstrap", &"A-data".to_string(), 60);
+        c.set("user:B:dashboard_bootstrap", &"B-data".to_string(), 60);
+        assert_eq!(
+            c.get::<String>("user:A:dashboard_bootstrap"),
+            Some("A-data".to_string())
+        );
+        assert_eq!(
+            c.get::<String>("user:B:dashboard_bootstrap"),
+            Some("B-data".to_string())
+        );
+    }
+
+    #[test]
+    fn ttl_zero_is_treated_as_expired() {
+        let c = MemoryCache::new();
+        c.set("k", &1i32, 0);
+        // expires_at == now-at-set; by the time we read, now >= expires_at -> gone.
+        assert_eq!(c.get::<i32>("k"), None);
+    }
+
+    #[test]
+    fn del_removes_only_that_key() {
+        let c = MemoryCache::new();
+        c.set("user:A:dashboard_bootstrap", &1i32, 60);
+        c.set("user:B:dashboard_bootstrap", &2i32, 60);
+        c.del("user:A:dashboard_bootstrap");
+        assert_eq!(c.get::<i32>("user:A:dashboard_bootstrap"), None);
+        assert_eq!(c.get::<i32>("user:B:dashboard_bootstrap"), Some(2));
+    }
+
+    #[test]
+    fn del_by_prefix_only_clears_matching_user() {
+        let c = MemoryCache::new();
+        c.set("user:A:dashboard_bootstrap", &1i32, 60);
+        c.set("user:A:collections_bootstrap", &2i32, 60);
+        c.set("user:B:dashboard_bootstrap", &3i32, 60);
+        c.del_by_prefix("user:A:");
+        assert_eq!(c.get::<i32>("user:A:dashboard_bootstrap"), None);
+        assert_eq!(c.get::<i32>("user:A:collections_bootstrap"), None);
+        // Other tenants untouched.
+        assert_eq!(c.get::<i32>("user:B:dashboard_bootstrap"), Some(3));
+    }
+
+    #[test]
+    fn type_mismatch_get_returns_none_without_panic() {
+        let c = MemoryCache::new();
+        c.set("k", &"a string".to_string(), 60);
+        // Deserialising a String as i32 fails -> None (no panic, no leak).
+        assert_eq!(c.get::<i32>("k"), None);
+    }
+}

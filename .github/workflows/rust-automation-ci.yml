@@ -163,7 +163,7 @@ jobs:
         run: npm run cortex:test --silent
 
   verify-server-feature-build:
-    name: server-feature offline build (SQLX_OFFLINE=true)
+    name: server-feature offline build + auth tests (SQLX_OFFLINE=true)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: verify-pure-rust
@@ -237,5 +237,31 @@ jobs:
                 done
             echo "=== full output ==="
             cat /tmp/server-build.log
+          fi
+          exit $EXIT
+
+      - name: cargo test --features server (auth + server-gated tests, offline)
+        # Runs the server-gated tests that the pure verify-pure-rust job cannot
+        # reach -- notably the JWT auth tests in src/auth.rs (auth.rs only
+        # compiles with the `server` feature). Still fully offline:
+        # SQLX_OFFLINE=true + the committed .sqlx/ cache, no database.
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set +e
+          cargo test --features server -p vantro-automation-rs \
+            --message-format=short 2>&1 | tee /tmp/server-test.log
+          EXIT=${PIPESTATUS[0]}
+          echo "server-test-exit=$EXIT"
+          if [ $EXIT -ne 0 ]; then
+            echo "=== test failures ==="
+            grep -E "^error|error\[|FAILED|panicked|assertion|no cached data|SQLX_OFFLINE" \
+              /tmp/server-test.log | head -40 \
+              | while IFS= read -r line; do
+                  echo "::error title=server-test::${line}"
+                done
+            echo "=== full output ==="
+            cat /tmp/server-test.log
           fi
           exit $EXIT
