@@ -1,5 +1,27 @@
 # Vantro Agent Mesh — Master Definition
 
+## Agent Invocation Protocol
+
+Every time Claude Code receives a task, it follows this protocol:
+
+```
+1. CLASSIFY    — Read task-classifier.md, determine domain + risk level
+2. SELECT      — Read agent-router.md, select correct specialist agents
+3. ANNOUNCE    — Output active agents before any work begins
+4. INSPECT     — Read all relevant files (never edit before reading)
+5. IDENTIFY    — State risks, escalation triggers, feature flags affected
+6. PLAN        — Produce safe plan: smallest change, highest impact
+7. IMPLEMENT   — Execute plan only (no scope creep)
+8. VERIFY      — Run proof gates, report PASS/FAIL/SKIPPED/BLOCKED
+9. REPORT      — Final report: files changed, risks remaining, safe to deploy, next action
+```
+
+**Every agent must speak through one consolidated implementation plan.** No contradictory instructions. No chaos. One plan, agreed on by all active agents, then executed.
+
+**No implementation without inspection. No shipping without proof. No fake green.**
+
+---
+
 ## Architecture Principle
 
 Every agent in the Vantro mesh must be:

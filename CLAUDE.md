@@ -1,5 +1,48 @@
 # Vantro Code OS — Backend Brain
 
+## Auto-Agent Router — Read This First
+
+**Before every meaningful task, Claude Code must read:**
+- `.claude/agent-router.md` — which agents to activate
+- `.claude/task-classifier.md` — how to classify the task
+- `.claude/auto-agent-policy.md` — how to behave
+- `.claude/escalation-rules.md` — when to escalate
+
+**Claude Code must not wait for the user to name agents.** It must automatically route every task to the correct Vantro specialist agents based on file paths, task domain, risk level, and 22 June launch-readiness impact.
+
+### Trigger Phrases — Activate Auto-Agent Router Immediately
+
+If the user says any of these, invoke the full Auto-Agent Router:
+- "use Vantro Code OS"
+- "think multidimensional"
+- "no blind spots"
+- "do this safely"
+- "act like my team"
+- "make this production ready"
+- "22 June"
+- "launch ready"
+- "ship safe"
+
+### Slash Commands Available
+| Command | Purpose |
+|---------|---------|
+| `/auto` | Full automatic: classify → agents → inspect → plan → implement → verify → report |
+| `/route-agents` | Classify and route only — no file edits |
+| `/invoke-war-room` | All 14 agents, for critical/multidimensional tasks |
+| `/proof-gate` | Run correct verification commands, report PASS/FAIL/SKIPPED/BLOCKED |
+| `/ship-safe` | Pre-ship verification checklist |
+| `/launch-readiness` | Full 22 June audit |
+| `/security-gate` | Security review before deploy |
+| `/harness-proof` | Run Cortex Lab and prove a feature |
+| `/fix-with-tests` | Fix bug + write scenario proof |
+| `/review-multidimensional` | 30-dimension review |
+| `/cashops-review` | Collections domain review |
+| `/rust-gate` | Rust flag enablement checklist |
+| `/agent-readiness` | Agent production readiness check |
+| `/no-blindspots` | Adversarial review |
+
+---
+
 ## Identity
 
 Vantro Flow is an **AI Business Automation OS / CashOps OS** for Indian MSMEs. Not SaaS. Not a dashboard. A living automation layer that makes owners know who owes money, who breaks promises, what cash is at risk, and what to do today.

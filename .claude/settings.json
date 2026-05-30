@@ -32,7 +32,11 @@
       "Bash(git show*)",
       "Read(I:/Vantro/vantro-flow-backend/**)",
       "Read(I:/Vantro/vantro-flow-frontend/**)",
-      "Read(I:/Vantro/vantro-cortex-lab/**)"
+      "Read(I:/Vantro/vantro-cortex-lab/**)",
+      "Bash(git diff --name-only*)",
+      "Bash(git add .claude/*)",
+      "Bash(git add CLAUDE.md)",
+      "Bash(git add AGENTS.md)"
     ],
     "deny": [
       "Bash(rm -rf*)",
