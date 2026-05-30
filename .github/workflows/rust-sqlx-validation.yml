@@ -295,6 +295,10 @@ jobs:
         with:
           name: sqlx-debug-cache
           path: .sqlx/
+          # .sqlx is a HIDDEN directory (leading dot). actions/upload-artifact@v4
+          # excludes hidden files by default, which made this upload find
+          # "no files" even though 8 query-*.json files exist. Must opt in.
+          include-hidden-files: true
           retention-days: 14
           if-no-files-found: warn
 
@@ -312,5 +316,9 @@ jobs:
         with:
           name: sqlx-offline-cache
           path: .sqlx/
+          # .sqlx is hidden (leading dot); upload-artifact@v4 skips hidden
+          # files unless this is set. Without it the upload finds no files
+          # and (with if-no-files-found: error) fails the job.
+          include-hidden-files: true
           retention-days: 14
           if-no-files-found: error
