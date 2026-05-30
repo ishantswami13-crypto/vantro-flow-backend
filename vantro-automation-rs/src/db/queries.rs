@@ -20,15 +20,17 @@ use uuid::Uuid;
 
 // ─── Dashboard bootstrap ─────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DashboardBootstrap {
     pub kpis: DashboardKpis,
     pub top_actions: Vec<ActionSummary>,
     pub last_updated: DateTime<Utc>,
-    pub source: &'static str,
+    // Stored as String (not &'static str) so the type satisfies the
+    // DeserializeOwned + Clone bounds required by MemoryCache::get_or_set.
+    pub source: String,
 }
 
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct DashboardKpis {
     pub today_sales_amount: f64,
     pub today_purchases_count: i64,
@@ -36,7 +38,7 @@ pub struct DashboardKpis {
     pub low_stock_count: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ActionSummary {
     pub id: Uuid,
     pub title: String,
@@ -115,20 +117,21 @@ pub async fn dashboard_bootstrap(
         },
         top_actions,
         last_updated: Utc::now(),
-        source: "db",
+        source: "db".to_string(),
     })
 }
 
 // ─── Collections bootstrap ───────────────────────────────────────────────────
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CollectionsBootstrap {
     pub summary: CollectionsSummary,
     pub last_updated: DateTime<Utc>,
-    pub source: &'static str,
+    // String (not &'static str) so DeserializeOwned + Clone bounds are met.
+    pub source: String,
 }
 
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct CollectionsSummary {
     pub total_receivables: f64,
     pub overdue_amount: f64,
@@ -187,7 +190,7 @@ pub async fn collections_bootstrap(
     Ok(CollectionsBootstrap {
         summary,
         last_updated: Utc::now(),
-        source: "db",
+        source: "db".to_string(),
     })
 }
 

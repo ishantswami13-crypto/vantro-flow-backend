@@ -22,7 +22,7 @@ pub struct CpiInput {
     pub partial_payment_ok: bool,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum CpiPriority {
     Low,
@@ -31,7 +31,7 @@ pub enum CpiPriority {
     Urgent,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum NextBestAction {
     WaitForDueDate,
@@ -44,7 +44,7 @@ pub enum NextBestAction {
     CreditHold,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum RecommendedTone {
     Soft,
@@ -55,7 +55,7 @@ pub enum RecommendedTone {
     RelationshipPreserving,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CpiResult {
     pub cpi_score: u8,
     pub priority: CpiPriority,
@@ -66,7 +66,7 @@ pub struct CpiResult {
     pub component_scores: CpiComponents,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CpiComponents {
     pub amount_urgency: u8,       // overdue amount × days
     pub promise_risk: u8,         // broken promise penalty

@@ -15,7 +15,7 @@ pub struct CustomerMetrics {
     pub calls_picked: u32,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ScoreResult {
     pub success: bool,
     pub credit_risk_score: u8,
