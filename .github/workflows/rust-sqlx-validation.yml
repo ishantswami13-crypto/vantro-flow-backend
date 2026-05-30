@@ -149,15 +149,31 @@ jobs:
           fi
           exit $EXIT
 
-      - name: cargo sqlx prepare --workspace (generates .sqlx/ cache)
-        # Runs a check-build of the server feature so sqlx can introspect
-        # every query! macro against the live Postgres schema.
-        # The -- --features server passes the feature flag to the inner cargo
-        # invocation that sqlx-cli orchestrates.
+      - name: Force-clean vantro-automation-rs before prepare
+        # CRITICAL for sqlx prepare correctness.
+        # cargo sqlx prepare only writes query-*.json when the query! macros
+        # actually RE-EXPAND during compilation. If the crate is already
+        # compiled (warm target/ from the cache restore, or from the step 12
+        # pre-check), cargo reports "up-to-date", the macros do not run, and
+        # prepare produces an EMPTY .sqlx/ while still exiting 0. Diagnostic
+        # run 6b9e261 proved exactly this: ".sqlx exists but contains zero
+        # query-*.json files after prepare".
+        # cargo clean -p forces a fresh recompile of just this crate during
+        # the next prepare, so the macros run and write the cache.
+        run: |
+          cargo clean -p vantro-automation-rs
+          echo "cleaned vantro-automation-rs build artifacts to force macro re-expansion"
+
+      - name: cargo sqlx prepare (generates .sqlx/ cache)
+        # Per-package prepare for the only crate that contains sqlx::query!
+        # macros (cortex-core has none). -- --features server enables the
+        # server feature so the bin (required-features = ["server"]) and its
+        # db::queries module compile, letting sqlx introspect all 8 queries
+        # against the live Postgres schema and write query-*.json files.
         shell: bash
         run: |
           set +e
-          cargo sqlx prepare --workspace -- --features server 2>&1 | tee /tmp/sqlx-prepare.log
+          cargo sqlx prepare -p vantro-automation-rs -- --features server 2>&1 | tee /tmp/sqlx-prepare.log
           EXIT=${PIPESTATUS[0]}
           echo "sqlx-prepare-exit=$EXIT"
           if [ $EXIT -ne 0 ]; then
