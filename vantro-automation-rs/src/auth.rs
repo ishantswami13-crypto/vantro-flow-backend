@@ -5,7 +5,7 @@
 
 use axum::{
     async_trait,
-    extract::{FromRequestParts, State},
+    extract::FromRequestParts,
     http::{request::Parts, HeaderMap},
 };
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};

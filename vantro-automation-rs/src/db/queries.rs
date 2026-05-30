@@ -268,7 +268,11 @@ pub async fn customer_metrics(
 
     Ok(row.map(|r| CustomerMetricsRow {
         customer_id,
-        name: r.name.unwrap_or_default(),
+        // r.name comes from `customers.name TEXT NOT NULL` -> sqlx infers
+        // String (non-null), so no Option unwrap is needed. The CTE main
+        // SELECT uses `FROM cs LEFT JOIN ...`, with `cs` as the join base,
+        // so cs.name is not made nullable by the LEFT JOIN composition.
+        name: r.name,
         total_overdue: r.overdue_amount.unwrap_or(0.0),
         max_delay_days: r.max_delay_days.unwrap_or(0.0),
         avg_delay_days: r.avg_delay_days.unwrap_or(0.0),
