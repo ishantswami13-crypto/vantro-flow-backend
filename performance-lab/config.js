@@ -2,9 +2,18 @@
 
 // FILE: performance-lab/config.js
 // All PERF_* env vars read once at startup. Blocks if prod URL detected.
+//
+// NOTE: railway.app is intentionally NOT in PROD_PATTERNS.
+// Railway staging services legitimately use *.up.railway.app URLs.
+// Only block known-production identifiers (custom domains, explicit prod subdomains,
+// the production Supabase DB). If/when you have a known production Railway URL,
+// add it explicitly below.
 
 const PROD_PATTERNS = [
-  /railway\.app/i, /vantro\.in/i, /\.prod\./i, /production/i, /supabase\.co/i,
+  /vantro\.in/i,       // production custom domain
+  /\.prod\./i,         // explicit prod subdomain
+  /production/i,       // URL contains the word production
+  /supabase\.co/i,     // production Supabase DB URL
 ];
 
 function looksLikeProd(url) {
