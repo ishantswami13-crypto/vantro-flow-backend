@@ -125,6 +125,28 @@ jobs:
             echo "  table $t: OK"
           done
 
+      - name: Pre-check server feature compiles (surfaces all errors before sqlx prepare)
+        # cargo sqlx prepare runs an internal cargo check and gives truncated output.
+        # This step runs cargo check independently first with full output, so all
+        # compile errors surface as named annotations before sqlx prepare hides them.
+        # If this step fails, sqlx prepare would also fail -- fix these errors first.
+        shell: bash
+        run: |
+          set +e
+          cargo check --features server -p vantro-automation-rs 2>&1 | tee /tmp/cargo-check-server.log
+          EXIT=${PIPESTATUS[0]}
+          echo "cargo-check-server-exit=$EXIT"
+          if [ $EXIT -ne 0 ]; then
+            echo "=== server-feature compile errors (ALL) ==="
+            cat /tmp/cargo-check-server.log | grep -E "^error(\[E[0-9]+\])?:" | while IFS= read -r line; do
+              echo "::error title=server-compile::${line}"
+            done
+            echo ""
+            echo "=== full output (last 120 lines) ==="
+            tail -120 /tmp/cargo-check-server.log
+          fi
+          exit $EXIT
+
       - name: cargo sqlx prepare --workspace (generates .sqlx/ cache)
         # Runs a check-build of the server feature so sqlx can introspect
         # every query! macro against the live Postgres schema.
