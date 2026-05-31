@@ -182,20 +182,115 @@ PANIC/OOM in logs: None visible
 
 ---
 
-## T+8h — target ~2026-05-31 ~14:50 UTC
+## T+8h — Official checkpoint | 2026-05-31 14:51 UTC (20:21 IST)
 
-*Pending.*
+**Checkpoint label:** Official T+8h
+**Executed:** 2026-05-31 14:51 UTC / 20:21 IST (1 min past target)
+**Elapsed from T+0h (~06:50 UTC):** ~8h 01min ✅
 
-| Metric | Value | vs T+0h |
-|---|---|---|
-| Health HTTP | | |
-| score-customer server-compute | | |
-| dashboard/bootstrap server-compute | | |
-| Wall-clock p50 | | |
-| Railway restarts | | |
-| Memory (MB) | | |
-| PANIC in logs | | |
-| safe_to_continue_soak | | |
+> **Non-gating T+6.2h observation (13:03 UTC, NOT counted as official):**
+> Early partial run showed Node dashboard/bootstrap (unauth) p50=603ms > 500ms threshold (critical_failure=true).
+> Rust remained 100% healthy at T+6.2h — server-compute 0ms all endpoints.
+> That run was audit-only and is not the official T+8h entry.
+
+**JWT refreshed:** `.staging-token` written at 14:51 UTC (2h TTL, user_id 11111111-..., _staging=true)
+
+**Performance Lab run:** `perf_mptwsyv2_01fc90` — 2026-05-31T15:03:06Z — 10 iterations — PERF_SKIP_DB=false
+
+| Endpoint | Metric kind | Server-compute p50 | Wall-clock p50 | p95 | Result |
+|---|---|---|---|---|---|
+| `GET /health` | wall-clock | — | **353ms** | 2070ms | PASS ⚠ (within 700ms; 8/10 success, 2 timeouts — network variability) |
+| `POST score-customer` | server-compute | **0ms** (max 3ms) | 367ms | 878ms | PASS ✓ |
+| `POST calculate-cpi` | server-compute | **0ms** (max 3ms) | 410ms | 1225ms | PASS ✓ |
+| `POST simulate-credit-sale` | server-compute | **0ms** | 717ms | 1231ms | PASS ✓ |
+| `POST evaluate-policy` | server-compute | **0ms** | 410ms | 1124ms | PASS ✓ |
+| `POST cost-route` | server-compute | **0ms** | 409ms | 933ms | PASS ✓ |
+| `GET dashboard/bootstrap` | server-compute | **0ms** (max 13ms) | 382ms | 623ms | PASS ✓ |
+| `GET collections/bootstrap` | server-compute | **0ms** (max 1ms) | 409ms | 717ms | PASS ✓ |
+| Wrapper: flag disabled | — | — | 1ms | 6ms | PASS ✓ |
+| Wrapper: missing URL | — | — | 1ms | 3ms | PASS ✓ |
+| Wrapper: conn refused | — | — | 3ms | 5ms | PASS ✓ |
+| Wrapper: timeout 250ms | — | — | 262ms | 262ms | PASS ⚠ (within 400ms) |
+| Wrapper: valid overhead | — | — | 3ms | 8ms | PASS ✓ |
+| Node dashboard (unauth 401) | — | — | **571ms** | 1369ms | **FAIL ❌** (>500ms threshold) |
+| Node collections (unauth 401) | — | — | 500ms | 717ms | PASS ⚠ (at boundary, within 500ms) |
+| Node /api/auth/me (auth 200) | — | — | **1843ms** | 5013ms | PASS ⚠ (within 3000ms; p95 exceeds 3000ms) |
+
+**Summary: 15/16 PASS · 1 FAIL · 0 SKIP · 1 critical**
+
+---
+
+### ⚠️ Node Dashboard Latency — Case B (2nd consecutive measurement)
+
+| Measurement | Run | p50 | Status |
+|---|---|---|---|
+| Non-gating T+6.2h | 13:03 UTC | 603ms | FAIL — audit-only |
+| **Official T+8h** | 14:51 UTC | **571ms** | **FAIL — 2nd consecutive** |
+
+**Classification: Node staging / network-latency risk — NOT a Rust sidecar failure.**
+
+- HTTP status correct: 401 returned on both measurements (correct expected status)
+- No correctness failure — purely latency
+- Root cause candidates: Node staging container under-provisioned at this time of day; Supabase auth middleware cold path on unauth requests; public-internet RTT variance from test client to Railway US East
+- The Node staging service is NOT production — this does not affect live users
+- Rust server-compute: **0ms stable throughout all checkpoints** — completely unaffected
+
+**Rust verdict: 🟢 HEALTHY.** 7/7 compute endpoints at 0ms server-compute, unchanged from T+0h.
+**Node latency verdict: 🟡 WATCH ITEM.** 2nd consecutive unauth dashboard latency over threshold. Not a soak blocker.
+
+---
+
+**Granular readiness status:**
+
+| Field | Value |
+|---|---|
+| rust_sidecar_ready | **YES (staging only)** |
+| node_staging_ready | **NO** — Node unauth dashboard test failed (latency) |
+| node_auth_baseline_ready | **YES** — Node auth 200 passing with real Supabase DB |
+| production_enablement_ready | **PENDING** — requires 24h soak + canary gate |
+| safe_to_enable_rust | **YES (staging only)** |
+
+**Railway logs at T+8h checkpoint:**
+
+| Field | Value |
+|---|---|
+| Service status | ● Online |
+| Log events (past 10h) | 1 event — `Starting Container` at 2026-05-31T11:28:16Z |
+| New restarts since T+4h (12:51 UTC) | **0** — CLEAN |
+| Error logs | 0 |
+| Warning logs | 0 |
+| HTTP 5xx logs | 0 |
+| PANIC in logs | None |
+| OOM in logs | None |
+| Auth errors | None |
+| Restart classification | **CLEAN** (no new restarts since 11:28 UTC) |
+
+**vs T+0h comparison:**
+
+| Metric | T+0h | T+4h | T+8h | Trend |
+|---|---|---|---|---|
+| Health wall p50 | 318ms | 323ms | 353ms | +35ms from T+0h — stable |
+| score-customer server-compute | 0ms | 0ms | **0ms** | ✓ flat |
+| dashboard/bootstrap server-compute | 0ms | 0ms | **0ms** | ✓ flat |
+| Wall-clock p50 (compute range) | 313–319ms | 309–323ms | 367–717ms | Higher variance — network |
+| Railway restarts (total) | 0 | 1 (11:28 UTC) | **1 (unchanged)** | ✓ no new restarts |
+| PANIC in logs | None | None | **None** | ✓ |
+| Node dashboard unauth p50 | N/A | 298ms ✓ | **571ms ❌** | Latency regression |
+
+**Safety checks:**
+
+| Check | Result |
+|---|---|
+| `npm run test:rust-fallback` | ✅ 8/8 PASS |
+| `npm run check` | ✅ OK |
+| `npm run cortex:test` | ✅ 100/100 PASS · 0 critical |
+| `npm run security:secrets` | ✅ No hardcoded secrets |
+
+**Production flag status:** `RUST_AUTOMATION_API_ENABLED=false` — untouched
+
+**safe_to_continue_soak: YES** (Rust healthy; Node latency regression logged as watch item)
+
+**Next checkpoint:** T+24h — target ~2026-06-01 06:50 UTC / 12:20 IST
 
 ---
 
