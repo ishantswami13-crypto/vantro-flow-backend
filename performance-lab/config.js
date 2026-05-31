@@ -4,16 +4,21 @@
 // All PERF_* env vars read once at startup. Blocks if prod URL detected.
 //
 // NOTE: railway.app is intentionally NOT in PROD_PATTERNS.
-// Railway staging services legitimately use *.up.railway.app URLs.
-// Only block known-production identifiers (custom domains, explicit prod subdomains,
-// the production Supabase DB). If/when you have a known production Railway URL,
-// add it explicitly below.
+// Railway staging services legitimately use *.up.railway.app URLs, and Railway
+// always names its single environment "production" — so ALL Railway service URLs
+// contain the substring "production". Blocking on that substring would prevent
+// any live staging test against Railway. Instead, block only known-production
+// identifiers (custom domains, explicit subdomain patterns, the production
+// Supabase DB). Add a known production Railway URL explicitly if one is ever
+// assigned.
 
 const PROD_PATTERNS = [
   /vantro\.in/i,       // production custom domain
-  /\.prod\./i,         // explicit prod subdomain
-  /production/i,       // URL contains the word production
+  /\.prod\./i,         // *.prod.* subdomain convention
   /supabase\.co/i,     // production Supabase DB URL
+  // NOTE: /production/i intentionally removed — Railway names its env "production"
+  // so *.up.railway.app staging URLs always contain "production" in the hostname.
+  // Guard instead via vantro.in (the real production custom domain).
 ];
 
 function looksLikeProd(url) {

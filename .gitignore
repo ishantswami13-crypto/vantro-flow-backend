@@ -41,3 +41,6 @@ performance-lab/reports/*
 !performance-lab/reports/latest.md
 # Old single-file report from legacy run.js
 performance-lab/report.md
+
+# Staging test artifacts (never commit)
+.staging-token

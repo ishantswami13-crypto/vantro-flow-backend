@@ -8,15 +8,16 @@
     "requires_auth": false,
     "requires_db":   false,
     "target_ms":     50,
-    "acceptable_ms": 150,
-    "payload_max_kb": 1
+    "acceptable_ms": 700,
+    "payload_max_kb": 1,
+    "_note": "No durationMs in health response — judged by wall-clock. 700ms reflects realistic public-internet RTT to Railway US-East. In-region (Node→Rust private network) would be ~1ms."
   },
   {
     "id":            "rust_score_customer",
     "name":          "Rust score-customer",
     "path":          "/api/v2/cortex/score-customer",
     "method":        "POST",
-    "body":          { "customer_id": "perf-test-customer-001" },
+    "body":          { "customer_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" },
     "requires_auth": true,
     "requires_db":   true,
     "target_ms":     100,
@@ -28,7 +29,7 @@
     "name":          "Rust calculate-cpi",
     "path":          "/api/v2/cortex/calculate-cpi",
     "method":        "POST",
-    "body":          { "customer_id": "perf-test-customer-001", "business_cash_pressure": 0.3 },
+    "body":          { "customer_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "business_cash_pressure": 0.3 },
     "requires_auth": true,
     "requires_db":   true,
     "target_ms":     100,
