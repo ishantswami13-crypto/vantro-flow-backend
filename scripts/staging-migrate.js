@@ -121,20 +121,9 @@ async function run() {
     await client.connect();
     console.log('[staging-migrate] Connected to staging Postgres.');
 
-    // Verify this is not the Supabase production DB by checking for Supabase-specific tables
-    const check = await client.query(`
-      SELECT COUNT(*) AS n FROM information_schema.tables
-      WHERE table_schema = 'public' AND table_name = 'auth'
-    `);
-    // Supabase has an auth schema with users table; plain Railway Postgres does not
-    const supabaseAuthCheck = await client.query(`
-      SELECT COUNT(*) AS n FROM information_schema.schemata WHERE schema_name = 'auth'
-    `);
-    if (parseInt(supabaseAuthCheck.rows[0].n, 10) > 0) {
-      console.error('[staging-migrate] BLOCKED: database has a Supabase "auth" schema.');
-      console.error('  This looks like the Supabase production database. Aborting.');
-      process.exit(1);
-    }
+    // Production Supabase is blocked above by PROD_SUPABASE_ID check.
+    // Non-prod Supabase projects (staging) are allowed — auth schema check removed
+    // because ALL Supabase projects have an auth schema, not just production.
 
     // Apply base schema
     console.log('\n[staging-migrate] Applying base schema (FK target tables)...');
