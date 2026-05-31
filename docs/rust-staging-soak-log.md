@@ -65,6 +65,46 @@
 
 ---
 
+## T+~1h — 2026-05-31 ~07:53 UTC (status semantics validation run)
+
+> Note: Not a scheduled checkpoint. Run to validate the new granular status
+> fields (`rust_sidecar_ready` etc.) added in this session. Confirms soak
+> is progressing cleanly.
+
+**Performance Lab (10 iterations, both URLs set):**
+
+| Endpoint | Server-compute | Wall-clock p50 | Result |
+|---|---|---|---|
+| `GET /health` | — | 406ms | PASS ⚠ |
+| `POST score-customer` | **0ms** | 310ms | PASS ✓ |
+| `POST calculate-cpi` | **0ms** | 410ms | PASS ✓ |
+| `POST simulate-credit-sale` | **0ms** | 317ms | PASS ✓ |
+| `POST evaluate-policy` | **0ms** | 308ms | PASS ✓ |
+| `POST cost-route` | **0ms** | 319ms | PASS ✓ |
+| `GET dashboard/bootstrap` | **0ms** | 315ms | PASS ✓ |
+| `GET collections/bootstrap` | **0ms** | 308ms | PASS ✓ |
+| Node unauth (dashboard) | — | 327ms | PASS ✓ |
+| Node unauth (collections) | — | 319ms | PASS ✓ |
+| Node auth (dashboard) | — | 321ms | FAIL (500 — placeholder Supabase, expected) |
+| Node auth (collections) | — | 321ms | FAIL (500 — placeholder Supabase, expected) |
+
+**Granular status:**
+
+| Field | Value |
+|---|---|
+| rust_sidecar_ready | **YES (staging only)** |
+| node_staging_ready | PARTIAL — unauth pass, auth needs non-prod Supabase |
+| node_auth_baseline_ready | NO — placeholder Supabase |
+| production_enablement_ready | NO |
+| safe_to_enable_rust | **YES (staging only)** |
+
+Exit code: **0** (Node auth 500 no longer exits 1 — correct)
+Railway restarts: 0 (service running continuously)
+PANIC/OOM in logs: None visible
+**safe_to_continue_soak: YES**
+
+---
+
 ## T+4h — target ~2026-05-31 ~10:50 UTC
 
 *Pending — refresh .staging-token before running spot check.*
@@ -74,8 +114,9 @@ JWT_SECRET=<staging-secret> npm run staging:jwt
 
 PERF_RUN_LIVE=true \
 PERF_RUST_BASE_URL=https://vantro-automation-staging-production.up.railway.app \
+PERF_NODE_BASE_URL=https://vantro-node-staging-production.up.railway.app \
 PERF_TEST_TOKEN=$(cat .staging-token) \
-PERF_ITERATIONS=10 PERF_TIMEOUT_MS=5000 \
+PERF_ITERATIONS=10 PERF_TIMEOUT_MS=5000 PERF_REQUIRE_NON_PROD=true \
 npm run perf:test
 ```
 
@@ -84,10 +125,11 @@ npm run perf:test
 | Health HTTP | | |
 | score-customer server-compute | | |
 | dashboard/bootstrap server-compute | | |
-| Wall-clock p50 | | |
+| Wall-clock p50 range | | |
 | Railway restarts | | |
 | Memory (MB) | | |
 | PANIC in logs | | |
+| rust_sidecar_ready | | |
 | safe_to_continue_soak | | |
 
 ---

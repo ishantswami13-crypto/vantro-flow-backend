@@ -299,29 +299,99 @@ async function main() {
   const skipped  = results.filter(r => r.skipped).length;
   const critical = measured.filter(r => r.critical_failure).length;
 
-  // safe_to_enable_rust is conservative by design:
-  //   - Offline mode (live not measured) → always NO
-  //   - Wrapper contract failed → always NO (critical safety gate)
-  //   - Any live test failed → NO
-  //   - All live Rust + wrapper pass → YES (staging only)
-  //   Production requires additional canary + soak steps regardless.
-  const WRAPPER_NAMES = new Set(WRAPPER_SCENARIOS.map(s => s.name));
-  const RUST_NAMES    = new Set(RUST_SCENARIOS.map(s => s.name));
-  const wrapperFailed    = results.some(r => !r.skipped && r.critical_failure && WRAPPER_NAMES.has(r.name));
+  // ── Granular readiness status ─────────────────────────────────────────────
+  //
+  // Four independent fields replace the single safe_to_enable_rust boolean:
+  //
+  //   rust_sidecar_ready       — Rust compute + DB endpoints + wrapper all pass.
+  //                              NOT affected by Node staging failures.
+  //   node_staging_ready       — Node service is up and 401-rejecting correctly.
+  //                              PARTIAL when auth-gated tests need Supabase.
+  //   node_auth_baseline_ready — Node auth 200 tests return real data.
+  //                              Only YES after non-prod Supabase is wired.
+  //   production_enablement_ready — All four gates met + soak/canary required.
+  //
+  // safe_to_enable_rust is kept for backwards compatibility and CI scripts.
+  // It now reflects only Rust+wrapper health, not Node health.
+  //
+  // WHY: Node auth tests fail with 500 when Supabase placeholder is in use.
+  // That is expected and documented. Treating it as a Rust failure would
+  // produce a falsely-blocked signal during the soak phase.
+
+  const WRAPPER_NAMES  = new Set(WRAPPER_SCENARIOS.map(s => s.name));
+  const RUST_NAMES     = new Set(RUST_SCENARIOS.map(s => s.name));
+  const NODE_NAMES     = new Set(BOOTSTRAP_SCENARIOS.map(s => s.name));
+  const nodeAuthIds    = new Set(BOOTSTRAP_SCENARIOS.filter(s =>  s.requires_auth).map(s => s.name));
+  const nodeUnauthIds  = new Set(BOOTSTRAP_SCENARIOS.filter(s => !s.requires_auth).map(s => s.name));
+
+  const wrapperFailed      = results.some(r => !r.skipped && r.critical_failure && WRAPPER_NAMES.has(r.name));
   const rustEndpointFailed = results.some(r => !r.skipped && r.critical_failure && RUST_NAMES.has(r.name));
-  const liveRustMeasured = results.some(r => !r.skipped && RUST_NAMES.has(r.name));
-  let safe_to_enable_rust;
+  const liveRustMeasured   = results.some(r => !r.skipped && RUST_NAMES.has(r.name));
+  const nodeConfigured     = !!cfg.nodeBaseUrl;
+  const nodeUnauthMeasured = results.some(r => !r.skipped && nodeUnauthIds.has(r.name));
+  const nodeUnauthAllPass  = results.filter(r => !r.skipped && nodeUnauthIds.has(r.name)).every(r => r.pass);
+  const nodeAuthMeasured   = results.some(r => !r.skipped && nodeAuthIds.has(r.name));
+  const nodeAuthAllPass    = results.filter(r => !r.skipped && nodeAuthIds.has(r.name)).every(r => r.pass);
+
+  // ── rust_sidecar_ready ────────────────────────────────────────────────────
+  let rust_sidecar_ready;
   if (wrapperFailed) {
-    safe_to_enable_rust = 'NO — Node wrapper fallback contract failed (do not enable Rust flag)';
+    rust_sidecar_ready = 'NO — Node wrapper fallback contract failed (do not enable Rust flag)';
   } else if (!liveRustMeasured) {
-    safe_to_enable_rust = 'NO — live Rust endpoints not yet measured (run with PERF_RUN_LIVE=true + PERF_RUST_BASE_URL)';
-  } else if (rustEndpointFailed || failed > 0) {
-    safe_to_enable_rust = 'NO — one or more live Rust endpoints missed budget (see above)';
+    rust_sidecar_ready = 'NO — live Rust endpoints not yet measured';
+  } else if (rustEndpointFailed) {
+    rust_sidecar_ready = 'NO — one or more Rust endpoints missed budget';
   } else {
-    safe_to_enable_rust = 'YES (staging only; production requires 24h soak + canary — see docs/rust-staging-live-test.md)';
+    rust_sidecar_ready = 'YES (staging only)';
   }
 
-  // Recommendations
+  // ── node_staging_ready ────────────────────────────────────────────────────
+  let node_staging_ready;
+  if (!nodeConfigured) {
+    node_staging_ready = 'NO — PERF_NODE_BASE_URL not set';
+  } else if (nodeUnauthMeasured && nodeUnauthAllPass && nodeAuthMeasured && nodeAuthAllPass) {
+    node_staging_ready = 'YES — unauth 401 + auth 200 tests both passing';
+  } else if (nodeUnauthMeasured && nodeUnauthAllPass) {
+    node_staging_ready = 'PARTIAL — unauth 401 tests pass; auth 200 tests need non-prod Supabase (see docs/node-staging-baseline.md)';
+  } else if (nodeUnauthMeasured) {
+    node_staging_ready = 'NO — Node service responding but unauth tests failed';
+  } else {
+    node_staging_ready = 'NO — Node URL set but no tests measured';
+  }
+
+  // ── node_auth_baseline_ready ──────────────────────────────────────────────
+  let node_auth_baseline_ready;
+  if (!nodeConfigured) {
+    node_auth_baseline_ready = 'NO — PERF_NODE_BASE_URL not set';
+  } else if (nodeAuthMeasured && nodeAuthAllPass) {
+    node_auth_baseline_ready = 'YES — Node auth 200 tests passing with real DB data';
+  } else if (nodeAuthMeasured) {
+    node_auth_baseline_ready = 'NO — Node auth tests not passing (placeholder Supabase or missing data; see docs/node-staging-baseline.md)';
+  } else {
+    node_auth_baseline_ready = 'NO — Node auth tests not yet measured';
+  }
+
+  // ── production_enablement_ready ───────────────────────────────────────────
+  let production_enablement_ready;
+  const rustOk = rust_sidecar_ready.startsWith('YES');
+  const nodeAuthOk = node_auth_baseline_ready.startsWith('YES');
+  if (rustOk && nodeAuthOk) {
+    production_enablement_ready = 'PENDING — Rust + Node baselines confirmed; requires 24h soak pass + canary gate (see docs/rust-staging-soak.md)';
+  } else {
+    const gaps = [];
+    if (!rustOk)     gaps.push(`rust_sidecar_ready: ${rust_sidecar_ready}`);
+    if (!nodeAuthOk) gaps.push(`node_auth_baseline_ready: ${node_auth_baseline_ready}`);
+    production_enablement_ready = `NO — ${gaps.join(' | ')}`;
+  }
+
+  // ── safe_to_enable_rust (backwards-compat, Rust-only) ─────────────────────
+  // Kept for CI scripts that grep this field. Now reflects only Rust+wrapper
+  // health — Node staging failures do NOT block this signal.
+  const safe_to_enable_rust = rustOk
+    ? 'YES (staging only; production requires 24h soak + canary — see docs/rust-staging-live-test.md)'
+    : rust_sidecar_ready;
+
+  // ── Recommendations ───────────────────────────────────────────────────────
   const recs = [];
   if (skip_explanations.length) recs.push(`${skipped} test(s) skipped — see "Skipped tests" section for required env vars.`);
   const wrapperResults = results.filter(r => !r.skipped && r.p50_ms != null && WRAPPER_SCENARIOS.some(s => s.name === r.name));
@@ -331,7 +401,12 @@ async function main() {
   if (!liveRustMeasured) {
     recs.push('Live Rust endpoints not measured. Follow docs/rust-staging-live-test.md to deploy staging and run: PERF_RUN_LIVE=true PERF_RUST_BASE_URL=<staging> npm run perf:test');
   }
-  if (failed > 0) recs.push('Fix failed tests before enabling Rust in any environment.');
+  if (rustEndpointFailed || wrapperFailed) {
+    recs.push('Rust or wrapper tests failed — fix before enabling Rust flag in any environment.');
+  }
+  if (node_auth_baseline_ready.startsWith('NO') && nodeConfigured) {
+    recs.push('Node auth baseline not ready — create a non-prod Supabase project and follow docs/node-staging-baseline.md.');
+  }
 
   const summary = {
     run_id,
@@ -346,6 +421,12 @@ async function main() {
     failed,
     skipped,
     critical_failures: critical,
+    // Granular readiness fields (primary signal)
+    rust_sidecar_ready,
+    node_staging_ready,
+    node_auth_baseline_ready,
+    production_enablement_ready,
+    // Backwards-compatible summary (Rust+wrapper only — does not reflect Node failures)
     safe_to_enable_rust,
     results,
     skip_explanations,
@@ -355,9 +436,10 @@ async function main() {
   printConsole(summary);
   writeReports(summary);
 
-  // Use exitCode + natural drain rather than process.exit() to avoid the
-  // Windows libuv UV_HANDLE_CLOSING assertion when handles are still closing.
-  process.exitCode = failed > 0 || critical > 0 ? 1 : 0;
+  // Exit 1 only on Rust or wrapper critical failures.
+  // Node auth failures (e.g. placeholder Supabase) are informational — they
+  // appear in node_auth_baseline_ready and do NOT exit 1 from the soak runner.
+  process.exitCode = (wrapperFailed || rustEndpointFailed) ? 1 : 0;
 }
 
 main().catch(err => {

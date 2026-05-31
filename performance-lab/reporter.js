@@ -39,6 +39,14 @@ function printConsole(summary) {
 
   console.log(line);
   console.log(`  Tests Run: ${summary.total}   Passed: ${summary.passed}   Failed: ${summary.failed}   Skipped: ${summary.skipped}   Critical: ${summary.critical_failures}`);
+  console.log('');
+  // Granular readiness fields — primary decision signals
+  console.log(`  rust_sidecar_ready:        ${summary.rust_sidecar_ready}`);
+  console.log(`  node_staging_ready:        ${summary.node_staging_ready}`);
+  console.log(`  node_auth_baseline_ready:  ${summary.node_auth_baseline_ready}`);
+  console.log(`  production_enablement_ready: ${summary.production_enablement_ready}`);
+  console.log('');
+  // Backwards-compatible summary (Rust+wrapper only)
   console.log(`  safe_to_enable_rust: ${summary.safe_to_enable_rust}`);
   console.log(line + '\n');
 }
@@ -97,7 +105,15 @@ ${rows}
 | Failed | ${summary.failed} |
 | Skipped | ${summary.skipped} |
 | Critical failures | ${summary.critical_failures} |
-| **safe_to_enable_rust** | **${summary.safe_to_enable_rust}** |
+
+## Readiness Status
+| Signal | Value |
+|--------|-------|
+| **rust_sidecar_ready** | **${summary.rust_sidecar_ready}** |
+| **node_staging_ready** | **${summary.node_staging_ready}** |
+| **node_auth_baseline_ready** | **${summary.node_auth_baseline_ready}** |
+| **production_enablement_ready** | **${summary.production_enablement_ready}** |
+| safe_to_enable_rust _(compat)_ | ${summary.safe_to_enable_rust} |
 
 ## Recommendations
 ${recs}
