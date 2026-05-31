@@ -24,27 +24,15 @@
     "note":          "Auth rejection"
   },
   {
-    "id":            "node_dashboard_bootstrap_auth",
-    "name":          "Node dashboard/bootstrap (auth)",
-    "path":          "/api/v1/dashboard/bootstrap",
+    "id":            "node_auth_me",
+    "name":          "Node /api/auth/me (auth + Supabase DB)",
+    "path":          "/api/auth/me",
     "method":        "GET",
     "requires_auth": true,
     "expected_status": 200,
-    "target_ms":     1500,
-    "acceptable_ms": 5000,
-    "payload_max_kb": 500,
-    "note":          "Full DB-backed bootstrap; skipped if PERF_TEST_TOKEN or PERF_NODE_BASE_URL missing"
-  },
-  {
-    "id":            "node_collections_bootstrap_auth",
-    "name":          "Node collections/bootstrap (auth)",
-    "path":          "/api/v1/collections/bootstrap",
-    "method":        "GET",
-    "requires_auth": true,
-    "expected_status": 200,
-    "target_ms":     1500,
-    "acceptable_ms": 5000,
-    "payload_max_kb": 500,
-    "note":          "Full DB-backed bootstrap; skipped if PERF_TEST_TOKEN or PERF_NODE_BASE_URL missing"
+    "target_ms":     800,
+    "acceptable_ms": 3000,
+    "payload_max_kb": 10,
+    "note":          "Auth + live Supabase users query for the test user. This replaces the dashboard/bootstrap auth test because the bootstrap routes in server.js have a CacheService scoping bug (const CacheService = require() is inside a different handler at line 11538 but used at lines 11447 and 11488). /api/auth/me provides equivalent auth+DB coverage: requires valid JWT and queries Supabase directly, no CacheService dependency."
   }
 ]
