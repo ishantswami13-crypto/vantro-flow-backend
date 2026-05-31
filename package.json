@@ -38,7 +38,8 @@
     "staging:seed":        "node scripts/staging-seed.js",
     "staging:jwt":         "node scripts/staging-jwt.js",
     "staging:verify-auth": "node scripts/staging-verify-auth.js",
-    "staging:setup-supabase": "node scripts/setup-node-staging-supabase.js"
+    "staging:setup-supabase": "node scripts/setup-node-staging-supabase.js",
+    "staging:create-supabase": "node scripts/create-supabase-staging.js"
   },
   "engines": {
     "node": ">=18.0.0"
