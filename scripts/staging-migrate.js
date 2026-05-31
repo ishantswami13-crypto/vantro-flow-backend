@@ -23,10 +23,12 @@ if (!DB_URL) {
   process.exit(1);
 }
 
-// Block production Supabase URL
-if (/supabase\.co/i.test(DB_URL)) {
-  console.error('[staging-migrate] BLOCKED: DATABASE_URL contains supabase.co — this is the production DB.');
-  console.error('  Use the Railway staging Postgres URL, not the Supabase production URL.');
+// Block production Supabase URL — identified by the known production project ID.
+// Non-prod Supabase projects are allowed; only the production project is blocked.
+const PROD_SUPABASE_ID = 'alepdpyqesevldobjxbo';
+if (DB_URL.includes(PROD_SUPABASE_ID)) {
+  console.error('[staging-migrate] BLOCKED: DATABASE_URL contains the production Supabase project ID.');
+  console.error('  Use a non-prod Supabase project or Railway staging Postgres, not the production DB.');
   process.exit(1);
 }
 
@@ -110,6 +112,7 @@ const MIGRATIONS = [
   '005_cortex_x_extensions.sql',
   // 006_cortex_rls.sql — SKIP: uses auth.uid() which is Supabase-specific.
   // Plain Railway Postgres does not have this function.
+  '007_agent_registry.sql', // Atlas Agent Mesh 216 registry table
 ];
 
 async function run() {

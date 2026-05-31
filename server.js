@@ -11576,6 +11576,60 @@ app.use(async (err, req, res, next) => {
   safeErrorResponse(res, event);
 });
 
+// ── ATLAS AGENT REGISTRY — Read-only API (Phase 1) ───────────────────────────
+// GET /api/agents/registry        — list core_public agents from registry table
+// GET /api/agents/registry/:id    — single agent definition
+// Feature-gated: FEATURE_AGENT_REGISTRY_API_ENABLED must be true
+// No write endpoints. No agent execution. Registry metadata only.
+
+app.get('/api/agents/registry', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _fe } = require('./lib/featureFlags');
+    if (!_fe('agent_registry_api_enabled')) return res.status(404).json({ error: 'Not found' });
+    const pool = getPool();
+    const result = await pool.query(
+      `SELECT agent_id, name, layer, squad, mission, business_function,
+              risk_level, approval_required, status, public_claim_status,
+              feature_flag, is_active, success_metric, tools_required,
+              audit_events, harness_scenarios, created_at
+       FROM agent_registry
+       WHERE public_claim_status = 'core_public'
+       ORDER BY layer ASC, name ASC`
+    );
+    res.json({
+      success: true,
+      count: result.rows.length,
+      agents: result.rows,
+      public_claim: '12 core specialized agents with an expandable Agent Mesh architecture.',
+    });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.get('/api/agents/registry/:agentId', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _fe } = require('./lib/featureFlags');
+    if (!_fe('agent_registry_api_enabled')) return res.status(404).json({ error: 'Not found' });
+    const { agentId } = req.params;
+    if (!/^[a-z_]+\.[a-z_]+$/.test(agentId)) {
+      return res.status(400).json({ error: 'Invalid agent ID format' });
+    }
+    const pool = getPool();
+    const result = await pool.query(
+      `SELECT agent_id, name, layer, squad, mission, business_function,
+              trigger_events, input_schema, tools_required, output_schema,
+              risk_level, policy_rules, approval_required, audit_events,
+              success_metric, cost_budget, harness_scenarios,
+              feature_flag, status, fallback_behavior, public_claim_status,
+              is_active, created_at, updated_at
+       FROM agent_registry
+       WHERE agent_id = $1 AND public_claim_status = 'core_public'`,
+      [agentId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Agent not found' });
+    res.json({ success: true, agent: result.rows[0] });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
 app.listen(PORT, () => {
   console.log(`✅ Vantro Flow Backend running on port ${PORT}`);
   console.log(`📝 API Base URL: http://localhost:${PORT}`);
