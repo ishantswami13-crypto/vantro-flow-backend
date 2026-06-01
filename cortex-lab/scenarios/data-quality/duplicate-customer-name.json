@@ -1,0 +1,14 @@
+{
+  "id": "data-quality/duplicate-customer-name",
+  "category": "data-quality",
+  "mode": ["static"],
+  "description": "Two customers sharing the same name (case-insensitive) must each receive a duplicate_name finding at Medium severity. Neither may be auto-fixed.",
+  "riskLevel": "low",
+  "expected": {
+    "issue_type": "duplicate_name",
+    "severity": "medium",
+    "count_min": 2,
+    "safe_to_auto_fix": false,
+    "approval_required": true
+  }
+}

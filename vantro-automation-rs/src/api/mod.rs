@@ -3,6 +3,7 @@ use axum::Router;
 
 mod bootstrap;
 mod cost;
+mod data_quality;
 mod health;
 mod policy;
 mod scoring;
@@ -16,5 +17,6 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .merge(simulate::routes())
         .merge(policy::routes())
         .merge(cost::routes())
+        .merge(data_quality::routes())
         .with_state(state)
 }

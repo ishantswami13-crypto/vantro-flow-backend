@@ -11630,6 +11630,41 @@ app.get('/api/agents/registry/:agentId', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// ── DATA QUALITY AGENT PREVIEW — Phase 2A ────────────────────────────────────
+// GET /api/agents/core.data_quality/preview
+// Read-only preview of data quality findings for the authenticated owner.
+// No mutations. Rust sidecar required; falls back to safe empty response.
+// Feature-gated: FEATURE_DATA_QUALITY_AGENT_ENABLED must be true.
+// DO NOT call the existing cron dataQualityAgent.js here — it mutates DB.
+
+app.get('/api/agents/core.data_quality/preview', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _fe } = require('./lib/featureFlags');
+    if (!_fe('data_quality_agent_enabled')) return res.status(404).json({ error: 'Not found' });
+
+    const { evaluateDataQualityRust } = require('./lib/services/rustAutomation/dataQualityAgentClient');
+    const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    const result = await evaluateDataQualityRust(token);
+
+    if (result) return res.json(result);
+
+    // Rust sidecar unavailable — safe empty response (no mutations)
+    return res.json({
+      success: true,
+      agent_id: 'core.data_quality',
+      status: 'preview_unavailable',
+      message: 'Data quality preview requires the Rust automation service. ' +
+               'Ensure RUST_AUTOMATION_BASE_URL is set and the sidecar is running.',
+      findings: [],
+      total_findings: 0,
+      checks_run: [],
+      warnings: ['Rust sidecar unavailable'],
+    });
+  } catch (err) {
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`✅ Vantro Flow Backend running on port ${PORT}`);
   console.log(`📝 API Base URL: http://localhost:${PORT}`);

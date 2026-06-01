@@ -1,0 +1,14 @@
+{
+  "id": "data-quality/cross-user-blocked",
+  "category": "data-quality",
+  "mode": ["live"],
+  "description": "Requesting GET /api/agents/core.data_quality/preview with User B's token must never return User A's findings. The Rust sidecar sources user_id strictly from the JWT payload.",
+  "riskLevel": "high",
+  "expected": {
+    "blocked": true,
+    "no_cross_tenant_data": true
+  },
+  "forbidden": {
+    "status_codes": [200]
+  }
+}

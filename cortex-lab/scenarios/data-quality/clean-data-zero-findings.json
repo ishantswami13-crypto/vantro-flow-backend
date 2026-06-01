@@ -1,0 +1,11 @@
+{
+  "id": "data-quality/clean-data-zero-findings",
+  "category": "data-quality",
+  "mode": ["static"],
+  "description": "Well-formed data — invoices with valid due dates and positive amounts, customers with unique non-blank names, promises with amounts and dates — must produce zero findings.",
+  "riskLevel": "low",
+  "expected": {
+    "total_findings": 0,
+    "findings_empty": true
+  }
+}

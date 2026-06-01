@@ -1,0 +1,13 @@
+{
+  "id": "data-quality/missing-invoice-due-date",
+  "category": "data-quality",
+  "mode": ["static"],
+  "description": "An invoice with no due_date must trigger a missing_due_date finding at Medium severity. safe_to_auto_fix must be false. approval_required must be true.",
+  "riskLevel": "low",
+  "expected": {
+    "issue_type": "missing_due_date",
+    "severity": "medium",
+    "safe_to_auto_fix": false,
+    "approval_required": true
+  }
+}

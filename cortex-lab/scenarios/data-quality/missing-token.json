@@ -1,0 +1,11 @@
+{
+  "id": "data-quality/missing-token",
+  "category": "data-quality",
+  "mode": ["live"],
+  "description": "GET /api/agents/core.data_quality/preview without an Authorization header must return HTTP 401. The authMiddleware must reject unauthenticated requests before the flag check.",
+  "riskLevel": "medium",
+  "expected": {
+    "status": 401,
+    "blocked": true
+  }
+}

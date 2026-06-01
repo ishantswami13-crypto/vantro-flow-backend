@@ -1,0 +1,13 @@
+{
+  "id": "data-quality/amount-paid-exceeds-total",
+  "category": "data-quality",
+  "mode": ["static"],
+  "description": "An invoice where amount_paid > total_amount by more than 0.01 must trigger a High-severity amount_paid_exceeds_total finding. This could indicate a duplicate payment or data entry error.",
+  "riskLevel": "medium",
+  "expected": {
+    "issue_type": "amount_paid_exceeds_total",
+    "severity": "high",
+    "safe_to_auto_fix": false,
+    "approval_required": true
+  }
+}
