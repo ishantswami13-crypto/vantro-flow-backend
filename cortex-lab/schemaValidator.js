@@ -6,7 +6,7 @@
 const VALID_CATEGORIES = new Set([
   'orchestration', 'collections', 'risk', 'inventory', 'cashflow',
   'security', 'ai-safety', 'learning', 'isolation', 'data-quality',
-  'policy-guard', 'cost-router',
+  'policy-guard', 'cost-router', 'owner-briefing'
 ]);
 const VALID_MODES = new Set(['static', 'dry-run', 'live', 'red-team']);
 const VALID_RISK  = new Set(['low', 'medium', 'high', 'critical']);

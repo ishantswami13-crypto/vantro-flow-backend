@@ -1,0 +1,12 @@
+{
+  "id": "owner-briefing/large-data-budget",
+  "category": "owner-briefing",
+  "mode": [
+    "static"
+  ],
+  "description": "Large data set payload stays under budget due to max_items.",
+  "riskLevel": "low",
+  "expected": {
+    "payload_capped": true
+  }
+}

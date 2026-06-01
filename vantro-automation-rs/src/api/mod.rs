@@ -6,6 +6,7 @@ mod cost;
 mod cost_router;
 mod data_quality;
 mod health;
+mod owner_briefing;
 mod policy;
 mod policy_guard;
 mod scoring;
@@ -19,6 +20,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .merge(simulate::routes())
         .merge(policy::routes())
         .merge(policy_guard::routes())
+        .merge(owner_briefing::routes())
         .merge(cost_router::routes())
         .merge(cost::routes())
         .merge(data_quality::routes())

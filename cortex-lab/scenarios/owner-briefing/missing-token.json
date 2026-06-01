@@ -1,0 +1,12 @@
+{
+  "id": "owner-briefing/missing-token",
+  "category": "owner-briefing",
+  "mode": [
+    "dry-run"
+  ],
+  "description": "Missing token returns 401.",
+  "riskLevel": "low",
+  "expected": {
+    "status_code": 401
+  }
+}

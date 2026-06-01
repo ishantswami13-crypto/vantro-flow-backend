@@ -1,0 +1,12 @@
+{
+  "id": "owner-briefing/rust-unavailable-fallback",
+  "category": "owner-briefing",
+  "mode": [
+    "dry-run"
+  ],
+  "description": "Rust unavailable returns safe unavailable fallback, no fake data.",
+  "riskLevel": "medium",
+  "expected": {
+    "fallback": true
+  }
+}

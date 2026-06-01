@@ -1,0 +1,12 @@
+{
+  "id": "owner-briefing/financial-mutation-blocked",
+  "category": "owner-briefing",
+  "mode": [
+    "static"
+  ],
+  "description": "Financial mutation suggestion is blocked / not auto-executable.",
+  "riskLevel": "high",
+  "expected": {
+    "safe_to_auto_execute": false
+  }
+}

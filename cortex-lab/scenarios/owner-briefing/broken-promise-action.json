@@ -1,0 +1,14 @@
+{
+  "id": "owner-briefing/broken-promise-action",
+  "category": "owner-briefing",
+  "mode": [
+    "static"
+  ],
+  "description": "Broken promise triggers high priority action.",
+  "riskLevel": "high",
+  "expected": {
+    "has_actions": true,
+    "action_priority": "high",
+    "action_type": "ESCALATE_PROMISE"
+  }
+}

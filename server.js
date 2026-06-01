@@ -11711,6 +11711,35 @@ app.post('/api/agents/core.policy_guard/evaluate', authMiddleware, async (req, r
   }
 });
 
+// -------------------------------------------------------------------------
+// 🤖 OWNER BRIEFING AGENT PREVIEW — Phase 2C.6
+// -------------------------------------------------------------------------
+// GET /api/agents/core.owner_briefing/preview
+// Read-only aggregation of business signals for the authenticated owner.
+// No mutations. No LLM calls. Rust sidecar required; falls back to safe empty response.
+// Feature-gated: FEATURE_OWNER_BRIEFING_AGENT_ENABLED must be true.
+
+app.get('/api/agents/core.owner_briefing/preview', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _fe } = require('./lib/featureFlags');
+    if (!_fe('owner_briefing_agent_enabled')) return res.status(404).json({ error: 'Not found' });
+
+    const { evaluateOwnerBriefingRust } = require('./lib/services/rustAutomation/ownerBriefingAgentClient');
+    const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+
+    const input = {
+      briefing_date: new Date().toISOString(),
+      max_items_per_section: 5
+    };
+
+    const result = await evaluateOwnerBriefingRust(input, token);
+    res.json(result);
+  } catch (error) {
+    console.error('Owner Briefing Agent preview error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`✅ Vantro Flow Backend running on port ${PORT}`);
   console.log(`📝 API Base URL: http://localhost:${PORT}`);

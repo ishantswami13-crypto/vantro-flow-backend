@@ -1,0 +1,12 @@
+{
+  "id": "owner-briefing/external-message-approval",
+  "category": "owner-briefing",
+  "mode": [
+    "static"
+  ],
+  "description": "External message suggestion requires approval.",
+  "riskLevel": "medium",
+  "expected": {
+    "approval_required": true
+  }
+}

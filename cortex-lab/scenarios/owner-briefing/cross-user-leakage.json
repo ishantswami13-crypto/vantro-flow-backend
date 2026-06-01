@@ -1,0 +1,13 @@
+{
+  "id": "owner-briefing/cross-user-leakage",
+  "category": "owner-briefing",
+  "mode": [
+    "static",
+    "dry-run"
+  ],
+  "description": "Cross-user data attempt results in no leakage.",
+  "riskLevel": "critical",
+  "expected": {
+    "cross_user_data_found": false
+  }
+}

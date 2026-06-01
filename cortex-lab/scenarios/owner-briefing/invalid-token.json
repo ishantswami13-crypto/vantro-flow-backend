@@ -1,0 +1,12 @@
+{
+  "id": "owner-briefing/invalid-token",
+  "category": "owner-briefing",
+  "mode": [
+    "dry-run"
+  ],
+  "description": "Invalid token returns 401.",
+  "riskLevel": "low",
+  "expected": {
+    "status_code": 401
+  }
+}

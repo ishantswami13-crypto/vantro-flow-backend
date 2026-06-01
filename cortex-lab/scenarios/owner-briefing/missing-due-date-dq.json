@@ -1,0 +1,12 @@
+{
+  "id": "owner-briefing/missing-due-date-dq",
+  "category": "owner-briefing",
+  "mode": [
+    "static"
+  ],
+  "description": "Missing due date triggers data quality warning.",
+  "riskLevel": "medium",
+  "expected": {
+    "data_quality_warning": true
+  }
+}

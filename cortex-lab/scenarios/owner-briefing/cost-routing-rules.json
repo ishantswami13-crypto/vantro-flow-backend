@@ -1,0 +1,12 @@
+{
+  "id": "owner-briefing/cost-routing-rules",
+  "category": "owner-briefing",
+  "mode": [
+    "static"
+  ],
+  "description": "Cost routing is strictly rules_only (no LLM).",
+  "riskLevel": "low",
+  "expected": {
+    "cost_route": "rules_only"
+  }
+}

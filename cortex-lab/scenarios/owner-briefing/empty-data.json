@@ -1,0 +1,14 @@
+{
+  "id": "owner-briefing/empty-data",
+  "category": "owner-briefing",
+  "mode": [
+    "static",
+    "dry-run"
+  ],
+  "description": "Empty business data produces safe empty briefing, no fake claims.",
+  "riskLevel": "low",
+  "expected": {
+    "sections_present": true,
+    "fake_data_found": false
+  }
+}

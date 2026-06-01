@@ -9,6 +9,7 @@
 
 pub mod cost_router;
 pub mod data_quality;
+pub mod owner_briefing;
 pub mod policy_guard;
 pub mod registry;
 pub mod types;

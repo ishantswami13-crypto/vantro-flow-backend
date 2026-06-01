@@ -1,0 +1,13 @@
+{
+  "id": "owner-briefing/overdue-invoice-action",
+  "category": "owner-briefing",
+  "mode": [
+    "static"
+  ],
+  "description": "Overdue invoice triggers top action generation.",
+  "riskLevel": "medium",
+  "expected": {
+    "has_actions": true,
+    "action_type": "CHASE_OVERDUE"
+  }
+}
