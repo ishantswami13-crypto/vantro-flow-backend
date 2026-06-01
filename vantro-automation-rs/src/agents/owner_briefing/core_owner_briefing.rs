@@ -82,11 +82,10 @@ pub async fn generate_owner_briefing(
     let mut top_actions = Vec::new();
 
     // 1. Cash / Receivables Section
-    // Using dynamic sqlx::query to avoid .sqlx cache requirements
     let invoices = sqlx::query(
-        "SELECT id, amount, due_date, status, customer_id 
+        "SELECT id, invoice_amount, due_date, payment_status, customer_id 
          FROM invoices 
-         WHERE user_id = $1 AND status != 'PAID'"
+         WHERE user_id = $1 AND payment_status != 'PAID'"
     )
     .bind(user_id)
     .fetch_all(pool)
@@ -97,14 +96,24 @@ pub async fn generate_owner_briefing(
     let mut cash_items = Vec::new();
 
     for row in &invoices {
-        let amount: f64 = row.try_get("amount").unwrap_or(0.0);
-        let due_date: Option<DateTime<Utc>> = row.try_get("due_date").ok();
+        use rust_decimal::Decimal;
+        let amount: f64 = row.try_get::<Decimal, _>("invoice_amount").map(|d| {
+            let s = d.to_string();
+            s.parse::<f64>().unwrap_or(0.0)
+        }).unwrap_or(0.0);
+        let due_date_str: Option<String> = row.try_get("due_date").ok();
         
         unpaid_amount += amount;
         
-        if let Some(due) = due_date {
-            if due < briefing_date {
-                overdue_count += 1;
+        let mut is_overdue = false;
+        if let Some(due_str) = &due_date_str {
+            if let Ok(due) = chrono::NaiveDate::parse_from_str(due_str, "%Y-%m-%d") {
+                let due_time = chrono::NaiveDateTime::new(due, chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default());
+                let due_utc = DateTime::<Utc>::from_naive_utc_and_offset(due_time, Utc);
+                if due_utc < briefing_date {
+                    overdue_count += 1;
+                    is_overdue = true;
+                }
             }
         }
 
@@ -112,8 +121,8 @@ pub async fn generate_owner_briefing(
             cash_items.push(serde_json::json!({
                 "id": row.try_get::<Uuid, _>("id").ok(),
                 "amount": amount,
-                "due_date": due_date,
-                "status": row.try_get::<String, _>("status").unwrap_or_default(),
+                "due_date": due_date_str,
+                "status": row.try_get::<String, _>("payment_status").unwrap_or_default(),
             }));
         }
     }
