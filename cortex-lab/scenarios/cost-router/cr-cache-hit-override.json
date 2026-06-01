@@ -1,0 +1,22 @@
+{
+  "id": "cr-cache-hit-override",
+  "category": "cost-router",
+  "description": "Cache available overrides LLM routing — zero cost, fast path",
+  "mode": ["static"],
+  "riskLevel": "low",
+  "command": {
+    "type": "cost_router_evaluate",
+    "input": {
+      "task_type": "owner_briefing",
+      "cache_available": true,
+      "estimated_tokens": 1000
+    }
+  },
+  "expected": {
+    "route": "cache",
+    "model_tier": "none",
+    "estimated_cost_usd": 0,
+    "approval_required": true,
+    "safe_to_execute": false
+  }
+}

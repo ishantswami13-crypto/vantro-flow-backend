@@ -1,0 +1,22 @@
+{
+  "id": "cr-rules-only-deterministic",
+  "category": "cost-router",
+  "description": "Deterministic task routes to rules_only — zero LLM cost",
+  "mode": ["static"],
+  "riskLevel": "low",
+  "command": {
+    "type": "cost_router_evaluate",
+    "input": {
+      "task_type": "rule_evaluation",
+      "deterministic_possible": true,
+      "estimated_tokens": 200
+    }
+  },
+  "expected": {
+    "route": "rules_only",
+    "model_tier": "none",
+    "estimated_cost_usd": 0,
+    "approval_required": true,
+    "safe_to_execute": false
+  }
+}

@@ -7,6 +7,7 @@
 //! so that policy, approval, cost, and audit guarantees are declared and
 //! test-enforced BEFORE any agent can act.
 
+pub mod cost_router;
 pub mod data_quality;
 pub mod policy_guard;
 pub mod registry;

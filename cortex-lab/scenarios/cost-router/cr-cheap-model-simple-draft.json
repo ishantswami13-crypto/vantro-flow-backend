@@ -1,0 +1,21 @@
+{
+  "id": "cr-cheap-model-simple-draft",
+  "category": "cost-router",
+  "description": "Low-risk simple draft routes to cheap model",
+  "mode": ["static"],
+  "riskLevel": "low",
+  "command": {
+    "type": "cost_router_evaluate",
+    "input": {
+      "task_type": "simple_draft",
+      "risk_level": "low",
+      "estimated_tokens": 300
+    }
+  },
+  "expected": {
+    "route": "cheap_model",
+    "model_tier": "cheap",
+    "approval_required": true,
+    "safe_to_execute": false
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "id": "cr-phase-2c-invariants",
+  "category": "cost-router",
+  "description": "Phase 2C invariants: approval_required=true and safe_to_execute=false on every route",
+  "mode": ["static"],
+  "riskLevel": "low",
+  "command": {
+    "type": "cost_router_evaluate",
+    "input": {
+      "task_type": "score_customer",
+      "risk_level": "low"
+    }
+  },
+  "expected": {
+    "approval_required": true,
+    "safe_to_execute": false,
+    "audit_event": "cost_router_evaluate"
+  }
+}

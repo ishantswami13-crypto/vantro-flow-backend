@@ -11665,6 +11665,29 @@ app.get('/api/agents/core.data_quality/preview', authMiddleware, async (req, res
   }
 });
 
+// ── COST ROUTER AGENT — Phase 2C ─────────────────────────────────────────────
+// POST /api/agents/core.cost_router/evaluate
+// Read-only routing decision. No DB queries. No mutations. No LLM calls.
+// Conservative fallback: Rust unavailable → require_approval (not hard block).
+// Feature-gated: FEATURE_COST_ROUTER_AGENT_ENABLED must be true.
+
+app.post('/api/agents/core.cost_router/evaluate', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _fe } = require('./lib/featureFlags');
+    if (!_fe('cost_router_agent_enabled')) return res.status(404).json({ error: 'Not found' });
+
+    const { evaluateCostRouterRust } = require('./lib/services/rustAutomation/costRouterAgentClient');
+    const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    const body  = req.body || {};
+    const result = await evaluateCostRouterRust(body, token);
+
+    // result is always an object (conservative fallback — never null)
+    return res.json(result);
+  } catch (err) {
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ── POLICY GUARD AGENT — Phase 2B ────────────────────────────────────────────
 // POST /api/agents/core.policy_guard/evaluate
 // Read-only policy evaluation. No DB queries. No mutations. No LLM calls.

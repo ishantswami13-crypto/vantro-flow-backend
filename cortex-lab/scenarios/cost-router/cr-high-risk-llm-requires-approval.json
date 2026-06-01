@@ -1,0 +1,20 @@
+{
+  "id": "cr-high-risk-llm-requires-approval",
+  "category": "cost-router",
+  "description": "High-risk task that would use an LLM is escalated to require_approval",
+  "mode": ["static", "red-team"],
+  "riskLevel": "high",
+  "command": {
+    "type": "cost_router_evaluate",
+    "input": {
+      "task_type": "complex_analysis",
+      "risk_level": "high"
+    }
+  },
+  "expected": {
+    "route": "require_approval",
+    "approval_required": true,
+    "safe_to_execute": false,
+    "reason_codes_include": ["HIGH_RISK_LLM_REQUIRES_APPROVAL"]
+  }
+}

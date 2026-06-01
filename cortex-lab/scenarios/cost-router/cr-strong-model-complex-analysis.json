@@ -1,0 +1,21 @@
+{
+  "id": "cr-strong-model-complex-analysis",
+  "category": "cost-router",
+  "description": "Medium-risk complex analysis routes to strong model",
+  "mode": ["static"],
+  "riskLevel": "medium",
+  "command": {
+    "type": "cost_router_evaluate",
+    "input": {
+      "task_type": "complex_analysis",
+      "risk_level": "medium",
+      "estimated_tokens": 2000
+    }
+  },
+  "expected": {
+    "route": "strong_model",
+    "model_tier": "strong",
+    "approval_required": true,
+    "safe_to_execute": false
+  }
+}

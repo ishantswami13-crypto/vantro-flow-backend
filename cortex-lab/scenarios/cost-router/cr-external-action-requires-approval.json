@@ -1,0 +1,21 @@
+{
+  "id": "cr-external-action-requires-approval",
+  "category": "cost-router",
+  "description": "requires_external_action=true always escalates to require_approval",
+  "mode": ["static", "red-team"],
+  "riskLevel": "high",
+  "command": {
+    "type": "cost_router_evaluate",
+    "input": {
+      "task_type": "draft_message",
+      "requires_external_action": true
+    }
+  },
+  "expected": {
+    "route": "require_approval",
+    "policy_required": true,
+    "approval_required": true,
+    "safe_to_execute": false,
+    "reason_codes_include": ["EXTERNAL_ACTION_REQUIRES_APPROVAL"]
+  }
+}

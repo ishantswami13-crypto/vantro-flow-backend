@@ -1,0 +1,23 @@
+{
+  "id": "cr-batch-low-latency",
+  "category": "cost-router",
+  "description": "Batchable low-latency-sensitivity task routes to batch",
+  "mode": ["static"],
+  "riskLevel": "low",
+  "command": {
+    "type": "cost_router_evaluate",
+    "input": {
+      "task_type": "simple_draft",
+      "risk_level": "low",
+      "batchable": true,
+      "latency_sensitivity": "low",
+      "estimated_tokens": 600
+    }
+  },
+  "expected": {
+    "route": "batch",
+    "model_tier": "cheap",
+    "approval_required": true,
+    "safe_to_execute": false
+  }
+}

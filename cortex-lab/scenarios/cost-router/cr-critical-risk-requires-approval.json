@@ -1,0 +1,20 @@
+{
+  "id": "cr-critical-risk-requires-approval",
+  "category": "cost-router",
+  "description": "Critical risk tasks always require approval before any model call",
+  "mode": ["static", "red-team"],
+  "riskLevel": "critical",
+  "command": {
+    "type": "cost_router_evaluate",
+    "input": {
+      "task_type": "owner_briefing",
+      "risk_level": "critical"
+    }
+  },
+  "expected": {
+    "route": "require_approval",
+    "approval_required": true,
+    "safe_to_execute": false,
+    "reason_codes_include": ["CRITICAL_RISK_REQUIRES_APPROVAL"]
+  }
+}
