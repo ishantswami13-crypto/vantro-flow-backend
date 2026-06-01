@@ -1,4 +1,4 @@
-use crate::error::AppResult;
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
@@ -73,7 +73,7 @@ pub async fn generate_owner_briefing(
     pool: &PgPool,
     user_id: Uuid,
     input: OwnerBriefingInput,
-) -> AppResult<OwnerBriefingOutput> {
+) -> Result<OwnerBriefingOutput> {
     let t0 = std::time::Instant::now();
     let max_items = input.max_items_per_section.unwrap_or(5);
     let briefing_date = input.briefing_date.unwrap_or_else(Utc::now);
