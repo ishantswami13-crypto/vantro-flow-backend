@@ -1,10 +1,10 @@
 use axum::{extract::State, routing::post, Json, Router};
 use tracing::{error, info, instrument};
 
+use vantro_automation_lib::agents::owner_briefing::{
+    generate_owner_briefing, OwnerBriefingInput, OwnerBriefingOutput,
+};
 use crate::{
-    agents::owner_briefing::{
-        generate_owner_briefing, OwnerBriefingInput, OwnerBriefingOutput,
-    },
     auth::AuthUser,
     error::AppResult,
     AppState,
