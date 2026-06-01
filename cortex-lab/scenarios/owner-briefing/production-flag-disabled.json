@@ -1,0 +1,11 @@
+{
+  "id": "owner-briefing/production-flag-disabled",
+  "category": "owner-briefing",
+  "mode": ["static"],
+  "description": "Production feature flag FEATURE_OWNER_BRIEFING_AGENT_ENABLED must remain false unless explicitly enabled.",
+  "riskLevel": "critical",
+  "expected": {
+    "production_flag_enabled": false,
+    "flag_name": "owner_briefing_agent_enabled"
+  }
+}

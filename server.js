@@ -11725,7 +11725,9 @@ app.get('/api/agents/core.owner_briefing/preview', authMiddleware, async (req, r
     if (!_fe('owner_briefing_agent_enabled')) return res.status(404).json({ error: 'Not found' });
 
     const { evaluateOwnerBriefingRust } = require('./lib/services/rustAutomation/ownerBriefingAgentClient');
+    const auditService = require('./lib/services/orchestrator/audit.service');
     const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    const userId = req.user?.id;
 
     const input = {
       briefing_date: new Date().toISOString(),
@@ -11733,6 +11735,23 @@ app.get('/api/agents/core.owner_briefing/preview', authMiddleware, async (req, r
     };
 
     const result = await evaluateOwnerBriefingRust(input, token);
+    const isFallback = result.audit_context === 'fallback_empty_briefing';
+
+    // Fire-and-forget audit log — never block the response
+    auditService.log(userId, {
+      action: 'AGENT_PREVIEW',
+      entityType: 'agent',
+      entityId: 'core.owner_briefing',
+      newValue: {
+        endpoint: '/api/agents/core.owner_briefing/preview',
+        agent_id: 'core.owner_briefing',
+        timestamp: new Date().toISOString(),
+        result_status: result.status || 'unknown',
+        path: isFallback ? 'fallback' : 'rust',
+      },
+      ...auditService.fromRequest(req),
+    }).catch(() => {});
+
     res.json(result);
   } catch (error) {
     console.error('Owner Briefing Agent preview error:', error);

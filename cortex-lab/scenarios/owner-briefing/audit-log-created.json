@@ -1,0 +1,13 @@
+{
+  "id": "owner-briefing/audit-log-created",
+  "category": "owner-briefing",
+  "mode": ["dry-run"],
+  "description": "Successful preview call creates an audit log entry with action AGENT_PREVIEW and entityId core.owner_briefing.",
+  "riskLevel": "medium",
+  "expected": {
+    "audit_log_created": true,
+    "audit_action": "AGENT_PREVIEW",
+    "audit_entity_id": "core.owner_briefing",
+    "audit_entity_type": "agent"
+  }
+}

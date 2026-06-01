@@ -1,0 +1,14 @@
+{
+  "id": "owner-briefing/staging-preview-success",
+  "category": "owner-briefing",
+  "mode": ["dry-run"],
+  "description": "Authenticated preview returns 200 with structured briefing (not unavailable).",
+  "riskLevel": "low",
+  "expected": {
+    "status_code": 200,
+    "has_agent_id": true,
+    "status_not": "unavailable",
+    "has_cash_summary": true,
+    "has_sections": true
+  }
+}
