@@ -12,7 +12,7 @@ use sqlx::Row;
 use std::time::Instant;
 use uuid::Uuid;
 use vantro_automation_lib::agents::data_quality::{
-    CustomerRow, DataQualityInput, InvoiceRow, PromiseRow, evaluate,
+    evaluate, CustomerRow, DataQualityInput, InvoiceRow, PromiseRow,
 };
 
 use crate::{auth::AuthUser, error::AppResult, AppState};

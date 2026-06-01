@@ -512,7 +512,9 @@ mod tests {
         assert_eq!(out.checks_run.len(), 8);
         assert!(out.checks_run.contains(&"missing_due_date".to_string()));
         assert!(out.checks_run.contains(&"duplicate_name".to_string()));
-        assert!(out.checks_run.contains(&"promise_missing_amount".to_string()));
+        assert!(out
+            .checks_run
+            .contains(&"promise_missing_amount".to_string()));
     }
 
     #[test]
