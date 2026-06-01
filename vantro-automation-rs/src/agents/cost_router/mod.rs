@@ -479,11 +479,12 @@ mod tests {
 
     #[test]
     fn batchable_low_priority_routes_to_batch() {
+        // estimated_tokens=1200 → input_tokens_estimate=600; cortex batch requires >500.
         let out = evaluate(
             &CostRouterInput {
                 batchable: Some(true),
                 latency_sensitivity: Some("low".to_string()),
-                estimated_tokens: Some(600),
+                estimated_tokens: Some(1_200),
                 risk_level: Some("low".to_string()),
                 ..base_input("simple_draft")
             },

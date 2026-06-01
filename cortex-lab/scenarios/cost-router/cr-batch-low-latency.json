@@ -11,7 +11,7 @@
       "risk_level": "low",
       "batchable": true,
       "latency_sensitivity": "low",
-      "estimated_tokens": 600
+      "estimated_tokens": 1200
     }
   },
   "expected": {
