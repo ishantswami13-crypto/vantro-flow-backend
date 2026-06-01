@@ -36,7 +36,7 @@ axum               = { version = "0.7", features = ["json", "macros", "tokio"], 
 tower              = { version = "0.4", optional = true }
 tower-http         = { version = "0.5", features = ["cors", "trace", "request-id", "timeout", "catch-panic"], optional = true }
 tokio              = { version = "1", features = ["full"], optional = true }
-sqlx               = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"], optional = true }
+sqlx               = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "rust_decimal"], optional = true }
 rust_decimal       = { version = "1", features = ["serde-with-str"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"], optional = true }
 jsonwebtoken       = { version = "9", optional = true }
