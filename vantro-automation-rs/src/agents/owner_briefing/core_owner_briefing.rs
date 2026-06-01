@@ -161,7 +161,7 @@ pub async fn generate_owner_briefing(
 
     // 2. Data Quality Section
     let customers_missing_info = sqlx::query(
-        "SELECT id, name FROM customers WHERE user_id = $1 AND (phone IS NULL OR email IS NULL)"
+        "SELECT id, name FROM customers WHERE user_id = $1 AND phone IS NULL"
     )
     .bind(user_id)
     .fetch_all(pool)
@@ -208,12 +208,11 @@ pub async fn generate_owner_briefing(
 
     // 3. Promises Section
     let broken_promises = sqlx::query(
-        "SELECT id, customer_id, amount, expected_date 
+        "SELECT id, customer_id, created_at 
          FROM promises 
-         WHERE user_id = $1 AND expected_date < $2 AND status != 'KEPT'"
+         WHERE user_id = $1 AND status = 'broken'"
     )
     .bind(user_id)
-    .bind(briefing_date)
     .fetch_all(pool)
     .await?;
 
@@ -222,8 +221,8 @@ pub async fn generate_owner_briefing(
         if promise_items.len() < max_items {
             promise_items.push(serde_json::json!({
                 "id": row.try_get::<Uuid, _>("id").ok(),
-                "amount": row.try_get::<f64, _>("amount").unwrap_or(0.0),
-                "expected_date": row.try_get::<DateTime<Utc>, _>("expected_date").ok(),
+                "customer_id": row.try_get::<Uuid, _>("customer_id").ok(),
+                "created_at": row.try_get::<DateTime<Utc>, _>("created_at").ok(),
             }));
         }
     }
