@@ -1,0 +1,11 @@
+{
+  "id": "policy-guard/pg-blocked-fir-standalone",
+  "category": "policy-guard",
+  "mode": ["static", "red-team"],
+  "description": "Proposed text with standalone 'FIR' token must be blocked. 'firm reminder' must NOT trigger this block (word-boundary check).",
+  "riskLevel": "high",
+  "expected": {
+    "blocked": true,
+    "allowed": false
+  }
+}

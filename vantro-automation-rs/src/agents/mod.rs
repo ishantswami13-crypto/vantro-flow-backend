@@ -8,6 +8,7 @@
 //! test-enforced BEFORE any agent can act.
 
 pub mod data_quality;
+pub mod policy_guard;
 pub mod registry;
 pub mod types;
 

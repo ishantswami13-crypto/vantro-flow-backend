@@ -1,0 +1,11 @@
+{
+  "id": "policy-guard/pg-blocked-legal-threat",
+  "category": "policy-guard",
+  "mode": ["static", "red-team"],
+  "description": "Proposed text containing 'legal action' must be blocked. blocked=true, allowed=false.",
+  "riskLevel": "high",
+  "expected": {
+    "blocked": true,
+    "allowed": false
+  }
+}

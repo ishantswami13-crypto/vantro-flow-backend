@@ -1,0 +1,11 @@
+{
+  "id": "policy-guard/pg-allowed-policy-not-police",
+  "category": "policy-guard",
+  "mode": ["static", "red-team"],
+  "description": "Text containing 'policy' or 'policies' must NOT be blocked by the 'police' phrase check. Word-boundary matching must distinguish the two words.",
+  "riskLevel": "low",
+  "expected": {
+    "blocked": false,
+    "allowed": true
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "id": "policy-guard/pg-blocked-police-threat",
+  "category": "policy-guard",
+  "mode": ["static", "red-team"],
+  "description": "Proposed text with standalone 'police' must be blocked. Text containing 'policy' must NOT be blocked (word-boundary prevents substring match).",
+  "riskLevel": "high",
+  "expected": {
+    "blocked": true,
+    "allowed": false
+  }
+}

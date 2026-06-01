@@ -6,6 +6,7 @@ mod cost;
 mod data_quality;
 mod health;
 mod policy;
+mod policy_guard;
 mod scoring;
 mod simulate;
 
@@ -16,6 +17,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .merge(scoring::routes())
         .merge(simulate::routes())
         .merge(policy::routes())
+        .merge(policy_guard::routes())
         .merge(cost::routes())
         .merge(data_quality::routes())
         .with_state(state)

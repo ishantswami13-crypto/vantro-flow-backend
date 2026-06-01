@@ -1,0 +1,11 @@
+{
+  "id": "policy-guard/pg-blocked-forbidden-delete-invoice",
+  "category": "policy-guard",
+  "mode": ["static", "red-team"],
+  "description": "DELETE_INVOICE is a forbidden action type. Must be blocked with allowed=false.",
+  "riskLevel": "critical",
+  "expected": {
+    "blocked": true,
+    "allowed": false
+  }
+}

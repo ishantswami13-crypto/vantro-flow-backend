@@ -1,0 +1,13 @@
+{
+  "id": "policy-guard/pg-allowed-firm-reminder-needs-approval",
+  "category": "policy-guard",
+  "mode": ["static"],
+  "description": "SEND_FIRM_REMINDER is in the always-approval list. Must be allowed but requires approval. safe_to_auto_execute must be false.",
+  "riskLevel": "medium",
+  "expected": {
+    "allowed": true,
+    "blocked": false,
+    "approval_required": true,
+    "safe_to_auto_execute": false
+  }
+}

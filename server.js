@@ -11665,6 +11665,29 @@ app.get('/api/agents/core.data_quality/preview', authMiddleware, async (req, res
   }
 });
 
+// ── POLICY GUARD AGENT — Phase 2B ────────────────────────────────────────────
+// POST /api/agents/core.policy_guard/evaluate
+// Read-only policy evaluation. No DB queries. No mutations. No LLM calls.
+// Fail-closed: if Rust sidecar unavailable, returns blocked=true (POLICY_GUARD_UNAVAILABLE).
+// Feature-gated: FEATURE_POLICY_GUARD_AGENT_ENABLED must be true.
+
+app.post('/api/agents/core.policy_guard/evaluate', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _fe } = require('./lib/featureFlags');
+    if (!_fe('policy_guard_agent_enabled')) return res.status(404).json({ error: 'Not found' });
+
+    const { evaluatePolicyGuardRust } = require('./lib/services/rustAutomation/policyGuardAgentClient');
+    const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    const body  = req.body || {};
+    const result = await evaluatePolicyGuardRust(body, token);
+
+    // result is always an object (fail-closed — never null)
+    return res.json(result);
+  } catch (err) {
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`✅ Vantro Flow Backend running on port ${PORT}`);
   console.log(`📝 API Base URL: http://localhost:${PORT}`);

@@ -1,0 +1,13 @@
+{
+  "id": "policy-guard/pg-allowed-safe-reminder",
+  "category": "policy-guard",
+  "mode": ["static"],
+  "description": "A gentle reminder action with safe text on internal channel must be allowed. Phase 2B invariants: approval_required=true, safe_to_auto_execute=false.",
+  "riskLevel": "low",
+  "expected": {
+    "allowed": true,
+    "blocked": false,
+    "approval_required": true,
+    "safe_to_auto_execute": false
+  }
+}
