@@ -220,7 +220,8 @@ All flags default OFF unless explicitly set in Railway env. Enable without redep
 | FEATURE_LEARNING_LOOP_ENABLED | OFF | When evaluation agent verified |
 | FEATURE_WORKFLOW_RUNNER_ENABLED | OFF | When workflow_runs schema verified |
 | RUST_CORTEX_CORE_ENABLED | **OFF** | cargo test + parity + harness pass |
-| RUST_AUTOMATION_API_ENABLED | **OFF** | cargo test + bootstrap <500ms + harness pass |
+| RUST_AUTOMATION_API_ENABLED | **ON (prod + staging)** | Enabled Phase 2C.15/2C.16; prod Node → dedicated `vantro-automation-prod` sidecar, staging Node → `vantro-automation-staging` |
+| FEATURE_OWNER_BRIEFING_AGENT_ENABLED | **ON (production canary)** | Phase 2C.15 rollout; Phase 2C.16 dedicated prod Rust sidecar; **GA pending clean 24h canary** (Phase 2C.17). RAG Evidence Contract enforced; rollback = set this OFF |
 
 ---
 
