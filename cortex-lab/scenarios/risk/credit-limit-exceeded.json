@@ -1,0 +1,7 @@
+{
+  "id": "credit-limit-exceeded",
+  "category": "risk",
+  "mode": ["dry-run", "live"],
+  "description": "Credit sale that pushes customer outstanding past credit_limit must require owner approval.",
+  "expected": { "approvalRequired": true }
+}

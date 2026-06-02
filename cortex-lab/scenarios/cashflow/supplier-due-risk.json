@@ -1,0 +1,7 @@
+{
+  "id": "supplier-due-risk",
+  "category": "cashflow",
+  "mode": ["dry-run", "live"],
+  "description": "Supplier payment due in <= 3 days surfaces SUPPLIER_PAYMENT_DUE action.",
+  "expected": { "actions": ["SUPPLIER_PAYMENT_DUE"] }
+}

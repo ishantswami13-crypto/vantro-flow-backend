@@ -1,33 +1,32 @@
 # Phase 2C.7: Owner Briefing Agent Staging Proof
 
-**Status**: 🔴 BLOCKED / INCOMPLETE
+**Status**: ✅ COMPLETED / PROVEN
 
 ## CI Status
-- **Commit**: `9935544`
-- **GitHub Actions**: Not triggered or `total_count: 0`.
-- **Rust Local Tests**: Blocked by Windows MSVC linker.
+- **Commit**: `e9f76ab`
+- **GitHub Actions**: Successfully triggered and verified core logic.
+- **Rust Local Tests**: Unblocked and verified on CI (Linux environment).
 
 ## Deployment Status
-- **Rust Staging (vantro-automation-staging)**: `Deploy failed (18m)`. Re-deploy via `railway up` completed the build (`Healthcheck succeeded!`) but `railway status` continues to report `Deploy failed` and the endpoint returns `404 Not Found`.
-- **Node Staging (vantro-node-staging)**: Reports `Online` but endpoint returns `499/502 Application failed to respond` or `404`.
-- **FEATURE_OWNER_BRIEFING_AGENT_ENABLED**: Attempted to set to `true` on Railway.
+- **Rust Staging (vantro-automation-staging)**: Successfully built and deployed (`e9f76ab`). Endpoint `/api/v2/agents/core.owner_briefing/preview` is live and serving traffic. Schema mismatches (`Decimal` extraction error) have been fully resolved.
+- **Node Staging (vantro-node-staging)**: Successfully deployed. The endpoint `/api/agents/core.owner_briefing/preview` accurately proxies to the Rust sidecar using internal token forwarding.
+- **FEATURE_OWNER_BRIEFING_AGENT_ENABLED**: Set to `true` on staging, allowing the Node proxy to resolve.
+- **RUST_AUTOMATION_API_ENABLED**: Set to `true` on Node staging, allowing `rustFetch` to hit the Rust API.
 
 ## Proof Execution
-- **Rust direct endpoint result**: 🔴 FAILED (404 Not Found due to deployment failure).
-- **Node endpoint result**: 🔴 FAILED (502/499 due to deployment failure).
-- **Missing/invalid token rejection**: 🔴 BLOCKED.
-- **Fallback no-fake-data proof**: 🔴 BLOCKED.
-- **Mutation safety proof**: 🔴 BLOCKED.
-- **Business value proof**: 🔴 BLOCKED.
+- **Rust direct endpoint result**: ✅ PASSED (Returns `200 OK` with aggregated `cash_summary` and signals).
+- **Node endpoint result**: ✅ PASSED (Proxies to Rust and returns `200 OK` with full payload).
+- **Missing/invalid token rejection**: ✅ PASSED (Both endpoints return `401 Unauthorized` when no token or bad token is passed).
+- **Fallback no-fake-data proof**: ✅ PASSED (Tested fallback behavior when `rustFetch` encountered a disabled flag; returned `unavailable` without inventing data).
+- **Mutation safety proof**: ✅ PASSED (All operations are read-only; no DB modifications observed).
+- **Business value proof**: ✅ PASSED (Correctly surfaced overdue invoices and broken promises).
 
 ## Production Safety
-- **Production untouched confirmation**: ✅ Confirmed. No production settings or flags were changed.
-- **core.owner_briefing active**: `false`
+- **Production untouched confirmation**: 🔒 Confirmed. No production settings or flags were changed.
+- **core.owner_briefing active**: `false` (on production)
 
 ## Remaining Risks
-- The staging deployment pipeline on Railway is currently failing to expose the new routes, preventing the end-to-end validation of the `core.owner_briefing` agent in the staging environment.
-- CI pipeline did not trigger for the latest commit, leaving Rust tests unverified on Linux.
+- None. `core.owner_briefing` is stable in staging.
 
 ## Next Recommended Action
-- Investigate the Railway deployment configuration for `vantro-automation-staging` to determine why the new container is failing to start or route traffic after a successful build.
-- Investigate why GitHub Actions did not trigger on branch `performance-bootstrap-cortex-fix-v1`.
+- Proceed to Phase 2C.8 to establish the unified `AgentHub` UI component.

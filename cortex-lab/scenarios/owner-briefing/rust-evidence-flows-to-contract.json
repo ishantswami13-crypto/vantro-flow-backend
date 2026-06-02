@@ -1,0 +1,37 @@
+{
+  "id": "owner-briefing/rust-evidence-flows-to-contract",
+  "category": "owner-briefing",
+  "mode": ["static", "dry-run"],
+  "description": "Rust OwnerBriefingOutput.evidence[] flows through Node enforceEvidenceContract and surfaces in the frontend evidence_contract. When seeded invoice/promise data exists, evidence is non-empty, safe_to_show=true, and evidence_source_ids are populated in the audit log.",
+  "riskLevel": "high",
+  "tags": ["rag-evidence-contract", "rust-evidence", "end-to-end", "2c.13"],
+  "expected": {
+    "rust_response.evidence_is_array": true,
+    "evidence_contract.evidence_length_gte_0": true,
+    "evidence_contract.safe_to_show_when_evidence_exists": true,
+    "evidence_contract.safe_to_show_false_when_evidence_empty": true,
+    "evidence_source_ids_populated_when_evidence_exists": true,
+    "no_fake_evidence": true,
+    "no_cross_tenant_evidence": true,
+    "audit_log.evidence_count_set": true,
+    "audit_log.evidence_source_ids_set": true,
+    "action.evidence_ids_reference_real_evidence": true,
+    "all_actions_safe_to_auto_execute_false": true,
+    "risky_actions_require_human_approval": true
+  },
+  "contract_rules": {
+    "rule": "RUST_EVIDENCE_END_TO_END",
+    "description": "Evidence flows from Rust DB queries → OwnerBriefingOutput.evidence[] → Node enforceEvidenceContract → evidence_contract in API response → frontend EvidenceContractPanel",
+    "enforcement_points": [
+      "vantro-automation-rs/src/agents/owner_briefing/core_owner_briefing.rs:generate_owner_briefing",
+      "lib/services/rustAutomation/ownerBriefingAgentClient.js:enforceEvidenceContract",
+      "server.js:/api/agents/core.owner_briefing/preview"
+    ],
+    "tenant_scoping": "user_id = $1 on all invoice, customer, promise queries",
+    "evidence_bounds": {
+      "max_invoice_evidence": 10,
+      "max_promise_evidence": 5,
+      "priority": "overdue invoices first, then unpaid, then broken promises"
+    }
+  }
+}

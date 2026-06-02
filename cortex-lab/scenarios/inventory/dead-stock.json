@@ -1,0 +1,7 @@
+{
+  "id": "dead-stock",
+  "category": "inventory",
+  "mode": ["dry-run"],
+  "description": "Product with no sales in 60 days surfaces in DATA_QUALITY_FIX / dead-stock report — must not auto-discount.",
+  "forbidden": { "actions": ["OFFER_DISCOUNT"] }
+}

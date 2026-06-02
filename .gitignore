@@ -44,3 +44,5 @@ performance-lab/report.md
 
 # Staging test artifacts (never commit)
 .staging-token
+cortex-lab/.env.test
+.railway_vars

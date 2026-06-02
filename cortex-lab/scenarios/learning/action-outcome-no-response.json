@@ -1,0 +1,7 @@
+{
+  "id": "action-outcome-no-response",
+  "category": "learning",
+  "mode": ["dry-run"],
+  "description": "When approved polite reminder produces no payment within N days, evaluationAgent must lower polite-tone score and suggest firmer next action.",
+  "expected": { "actions": ["SEND_FIRM_REMINDER"] }
+}

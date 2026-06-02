@@ -1,0 +1,7 @@
+{
+  "id": "owner-only-approval",
+  "category": "security",
+  "mode": ["live"],
+  "description": "Owner token may approve a high-risk action; staff token attempting the same must be rejected with 403.",
+  "expected": { "approvalRequired": true }
+}

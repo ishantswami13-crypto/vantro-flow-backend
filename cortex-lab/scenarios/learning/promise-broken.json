@@ -1,0 +1,7 @@
+{
+  "id": "promise-broken",
+  "category": "learning",
+  "mode": ["dry-run"],
+  "description": "Customer breaks a promise twice — promise_reliability_score drops, credit_risk_score rises, future credit warning surfaces.",
+  "expected": { "actions": ["STOP_CREDIT_WARNING"] }
+}

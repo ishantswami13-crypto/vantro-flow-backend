@@ -1,0 +1,7 @@
+{
+  "id": "cashflow-gap",
+  "category": "cashflow",
+  "mode": ["dry-run"],
+  "description": "Expected outflow > expected inflow over next 7 days emits CASHFLOW_RISK action.",
+  "expected": { "actions": ["CASHFLOW_RISK"] }
+}

@@ -1,0 +1,7 @@
+{
+  "id": "owner-call-needed",
+  "category": "collections",
+  "mode": ["dry-run"],
+  "description": "High-value overdue + broken-promise history must escalate via ESCALATE_TO_OWNER + CALL_CUSTOMER actions.",
+  "expected": { "actions": ["ESCALATE_TO_OWNER"] }
+}

@@ -1,0 +1,7 @@
+{
+  "id": "tone-success-learning",
+  "category": "learning",
+  "mode": ["dry-run"],
+  "description": "Across N payments per customer, business_memory should converge on the tone that historically recovered fastest.",
+  "expected": {}
+}

@@ -1,0 +1,7 @@
+{
+  "id": "expected-cash-week",
+  "category": "cashflow",
+  "mode": ["dry-run"],
+  "description": "Sum of expected_inflow over next 7 days must match sum of unpaid receivables due in that window.",
+  "expected": {}
+}

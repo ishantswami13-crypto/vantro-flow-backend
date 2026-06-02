@@ -1,0 +1,7 @@
+{
+  "id": "promise-kept",
+  "category": "learning",
+  "mode": ["dry-run"],
+  "description": "Customer keeps a promise — promise_reliability_score increases, credit_risk_score decreases.",
+  "expected": {}
+}

@@ -1,0 +1,7 @@
+{
+  "id": "high-value-risky-customer",
+  "category": "risk",
+  "mode": ["dry-run"],
+  "description": "Sale > ₹50,000 to high-risk customer must be flagged via simulationEngine warning before save.",
+  "expected": { "actions": ["CREDIT_LIMIT_REVIEW", "STOP_CREDIT_WARNING"], "approvalRequired": true }
+}

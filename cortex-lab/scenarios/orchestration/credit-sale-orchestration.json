@@ -1,6 +1,9 @@
 {
-  "name": "credit-sale-orchestration",
+  "id": "credit-sale-orchestration",
+  "name": "Credit sale creates connected Cortex chain",
   "category": "orchestration",
+  "mode": ["static", "dry-run", "live"],
+  "riskLevel": "medium",
   "description": "Creating a credit sale must atomically produce: sale row, inventory reduction, receivable, expected cashflow inflow, business event, audit log, and a collection ai_action.",
   "seed": {
     "user_id": "TEST_USER_A",
@@ -13,6 +16,7 @@
   },
   "command": {
     "type": "CREATE_SALE",
+    "actor": "ownerA",
     "payload": {
       "customer_name": "Rahul Traders",
       "amount": 12000,
@@ -21,17 +25,15 @@
       "due_in_days": 15
     }
   },
-  "expected_events": [
-    "SALE_CREATED",
-    "STOCK_REDUCED",
-    "RECEIVABLE_CREATED",
-    "CASHFLOW_UPDATED"
-  ],
-  "expected_actions_min": 0,
-  "expected_db_changes": {
-    "invoices": { "min_new_rows": 1 },
-    "cashflow_events": { "min_new_rows": 1 }
+  "expected": {
+    "events": ["SALE_CREATED"],
+    "actions": [],
+    "dbChanges": { "invoices": { "minNewRows": 1 } },
+    "blocked": false
   },
-  "expected_blocked_actions": [],
-  "expected_policy_decisions_min": 0
+  "forbidden": {
+    "actions": ["MARK_PAID", "DELETE_INVOICE"],
+    "externalEffects": ["whatsapp_send", "sms_send"]
+  },
+  "scoreWeights": { "orchestration": 50, "policy": 25, "dataIntegrity": 25 }
 }

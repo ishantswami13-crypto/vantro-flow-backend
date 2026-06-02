@@ -1,0 +1,8 @@
+{
+  "id": "purchase-orchestration",
+  "category": "orchestration",
+  "mode": ["dry-run", "live"],
+  "description": "Credit purchase produces: purchase row, inventory increase, payable, supplier-payment-due action if due in <= 3 days.",
+  "command": { "type": "CREATE_PURCHASE", "actor": "ownerA", "payload": { "amount": 8000, "paid_amount": 0, "due_in_days": 2 } },
+  "expected": { "events": ["PURCHASE_CREATED"], "actions": ["SUPPLIER_PAYMENT_DUE"] }
+}

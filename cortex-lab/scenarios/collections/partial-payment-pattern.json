@@ -1,0 +1,7 @@
+{
+  "id": "partial-payment-pattern",
+  "category": "collections",
+  "mode": ["dry-run"],
+  "description": "Customer repeatedly pays in parts. business_memory.partial_payment_score should increase; future suggestion offers ASK_PARTIAL_PAYMENT.",
+  "expected": { "actions": ["ASK_PARTIAL_PAYMENT"] }
+}

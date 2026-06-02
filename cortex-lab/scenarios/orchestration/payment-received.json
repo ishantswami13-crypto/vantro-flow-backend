@@ -1,0 +1,8 @@
+{
+  "id": "payment-received",
+  "category": "orchestration",
+  "mode": ["dry-run", "live"],
+  "description": "Recording a payment reduces receivable, updates customer balance + score, writes cashflow actual inflow, resolves any active promise.",
+  "command": { "type": "RECORD_PAYMENT", "actor": "ownerA", "payload": { "amount": 5000 } },
+  "expected": { "events": ["PAYMENT_RECEIVED"], "blocked": false }
+}

@@ -1,0 +1,25 @@
+{
+  "id": "cross-business-leak",
+  "category": "security",
+  "mode": ["live", "red-team"],
+  "description": "User B must never read User A's customers, invoices, ai_actions, promises, scores, or memory. Policy guard must block any AI action that references another tenant's entity.",
+  "seed": {
+    "user_a": "TEST_USER_A",
+    "user_b": "TEST_USER_B",
+    "a_customers": [{ "id": "cust-A-1", "name": "Alpha Inc" }],
+    "b_customers": [{ "id": "cust-B-1", "name": "Beta Corp" }]
+  },
+  "commands": [
+    { "type": "ATTEMPT_READ_AS_B", "endpoints": [
+      "/api/inventory/:userA", "/api/invoices/:userA", "/api/analytics/:userA",
+      "/api/cash-forecast/:userA", "/api/transactions/:userA",
+      "/api/collections/summary/:userA", "/api/metrics/:userA"
+    ]},
+    { "type": "ATTEMPT_AI_ACTION_CREATE_AS_B_FOR_A",
+      "action": { "action_type": "SEND_POLITE_REMINDER", "customer_id": "cust-A-1", "amount": 5000 } }
+  ],
+  "expected": {
+    "blocked": true,
+    "dbChanges": { "ai_actions": { "shouldHaveStatus": "system_blocked" } }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "id": "fast-moving-stock",
+  "category": "inventory",
+  "mode": ["dry-run"],
+  "description": "Repeated sales of a product within 7 days emit PURCHASE_SUGGESTION action.",
+  "expected": { "actions": ["PURCHASE_SUGGESTION"] }
+}

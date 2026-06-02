@@ -1,0 +1,7 @@
+{
+  "id": "firm-reminder-needed",
+  "category": "collections",
+  "mode": ["dry-run", "live"],
+  "description": "Overdue > 7 days must produce SEND_FIRM_REMINDER with requires_approval=true and risk_level medium/high.",
+  "expected": { "actions": ["SEND_FIRM_REMINDER"] }
+}

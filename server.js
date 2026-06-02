@@ -11734,8 +11734,9 @@ app.get('/api/agents/core.owner_briefing/preview', authMiddleware, async (req, r
       max_items_per_section: 5
     };
 
-    const result = await evaluateOwnerBriefingRust(input, token);
+    const result = await evaluateOwnerBriefingRust(input, token, userId);
     const isFallback = result.audit_context === 'fallback_empty_briefing';
+    const ec = result.evidence_contract;
 
     // Fire-and-forget audit log — never block the response
     auditService.log(userId, {
@@ -11743,11 +11744,23 @@ app.get('/api/agents/core.owner_briefing/preview', authMiddleware, async (req, r
       entityType: 'agent',
       entityId: 'core.owner_briefing',
       newValue: {
-        endpoint: '/api/agents/core.owner_briefing/preview',
-        agent_id: 'core.owner_briefing',
-        timestamp: new Date().toISOString(),
-        result_status: result.status || 'unknown',
-        path: isFallback ? 'fallback' : 'rust',
+        endpoint:             '/api/agents/core.owner_briefing/preview',
+        agent_name:           'core.owner_briefing',
+        briefing_id:          ec?.briefing_id || null,
+        timestamp:            new Date().toISOString(),
+        result_status:        result.status || 'unknown',
+        path:                 isFallback ? 'fallback' : 'rust',
+        // Evidence contract audit fields
+        claim_count:          ec?.claims?.length ?? 0,
+        safe_claim_count:     ec?.claims?.filter(c => c.safe_to_show_claim)?.length ?? 0,
+        blocked_claim_count:  ec?.blocked_claim_count ?? 0,
+        evidence_count:       ec?.evidence?.length ?? 0,
+        evidence_source_ids:  ec?.evidence_source_ids ?? [],
+        confidence:           ec?.confidence ?? 0,
+        safe_to_show:         ec?.safe_to_show ?? false,
+        fallback_reason:      ec?.fallback_reason ?? null,
+        blocked_reasons:      ec?.claims?.filter(c => c.blocked_reason).map(c => c.blocked_reason) ?? [],
+        contract_version:     ec?.contract_version ?? null,
       },
       ...auditService.fromRequest(req),
     }).catch(() => {});

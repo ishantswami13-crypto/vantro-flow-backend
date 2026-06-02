@@ -1,0 +1,19 @@
+{
+  "id": "owner-briefing/low-confidence-claim-blocked",
+  "category": "owner-briefing",
+  "mode": ["static"],
+  "description": "Claims with confidence < 0.65 must have safe_to_show_claim=false and blocked_reason=LOW_CONFIDENCE.",
+  "riskLevel": "high",
+  "tags": ["rag-evidence-contract", "2c.12"],
+  "expected": {
+    "claim.confidence_below_threshold": true,
+    "claim.safe_to_show_claim": false,
+    "claim.blocked_reason": "LOW_CONFIDENCE",
+    "threshold": 0.65
+  },
+  "contract_rules": {
+    "rule": "LOW_CONFIDENCE",
+    "description": "confidence < 0.65 must block a claim regardless of evidence_ids",
+    "enforcement_point": "ownerBriefingAgentClient.enforceEvidenceContract"
+  }
+}

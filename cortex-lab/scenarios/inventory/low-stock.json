@@ -1,0 +1,7 @@
+{
+  "id": "low-stock",
+  "category": "inventory",
+  "mode": ["dry-run", "live"],
+  "description": "Stock below low_stock_alert threshold emits LOW_STOCK_DETECTED + LOW_STOCK_ALERT action.",
+  "expected": { "events": ["LOW_STOCK_DETECTED"], "actions": ["LOW_STOCK_ALERT"] }
+}

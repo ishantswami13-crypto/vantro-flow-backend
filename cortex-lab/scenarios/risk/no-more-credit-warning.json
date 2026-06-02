@@ -1,0 +1,7 @@
+{
+  "id": "no-more-credit-warning",
+  "category": "risk",
+  "mode": ["dry-run"],
+  "description": "Three back-to-back broken promises must mark customer no-more-credit and emit STOP_CREDIT_WARNING.",
+  "expected": { "actions": ["STOP_CREDIT_WARNING"] }
+}

@@ -1,0 +1,7 @@
+{
+  "id": "public-endpoint-leak",
+  "category": "security",
+  "mode": ["live"],
+  "description": "Public endpoints (e.g. /api/public/profile/:userId, /api/public/referrals/:userId) must not return private financial data.",
+  "expected": { "blocked": true }
+}

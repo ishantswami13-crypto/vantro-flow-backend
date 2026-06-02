@@ -1,0 +1,7 @@
+{
+  "id": "staff-permission-denied",
+  "category": "security",
+  "mode": ["live"],
+  "description": "Staff token must not approve owner-only actions or send external messages.",
+  "expected": { "blocked": true }
+}

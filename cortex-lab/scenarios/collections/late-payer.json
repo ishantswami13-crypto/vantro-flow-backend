@@ -1,0 +1,7 @@
+{
+  "id": "late-payer",
+  "category": "collections",
+  "mode": ["dry-run"],
+  "description": "Customer with multiple late payments triggers risk_level escalation in customer_scores.",
+  "expected": { "actions": ["SEND_FIRM_REMINDER"] }
+}

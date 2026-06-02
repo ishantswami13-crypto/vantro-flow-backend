@@ -1,0 +1,21 @@
+{
+  "id": "owner-briefing/verified-evidence-allows-claim",
+  "category": "owner-briefing",
+  "mode": ["static"],
+  "description": "When evidence exists, claim has evidence_ids, and confidence >= 0.65, safe_to_show_claim must be true and safe_to_show must be true.",
+  "riskLevel": "low",
+  "tags": ["rag-evidence-contract", "2c.12"],
+  "expected": {
+    "evidence_contract.evidence_length_gt_0": true,
+    "claim.evidence_ids_non_empty": true,
+    "claim.confidence_gte_threshold": true,
+    "claim.safe_to_show_claim": true,
+    "evidence_contract.safe_to_show": true,
+    "threshold": 0.65
+  },
+  "contract_rules": {
+    "rule": "VERIFIED_EVIDENCE_ALLOWS_CLAIM",
+    "description": "a claim with evidence, evidence_ids, and confidence >= 0.65 must be shown (safe_to_show_claim=true)",
+    "enforcement_point": "ownerBriefingAgentClient.enforceEvidenceContract"
+  }
+}

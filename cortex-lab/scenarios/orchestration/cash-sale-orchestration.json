@@ -1,0 +1,9 @@
+{
+  "id": "cash-sale-orchestration",
+  "category": "orchestration",
+  "mode": ["dry-run", "live"],
+  "description": "Cash sale produces: sale, inventory reduction, payment row, actual cashflow inflow, audit log. No receivable.",
+  "command": { "type": "CREATE_SALE", "actor": "ownerA", "payload": { "amount": 5000, "paid_amount": 5000, "payment_method": "cash" } },
+  "expected": { "events": ["SALE_CREATED", "PAYMENT_RECEIVED"], "blocked": false },
+  "forbidden": { "events": ["RECEIVABLE_CREATED"] }
+}

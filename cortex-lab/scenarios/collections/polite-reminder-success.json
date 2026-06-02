@@ -1,0 +1,7 @@
+{
+  "id": "polite-reminder-success",
+  "category": "collections",
+  "mode": ["dry-run"],
+  "description": "Customer pays after polite reminder. business_memory must record polite-tone success and customer_score.recovery_probability must move up.",
+  "expected": { "events": ["PAYMENT_RECEIVED"], "actions": [] }
+}

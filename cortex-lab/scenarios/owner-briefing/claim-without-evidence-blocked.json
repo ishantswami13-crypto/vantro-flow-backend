@@ -1,0 +1,18 @@
+{
+  "id": "owner-briefing/claim-without-evidence-blocked",
+  "category": "owner-briefing",
+  "mode": ["static"],
+  "description": "Any claim with evidence_ids=[] must have safe_to_show_claim=false and blocked_reason=CLAIM_MISSING_EVIDENCE, even when other evidence exists.",
+  "riskLevel": "high",
+  "tags": ["rag-evidence-contract", "2c.12"],
+  "expected": {
+    "claim.safe_to_show_claim": false,
+    "claim.blocked_reason": "CLAIM_MISSING_EVIDENCE",
+    "claim.evidence_ids_empty": true
+  },
+  "contract_rules": {
+    "rule": "CLAIM_MISSING_EVIDENCE",
+    "description": "claims without evidence_ids must be individually blocked even if overall evidence exists",
+    "enforcement_point": "ownerBriefingAgentClient.enforceEvidenceContract"
+  }
+}

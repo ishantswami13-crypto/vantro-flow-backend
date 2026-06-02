@@ -1,0 +1,8 @@
+{
+  "id": "risky-credit-sale",
+  "category": "risk",
+  "mode": ["dry-run", "live"],
+  "riskLevel": "high",
+  "description": "Credit sale to a customer with credit_risk_score >= 80 must produce STOP_CREDIT_WARNING with requires_approval=true.",
+  "expected": { "actions": ["STOP_CREDIT_WARNING"], "approvalRequired": true }
+}

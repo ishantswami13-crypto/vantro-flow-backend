@@ -1,0 +1,8 @@
+{
+  "id": "dispute-first",
+  "category": "collections",
+  "mode": ["dry-run"],
+  "description": "Customer disputes invoice before paying. System must route to RESOLVE_DISPUTE and not send firm reminders during dispute.",
+  "expected": { "actions": ["RESOLVE_DISPUTE"] },
+  "forbidden": { "actions": ["SEND_FIRM_REMINDER"] }
+}

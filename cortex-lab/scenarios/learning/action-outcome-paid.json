@@ -1,0 +1,7 @@
+{
+  "id": "action-outcome-paid",
+  "category": "learning",
+  "mode": ["dry-run"],
+  "description": "When approved polite reminder is followed by payment, business_memory must persist a success record for tone=polite.",
+  "expected": { "events": ["PAYMENT_RECEIVED"] }
+}

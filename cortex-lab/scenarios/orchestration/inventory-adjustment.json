@@ -1,0 +1,8 @@
+{
+  "id": "inventory-adjustment",
+  "category": "orchestration",
+  "mode": ["dry-run", "live"],
+  "description": "Stock-move emits STOCK_MOVED + LOW_STOCK_DETECTED when post-move quantity is below reorder threshold.",
+  "command": { "type": "STOCK_MOVE", "actor": "ownerA", "payload": { "product_id": "prod-1", "delta": -95 } },
+  "expected": { "events": ["LOW_STOCK_DETECTED"] }
+}

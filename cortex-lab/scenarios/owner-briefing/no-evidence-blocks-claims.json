@@ -1,0 +1,20 @@
+{
+  "id": "owner-briefing/no-evidence-blocks-claims",
+  "category": "owner-briefing",
+  "mode": ["static"],
+  "description": "When evidence array is empty, safe_to_show must be false, all claims must have safe_to_show_claim=false, and fallback_reason must be set.",
+  "riskLevel": "critical",
+  "tags": ["rag-evidence-contract", "2c.12"],
+  "expected": {
+    "evidence_contract.safe_to_show": false,
+    "evidence_contract.evidence_length": 0,
+    "evidence_contract.fallback_reason_set": true,
+    "all_claims_blocked": true,
+    "no_unsupported_summary": true
+  },
+  "contract_rules": {
+    "rule": "NO_EVIDENCE_NO_CLAIM",
+    "description": "empty evidence array must block all claims and set safe_to_show=false",
+    "enforcement_point": "ownerBriefingAgentClient.enforceEvidenceContract"
+  }
+}
