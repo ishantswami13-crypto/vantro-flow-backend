@@ -24,6 +24,28 @@ function tryRequire(rel) {
   try { return require(rel); } catch (err) { return { __err: err }; }
 }
 
+// ── Static-mode Supabase mock ────────────────────────────────────────────────
+// Static mode is "no DB, no network": policyGuard's Supabase calls are stubbed in
+// runPolicyGuardBattery. A *real* client is unusable here for two reasons:
+//   1. lib/config/supabaseClient exports `null` when SUPABASE_URL/KEY are absent
+//      (CI has no .env), and policyGuard destructures it at import time — a null
+//      client cannot be stubbed, so the battery was skipped (policy_safety 7/1).
+//   2. With creds present, @supabase/supabase-js createClient eagerly constructs a
+//      RealtimeClient that requires WebSocket and THROWS on Node < 22 (CI = Node 18).
+// Pre-seed the require cache with a stubbable, non-null fake client BEFORE any
+// product module loads, so supabaseClient.js never executes (createClient is never
+// called → no WebSocket dependency, no real connection) and policyGuard destructures
+// the fake. runPolicyGuardBattery then replaces `.from` with its deterministic fake.
+(function mockSupabaseClientForStatic() {
+  const Module = require('module');
+  const clientPath = require.resolve('../../lib/config/supabaseClient');
+  const mock = new Module(clientPath, module);
+  mock.filename = clientPath;
+  mock.loaded = true;
+  mock.exports = { supabase: { from() { return {}; } } };
+  require.cache[clientPath] = mock;
+})();
+
 const promptGuard  = tryRequire('../../lib/services/orchestrator/promptGuard.service');
 const llmPlanner   = tryRequire('../../lib/services/orchestrator/llmPlanner.service');
 const policyGuard  = tryRequire('../../lib/services/orchestrator/policyGuard.service');

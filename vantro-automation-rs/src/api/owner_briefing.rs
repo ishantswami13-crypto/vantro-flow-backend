@@ -1,13 +1,9 @@
 use axum::{extract::State, routing::post, Json, Router};
 use tracing::{error, info, instrument};
 
+use crate::{auth::AuthUser, error::AppResult, AppState};
 use vantro_automation_lib::agents::owner_briefing::{
     generate_owner_briefing, OwnerBriefingInput, OwnerBriefingOutput,
-};
-use crate::{
-    auth::AuthUser,
-    error::AppResult,
-    AppState,
 };
 
 pub fn routes() -> Router<AppState> {
