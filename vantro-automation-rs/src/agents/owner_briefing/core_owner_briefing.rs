@@ -40,28 +40,39 @@ impl EvidenceItem {
         status: &str,
         due_date: Option<&str>,
         is_overdue: bool,
-        customer_id: Option<&str>,
+        // Intentionally not serialized — see the metadata note below.
+        _customer_id: Option<&str>,
     ) -> Self {
         let label = if is_overdue {
             "Overdue invoice".to_string()
         } else {
             "Unpaid invoice".to_string()
         };
+        // Reflect the overdue state in the excerpt so the evidence text matches the
+        // label (an overdue invoice should read as "overdue", not just its raw status).
+        let status_lc = status.to_lowercase();
+        let state = if is_overdue {
+            "overdue"
+        } else {
+            status_lc.as_str()
+        };
         let excerpt = format!(
             "Invoice for ₹{:.2} is {} (due: {})",
             amount,
-            status.to_lowercase(),
+            state,
             due_date.unwrap_or("unknown")
         );
+        // Evidence is row-centric (source_type:source_id). The raw customer_id is
+        // deliberately NOT embedded here: it is unconsumed downstream (Node + the
+        // frontend reference evidence only by source_id/id) and the RAG evidence
+        // contract keeps internal entity IDs out of the serialized payload that
+        // flows to the LLM and UI. Tenant scoping/customer linkage stays internal.
         let mut meta = serde_json::json!({
             "status": status,
             "is_overdue": is_overdue,
         });
         if let Some(dd) = due_date {
             meta["due_date"] = serde_json::Value::String(dd.to_string());
-        }
-        if let Some(cid) = customer_id {
-            meta["customer_id"] = serde_json::Value::String(cid.to_string());
         }
         EvidenceItem {
             id: format!("invoice:{}", invoice_id),
@@ -80,13 +91,11 @@ impl EvidenceItem {
 
     fn broken_promise(
         promise_id: &str,
-        customer_id: Option<&str>,
+        // Intentionally not serialized — same evidence-contract/privacy rule as invoice().
+        _customer_id: Option<&str>,
         created_at: Option<&str>,
     ) -> Self {
-        let mut meta = serde_json::json!({ "status": "broken" });
-        if let Some(cid) = customer_id {
-            meta["customer_id"] = serde_json::Value::String(cid.to_string());
-        }
+        let meta = serde_json::json!({ "status": "broken" });
         EvidenceItem {
             id: format!("promise:{}", promise_id),
             source_type: "promise".to_string(),
@@ -555,7 +564,10 @@ mod tests {
         assert!(json.contains("\"id\":\"invoice:abc123\""));
         assert!(json.contains("12000.0"));
         assert!(json.contains("\"confidence\":1.0"));
-        assert!(!json.contains("cust-001")); // customer_id only in metadata
+        // Evidence is row-centric: it must never serialize a raw customer_id, even
+        // when one is passed to the builder (privacy / RAG evidence contract).
+        assert!(!json.contains("cust-001"));
+        assert!(!json.contains("customer_id"));
     }
 
     #[test]
@@ -575,6 +587,9 @@ mod tests {
         assert!(json.contains("\"confidence\":1.0"));
         // Amount should NOT be in JSON (None + skip_serializing_if)
         assert!(!json.contains("\"amount\""));
+        // Same evidence-contract rule for the promise path: no raw customer_id.
+        assert!(!json.contains("cust-002"));
+        assert!(!json.contains("customer_id"));
     }
 
     #[test]
