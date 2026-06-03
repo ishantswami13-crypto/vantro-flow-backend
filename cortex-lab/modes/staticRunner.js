@@ -24,6 +24,22 @@ function tryRequire(rel) {
   try { return require(rel); } catch (err) { return { __err: err }; }
 }
 
+// ── Static-mode DB stub bootstrap ────────────────────────────────────────────
+// Static mode stubs ALL Supabase access (see runPolicyGuardBattery). But
+// lib/config/supabaseClient exports `null` when SUPABASE_URL/KEY are absent
+// (e.g. in CI, which has no .env), and policyGuard destructures that client at
+// import time — so a null client cannot be stubbed and the entire policyGuard
+// battery is skipped (CI saw policy_safety 7/1, 88%). Provide harmless
+// placeholder credentials BEFORE the product modules load so a non-null client
+// object exists to stub. No real connection is ever opened: every `.from` call
+// is replaced in runPolicyGuardBattery, and the `.invalid` TLD (RFC 2606)
+// guarantees no accidental network use. Real credentials, when present, are
+// left untouched.
+if (!process.env.SUPABASE_URL || !(process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY)) {
+  process.env.SUPABASE_URL = process.env.SUPABASE_URL || 'http://static-harness.invalid';
+  process.env.SUPABASE_KEY = process.env.SUPABASE_KEY || 'static-harness-placeholder';
+}
+
 const promptGuard  = tryRequire('../../lib/services/orchestrator/promptGuard.service');
 const llmPlanner   = tryRequire('../../lib/services/orchestrator/llmPlanner.service');
 const policyGuard  = tryRequire('../../lib/services/orchestrator/policyGuard.service');
