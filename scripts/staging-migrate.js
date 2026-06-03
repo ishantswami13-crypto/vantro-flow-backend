@@ -47,13 +47,58 @@ const BASE_SCHEMA = `
 -- These tables mirror the production schema columns needed by Rust queries.
 -- Staging-only: NOT a production migration.
 
+-- users: must match the production-shaped table the Node backend expects
+-- (/api/auth/me, /api/settings, /api/auth/login). The older stub had only
+-- id/email/name/password/created_at, which made /api/auth/me 500 on a missing
+-- phone column. Columns + types mirror supabase-schema.sql, plus the extra
+-- columns server.js selects in /api/auth/me fullColumns.
 CREATE TABLE IF NOT EXISTS users (
-  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  email      TEXT UNIQUE NOT NULL,
-  name       TEXT,
-  password   TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email           TEXT UNIQUE NOT NULL,
+  name            TEXT,
+  password        TEXT,
+  password_hash   TEXT,
+  phone           TEXT,
+  business_name   TEXT,
+  owner_name      TEXT,
+  plan            TEXT DEFAULT 'free',
+  gstin           TEXT,
+  address         TEXT,
+  logo_url        TEXT,
+  whatsapp_phone  TEXT,
+  whatsapp_token  TEXT,
+  industry        TEXT,
+  business_size   TEXT,
+  city            TEXT,
+  gst_registered  BOOLEAN,
+  has_workers     BOOLEAN,
+  onboarding_done BOOLEAN DEFAULT FALSE,
+  language        TEXT DEFAULT 'hinglish',
+  contact_time    TEXT DEFAULT 'morning',
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
+-- Self-heal staging DBs created by the older stub (idempotent; mirrors
+-- scripts/supabase/phase-2c-18-users-schema-align.sql).
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash   TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS phone           TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS business_name   TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS owner_name      TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS plan            TEXT DEFAULT 'free';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS gstin           TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS address         TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS logo_url        TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_phone  TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_token  TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS industry        TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS business_size   TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS city            TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS gst_registered  BOOLEAN;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS has_workers     BOOLEAN;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_done BOOLEAN DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS language        TEXT DEFAULT 'hinglish';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS contact_time    TEXT DEFAULT 'morning';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at      TIMESTAMPTZ DEFAULT NOW();
 
 -- suppliers stub: needed as FK target for ai_actions.supplier_id in migration 001.
 -- Only id is required; other columns added when production supplier schema is tracked.

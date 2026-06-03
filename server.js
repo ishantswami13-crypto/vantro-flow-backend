@@ -762,6 +762,23 @@ function buildLedgerSummary(transactions) {
   }, { totalIn: 0, totalOut: 0, balance: 0, monthIn: 0, monthOut: 0, monthBalance: 0 });
 }
 
+// ── Cortex test/seed data guard ───────────────────────────────────────────────
+// cortex-lab/seed.js creates synthetic rows tagged "[cortex-test <runId>]" with
+// the default name "Cortex Test Customer" (and "Cortex Chain" variants). These
+// are real rows in the DB used for pipeline testing. This guard HIDES them from
+// every tenant-facing API response so production demos never show fake debtors,
+// fake receivables, or fake forecast inputs. It NEVER deletes data — the rows
+// remain in the database and can be cleaned up separately by run-ID marker.
+const CORTEX_TEST_PATTERN = /\[cortex-test|cortex[\s_-]*test|cortex[\s_-]*chain/i;
+function isCortexTestRow(row) {
+  if (!row || typeof row !== 'object') return false;
+  const fields = [row.customer_name, row.party_name, row.supplier_name, row.name, row.notes, row.description];
+  return fields.some((v) => typeof v === 'string' && CORTEX_TEST_PATTERN.test(v));
+}
+function stripCortexTestRows(rows) {
+  return Array.isArray(rows) ? rows.filter((row) => !isCortexTestRow(row)) : rows;
+}
+
 // Razorpay instance (initialised lazily so missing keys don't crash startup)
 let razorpay = null;
 if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
@@ -1740,13 +1757,16 @@ app.get('/api/invoices/:userId', requireOwner, async (req, res) => {
     await ensureConnectedBusinessData(userId);
     await syncExistingSalesReceivables(userId);
 
-    const { data, error } = await supabase
+    const { data: rawInvoices, error } = await supabase
       .from('invoices')
       .select('*')
       .eq('user_id', userId)
       .order('days_overdue', { ascending: false });
 
     if (error) throw error;
+
+    // Hide synthetic cortex-lab seed rows from the tenant's invoice list
+    const data = stripCortexTestRows(rawInvoices || []);
 
     const totalOutstanding = data.reduce(
       (sum, inv) => sum + (inv.payment_status === 'Pending' ? calculateOutstanding(inv.invoice_amount, inv.payment_amount) : 0),
@@ -3487,8 +3507,8 @@ async function getReceivableRows(userId) {
     supabase.from('sales').select('*').eq('user_id', userId),
   ]);
 
-  const invoices = invoiceResult.error ? [] : invoiceResult.data || [];
-  const sales = saleResult.error ? [] : saleResult.data || [];
+  const invoices = stripCortexTestRows(invoiceResult.error ? [] : invoiceResult.data || []);
+  const sales = stripCortexTestRows(saleResult.error ? [] : saleResult.data || []);
   const invoiceRows = invoices.map(normalizeReceivableInvoice).filter((row) => row.customer_name && row.amount > 0);
   const linkedSaleIds = new Set(invoiceRows.filter((row) => row.source_type === 'sales').map((row) => String(row.source_id)));
   const invoiceNumbers = new Set(invoiceRows.map((row) => normalizePartyKey(row.invoice_number)).filter(Boolean));
@@ -3505,7 +3525,7 @@ async function getReceivableRows(userId) {
 async function getPayableRows(userId) {
   const { data, error } = await supabase.from('purchases').select('*').eq('user_id', userId);
   if (error) return [];
-  return (data || []).map(normalizePayablePurchase).filter((row) => row.supplier_name && row.amount > 0);
+  return stripCortexTestRows(data || []).map(normalizePayablePurchase).filter((row) => row.supplier_name && row.amount > 0);
 }
 
 async function syncExistingSalesReceivables(userId) {
@@ -6834,8 +6854,10 @@ app.post('/api/ml/briefing', authMiddleware, async (req, res) => {
       supabase.from('users').select('business_name,plan').eq('id', userId).single(),
     ]);
 
-    const invoices = invoicesRaw || [];
-    const calls = callsRaw || [];
+    // Hide synthetic cortex-lab seed rows so AI Founder / Neural Engine never
+    // surface "Cortex Test Customer" debtors in a real tenant's briefing.
+    const invoices = stripCortexTestRows(invoicesRaw || []);
+    const calls = stripCortexTestRows(callsRaw || []);
     const businessName = userData?.business_name || 'Your Business';
 
     // Group calls by customer
@@ -10864,7 +10886,7 @@ app.get('/api/customer-scores', authMiddleware, async (req, res) => {
       }
     }
 
-    res.json({ scores });
+    res.json({ scores: stripCortexTestRows(scores) });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
