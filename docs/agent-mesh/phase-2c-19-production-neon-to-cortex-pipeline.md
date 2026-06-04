@@ -2,6 +2,7 @@
 
 **Status:** 🔍 SCOPING — read-only design. No code, no migration, no deploy, no production
 or Railway changes. Builds on Phase 2C.18 (dedicated staging Cortex DB).
+**Read-only Neon schema discovery completed 2026-06-04 — see §10. Mapping verification — see §11.**
 
 > This document contains **no secrets** — no `DATABASE_URL`, Supabase keys, `JWT_SECRET`,
 > tokens, or passwords. Source/target connection strings live only in gitignored env
@@ -152,6 +153,144 @@ or use a different account/tenant key. The exact Neon schema, PKs, and tenant id
 - Neon read access method: read-replica/endpoint + least-privilege read-only credential (new env var; **not** the app write URL).
 - Expected data volume (backfill size, daily delta) → batch sizing/throttling.
 - Sync cadence: one-time backfill + incremental (cron) vs event-driven.
+
+---
+
+## 10. Read-only schema discovery findings (2026-06-04 · Neon `neondb` · role `atlas_readonly` · PG 17.10)
+
+**Method:** SELECT-only introspection of `information_schema`/catalogs inside a `BEGIN TRANSACTION READ ONLY` via a least-privilege role. **No row values read, no writes, no Neon/Cortex/Railway changes.** Connection referenced by env-var name `NEON_READONLY_URL` only (never printed).
+
+### 10a. Source schema (Neon) — metadata only
+Neon `public` has **5 base tables**. There is **no `user_id` column anywhere** — Neon is **organization-scoped**, keyed by `organization_id` → `organizations.id`. **No FK constraints are declared** (referential integrity is application-enforced) and source tables carry **no UNIQUE/natural-key constraints** (only integer PK `id`).
+
+| Neon table | exists | PK | tenant col | timestamp / watermark | source key (idempotency) | → Cortex target |
+|---|---|---|---|---|---|---|
+| `customers` | ✅ | `id` | `organization_id` | `created_at` | PK `id` (match on `name`,`phone`,`email`) | `customers` |
+| `invoices` | ✅ | `id` | `organization_id` | `invoice_date`,`due_date`,`created_at`,`updated_at` | PK `id`; `invoice_number` present but **not unique-constrained** | `invoices` |
+| `payment_promises` | ✅ | `id` | `organization_id` | `promised_date`,`created_at` | PK `id` | `promises` |
+| `follow_ups` | ✅ | `id` | `organization_id` | `performed_at`,`created_at` | PK `id` | `followups` |
+| `organizations` (tenant root) | ✅ | `id` | — (is the tenant) | `created_at`,`onboarding_completed_at` | `email`, `gst_number` (candidate shared keys) | resolve `users.id` |
+| `sales` | ❌ missing | — | — | — | — | no source |
+| `promises` | ❌ (real name `payment_promises`) | — | — | — | — | — |
+| `audit_logs` | ❌ missing | — | — | — | — | Cortex-internal only |
+| `business_events` | ❌ missing | — | — | — | — | Cortex-internal only |
+
+Column inventory (names/types only — no values):
+- `customers`: id, organization_id, name, phone, whatsapp_number, email, city, status, created_at, total_outstanding, avg_payment_delay_days, preferred_language
+- `invoices`: id, organization_id, customer_id, invoice_number, invoice_date, due_date, amount, amount_paid, status, created_at, updated_at, days_overdue, aging_bucket
+- `payment_promises`: id, organization_id, customer_id, invoice_id, promised_amount, promised_date, promised_via, notes, status, created_at
+- `follow_ups`: id, organization_id, customer_id, invoice_id, activity_type, message_text, performed_at, created_at
+- `organizations`: id, name, business_type, city, state, plan, created_at, contact_name, email, company_scale, selected_modules, onboarding_completed, onboarding_completed_at, gst_number
+
+### 10b. Tables found vs missing (vs the planned target set)
+- **Found:** `customers`, `invoices` (planned) + `payment_promises` (≙ planned `promises`), `follow_ups` (≙ Cortex `followups`), `organizations` (tenant root).
+- **Missing:** `sales`, `audit_logs`, `business_events` — **no Neon source**. Cortex `audit_logs`/`business_events` are populated by the **sync's own batch ledger** (Cortex-side, §5.4), not synced from Neon. `sales` has no source → out of scope unless a source is identified.
+
+### 10c. Tenant mapping options (Neon organization → Cortex `users.id`)
+Cortex is **user-scoped** (`user_id UUID REFERENCES users(id)`); Neon is **organization-scoped** (`organization_id INT`). The key spaces differ, so a deterministic bridge is required. Candidate shared keys on `organizations`:
+1. **`organizations.email` → Cortex `users.email`** — most likely join, but not unique-constrained in Neon and Cortex side not yet inspected.
+2. **`organizations.gst_number`** — stable legal business id; useful only if Cortex stores it.
+3. **explicit curated map** `neon_org_id → cortex_user_id`, human-verified once (safest).
+
+### 10d. Blockers / open questions (updated)
+- **B1 — Cortex `users` schema not inspected.** This task authorized read-only **Neon** only; no read-only Cortex credential was provided and `DATABASE_URL`/service-role were deliberately not used. Cannot yet confirm `users.email`/`users.phone` exist or are unique. → read-only Cortex check (or confirm from `supabase-schema.sql`).
+- **B2 — org→user cardinality undefined.** One Neon `organization` may map to one or many Cortex users; a 1-org→1-user assumption must be confirmed by product/owner.
+- **B3 — `organizations.email` not unique / coverage unknown.** Verify uniqueness + null-coverage (aggregate counts, still read-only) before using as a join key.
+- **B4 — no DB-level FKs in Neon.** `organization_id`/`customer_id`/`invoice_id` integrity is app-enforced; transform must validate parents and reject orphans.
+- **B5 — `sales` has no Neon source**; `audit_logs`/`business_events` are Cortex-internal, not synced.
+- ✅ **Resolved from §9:** Neon schema + tenant identifier (`organization_id`) confirmed; read-only access (`NEON_READONLY_URL`, role `atlas_readonly`, SELECT-only) confirmed working.
+
+### 10e. Proposed mapping contract (CONDITIONAL — pending B1–B3, do not implement yet)
+An explicit, audited bridge table in **Cortex/staging** (never in Neon):
+```
+neon_org_map(
+  neon_organization_id INT PRIMARY KEY,
+  cortex_user_id       UUID NOT NULL REFERENCES users(id),
+  match_key            TEXT,            -- e.g. normalized email / gst_number
+  match_method         TEXT,            -- 'email' | 'gst' | 'manual'
+  verified_by          TEXT,
+  verified_at          TIMESTAMPTZ
+)
+```
+- Seed by matching `lower(trim(organizations.email))` → `users.email`; fall back to `gst_number`; **never auto-create on ambiguity or miss** — leave unmapped and log.
+- Sync resolves `user_id` via this table **only**; rows for unmapped orgs are **skipped + recorded** (fail-closed → no cross-tenant risk).
+- Carry `source_id=<neon pk>`, `sync_source='neon'`, `sync_batch_id` for idempotent UPSERT + batch rollback (§5).
+
+### 10f. Recommended next step (still no sync code, gated)
+1. Read-only inspect Cortex `users` (+ `customers/invoices/promises/followups`) to confirm join key + natural keys → resolves **B1**.
+2. Read-only **aggregate** check on Neon `organizations.email`/`gst_number` (count, distinct, null) → resolves **B3**. Aggregates only; no row values.
+3. Product decision on org→user cardinality → resolves **B2**.
+4. Then design the `neon_org_map` seed + a **staging-only dry-run** extract→transform (no load) against OWNER_A/OWNER_B fixtures.
+
+---
+
+## 11. Mapping verification (2026-06-04) — Cortex `users` + Neon aggregates + verdict
+
+Read-only. Cortex side confirmed from **repo files only** (no DB connection). Neon side = **aggregate counts only** via `NEON_READONLY_URL` (no row values). No writes anywhere.
+
+### 11a. Cortex `users` schema (from `supabase-schema.sql` + `scripts/supabase/phase-2c-18-users-schema-align.sql`)
+Columns: `id` (UUID PK), **`email` (TEXT UNIQUE NOT NULL)**, `phone` (TEXT, nullable), `business_name`, `password_hash`, `plan`, **`gstin` (TEXT, nullable)**, `address`, `logo_url`, `whatsapp_phone`, `whatsapp_token`, `industry`, `language`, `contact_time`, `created_at`, `updated_at` (+ staging-only: `owner_name`, `city`, `business_size`, `gst_registered`, `has_workers`, `onboarding_done`).
+- **email exists: yes · unique: YES (UNIQUE NOT NULL) · fully populated: yes (NOT NULL)**
+- **phone exists: yes · unique: NO** (plain TEXT)
+- **gstin exists: yes · unique: NO**
+- The **only** UNIQUE constraint on `users` is `email` → Cortex offers exactly one deterministic join target: **`users.email`**.
+
+### 11b. Neon `organizations` aggregates (counts only, no values)
+| metric | value |
+|---|---|
+| total_organizations | **1** |
+| email_populated | 0 |
+| email_null | 1 |
+| email_empty_string | 0 |
+| email_distinct_norm (nonempty) | 0 |
+| **email fully populated** | **false (0% coverage)** |
+| gst_number column exists | yes |
+| gst_populated | 0 |
+| gst_null | 1 |
+| gst_empty_string | 0 |
+| gst_distinct_norm (nonempty) | 0 |
+| **gst_number fully populated** | **false (0% coverage)** |
+
+> "unique among populated" came back vacuously true (0 populated rows) — **not** evidence of a usable key. The decisive fact is **zero coverage**: the single org has NULL `email` and NULL `gst_number`.
+> ⚠️ Only **1 organization** exists, with no email/gstin → this Neon DB looks **near-empty / seed-stage**, not a populated production tenant set. Confirm it is the real production app DB before relying on it (blocker **B6**).
+
+### 11c. Candidate join safety
+- `organizations.email` fully populated? **No (0/1).** Unique? Vacuous → **not usable as an automatic key now.**
+- `organizations.gst_number` fully populated? **No (0/1).** Unique? Vacuous → not usable now.
+- Cortex compatible unique field? **Yes — `users.email` (UNIQUE NOT NULL)** — but the Neon side currently has no email value to match against.
+
+### 11d. Cardinality (CONFIRMED 2026-06-04 by owner)
+**1 Neon organization → 1 Cortex `users.id` owner workspace (1:1).** `neon_org_map` is therefore a clean 1:1 PK bridge (`neon_org_id` PK → exactly one `cortex_user_id`).
+
+### 11e. MAPPING VERDICT: **B — SAFE WITH MANUAL MAP**
+Automatic email→email mapping (verdict A) is **not possible**: `organizations.email` and `gst_number` are both NULL (0% coverage), so there is no deterministic value to join on — even though both sides have the right *columns* and `users.email` is unique. Not verdict C either: a safe bridge is achievable via an **explicit, human-verified `neon_org_map`** seed (one row, since one org). The mapping must be **manual**; no automatic fuzzy matching; unresolved orgs rejected + logged.
+
+### 11f. `neon_org_map` contract (design only — do not implement)
+```
+neon_org_map(
+  neon_org_id            INT          PRIMARY KEY,        -- Neon organizations.id
+  verified_external_key  TEXT,                            -- owner email / gstin used to confirm (nullable; manual allowed)
+  cortex_user_id         UUID NOT NULL,                   -- REFERENCES users(id)
+  mapping_source         TEXT NOT NULL,                   -- 'manual' | 'email' | 'gstin'
+  verified_by            TEXT NOT NULL,
+  verified_at            TIMESTAMPTZ NOT NULL,
+  created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+  notes                  TEXT,
+  active                 BOOLEAN NOT NULL DEFAULT true
+)
+```
+Resolution rules (future sync):
+- Every Neon row resolves its tenant **only** via `neon_org_map` (active = true).
+- Unresolved `organization_id` → row **rejected + logged** (fail-closed); never defaulted, never guessed.
+- **No automatic fuzzy matching**; every binding is human-verified.
+- Loaded Cortex rows stamped with resolved `user_id`, `source_id = <neon pk>`, `sync_source = 'neon'`, `sync_batch_id`.
+
+### 11g. Blockers / next gate
+- **B6 — RESOLVED (owner-confirmed 2026-06-04):** This **is** the real production app DB, just **early-stage** — ~1 org and sparse data today, so **current backfill volume ≈ 0**. Sync design may proceed; expect effectively nothing to sync until real tenants/data arrive.
+- **B2 — RESOLVED (owner-confirmed):** **1 org → 1 Cortex owner user (1:1).**
+- **B1 — RESOLVED:** Cortex `users.email` is UNIQUE NOT NULL (repo-confirmed); deterministic join target exists.
+- **B3 — RESOLVED (by data):** email/gst coverage is 0% → automatic key not viable → **manual map required**.
+- **No open blockers.** **Next gate:** author the `neon_org_map` seed (1 verified row: the single Neon `organization_id` → its verified `cortex_user_id`) in **staging Cortex**, then a **staging-only dry-run** extract→transform (no load) on OWNER_A/OWNER_B fixtures. No production and no sync code until that dry-run passes the §6 proof gates.
 
 ---
 
