@@ -294,6 +294,39 @@ Resolution rules (future sync):
 
 ---
 
+## 12. Dry-run proof (2026-06-04) — staging-only, NO LOAD
+
+**Scope:** read-only Neon (`atlas_readonly`, `BEGIN TRANSACTION READ ONLY`) → resolve `organization_id` via the explicit `neon_org_map` seed → **manual parent validation** (Neon has no DB-level FKs) → normalize to Cortex shapes **in memory** → **NO load** (no Cortex/Supabase connection, no insert/upsert, no deploy, no migrations, no Railway). Script: `scripts/phase-2c-19-neon-cortex-dry-run.js`; seed: `scripts/phase-2c-19-neon-org-map.staging.json` (staging-only, OWNER_A fixture). Counts/shapes only — **no Neon row values printed**.
+
+### 12a. Extracted counts (read-only)
+`customers=5 · invoices=8 · payment_promises=0 · follow_ups=5` → total **18**.
+
+### 12b. Fail-closed proof (empty seed)
+With **no** seed entry, every row is rejected: **resolved=0, rejected_unresolved_org=18, normalized=0** — nothing passes without an explicit mapping.
+
+### 12c. Seeded proof (org 1 → OWNER_A, manual/verified)
+**resolved_valid=18, rejected_unresolved_org=0, rejected_orphan=0.** All 8 `invoices.customer_id` resolve to the 5 customers; all 5 `follow_ups` parents present → **0 orphans**. **Repeatable:** two consecutive runs produced identical counts.
+
+### 12d. Normalized shape summary (field names only)
+- **customer:** `user_id, source_type, source_id, name, phone, email, status, natural_key, sync_source`
+- **invoice:** `user_id, source_type, source_id, customer_source_id, invoice_number, amount, amount_paid, status, due_date, sync_source`
+- **followup:** `user_id, source_type, source_id, customer_source_id, invoice_source_id, activity_type, performed_at, sync_source`
+- **promise:** none produced (0 source rows)
+
+### 12e. Evidence-eligible
+**13** (8 invoices + 5 customers + 0 promises), shape **`{user_id, source_type, source_id}` only** — no raw `customer_id`/PII.
+
+### 12f. Proof gates — ALL PASS (`loaded=false`)
+no Neon writes · no Cortex/production writes · row accounting balances · no unresolved rows pass · mapping explicit/manual · no fuzzy matching · output user_id-scoped · evidence ⊆ resolved · no raw customer_id leak in evidence. → **No Neon writes · No Cortex writes · No production touched.**
+
+### 12g. B6 correction (IMPORTANT)
+§11g recorded "backfill ≈ 0". **That was wrong.** Neon org 1 has NULL `email`/`gst_number` (no automatic shared key) **but does contain 18 real child rows** (5 customers, 8 invoices, 5 follow-ups). **Real data exists** and is worth syncing — but because email/gst are NULL, an **explicit, human-verified** mapping is **mandatory before any load** (no automatic match is possible).
+
+### 12h. Pre-load gate (MUST pass before any staging load)
+The dry-run binding `org 1 → OWNER_A` is a **placeholder for proof only — not production truth.** Before any staging *load*, an operator must verify: (1) the target `cortex_user_id` (OWNER_A or the correct owner) **exists in staging Cortex `users`**, and (2) Neon org 1 **genuinely belongs to that owner.** Since Neon org email/gst are NULL, this is a human decision recorded in `neon_org_map` (`verified_by`/`verified_at`), never auto-derived.
+
+---
+
 ## Appendix — what is already in place (reusable)
 - Cortex target schema is fully `user_id`-scoped with natural keys (this repo) — ready for idempotent UPSERT.
 - Staging Cortex DB is isolated (Phase 2C.18); `scripts/apply-sql-file.js` + `staging-migrate.js` patterns exist for safe, idempotent DDL.
