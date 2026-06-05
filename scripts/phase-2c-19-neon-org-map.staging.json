@@ -1,17 +1,18 @@
 {
-  "_comment": "STAGING-ONLY, explicit, human-verified Neon->Cortex tenant map for the Phase 2C.19 dry-run. NOT production. Contains NO secrets. Resolution is an EXACT integer org_id lookup only — no fuzzy matching. Any Neon organization_id not listed (or inactive) is REJECTED (fail-closed). cortex_user_id values are deterministic STAGING fixture owners (OWNER_A/OWNER_B). A real staging load must re-verify the cortex_user_id exists in staging Cortex `users` and that the org truly belongs to that owner.",
+  "_comment": "STAGING-ONLY, explicit, human-verified Neon->Cortex tenant map. NOT production truth. Contains NO secrets. Resolution is an EXACT integer org_id lookup only — no fuzzy matching. Any Neon organization_id not listed (or inactive) is REJECTED (fail-closed). PROMOTED 2026-06-04 to a verified staging-load seed: OWNER_A confirmed to exist in staging Cortex `users` (Supabase REST, count=1), and operator (Ishant) confirmed STAGING-TEST routing of Neon org 1 -> OWNER_A. This is deliberate test routing for the isolated staging Cortex DB only, NOT a claim of real-world ownership (Neon org email/gst are NULL, so no automatic match exists).",
   "environment": "staging",
+  "seed_status": "staging_load_verified",
   "verdict": "SAFE_WITH_MANUAL_MAP",
   "cardinality": "1_neon_org_to_1_cortex_user",
   "entries": [
     {
       "neon_org_id": 1,
       "cortex_user_id": "11111111-1111-1111-1111-111111111111",
-      "mapping_source": "manual",
-      "verified_by": "phase-2c-19-gate-operator",
-      "verified_at": "2026-06-04T00:00:00Z",
+      "mapping_source": "manual_staging_test_routing",
+      "verified_by": "Ishant",
+      "verified_at": "2026-06-04T12:35:34.574Z",
       "active": true,
-      "notes": "STAGING DRY-RUN ONLY: single Neon production org (id=1) bound to OWNER_A staging fixture user. No-load. Before any real staging load this binding MUST be re-verified: confirm OWNER_A (or the correct owner) exists in staging Cortex `users`, and that Neon org 1 genuinely belongs to that owner (Neon org email/gst are NULL, so this is an operator decision, not an automatic match)."
+      "notes": "STAGING TEST ONLY. Human-confirmed routing of Neon org 1 to OWNER_A for isolated staging load proof. Not production truth."
     }
   ]
 }

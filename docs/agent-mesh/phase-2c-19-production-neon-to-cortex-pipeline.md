@@ -327,6 +327,63 @@ The dry-run binding `org 1 → OWNER_A` is a **placeholder for proof only — no
 
 ---
 
+## 13. Pre-load gate clearance (2026-06-04) — staging-test routing, NO LOAD
+
+§12h pre-load checks cleared for a **staging-test load proof only** (NOT production truth):
+- **B7 (staging connectivity) — CLEARED via Supabase REST.** The direct `STAGING_DATABASE_URL` host is unreachable from local (IPv4/IPv6 direct-connection limit, per §7.2). OWNER_A existence was instead confirmed through the **staging Supabase REST API** (service role, staging project ref): **`owner_a_exists=true`, `matching_user_count=1`** (booleans/counts only; no PII, no keys/URLs printed).
+- **B8 (ownership) — CLEARED for STAGING-TEST routing only.** Operator **Ishant** confirmed deliberate routing of Neon org 1 → OWNER_A for the isolated staging load proof. **Not production truth, not real-world ownership** (Neon org 1 email/gst are NULL → no automatic match possible).
+- **Neon org 1** re-confirmed read-only: exists; child counts `customers=5 invoices=8 payment_promises=0 follow_ups=5`.
+- **Seed promoted** → `scripts/phase-2c-19-neon-org-map.staging.json` is now a **verified staging-load seed**: `mapping_source=manual_staging_test_routing`, `verified_by=Ishant`, `verified_at=2026-06-04T12:35:34.574Z`, `active=true`, `seed_status=staging_load_verified`.
+- **No load performed** — no Cortex/Neon writes, no upsert, no deploy, no Railway changes.
+
+**Gate state:** ready for the **staging LOAD** step (idempotent UPSERT into staging Cortex + `sync_batches` ledger + §6 live proofs). Production remains out of scope and would require its own **real-ownership** mapping — never this staging-test routing.
+
+---
+
+## 14. Staging LOAD attempt (2026-06-04) — BLOCKED: target schema not ready (NO LOAD, NO WRITES)
+
+Preflight via staging Supabase REST (service role, read-only, `limit=0`, counts/booleans only). **Load was NOT attempted** — staging Cortex lacks the required sync schema. **No Cortex writes, no Neon writes, no migrations, no deploy.**
+
+**Preflight results:**
+- Staging REST reachable; **OWNER_A count=1, OWNER_B count=1** (both exist → tenant-isolation test is possible once schema is ready).
+- Neon read-only extraction/transform re-confirmed: `extracted=18, resolved=18, rejected=0, orphan=0, evidence-eligible=13` (no load).
+- Content tables present: `users, customers, invoices, followups, promises, business_events, audit_logs`.
+- **`sync_batches` ledger table: MISSING.**
+- **Sync provenance columns MISSING:**
+  - `customers`: `source_type, source_id, sync_source, sync_batch_id` (all missing; `user_id` present)
+  - `invoices`: `sync_source, sync_batch_id` (missing; `source_type, source_id, user_id` already present)
+  - `followups`: `source_type, source_id, sync_source, sync_batch_id` (all missing; `user_id` present)
+- `required_target_schema_ready = false`.
+
+**Exact STAGING schema required before load (review + approve; apply via staging-only tooling — NOT run here):**
+1. **`sync_batches`** ledger: `sync_batch_id uuid pk`, `sync_source text not null`, `user_id uuid null references users(id)`, `status text not null`, `started_at timestamptz not null default now()`, `finished_at timestamptz`, `source_watermark text`, `counts jsonb`.
+2. **ADD COLUMN IF NOT EXISTS** — `customers` & `followups`: `source_type text, source_id text, sync_source text, sync_batch_id uuid`; `invoices`: `sync_source text, sync_batch_id uuid`. (Match `invoices`' existing `source_type`/`source_id` types for consistency.)
+3. **UNIQUE constraint for idempotency** on each content table, e.g. `UNIQUE (user_id, sync_source, source_type, source_id)` — without it, re-running the load would create duplicates (idempotency gate would fail). `customers` retains its existing `uq_customers_user_name_phone` natural key as well.
+
+**Decision:** STOP per the pre-load rules (missing `sync_batches`/columns/conflict-constraints → report, do not migrate). **Not a launch blocker** — the Neon→Cortex sync is feature-flag OFF and Owner Briefing correctly returns `safe_to_show=false` with no evidence. **Next gate:** review + approve the staging schema above → apply via staging-only migration tooling (`apply-sql-file.js`/`staging-migrate.js`, which block the production ref) → re-run the staging LOAD + §6 live proofs.
+
+---
+
+## 15. Staging schema enablement (2026-06-04) — APPLIED via Supabase SQL Editor + REST-verified (NO LOAD)
+
+Reviewable idempotent staging-only migration: **`scripts/supabase/phase-2c-19-staging-sync-schema.sql`**. **Applied manually via the staging Supabase SQL Editor** (project `vantro-cortex-staging-db`) — the local env can't reach the direct PG host (IPv6-only) and REST can't run DDL, so the operator ran it in the SQL Editor (`sync_batches` created with RLS enabled). **No production, no Neon writes, no Railway, no deploy, no data load.**
+
+**Migration contents (idempotent; `CREATE`/`ADD COLUMN`/`CREATE INDEX … IF NOT EXISTS`; no `DROP`):**
+- `sync_batches(sync_batch_id uuid pk, sync_source text not null, user_id uuid null references users(id), status text not null, started_at timestamptz default now(), finished_at timestamptz, source_watermark text, counts jsonb default '{}', notes text)`.
+- ADD COLUMN — customers `(source_type, source_id, sync_source, sync_batch_id)`; invoices `(sync_source, sync_batch_id)` (source_type/source_id already present); followups `(source_type, source_id, sync_source, sync_batch_id)`.
+- **PARTIAL UNIQUE INDEX** `WHERE source_id IS NOT NULL` on customers/invoices/followups `(user_id, sync_source, source_type, source_id)` — idempotency anchor for **synced rows only** (native rows unconstrained; cannot fail on existing data since 0 synced rows).
+- Helper indexes: `sync_batches(sync_source, user_id, started_at desc)`, and `(sync_batch_id)` on customers/invoices/followups.
+
+**Verified via staging REST (read-only, 2026-06-04):**
+- `sync_batches` **exists** — columns `sync_batch_id, sync_source, user_id, status, started_at, counts` all present.
+- `customers` / `invoices` / `followups` — **all four** provenance columns (`source_type, source_id, sync_source, sync_batch_id`) present on each.
+- **No-data-load confirmed:** `sync_batches` row count = 0; rows with `sync_source='neon'` = 0 and rows with `sync_batch_id` = 0 across all three tables.
+- **Indexes** (`uq_customers_sync_src`, `uq_invoices_sync_src`, `uq_followups_sync_src`, `ix_sync_batches_src_user_started`, `ix_{customers,invoices,followups}_sync_batch`): **not introspectable via PostgREST** (pg_catalog not exposed) → operator-reported as created; **functional proof deferred to the LOAD idempotency gate** (a re-run UPSERT producing 0 duplicates proves the partial unique index is enforcing).
+
+**Schema blocker CLEARED.** **Next gate:** staging LOAD proof — idempotent UPSERT (REST `Prefer: resolution=merge-duplicates` on `(user_id, sync_source, source_type, source_id)`) + `sync_batches` ledger + §6 live proofs (0-dupe re-run, OWNER_A/OWNER_B isolation, rollback-by-batch, Owner Briefing evidence). No production; no data load until that gate runs.
+
+---
+
 ## Appendix — what is already in place (reusable)
 - Cortex target schema is fully `user_id`-scoped with natural keys (this repo) — ready for idempotent UPSERT.
 - Staging Cortex DB is isolated (Phase 2C.18); `scripts/apply-sql-file.js` + `staging-migrate.js` patterns exist for safe, idempotent DDL.
