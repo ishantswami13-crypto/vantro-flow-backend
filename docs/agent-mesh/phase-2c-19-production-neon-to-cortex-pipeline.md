@@ -382,6 +382,51 @@ Reviewable idempotent staging-only migration: **`scripts/supabase/phase-2c-19-st
 
 **Schema blocker CLEARED.** **Next gate:** staging LOAD proof — idempotent UPSERT (REST `Prefer: resolution=merge-duplicates` on `(user_id, sync_source, source_type, source_id)`) + `sync_batches` ledger + §6 live proofs (0-dupe re-run, OWNER_A/OWNER_B isolation, rollback-by-batch, Owner Briefing evidence). No production; no data load until that gate runs.
 
+### 15.1 — Index verification CLOSED · `schema_ready = true` (2026-06-05, read-only, NO LOAD)
+
+The §15 caveat ("indexes not introspectable via PostgREST → operator-reported; functional proof deferred to the LOAD gate") is now **closed for existence**. All seven sync indexes were confirmed to **exist** via a read-only `pg_indexes` query run in the staging Supabase SQL Editor (project `vantro-cortex-staging-db`) — **7/7 by name** (index names only; no rows, no PII):
+`uq_customers_sync_src`, `uq_invoices_sync_src`, `uq_followups_sync_src`, `ix_sync_batches_src_user_started`, `ix_customers_sync_batch`, `ix_invoices_sync_batch`, `ix_followups_sync_batch`.
+Each name was created by its own `CREATE [UNIQUE] INDEX IF NOT EXISTS <name>` in the idempotent migration (these names did not exist pre-apply per §14), so by-name existence pins them to the authored partial-unique definitions; **enforcement** (the `WHERE source_id IS NOT NULL` partial unique actually rejecting duplicates) is functionally proven by the 0-duplicate re-run at the LOAD idempotency gate (§6).
+
+Re-confirmed the same day via staging REST (read-only, service role; booleans/counts only — no keys, URLs, refs, or PII):
+- `sync_batches` exists; `customers` / `invoices` / `followups` each carry all four provenance columns (`source_type, source_id, sync_source, sync_batch_id`).
+- **No data load (airtight):** `sync_source='neon'` rows = **0** on all three tables; `sync_batches` total rows = **0**; rows carrying a non-null `sync_batch_id` = **0** on all three tables.
+
+**`schema_ready = true`** — §14's full required schema (ledger table + provenance columns + idempotency/helper indexes) is present and verified. **No production · no Neon · no Railway · no deploy · no data load.** **Next gate unchanged:** the staging LOAD proof (§6 live proofs), still gated behind explicit operator approval — not started.
+
+---
+
+## 16. Staging LOAD proof (2026-06-05) — REVERSIBLE, rolled back clean (NO PERSISTENT LOAD)
+
+First end-to-end **staging-only** Neon→Cortex LOAD, executed as a **reversible proof**: real fixture data was idempotently UPSERTed into staging Cortex under one `sync_batch_id`, every §6 gate was exercised, then the batch was **rolled back**, returning staging to the pre-load clean state. Reusable script: **`scripts/phase-2c-19-neon-cortex-load.js`** (modes `dry-run` / `proof` / `persistent` / `rollback`; persistent is **fail-closed** behind env `ALLOW_PERSISTENT_STAGING_LOAD=true` + `--confirm=PERSIST`). Neon read-only via `NEON_READONLY_URL` (`BEGIN TRANSACTION READ ONLY`, SELECT-only); Cortex writes via staging Supabase REST (service role); production refs blocked. Counts/booleans only — no PII, no secrets printed.
+
+**Batch:** `d5f972e4-a417-40f0-8a6d-a7301e75eced` (opened → loaded → proven → rolled back → removed).
+
+### 16a. Gate results — ALL PASS
+| Gate | Result |
+|------|--------|
+| Pre-load clean | `sync_source='neon'` = 0/0/0 before load |
+| Load (pass 1) | customers inserted **5** · invoices **8** · followups **5** · rejected **0** · orphan **0** (18 rows; batch-tagged 5/8/5) |
+| Idempotency (pass 2) | re-run inserts **0/0/0** · **net-new = 0** · counts stable (5/8/5) |
+| Partial-unique enforcement | raw duplicate insert → **HTTP 409 (unique_violation)** → indexes **reject duplicates** |
+| Tenant isolation | **0** rows with `user_id ≠ OWNER_A`; all 18 rows = OWNER_A + this batch |
+| Batch close | ledger → `succeeded` with counts |
+| Rollback by `sync_batch_id` | deleted exactly followups **5** · invoices **8** · customers **5** · ledger **1** |
+| Final clean | `sync_source='neon'` = 0/0/0 · `sync_batches` = 0 (independently re-verified) |
+
+This **closes the §15.1 enforcement caveat**: the `WHERE source_id IS NOT NULL` partial unique is no longer "proof-deferred" — the 409 probe proves it actually rejects duplicates.
+
+### 16b. Safety attestation
+Neon writes: **none** (read-only txn). Production touched: **no**. Railway touched: **no**. Deploy: **no**. Secrets exposed: **no**. PII printed: **no** (fixture PII was written to staging transiently, then deleted on rollback).
+
+### 16c. Honest scope (boundaries, not failures)
+- **Single-tenant isolation only** — Neon has exactly 1 org, so isolation was proven as "0 rows for any `user_id ≠ OWNER_A`," not a true 2-org OWNER_A/OWNER_B split-load. Re-run when a second Neon org exists.
+- **Owner Briefing evidence gate (§6) NOT run** — the proof rolled back, so no data remained to brief on. Requires a **persistent** load.
+- **Conservative field mapping** — core fields + provenance loaded; enum/derived fields (`payment_status`, `days_overdue`, `followup_type`, `tone`, `status`) left to table defaults to avoid CHECK-constraint risk on the first proof.
+
+### 16d. Next gate
+**Persistent staging load** (`--mode=persistent`, fail-closed behind the flag + confirm) → then the Owner Briefing evidence gate (`safe_to_show=true` from real staging records) and Harness X pipeline scenarios. Production remains out of scope (needs a real-ownership mapping, never this staging-test routing).
+
 ---
 
 ## Appendix — what is already in place (reusable)
