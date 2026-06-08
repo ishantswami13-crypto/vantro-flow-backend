@@ -429,6 +429,60 @@ Neon writes: **none** (read-only txn). Production touched: **no**. Railway touch
 
 ---
 
+## 17. Persistent staging load (2026-06-06) — DONE & verified · Owner Briefing gate PASS (2026-06-08)
+
+First **persistent** (non-reversible-by-default) staging-only Neon→Cortex load, run with `ALLOW_PERSISTENT_STAGING_LOAD=true … --mode=persistent --confirm=PERSIST`. Neon read-only (`BEGIN TRANSACTION READ ONLY`, SELECT-only); Cortex writes via staging Supabase REST; production refs blocked; counts/booleans only — no PII, no secrets printed. **Data intentionally left in staging** (precondition for the Owner Briefing evidence gate). Closes §16c's "Owner Briefing gate NOT run / proof rolled back" boundary for the data half.
+
+### 17a. Preflight baseline (read-only) — clean
+OWNER_A exists = 1 · OWNER_B exists = 1 · `sync_source='neon'` = 0/0/0 · `sync_batches` = 0 · prod-block OK · Neon extraction read-only OK (5 customers / 8 invoices / 5 followups resolved, 0 rejected, 0 orphan).
+
+### 17b. Load + idempotency + isolation — ALL PASS
+| Gate | Result |
+|------|--------|
+| Persistent load (run 1) | customers inserted **5** · invoices **8** · followups **5** · rejected **0** · orphan **0** · batch closed=succeeded · persisted=true |
+| Idempotency (run 2, same cmd) | inserted **0/0/0** · updated **5/8/5** · **net-new = 0** · neon counts stable 5/8/5 (no duplicates) |
+| Tenant isolation | OWNER_A neon rows = **5/8/5** (expected) · OWNER_B neon rows = **0/0/0** · rows where `user_id ≠ OWNER_A` & neon = **0/0/0** · no cross-tenant leakage |
+
+**Batch ids:** run 1 = `2f5b9d64-9c54-4f75-ada2-d98bda4a5931`; run 2 = `23f7be9b-bf51-4aef-8729-f3cfc42059fe`. The idempotent re-run re-tags rows to the latest batch, so **all 18 data rows currently belong to `23f7be9b-…`** (run-1 batch retains only its ledger row). `sync_batches` total = 2.
+
+### 17c. Owner Briefing evidence gate — COMPLETED (2026-06-08) · PASS (proof in §17d)
+**RESOLVED 2026-06-08:** Sidecar built (`target/debug/vantro-automation.exe`) and run on `:3002` against staging via the `aws-1-ap-southeast-1` **session pooler**. Root cause of the earlier connect failures was the pooler **host generation**, not the region: `aws-0-*` returns Supavisor `tenant_not_found` for every region, while this project's tenant lives on `aws-1-*` (verified by a safe dummy-password region probe — `aws-1-ap-southeast-1` → `28P01`). The direct `db.<ref>` host is IPv6-only (no A record), so the IPv4 pooler is required. Gate `overall_pass=true`; full proof in §17d. The original completion-path context (historical) follows.
+
+The evidence gate (`/api/agents/core.owner_briefing/preview` → `evaluateOwnerBriefingRust` → Rust sidecar) needs the `vantro-automation-rs` sidecar running against staging; when the sidecar is unreachable the contract **fails closed** to `safe_to_show=false`, so the positive OWNER_A case cannot be proven without it. The sidecar is not built, and it could not be built in this session: rustup default is MSVC but `cl.exe`/`link.exe` are not on PATH (no active VS Developer environment), and the bash shell shadows `link` with GNU coreutils. **No fake/synthetic briefing result was produced.** A reusable, fail-closed gate helper now exists — **`scripts/phase-2c-19-owner-briefing-evidence-gate.js`** (syntax-validated; fail-closed behaviour verified with the sidecar down; mints HS256 `{userId}` JWTs for OWNER_A/OWNER_B without printing the secret; applies the authoritative Node evidence contract; read-only REST subset/isolation checks; prints counts/booleans only). Completion path, from a **VS Developer PowerShell** (so MSVC `cl.exe`/`link.exe` are on PATH):
+1. `$env:SQLX_OFFLINE="true"; cargo build --features server -p vantro-automation-rs --bin vantro-automation` (workspace-root `.sqlx` cache is committed).
+2. **Terminal 1:** `node scripts/phase-2c-19-launch-staging-sidecar.js` — secret-safe launcher: loads `.env.staging` silently, pins `DATABASE_URL` to the staging URL (never inherits `.env`'s prod `DATABASE_URL`), resolves `JWT_SECRET` from `.env`, sets `RUST_AUTOMATION_API_ENABLED=true`/`RUST_AUTOMATION_PORT=3002`, **prod-blocks** the connection, and spawns `target/debug/vantro-automation.exe` (prints booleans/status only).
+3. **Terminal 2:** `node scripts/phase-2c-19-owner-briefing-evidence-gate.js` → expect OWNER_A `safe_to_show=true` + evidence>0 (source ids ⊆ OWNER_A rows, ≥1 synced), OWNER_B `safe_to_show=false` + 0 evidence + isolation ok → `overall_pass=true`.
+
+### 17d. Owner Briefing Evidence Gate Proof (2026-06-08) — PASS
+Resolves §17c. Staging `vantro-automation` sidecar run on `:3002` against staging Cortex via the `aws-1-ap-southeast-1` session pooler; `node scripts/phase-2c-19-owner-briefing-evidence-gate.js` → **`overall_pass=true`**. Safe proof (counts/booleans only):
+
+| Field | Value |
+|-------|-------|
+| Gate run (UTC) | `2026-06-08T11:56:53Z` |
+| Branch / commit | `performance-bootstrap-cortex-fix-v1` @ `b3fb251` (working tree uncommitted) |
+| Active staging batch id | `23f7be9b-bf51-4aef-8729-f3cfc42059fe` (`status=succeeded`, `sync_source=neon`, finished `2026-06-06T15:56:28Z`; OWNER_A's synced rows all belong to this single batch — `owner_a_single_batch=true`) |
+| OWNER_A summary | HTTP **200** · `safe_to_show=true` · evidence_count **12** · claims **2** (2 safe / 0 blocked, confidence 0.9) · `evidence_shape_ok=true` · ids ⊆ OWNER_A row universe (`subset_check_available=true`) · ≥1 synced-from-neon (`evidence_includes_synced=true`) · no raw customer_id |
+| OWNER_B summary | HTTP **200** · `safe_to_show=false` · evidence_count **0** · claims **0** · `fallback_reason=NO_VERIFIED_EVIDENCE` · `isolation_ok=true` |
+| Evidence count | OWNER_A = **12** · OWNER_B = **0** |
+| safe_to_show result | OWNER_A = **true** (only with verified evidence) · OWNER_B = **false** (fail-closed) |
+| Cross-tenant leakage | **none** — OWNER_B isolation ok; every OWNER_A evidence source_id ∈ OWNER_A's real Cortex row universe |
+| Fake evidence | **none** — all evidence ids reference real OWNER_A rows; synced-Neon rows verifiably flow into evidence |
+| External sending | **none** — read-only `…/preview`; `FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED` unchanged/off |
+| Production touched | **no** — localhost:3002 → staging pooler; prod ref `alepdpyqesevldobjxbo` + `vantro.in` hard-blocked at launcher and gate |
+| Railway touched | **no** |
+| Env files changed | **no** — pooler URL assembled in session memory only (never printed/written) |
+| Secrets exposed | **no** — JWT/DB URL/keys/PII never printed; counts/booleans only |
+
+Method: the gate applies the authoritative `enforceEvidenceContract` (production code, not a copy) and cross-checks each evidence `source_id` against OWNER_A's real Cortex row universe via read-only staging REST. No commit made.
+
+### 17e. Safety attestation
+Neon writes: **none** (read-only). Production: **no**. Railway: **no**. Deploy: **no**. Secrets exposed: **no**. PII printed: **no** (real fixture PII written to staging Cortex and intentionally retained; counts/booleans only in all output). Feature flag unchanged / no production exposure.
+
+### 17f. Rollback readiness (ready, NOT executed)
+Data gates passed, so the load is **kept**. To fully revert: `--mode=rollback --batch=23f7be9b-bf51-4aef-8729-f3cfc42059fe` (removes 18 data rows + its ledger), then `--mode=rollback --batch=2f5b9d64-9c54-4f75-ada2-d98bda4a5931` (removes the orphan run-1 ledger row) → staging returns to the 0/0/0 · `sync_batches`=0 baseline.
+
+---
+
 ## Appendix — what is already in place (reusable)
 - Cortex target schema is fully `user_id`-scoped with natural keys (this repo) — ready for idempotent UPSERT.
 - Staging Cortex DB is isolated (Phase 2C.18); `scripts/apply-sql-file.js` + `staging-migrate.js` patterns exist for safe, idempotent DDL.
