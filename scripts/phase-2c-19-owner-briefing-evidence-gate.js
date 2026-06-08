@@ -158,54 +158,125 @@ function isolationOk(evidenceB, syncedA) {
   if (syncedA) return !evidenceB.some((e) => e && syncedA.has(String(e.source_id)));
   return evidenceB.length === 0; // conservative fallback when the synced set is unavailable
 }
+// claims from the authoritative contract (each carries safe_to_show_claim)
+function claimsOf(ec) { return ec && Array.isArray(ec.claims) ? ec.claims : []; }
+// STRICT subset: REQUIRES the OWNER_A row universe — fail-closed if it isn't checkable
+// (no "unknown but pass"). Every evidence source_id must be a real OWNER_A row.
+function evidenceSubsetOk(evidence, universe) {
+  if (!universe) return false;
+  if (!Array.isArray(evidence) || evidence.length === 0) return false;
+  return evidence.every((e) => e && universe.has(String(e.source_id)));
+}
 
 (async () => {
   const rowIds = await ownerARowIds(); // null if staging REST creds unavailable
   const universe = rowIds ? rowIds.universe : null;
   const syncedA = rowIds ? rowIds.synced : null;
+  const subset_check_available = !!universe;   // OWNER_A row universe checkable?
+  const synced_set_available = !!syncedA;      // synced-from-neon set checkable?
+
+  // The gate must run ONLY against the LOCAL staging sidecar — never a production endpoint,
+  // and only the read-only /preview path. REST reads must never target the production ref.
+  const production_endpoint_blocked = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/i.test(BASE);
+  const preview_path_is_readonly = /\/preview\/?$/i.test(PREVIEW_PATH);
+  const rest_prod_blocked = !(DB_URL && (DB_URL.includes(PROD_SUPABASE_ID) || /vantro\.in/i.test(DB_URL)));
 
   const a = await callBriefing(mint(OWNER_A));
   const b = await callBriefing(mint(OWNER_B));
-
   const sidecar_reachable = a.reachable && b.reachable;
 
-  // Fail closed: if the sidecar is unreachable, the gate cannot pass.
+  // Fail closed: unreachable sidecar / non-success response ⇒ null contract ⇒ no pass.
   const ecA = a.rustResult ? enforceEvidenceContract(a.rustResult, OWNER_A) : null;
   const ecB = b.rustResult ? enforceEvidenceContract(b.rustResult, OWNER_B) : null;
   const evA = ecA && Array.isArray(ecA.evidence) ? ecA.evidence : [];
   const evB = ecB && Array.isArray(ecB.evidence) ? ecB.evidence : [];
+  const clA = claimsOf(ecA);
+  const clB = claimsOf(ecB);
 
-  const owner_a_status            = a.reachable ? a.status : 'UNREACHABLE';
-  const owner_a_safe_to_show      = ecA ? !!ecA.safe_to_show : false;
-  const owner_a_evidence_count    = evA.length;
-  const owner_a_evidence_shape_ok = evidenceShapeOk(evA, universe);
-  const owner_a_no_raw_customer_id = noRawCustomerId(evA);
+  // ── OWNER_A (must serve verified, OWNER_A-scoped, synced evidence) ──────────
+  const owner_a_status                   = a.reachable ? a.status : 'UNREACHABLE';
+  const owner_a_safe_to_show             = ecA ? ecA.safe_to_show === true : false;
+  const owner_a_evidence_count           = evA.length;
+  const owner_a_claims_count             = clA.length;
+  const owner_a_safe_claim_count         = clA.filter((c) => c && c.safe_to_show_claim === true).length;
+  const owner_a_evidence_shape_ok        = evidenceShapeOk(evA, universe);
+  const owner_a_evidence_subset_ok       = evidenceSubsetOk(evA, universe);          // requires universe (fail-closed)
+  const owner_a_evidence_includes_synced = includesSynced(evA, syncedA);             // null if not checkable
+  const owner_a_no_raw_customer_id       = noRawCustomerId(evA);
 
+  // ── OWNER_B (must fail closed: zero evidence, zero claims, no OWNER_A data) ──
   const owner_b_status            = b.reachable ? b.status : 'UNREACHABLE';
-  const owner_b_safe_to_show      = ecB ? !!ecB.safe_to_show : false;
+  const owner_b_safe_to_show      = ecB ? ecB.safe_to_show === true : true;          // unknown ⇒ unsafe (fails ===false)
   const owner_b_evidence_count    = evB.length;
+  const owner_b_claims_count      = clB.length;
   const owner_b_isolation_ok      = isolationOk(evB, syncedA);
+  const owner_b_no_owner_a_data   = subset_check_available
+    ? !evB.some((e) => e && universe.has(String(e.source_id)))
+    : evB.length === 0;
 
-  const owner_a_pass = a.reachable && a.status === 200 && owner_a_safe_to_show === true &&
-    owner_a_evidence_count > 0 && owner_a_evidence_shape_ok && owner_a_no_raw_customer_id;
-  // OWNER_B: HTTP 200 (or safe no-evidence) + safe_to_show=false + no evidence + isolation holds
-  const owner_b_pass = b.reachable && (b.status === 200) && owner_b_safe_to_show === false &&
-    owner_b_evidence_count === 0 && owner_b_isolation_ok;
+  // ── HARD pass conditions — any missing/unknown value ⇒ false (no "unknown but pass") ──
+  const owner_a_pass =
+    a.reachable === true && a.status === 200 &&
+    owner_a_safe_to_show === true &&
+    owner_a_evidence_count > 0 &&
+    owner_a_claims_count > 0 &&
+    owner_a_safe_claim_count > 0 &&
+    owner_a_evidence_shape_ok === true &&
+    owner_a_evidence_subset_ok === true &&
+    owner_a_evidence_includes_synced === true &&
+    owner_a_no_raw_customer_id === true;
 
-  const overall_pass = sidecar_reachable && owner_a_pass && owner_b_pass;
+  const owner_b_pass =
+    b.reachable === true && b.status === 200 &&
+    owner_b_safe_to_show === false &&
+    owner_b_evidence_count === 0 &&
+    owner_b_claims_count === 0 &&
+    owner_b_isolation_ok === true &&
+    owner_b_no_owner_a_data === true;
 
-  // Required output — counts/booleans only:
+  const overall_pass =
+    sidecar_reachable === true &&
+    production_endpoint_blocked === true &&
+    preview_path_is_readonly === true &&
+    rest_prod_blocked === true &&
+    subset_check_available === true &&   // proof must be CHECKABLE
+    synced_set_available === true &&
+    owner_a_pass === true &&
+    owner_b_pass === true;
+
+  // Required output — counts/booleans only (no PII, no secrets, no raw rows):
   const result = {
-    owner_a_status, owner_a_safe_to_show, owner_a_evidence_count,
-    owner_a_evidence_shape_ok, owner_a_no_raw_customer_id,
-    owner_b_status, owner_b_safe_to_show, owner_b_evidence_count, owner_b_isolation_ok,
     overall_pass,
-    // additive diagnostics (booleans/counts only — no PII/secrets):
     sidecar_reachable,
-    owner_a_evidence_includes_synced: includesSynced(evA, syncedA),
-    subset_check_available: !!universe,
+    production_endpoint_blocked,
+    preview_path_is_readonly,
+    rest_prod_blocked,
+    subset_check_available,
+    synced_set_available,
+    external_send_used: false, // gate only calls the read-only /preview; it never sends
+    owner_a_status,
+    owner_a_safe_to_show,
+    owner_a_evidence_count,
+    owner_a_claims_count,
+    owner_a_safe_claim_count,
+    owner_a_evidence_shape_ok,
+    owner_a_evidence_subset_ok,
+    owner_a_evidence_includes_synced,
+    owner_a_no_raw_customer_id,
+    owner_a_pass,
+    owner_b_status,
+    owner_b_safe_to_show,
+    owner_b_evidence_count,
+    owner_b_claims_count,
+    owner_b_isolation_ok,
+    owner_b_no_owner_a_data,
+    owner_b_pass,
   };
-  if (!sidecar_reachable) result._note = 'Sidecar unreachable → fail-closed. Build+run vantro-automation on :3002 from a VS Developer PowerShell (see header).';
+  if (!sidecar_reachable) {
+    result._note = 'Sidecar unreachable → fail-closed. Launch the staging sidecar on :3002 first (scripts/phase-2c-19-launch-staging-sidecar.js).';
+  } else if (!subset_check_available || !synced_set_available) {
+    result._note = 'OWNER_A row universe / synced set not checkable via staging REST → fail-closed (no unknown-but-pass).';
+  }
   console.log('GATE_JSON:' + JSON.stringify(result, null, 1));
   process.exit(overall_pass ? 0 : 1);
 })().catch((e) => fail(e && e.message ? e.message : e));
