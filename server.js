@@ -11794,6 +11794,30 @@ app.get('/api/agents/core.owner_briefing/preview', authMiddleware, async (req, r
   }
 });
 
+// -------------------------------------------------------------------------
+// 🛰️ ATLAS RUNTIME TRUTH — Read-only honest capability snapshot — Phase 2C.21
+// -------------------------------------------------------------------------
+// GET /api/atlas/runtime-truth
+// Tells frontend/agents EXACTLY what is real, proven, limited, planned, or
+// blocked. Built from a static registry + safety-flag booleans.
+// No DB. No mutations. No LLM calls. No secrets/PII/env values.
+// Counts / booleans / status only. Atlas must never fake live capability.
+// Feature-gated: FEATURE_RUNTIME_TRUTH_API_ENABLED must be true.
+
+app.get('/api/atlas/runtime-truth', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _fe } = require('./lib/featureFlags');
+    if (!_fe('runtime_truth_api_enabled')) return res.status(404).json({ error: 'Not found' });
+
+    const { buildRuntimeTruth } = require('./lib/services/runtimeTruth.service');
+    const truth = buildRuntimeTruth({ generatedAt: new Date().toISOString() });
+
+    return res.json(truth);
+  } catch (err) {
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`✅ Vantro Flow Backend running on port ${PORT}`);
   console.log(`📝 API Base URL: http://localhost:${PORT}`);
