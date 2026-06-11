@@ -1,6 +1,6 @@
 # Phase 2C.22 — Runtime Truth Live Contract Proof
 
-> **Status:** Implemented (proof script + doc), uncommitted, awaiting Codex review + Ishant approval
+> **Status:** Committed in PR #11 (`8f9afdd`) as Phase 2C.22 proof artifacts; not merged to integration at time of PR review
 > **Branch:** `phase-2c-22-runtime-truth-live-contract`
 > **Base:** `c9931e4` (origin/performance-bootstrap-cortex-fix-v1, with Phase 2C.21 merged)
 > **Scope:** Backend only. No production / Railway / env / frontend / main / DB / deploy.
