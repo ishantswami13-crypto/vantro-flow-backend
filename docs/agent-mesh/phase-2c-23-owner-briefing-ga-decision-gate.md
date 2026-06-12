@@ -1,6 +1,6 @@
 # Phase 2C.23 — Owner Briefing GA Decision Gate
 
-> **Status:** Implemented (decision doc + fail-closed checker), uncommitted, awaiting Codex review + Ishant approval
+> **Status:** Committed in PR #12 as Phase 2C.23 decision artifacts; not merged to integration at time of PR review.
 > **Branch:** `phase-2c-23-owner-briefing-ga-decision-gate`
 > **Base:** `f948514` (origin/performance-bootstrap-cortex-fix-v1, with 2C.21 + 2C.22 merged)
 > **Scope:** Backend only. No production / Railway / env / frontend / main / DB / deploy.
