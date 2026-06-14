@@ -26,8 +26,9 @@
  * (Same doctrine as the 2C.21/2C.22/2C.23 checkers.)
  *
  * SAFETY: read-only. Opens NO database, makes NO network call, writes NO file,
- * spawns NO process. The only env interaction is DELETING FEATURE_* vars
- * in-process (never on disk) so the flag-default check is deterministic. Output is
+ * spawns NO process, and makes NO env mutation — flag state is read as-is via the
+ * pure runtime-truth build, with flag defaults verified by source-pattern match
+ * against lib/featureFlags.js. Output is
  * COUNTS / BOOLEANS / STATUS / MARKER NAMES only — never secrets, DB URLs, JWTs,
  * tokens, env values, PII, or raw row data.
  *
