@@ -11861,6 +11861,49 @@ app.get('/api/atlas/packs/:id', authMiddleware, async (req, res) => {
 });
 // END ATLAS PACK REGISTRY (Phase 2C.26)
 
+// -------------------------------------------------------------------------
+// ATLAS WORKFLOW REGISTRY — Read-only Atlas business-process layer — Phase 2C.27
+// -------------------------------------------------------------------------
+// GET /api/atlas/workflows        — full read-only workflow-registry truth (counts + workflows)
+// GET /api/atlas/workflows/:id     — single workflow truth
+// READ-ONLY: no execution, no activation, no production sync, no external send, no DB write.
+// No DB. No mutations. No LLM calls. No secrets/PII/env values.
+// Counts / booleans / status / labels only. Atlas must never fake live capability.
+// No POST/PATCH/DELETE. Feature-gated: FEATURE_ATLAS_WORKFLOW_REGISTRY_API_ENABLED (default OFF).
+
+app.get('/api/atlas/workflows', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _fe } = require('./lib/featureFlags');
+    if (!_fe('atlas_workflow_registry_api_enabled')) return res.status(404).json({ error: 'Not found' });
+
+    const { buildAtlasWorkflowRegistryTruth } = require('./lib/services/atlasWorkflowRegistry.service');
+    const truth = buildAtlasWorkflowRegistryTruth({ generatedAt: new Date().toISOString() });
+
+    return res.json(truth);
+  } catch (err) {
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/atlas/workflows/:id', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _fe } = require('./lib/featureFlags');
+    if (!_fe('atlas_workflow_registry_api_enabled')) return res.status(404).json({ error: 'Not found' });
+
+    const { id } = req.params;
+    if (!/^[a-z0-9_]+$/.test(id)) return res.status(400).json({ error: 'Invalid workflow ID format' });
+
+    const { getAtlasWorkflowById } = require('./lib/services/atlasWorkflowRegistry.service');
+    const workflow = getAtlasWorkflowById(id);
+    if (!workflow) return res.status(404).json({ error: 'Workflow not found' });
+
+    return res.json({ success: true, workflow });
+  } catch (err) {
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+// END ATLAS WORKFLOW REGISTRY (Phase 2C.27)
+
 app.listen(PORT, () => {
   console.log(`✅ Vantro Flow Backend running on port ${PORT}`);
   console.log(`📝 API Base URL: http://localhost:${PORT}`);
