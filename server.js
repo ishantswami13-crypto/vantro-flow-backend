@@ -11818,6 +11818,49 @@ app.get('/api/atlas/runtime-truth', authMiddleware, async (req, res) => {
   }
 });
 
+// -------------------------------------------------------------------------
+// ATLAS PACK REGISTRY — Read-only Atlas Pack Civilization Layer truth — Phase 2C.26
+// -------------------------------------------------------------------------
+// GET /api/atlas/packs        — full read-only pack-registry truth (counts + packs)
+// GET /api/atlas/packs/:id    — single pack truth
+// READ-ONLY: no execution, no activation, no production sync, no external send.
+// No DB. No mutations. No LLM calls. No secrets/PII/env values.
+// Counts / booleans / status / labels only. Atlas must never fake live capability.
+// No POST/PATCH/DELETE. Feature-gated: FEATURE_ATLAS_PACK_REGISTRY_API_ENABLED (default OFF).
+
+app.get('/api/atlas/packs', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _fe } = require('./lib/featureFlags');
+    if (!_fe('atlas_pack_registry_api_enabled')) return res.status(404).json({ error: 'Not found' });
+
+    const { buildAtlasPackRegistryTruth } = require('./lib/services/atlasPackRegistry.service');
+    const truth = buildAtlasPackRegistryTruth({ generatedAt: new Date().toISOString() });
+
+    return res.json(truth);
+  } catch (err) {
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/atlas/packs/:id', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _fe } = require('./lib/featureFlags');
+    if (!_fe('atlas_pack_registry_api_enabled')) return res.status(404).json({ error: 'Not found' });
+
+    const { id } = req.params;
+    if (!/^[a-z0-9_]+$/.test(id)) return res.status(400).json({ error: 'Invalid pack ID format' });
+
+    const { getAtlasPackById } = require('./lib/services/atlasPackRegistry.service');
+    const pack = getAtlasPackById(id);
+    if (!pack) return res.status(404).json({ error: 'Pack not found' });
+
+    return res.json({ success: true, pack });
+  } catch (err) {
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+// END ATLAS PACK REGISTRY (Phase 2C.26)
+
 app.listen(PORT, () => {
   console.log(`✅ Vantro Flow Backend running on port ${PORT}`);
   console.log(`📝 API Base URL: http://localhost:${PORT}`);
