@@ -11951,6 +11951,50 @@ app.get('/api/atlas/agents/:id', authMiddleware, async (req, res) => {
 });
 // END ATLAS AGENT UNIVERSE (Phase 2C.28)
 
+// -------------------------------------------------------------------------
+// BEGIN ATLAS RELATIONSHIP GRAPH (Phase 2C.29) — Read-only Pack/Agent/Workflow topology
+// -------------------------------------------------------------------------
+// GET /api/atlas/relationship-graph            — full read-only graph truth (nodes + edges + counts)
+// GET /api/atlas/relationship-graph/nodes/:id  — single node + FIRST-DEGREE adjacency only
+// READ-ONLY: no execution, no activation, no production access, no external send, no
+// production sync, no DB write, no recursion, no pathfinding, no /paths, no caller-
+// controlled depth. Counts are registry TOPOLOGY counts, not live-capability metrics.
+// No DB. No mutations. No LLM calls. No secrets/PII/env values. No POST/PATCH/PUT/DELETE.
+// Feature-gated: FEATURE_ATLAS_RELATIONSHIP_GRAPH_API_ENABLED (default OFF).
+
+app.get('/api/atlas/relationship-graph', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _fe } = require('./lib/featureFlags');
+    if (!_fe('atlas_relationship_graph_api_enabled')) return res.status(404).json({ error: 'Not found' });
+
+    const { buildAtlasRelationshipGraphTruth } = require('./lib/services/atlasRelationshipGraph.service');
+    const truth = buildAtlasRelationshipGraphTruth({ generatedAt: new Date().toISOString() });
+
+    return res.json(truth);
+  } catch (err) {
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/atlas/relationship-graph/nodes/:id', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _fe } = require('./lib/featureFlags');
+    if (!_fe('atlas_relationship_graph_api_enabled')) return res.status(404).json({ error: 'Not found' });
+
+    const { id } = req.params;
+    if (!/^[a-z]+:[a-z0-9_.]+$/.test(id)) return res.status(400).json({ error: 'Invalid node ID format' });
+
+    const { getAtlasRelationshipGraphNodeById } = require('./lib/services/atlasRelationshipGraph.service');
+    const node = getAtlasRelationshipGraphNodeById(id);
+    if (!node) return res.status(404).json({ error: 'Node not found' });
+
+    return res.json({ success: true, ...node });
+  } catch (err) {
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+// END ATLAS RELATIONSHIP GRAPH (Phase 2C.29)
+
 app.listen(PORT, () => {
   console.log(`✅ Vantro Flow Backend running on port ${PORT}`);
   console.log(`📝 API Base URL: http://localhost:${PORT}`);
