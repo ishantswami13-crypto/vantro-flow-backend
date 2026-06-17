@@ -11904,6 +11904,53 @@ app.get('/api/atlas/workflows/:id', authMiddleware, async (req, res) => {
 });
 // END ATLAS WORKFLOW REGISTRY (Phase 2C.27)
 
+// -------------------------------------------------------------------------
+// BEGIN ATLAS AGENT UNIVERSE (Phase 2C.28) — Read-only Atlas Agent Universe truth
+// -------------------------------------------------------------------------
+// GET /api/atlas/agents        — full read-only agent-registry truth (counts + agents)
+// GET /api/atlas/agents/:id    — single agent truth
+// READ-ONLY: no execution, no activation, no production enablement, no external send,
+// no production sync, no DB write. is_implemented/harness_verified are facts only.
+// No DB. No mutations. No LLM calls. No secrets/PII/env values.
+// Counts / booleans / status / labels only. Atlas must never fake live capability or
+// claim that hundreds of agents are live. Canonical Atlas-truth agents route (sibling of
+// /api/atlas/packs and /api/atlas/workflows); distinct from the DB-backed
+// /api/agents/registry operational route, which it does not modify or replace.
+// No POST/PATCH/DELETE. Feature-gated: FEATURE_ATLAS_AGENT_REGISTRY_API_ENABLED (default OFF).
+
+app.get('/api/atlas/agents', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _fe } = require('./lib/featureFlags');
+    if (!_fe('atlas_agent_registry_api_enabled')) return res.status(404).json({ error: 'Not found' });
+
+    const { buildAtlasAgentRegistryTruth } = require('./lib/services/atlasAgentRegistry.service');
+    const truth = buildAtlasAgentRegistryTruth({ generatedAt: new Date().toISOString() });
+
+    return res.json(truth);
+  } catch (err) {
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/atlas/agents/:id', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _fe } = require('./lib/featureFlags');
+    if (!_fe('atlas_agent_registry_api_enabled')) return res.status(404).json({ error: 'Not found' });
+
+    const { id } = req.params;
+    if (!/^[a-z0-9_.]+$/.test(id)) return res.status(400).json({ error: 'Invalid agent ID format' });
+
+    const { getAtlasAgentById } = require('./lib/services/atlasAgentRegistry.service');
+    const agent = getAtlasAgentById(id);
+    if (!agent) return res.status(404).json({ error: 'Agent not found' });
+
+    return res.json({ success: true, agent });
+  } catch (err) {
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+// END ATLAS AGENT UNIVERSE (Phase 2C.28)
+
 app.listen(PORT, () => {
   console.log(`✅ Vantro Flow Backend running on port ${PORT}`);
   console.log(`📝 API Base URL: http://localhost:${PORT}`);
