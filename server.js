@@ -11995,6 +11995,52 @@ app.get('/api/atlas/relationship-graph/nodes/:id', authMiddleware, async (req, r
 });
 // END ATLAS RELATIONSHIP GRAPH (Phase 2C.29)
 
+// -------------------------------------------------------------------------
+// BEGIN ATLAS ACTION APPROVAL (Phase 2C.30) — Read-only approval-requirement contract
+// -------------------------------------------------------------------------
+// GET /api/atlas/action-approvals       — full read-only approval-requirement truth
+// GET /api/atlas/action-approvals/:id    — single approval contract
+// READ-ONLY: describes what approval WOULD be required. It does NOT request, grant,
+// deny, record, queue, or execute approvals. No approve/reject/request/decide/execute/
+// activate/send/sync/deploy. No DB write, no mutation, no external send, no auto-approve.
+// Counts are approval REQUIREMENTS, not an operational queue or granted approvals.
+// No POST/PATCH/PUT/DELETE. Distinct from the operational AI Action Center
+// (/api/ai-actions/*), which this phase does not modify. No secrets/PII/approver ids.
+// Feature-gated: FEATURE_ATLAS_ACTION_APPROVAL_API_ENABLED (default OFF).
+
+app.get('/api/atlas/action-approvals', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _fe } = require('./lib/featureFlags');
+    if (!_fe('atlas_action_approval_api_enabled')) return res.status(404).json({ error: 'Not found' });
+
+    const { buildAtlasActionApprovalTruth } = require('./lib/services/atlasActionApprovalRegistry.service');
+    const truth = buildAtlasActionApprovalTruth({ generatedAt: new Date().toISOString() });
+
+    return res.json(truth);
+  } catch (err) {
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/atlas/action-approvals/:id', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _fe } = require('./lib/featureFlags');
+    if (!_fe('atlas_action_approval_api_enabled')) return res.status(404).json({ error: 'Not found' });
+
+    const { id } = req.params;
+    if (!/^[a-z0-9_.]+$/.test(id)) return res.status(400).json({ error: 'Invalid contract ID format' });
+
+    const { getAtlasActionApprovalContractById } = require('./lib/services/atlasActionApprovalRegistry.service');
+    const contract = getAtlasActionApprovalContractById(id);
+    if (!contract) return res.status(404).json({ error: 'Contract not found' });
+
+    return res.json({ success: true, contract });
+  } catch (err) {
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+// END ATLAS ACTION APPROVAL (Phase 2C.30)
+
 app.listen(PORT, () => {
   console.log(`✅ Vantro Flow Backend running on port ${PORT}`);
   console.log(`📝 API Base URL: http://localhost:${PORT}`);
