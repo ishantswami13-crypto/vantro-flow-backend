@@ -34,8 +34,17 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         Ok(Config {
-            port: env::var("RUST_AUTOMATION_PORT")
+            // Port precedence (Railway-compatible):
+            //   1. PORT                 — injected by Railway/PaaS; the port the
+            //                             platform health-checks and routes to.
+            //   2. RUST_AUTOMATION_PORT — explicit override for local/multi-service dev.
+            //   3. 3002                 — default (distinct from Node on 3001).
+            // Honouring PORT directly means the service binds the platform port
+            // even if RUST_AUTOMATION_PORT=$PORT was not set in the service env,
+            // which is the documented cause of the 30s health-check timeout.
+            port: env::var("PORT")
                 .ok()
+                .or_else(|| env::var("RUST_AUTOMATION_PORT").ok())
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3002),
             database_url: require("DATABASE_URL")?,
