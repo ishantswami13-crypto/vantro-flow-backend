@@ -5077,6 +5077,29 @@ app.get('/api/ready', (req, res) => {
   });
 });
 
+// ── Phase 2C.31T: deep readiness probe (ADDITIVE — does not change /api/health or
+// /api/ready). Reports Node liveness + real DB `SELECT 1` (short timeout, over the SAME
+// shared application pgPool) + Node->Rust `/health` (existing fail-closed client). Safe
+// booleans/status only: no secrets, no env values, no customer/tenant data, no table read,
+// no schema mutation, no migration, no agent/workflow/external-send. Always HTTP 200 if the
+// process is alive — the `success` body field conveys readiness; this is NOT the Railway
+// liveness gate (that remains /api/health). safe_to_load_data is always false.
+app.get('/api/health/deep', async (req, res) => {
+  try {
+    const { deepReadiness } = require('./lib/health/deepReadiness');
+    const report = await deepReadiness(pgPool, req.requestId);
+    res.status(200).json(report);
+  } catch (e) {
+    res.status(200).json({
+      success: false,
+      checks: { node: 'ok', db: 'fail', rust: 'fail' },
+      safe_to_load_data: false,
+      timestamp: new Date().toISOString(),
+      request_id: req.requestId || null,
+    });
+  }
+});
+
 app.post('/api/client-errors', async (req, res) => {
   const { path, message, error_id, browser_info, stack_hash, type = ErrorTaxonomy.CLIENT_UI_ERROR } = req.body;
   
