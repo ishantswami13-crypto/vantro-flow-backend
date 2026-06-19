@@ -50,7 +50,9 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(port = cfg.port, env = %cfg.app_env, "Vantro Automation RS starting");
 
-    let db = db::pool::create_pool(&cfg.database_url).await?;
+    // Lazy pool (Phase 2C.31S): no await/eager connect — the server binds and serves
+    // /health even if the DB is unreachable; DB-backed endpoints connect on first use.
+    let db = db::pool::create_pool(&cfg.database_url)?;
     let cache = Arc::new(cache::memory::MemoryCache::new());
     let events = Arc::new(events::publisher::EventPublisher::new(
         cfg.nats_url.as_deref(),
