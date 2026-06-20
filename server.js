@@ -635,8 +635,21 @@ function verifyPublicBillToken(token, billId) {
 let pgPool = null;
 if (process.env.DATABASE_URL) {
   const { Pool } = require('pg');
-  const { buildSanitizedPgConfig } = require('./lib/db/pgConfig');
+  const { buildSanitizedPgConfig, estimateStartupPacket } = require('./lib/db/pgConfig');
   pgPool = new Pool(buildSanitizedPgConfig(process.env.DATABASE_URL));
+  // Phase 2C.31W — sanitized runtime proof of the PG startup-packet size. Logs ONLY field
+  // names, presence, and byte lengths (never any value, credential, URL, or PII) so the
+  // remaining ESTARTUPPACKETTOOLARGE source can be pinpointed from deployed logs. Never blocks
+  // startup; never changes connection behavior.
+  try {
+    const est = estimateStartupPacket(buildSanitizedPgConfig(process.env.DATABASE_URL));
+    safeLog('info', '[pg] startup packet estimate', {
+      totalBytes: est.totalBytes,
+      limit: est.limit,
+      belowLimit: est.belowLimit,
+      fields: est.fields,
+    });
+  } catch (_) { /* diagnostic only — never block startup */ }
 }
 function getPool() {
   if (!pgPool) throw new Error('DATABASE_URL is not configured');
@@ -5061,15 +5074,23 @@ app.get('/api/live', (req, res) => {
 });
 
 app.get('/api/ready', (req, res) => {
+  // Phase 2C.31W — liveness/config readiness ONLY. DATABASE_URL *presence* is NOT DB
+  // connectivity, so this endpoint reports it honestly and never implies a working DB
+  // connection. The real DB-connectivity proof is GET /api/health/deep (runs SELECT 1 over
+  // the shared pool). This handler performs no DB query and never fakes DB readiness.
+  // Removed false-green shape: database: process.env.DATABASE_URL ? 'ok' : 'missing'
   res.json({
     success: true,
     status: 'ready',
     checks: {
-      database: process.env.DATABASE_URL ? 'ok' : 'missing',
+      database_configured: !!process.env.DATABASE_URL,
+      database_connectivity: 'not_checked',
       authConfig: process.env.JWT_SECRET ? 'ok' : 'missing',
       supabaseConfig: process.env.SUPABASE_URL ? 'ok' : 'missing',
       metrics: process.env.METRICS_TOKEN ? 'ok' : 'missing'
     },
+    db_readiness_endpoint: '/api/health/deep',
+    ready_for_data_load: false,
     requestId: req.requestId
   });
 });
