@@ -635,11 +635,8 @@ function verifyPublicBillToken(token, billId) {
 let pgPool = null;
 if (process.env.DATABASE_URL) {
   const { Pool } = require('pg');
-  pgPool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false },
-    max: 10,
-  });
+  const { buildSanitizedPgConfig } = require('./lib/db/pgConfig');
+  pgPool = new Pool(buildSanitizedPgConfig(process.env.DATABASE_URL));
 }
 function getPool() {
   if (!pgPool) throw new Error('DATABASE_URL is not configured');
@@ -5523,7 +5520,8 @@ CREATE INDEX IF NOT EXISTS idx_bank_transactions_status ON bank_transactions(use
   let client;
   try {
     const { Client } = require('pg');
-    client = new Client({ connectionString: dbUrl, ssl: { rejectUnauthorized: false } });
+    const { buildSanitizedPgConfig } = require('./lib/db/pgConfig');
+    client = new Client(buildSanitizedPgConfig(dbUrl));
     await client.connect();
 
     await client.query(`
