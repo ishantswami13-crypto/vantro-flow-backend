@@ -59,11 +59,13 @@ function verifyJWT(token) {
   const currentSecret = getSecret('JWT_SECRET');
   const previousSecret = getPreviousSecret('JWT_SECRET');
   try {
-    return jwt.verify(token, currentSecret);
+    // Phase 2C.35-P2: pin the algorithm allowlist (tokens are HS256-signed) to
+    // prevent algorithm-confusion / alg:none acceptance.
+    return jwt.verify(token, currentSecret, { algorithms: ['HS256'] });
   } catch (err) {
     if (previousSecret) {
       try {
-        return jwt.verify(token, previousSecret);
+        return jwt.verify(token, previousSecret, { algorithms: ['HS256'] });
       } catch (innerErr) {
         throw innerErr;
       }
@@ -105,7 +107,10 @@ function normalizeRoute(path) {
 const { safeLog } = require('./lib/observability/logger');
 const { ErrorTaxonomy, SecurityEventTaxonomy, createErrorEvent, logErrorEvent, safeErrorResponse, logSecurityEvent } = require('./lib/observability/error-tracking');
 const { isEnabled: isFeatureEnabled } = require('./lib/featureFlags'); // Vantro Cortex feature flags
-const { guardExternalSend } = require('./lib/safety/externalSend'); // Phase 2C.35-P1 global external-send kill switch
+const { guardExternalSend, guardPush } = require('./lib/safety/externalSend'); // Phase 2C.35 external-send kill switch + push policy
+// Phase 2C.35-P2 log sanitizers — never emit full PII / raw tenant IDs to logs.
+function maskId(id) { const s = String(id == null ? '' : id); return s ? s.slice(0, 8) + '…' : '∅'; }
+function maskPhone(p) { const d = String(p == null ? '' : p).replace(/\D/g, ''); return d.length >= 4 ? '***' + d.slice(-2) : '***'; }
 const app = express();
 app.set('trust proxy', 1); // Railway sits behind a proxy — needed for express-rate-limit to see real IP
 
@@ -224,7 +229,7 @@ function invalidateBusinessCache(userId) {
       summaryCache.delete(key);
     }
   }
-  console.log(`[Cache] Invalidated cache for user ${userId}`);
+  console.log(`[Cache] Invalidated cache for user ${maskId(userId)}`);
 }
 
 // Lightweight background cache warming helper
@@ -236,15 +241,15 @@ function warmBusinessCache(userId) {
     calculateDashboardControlRoom(userId).then(data => {
       const cacheKey = buildBusinessCacheKey(userId, 'control-room');
       setCache(cacheKey, data, 60);
-      console.log(`[Cache Warmer] Dashboard warmed for user ${userId}`);
+      console.log(`[Cache Warmer] Dashboard warmed for user ${maskId(userId)}`);
     }),
     calculateAnalyticsSummary(userId).then(data => {
       const cacheKey = buildBusinessCacheKey(userId, 'analytics');
       setCache(cacheKey, data, 60);
-      console.log(`[Cache Warmer] Analytics warmed for user ${userId}`);
+      console.log(`[Cache Warmer] Analytics warmed for user ${maskId(userId)}`);
     })
   ]).catch(err => {
-    console.warn(`[Cache Warmer] Silent background warming error for user ${userId}:`, err.message);
+    console.warn(`[Cache Warmer] Silent background warming error for user ${maskId(userId)}:`, err.message);
   });
 }
 
@@ -879,7 +884,7 @@ async function sendWhatsAppMessage(phone, message, creds = {}, opts = {}) {
         body: JSON.stringify({ countryCode: '91', phoneNumber: digits, callbackData: 'vantro-auto', type: 'Text', data: { message } }),
       });
       const data = await res.json();
-      console.log(`[WA Interakt] ${digits}: ${data.result ? 'sent' : 'failed'}`);
+      console.log(`[WA Interakt] ${maskPhone(digits)}: ${data.result ? 'sent' : 'failed'}`);
       return { success: !!data.result, provider: 'interakt', data };
     }
     if (watiUrl && watiToken) {
@@ -889,7 +894,7 @@ async function sendWhatsAppMessage(phone, message, creds = {}, opts = {}) {
         body: JSON.stringify({ messageText: message }),
       });
       const data = await res.json();
-      console.log(`[WA Wati] ${digits}: ${data.result ? 'sent' : 'failed'}`);
+      console.log(`[WA Wati] ${maskPhone(digits)}: ${data.result ? 'sent' : 'failed'}`);
       return { success: !!data.result, provider: 'wati', data };
     }
     // Vantro's Twilio WhatsApp — managed fallback for ALL users
@@ -903,7 +908,7 @@ async function sendWhatsAppMessage(phone, message, creds = {}, opts = {}) {
             to: `whatsapp:+91${digits}`,
             body: message,
           });
-          console.log(`[WA Twilio] ${digits}: sent`);
+          console.log(`[WA Twilio] ${maskPhone(digits)}: sent`);
           return { success: true, provider: 'twilio_whatsapp' };
         } catch (twilioErr) {
           console.warn('[WA Twilio] Send failed, falling to mock:', twilioErr.message);
@@ -981,7 +986,7 @@ async function sendOTPEmail(email, name, otp) {
       }),
     });
     const data = await res.json().catch(() => ({}));
-    console.log(`[EMAIL OTP] Resend → ${email}: ${data.id ? 'sent' : 'failed'}`);
+    console.log(`[EMAIL OTP] Resend delivery: ${data.id ? 'sent' : 'failed'}`);
   } else {
     // Email delivery not configured. NEVER log the OTP value or the recipient.
     console.log('[EMAIL OTP] delivery not configured (RESEND_API_KEY unset) — OTP not emailed');
@@ -2611,7 +2616,7 @@ async function ensureConnectedBusinessData(userId) {
     return; // Already ran recently
   }
 
-  console.log(`[Auto-Reconcile] Starting for user ${userId}...`);
+  console.log(`[Auto-Reconcile] Starting for user ${maskId(userId)}...`);
   lastReconciled[userId] = now;
 
   try {
@@ -2723,9 +2728,9 @@ async function ensureConnectedBusinessData(userId) {
       });
       await supabase.from('products').update({ current_stock: stock, updated_at: new Date() }).eq('id', prod.id);
     }
-    console.log(`[Auto-Reconcile] Completed for user ${userId}.`);
+    console.log(`[Auto-Reconcile] Completed for user ${maskId(userId)}.`);
   } catch (err) {
-    console.error(`[Auto-Reconcile] Error for user ${userId}:`, err.message);
+    console.error(`[Auto-Reconcile] Error for user ${maskId(userId)}:`, err.message);
   }
 }
 
@@ -2759,7 +2764,7 @@ const businessEvents = new (require('events').EventEmitter)();
 
 async function emitBusinessEvent(userId, eventType, payload = {}) {
   try {
-    console.log(`[Event Engine] Emitting '${eventType}' for user ${userId}`);
+    console.log(`[Event Engine] Emitting '${eventType}' for user ${maskId(userId)}`);
 
     // Invalidate user-scoped summary cache on write
     invalidateBusinessCache(userId);
@@ -6565,7 +6570,7 @@ async function makeAutoCall(userId, invoice) {
   try {
     const twilioClient = getTwilio();
     if (!twilioClient) {
-      console.log(`[Dunning/call] Twilio not configured — skipping call for ${invoice.customer_name}`);
+      console.log(`[Dunning/call] Twilio not configured — skipping call for invoice ${maskId(invoice.id)}`);
       return false;
     }
     // Phase 2C.35-P1: external-send kill switch — no auto voice call unless enabled.
@@ -6627,7 +6632,7 @@ async function makeAutoCall(userId, invoice) {
 
     return true;
   } catch (err) {
-    console.error(`[Dunning/call] Call failed for ${invoice.customer_name}:`, err.message);
+    console.error(`[Dunning/call] Call failed for invoice ${maskId(invoice.id)}:`, err.message);
     return false;
   }
 }
@@ -6740,7 +6745,7 @@ async function runDunningCycle() {
           } else {
             // WhatsApp (per-user creds → env fallback → mock)
             await sendWhatsAppMessage(invoice.customer_phone, msg, waCreds).catch(e =>
-              console.error(`[Dunning] WA send failed for ${invoice.customer_name}:`, e.message)
+              console.error(`[Dunning] WA send failed for invoice ${maskId(invoice.id)}:`, e.message)
             );
           }
           // Track reminder timestamp for frontend display
@@ -7532,6 +7537,8 @@ app.post('/api/notifications/subscribe', authMiddleware, async (req, res) => {
 // Internal helper: send push to a user
 async function sendPushToUser(userId, title, body, data = {}) {
   if (!process.env.VAPID_PUBLIC_KEY) return; // not configured
+  // Phase 2C.35-P2: web-push is fail-closed for launch (FEATURE_PUSH_NOTIFICATIONS_ENABLED).
+  if (guardPush()) return;
   try {
     const { data: user } = await supabase
       .from('users').select('push_subscription').eq('id', userId).single();
@@ -8538,7 +8545,7 @@ app.post('/api/voice/recording', async (req, res) => {
       console.log(`⚠️ Empty transcript for ${RecordingSid}`);
       return;
     }
-    console.log(`📞 Call transcript (user ${userId}): ${transcript}`);
+    console.log(`📞 Call transcript received (user ${maskId(userId)}, ${transcript.length} chars)`);
 
     // 3. Load vocabulary + user profile for context
     const [{ data: vocab }, { data: profile }] = await Promise.all([
@@ -8620,7 +8627,7 @@ Extract order from Hindi/Hinglish transcript. Return ONLY valid JSON, no comment
         } catch (ce) { console.error('Worker auto-call error:', ce.message); }
       }
     }
-    console.log(`✅ Order from call saved — user ${userId}`);
+    console.log(`✅ Order from call saved — user ${maskId(userId)}`);
   } catch (err) {
     console.error('Recording processing error:', err.message);
   }
@@ -8850,7 +8857,7 @@ app.post('/api/ai/brain', authMiddleware, async (req, res) => {
       supabase.from('business_vocabulary').select('term,meaning,aliases').eq('user_id', userId).limit(50),
       supabase.from('brain_rules').select('rule,category').eq('user_id', userId).limit(30),
       supabase.from('workers').select('name,role,is_active').eq('user_id', userId),
-      supabase.from('invoices').select('customer_name,invoice_amount,due_date,status').eq('user_id', userId).eq('status','unpaid').order('invoice_amount', { ascending: false }).limit(10),
+      supabase.from('invoices').select('customer_name,invoice_amount,due_date,payment_status').eq('user_id', userId).eq('payment_status','Pending').order('invoice_amount', { ascending: false }).limit(10),
       supabase.from('orders').select('customer_name,items,status,total_amount,delivery_time').eq('user_id', userId).eq('order_date', today),
       supabase.from('expenses').select('description,amount,category').eq('user_id', userId).eq('expense_date', today),
     ]);
@@ -9003,8 +9010,8 @@ RULES:
       switch (name) {
         case 'get_invoices': {
           const order = args.sort_by === 'days_overdue' ? 'due_date' : 'invoice_amount';
-          let q = supabase.from('invoices').select('customer_name,invoice_amount,due_date,status')
-            .eq('user_id', userId).eq('status', 'unpaid').order(order, { ascending: false }).limit(args.limit || 10);
+          let q = supabase.from('invoices').select('customer_name,invoice_amount,due_date,payment_status')
+            .eq('user_id', userId).eq('payment_status', 'Pending').order(order, { ascending: false }).limit(args.limit || 10);
           if (args.min_amount) q = q.gte('invoice_amount', args.min_amount);
           const { data } = await q;
           return (data || []).map(i => ({
@@ -9054,7 +9061,7 @@ RULES:
             (data || []).forEach(o => { map[o.customer_name] = (map[o.customer_name] || 0) + Number(o.total_amount || 0); });
             return Object.entries(map).sort(([,a],[,b]) => b-a).slice(0, args.limit || 5).map(([name, total]) => ({ name, total: `₹${total.toLocaleString('en-IN')}` }));
           } else {
-            const { data } = await supabase.from('invoices').select('customer_name,invoice_amount').eq('user_id', userId).eq('status','unpaid').order('invoice_amount', { ascending: false }).limit(args.limit || 5);
+            const { data } = await supabase.from('invoices').select('customer_name,invoice_amount').eq('user_id', userId).eq('payment_status','Pending').order('invoice_amount', { ascending: false }).limit(args.limit || 5);
             return data || [];
           }
         }
@@ -9196,9 +9203,12 @@ app.get('/api/bills/public/:id', async (req, res) => {
     // Phase 2C.35-P1: minimise PII on the public payload — do NOT expose customer
     // phone/email/GSTIN or the owner's personal name. Bill content + seller
     // business header (needed for a valid GST invoice) only.
+    // Phase 2C.35-P2: minimal external-safe payload. Seller tax-id and full
+    // address fields are removed by default (re-add only behind an explicit,
+    // documented full-invoice path). No customer contact PII, no owner name, no raw tenant IDs.
     const { data, error } = await supabase
       .from('bills')
-      .select('id, user_id, bill_number, customer_name, invoice_date, due_date, items, subtotal, tax_amount, total_amount, status, notes, paid_at, created_at, users(business_name, gstin, city, business_address)')
+      .select('id, user_id, bill_number, customer_name, invoice_date, due_date, items, subtotal, tax_amount, total_amount, status, notes, paid_at, created_at, users(business_name, city)')
       .eq('id', req.params.id)
       .single();
     if (error || !data) return res.status(404).json({ error: 'Invoice not found' });

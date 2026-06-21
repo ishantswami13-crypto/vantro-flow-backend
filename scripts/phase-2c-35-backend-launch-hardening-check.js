@@ -181,17 +181,65 @@ gate('G06', 'HIGH', 'No bare req.user.id (JWT claim is userId; bare .id is undef
   return { red: false, detail: 'all req.user identity reads use userId (with safe fallback)' };
 });
 
-// G07 — Public bill endpoint must default to requiring a signed token (fail-closed), not REQUIRE_SIGNED===true opt-in.
-gate('G07', 'HIGH', 'Public bill endpoint requires signed token by default (no fail-open PII)', () => {
+// G07 — Public bill: fail-closed by default AND minimal payload (no customer/seller PII).
+gate('G07', 'HIGH', 'Public bill requires signed token by default + minimal payload (no PII)', () => {
   if (!serverJs) return { red: true, detail: 'server.js unreadable' };
-  const hasPublicBill = /\/api\/bills\/public\//.test(serverJs);
-  if (!hasPublicBill) return { red: false, detail: 'no public bill route present (n/a)' };
+  const idx = serverJs.indexOf("app.get('/api/bills/public/:id'");
+  if (idx < 0) return { red: false, detail: 'no public bill route present (n/a)' };
+  const block = serverJs.slice(idx, idx + 2600);
   // Fail-open shape: signing only required when env === 'true'.
-  const failOpen = /REQUIRE_SIGNED_PUBLIC_BILLS\s*===\s*'true'/.test(serverJs);
-  if (failOpen) {
-    return { red: true, detail: 'signed-token enforcement is gated behind REQUIRE_SIGNED_PUBLIC_BILLS===\'true\' (default OFF) → unauthenticated PII disclosure by bill UUID. Default to required.' };
+  if (/REQUIRE_SIGNED_PUBLIC_BILLS\s*===\s*'true'/.test(serverJs)) {
+    return { red: true, detail: "signed-token enforcement gated behind REQUIRE_SIGNED_PUBLIC_BILLS==='true' (default OFF) → PII disclosure by bill UUID. Default to required." };
   }
-  return { red: false, detail: 'public bill route does not appear to default fail-open' };
+  // Inspect ONLY the .select(...) field list (not surrounding comments).
+  const selMatch = block.match(/\.from\(['"]bills['"]\)\s*\.select\(\s*['"]([^'"]+)['"]/);
+  if (!selMatch) return { red: true, detail: 'could not locate the bills public .select(...) to verify payload fields.' };
+  const sel = selMatch[1];
+  const leaks = ['customer_phone', 'customer_email', 'customer_gstin', 'business_address', 'owner_name'].filter((f) => sel.includes(f));
+  if (/users\([^)]*\bgstin\b/.test(sel)) leaks.push('users.gstin');
+  if (leaks.length) {
+    return { red: true, detail: `public bill payload still exposes: ${leaks.join(', ')}. Remove from the default external-safe payload.` };
+  }
+  return { red: false, detail: 'public bill fail-closed by default; payload excludes customer/seller PII + owner name' };
+});
+
+// G10 — invoices.status='unpaid' reads (invoices use payment_status, not a status column).
+gate('G10', 'HIGH', "No invoices reads on a non-existent status='unpaid' column", () => {
+  if (!serverJs) return { red: true, detail: 'server.js unreadable' };
+  const re = /from\(['"]invoices['"]\)[\s\S]{0,200}?\.eq\(\s*['"]status['"]\s*,\s*['"]unpaid['"]\s*\)/g;
+  const n = count(serverJs, re);
+  if (n > 0) return { red: true, detail: `${n} invoices query(ies) filter status='unpaid' — invoices canonical is payment_status='Pending'/'Paid'; returns nothing.` };
+  return { red: false, detail: "invoices use payment_status (no status='unpaid' reads)" };
+});
+
+// G11 — No direct console.* leaking raw PII / message bodies.
+gate('G11', 'HIGH', 'No direct console.* logs leaking PII (transcript/phone/email/OTP/message/name)', () => {
+  if (!serverJs) return { red: true, detail: 'server.js unreadable' };
+  const risky = [
+    /\$\{transcript\}/, /\$\{otp\}/, /\$\{email\}/, /\$\{message\}/, /\$\{digits\}/,
+    /\$\{customer_name\}/, /\$\{invoice\.customer_name\}/, /\$\{customer_phone\}/, /\$\{user\.phone\}/,
+  ];
+  const hits = [];
+  for (const ln of serverJs.split('\n')) {
+    if (!/console\.(log|error|warn|info)\s*\(/.test(ln)) continue;
+    for (const re of risky) {
+      if (re.test(ln)) { hits.push(ln.trim().slice(0, 64)); break; }
+    }
+  }
+  if (hits.length) return { red: true, detail: `${hits.length} console.* PII leak(s); e.g. ${hits[0]}` };
+  return { red: false, detail: 'no direct console.* PII/message leaks (mask helpers used)' };
+});
+
+// G12 — OTP/web-push send policy is explicit (auth-OTP flag default ON; push fail-closed).
+gate('G12', 'HIGH', 'OTP via explicit flag (default ON) + web-push fail-closed', () => {
+  const mod = read('lib/safety/externalSend.js');
+  if (!mod) return { red: true, detail: 'lib/safety/externalSend.js missing' };
+  const otpPolicy = /authOtpSendEnabled/.test(mod) && /FEATURE_AUTH_OTP_SENDING_ENABLED/.test(mod);
+  const pushPolicy = /pushSendEnabled/.test(mod) && /FEATURE_PUSH_NOTIFICATIONS_ENABLED/.test(mod);
+  const pushGated = !!serverJs && /guardPush\(\)/.test(serverJs);
+  if (!otpPolicy) return { red: true, detail: 'auth-OTP policy (FEATURE_AUTH_OTP_SENDING_ENABLED) not defined in the guard module.' };
+  if (!pushPolicy || !pushGated) return { red: true, detail: 'web-push not fail-closed (needs FEATURE_PUSH_NOTIFICATIONS_ENABLED + guardPush()).' };
+  return { red: false, detail: 'OTP=explicit flag (default ON); web-push=fail-closed (default OFF) via guardPush' };
 });
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -203,7 +251,7 @@ gate('G08', 'MEDIUM', 'Postgres TLS verifies server certificate (rejectUnauthori
   if (pgConfig === null) return { red: false, detail: 'pgConfig.js not present (skipped)' };
   const disabled = /rejectUnauthorized\s*:\s*false/.test(pgConfig);
   return disabled
-    ? { red: true, detail: 'lib/db/pgConfig.js sets ssl.rejectUnauthorized:false — MITM-hardening gap (encrypted but unverified). Pin Supabase CA or document accepted risk.' }
+    ? { red: true, detail: 'DOCUMENTED MEDIUM (not changed in code): pgConfig.js keeps ssl.rejectUnauthorized:false (TLS on, peer cert NOT verified). The 2C.31V/W startup-packet gates assert this exact ssl shape and flipping it without the Supabase CA would break the DB runtime. OWNER ACTION: supply the Supabase CA + enable cert verification via staging/production env (do NOT mutate env from code).' }
     : { red: false, detail: 'no rejectUnauthorized:false in pgConfig' };
 });
 

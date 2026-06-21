@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT COUNT(*) AS cnt FROM invoices\n             WHERE user_id = $1 AND payment_status = 'Overdue'",
+  "query": "SELECT COUNT(*) AS cnt FROM invoices\n             WHERE user_id = $1 AND payment_status IN ('Overdue','Pending') AND days_overdue > 0",
   "describe": {
     "columns": [
       {
@@ -18,5 +18,5 @@
       null
     ]
   },
-  "hash": "2640ee55314283c60336cef85e5ad06d0812c25d9f61da8fae7518e7ffef586c"
+  "hash": "c6df10e65a56466a92d4773f0369180708be22ea5ef7f81438eef72c22ad24d7"
 }
