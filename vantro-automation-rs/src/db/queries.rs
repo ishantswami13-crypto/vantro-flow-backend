@@ -72,8 +72,10 @@ pub async fn dashboard_bootstrap(
         )
         .fetch_one(pool),
         sqlx::query!(
+            // Phase 2C.35-P1: no row is ever stored as 'Overdue'; overdue is
+            // Pending + days_overdue > 0 (matches the customer-metrics query).
             "SELECT COUNT(*) AS cnt FROM invoices
-             WHERE user_id = $1 AND payment_status = 'Overdue'",
+             WHERE user_id = $1 AND payment_status IN ('Overdue','Pending') AND days_overdue > 0",
             user_id
         )
         .fetch_one(pool),
@@ -152,7 +154,7 @@ pub async fn collections_bootstrap(
         sqlx::query!(
             r#"SELECT
                  COALESCE(SUM(COALESCE(total_amount, invoice_amount, 0) - COALESCE(amount_paid, 0)), 0.0)::float8 AS total_receivables,
-                 COALESCE(SUM(CASE WHEN payment_status = 'Overdue'
+                 COALESCE(SUM(CASE WHEN payment_status IN ('Overdue','Pending') AND days_overdue > 0
                    THEN COALESCE(total_amount, invoice_amount, 0) - COALESCE(amount_paid, 0)
                    ELSE 0 END), 0.0)::float8 AS overdue_amount,
                  COALESCE(SUM(CASE WHEN due_date >= $2 AND due_date <= $3

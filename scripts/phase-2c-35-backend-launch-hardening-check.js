@@ -83,23 +83,25 @@ const rustQueries = read('vantro-automation-rs/src/db/queries.rs');
 // BLOCKER gates
 // ───────────────────────────────────────────────────────────────────────────
 
-// G01 — External-send kill-switch must be enforced in code (not merely defined/reported).
-gate('G01', 'BLOCKER', 'External-send kill-switch (FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED) enforced on send paths', () => {
+// G01 — External-send kill-switch must be enforced via the central guard at every send path.
+gate('G01', 'BLOCKER', 'External-send kill-switch enforced via central guard on every send path', () => {
   if (!serverJs) return { red: true, detail: 'server.js unreadable' };
-  const definedInFlags = featureFlags && /external_message_sending_enabled/.test(featureFlags);
-  // The flag must be REFERENCED somewhere in server.js (the choke point sendWhatsAppMessage / send routes / crons).
-  const enforcedInServer = /external_message_sending_enabled|FEATURE_EXTERNAL_MESSAGE_SENDING/.test(serverJs);
-  const sendSites =
-    count(serverJs, /sendWhatsAppMessage\s*\(/g) +
-    count(serverJs, /\.(messages|calls)\.create\s*\(/g) +
-    count(serverJs, /webpush\.sendNotification\s*\(/g);
-  if (!enforcedInServer) {
-    return {
-      red: true,
-      detail: `flag ${definedInFlags ? 'defined in featureFlags' : 'NOT defined'} but referenced 0x in server.js; ${sendSites} send call-sites are ungated. Add a fail-closed guard inside sendWhatsAppMessage()/calls.create()/sendNotification().`,
-    };
-  }
-  return { red: false, detail: `flag referenced in server.js across send paths (${sendSites} send sites present)` };
+  const guardModule = read('lib/safety/externalSend.js');
+  const moduleEnforcesFlag = !!guardModule && /external_message_sending_enabled/.test(guardModule) && /guardExternalSend/.test(guardModule);
+  const requiredInServer = /require\(['"]\.\/lib\/safety\/externalSend['"]\)/.test(serverJs);
+  const guardCalls = count(serverJs, /guardExternalSend\s*\(/g);
+  // The WhatsApp choke point (covers all sendWhatsAppMessage call-sites) must call the guard.
+  const waIdx = serverJs.indexOf('async function sendWhatsAppMessage');
+  const waBody = waIdx >= 0 ? serverJs.slice(waIdx, waIdx + 1600) : '';
+  const waGuarded = /guardExternalSend\s*\(\s*['"]whatsapp['"]/.test(waBody);
+  // Every voice calls.create site should be guarded (3 sites → at least 3 voice guards).
+  const voiceSites = count(serverJs, /\.calls\.create\s*\(/g);
+  const voiceGuards = count(serverJs, /guardExternalSend\s*\(\s*['"]voice['"]/g);
+  if (!moduleEnforcesFlag) return { red: true, detail: 'lib/safety/externalSend.js missing or does not enforce external_message_sending_enabled.' };
+  if (!requiredInServer || guardCalls < 1) return { red: true, detail: 'server.js does not require/use the external-send guard.' };
+  if (!waGuarded) return { red: true, detail: 'sendWhatsAppMessage choke point does not route through guardExternalSend.' };
+  if (voiceSites > voiceGuards) return { red: true, detail: `${voiceSites} voice calls.create site(s) but only ${voiceGuards} voice guard(s).` };
+  return { red: false, detail: `guard enforces flag; ${guardCalls} guard call-site(s); WhatsApp choke point + ${voiceGuards}/${voiceSites} voice sites guarded.` };
 });
 
 // G02 — Pre-OTP "preVerify" token must be rejected by the session middlewares (authMiddleware / requireOwner / adminOnly).
@@ -115,22 +117,22 @@ gate('G02', 'BLOCKER', 'preVerify (pre-OTP) token rejected by session auth middl
   return { red: false, detail: 'preVerify rejection guard present' };
 });
 
-// G03 — Rust sidecar x-user-id auth bypass must not fail OPEN (NODE_ENV default to "development" with no Railway fail-safe).
-gate('G03', 'BLOCKER', 'Rust sidecar x-user-id bypass is fail-closed (no insecure default env)', () => {
+// G03 — Rust sidecar x-user-id bypass must be fail-closed: explicit opt-in, never on Railway, never prod.
+gate('G03', 'BLOCKER', 'Rust sidecar x-user-id bypass is fail-closed (explicit opt-in, never Railway/prod)', () => {
   if (rustConfig === null && rustAuth === null) {
     return { red: false, detail: 'rust sidecar sources not present in this checkout (skipped)' };
   }
   const hasBypass = rustAuth && /x-user-id/.test(rustAuth);
-  // Closure param may be `||` or `|_|`; match either form of the insecure default.
+  if (!hasBypass) return { red: false, detail: 'no x-user-id bypass present' };
+  // Insecure default: NODE_ENV unwrap_or_else to "development" (|| or |_| closure form).
   const insecureDefault = rustConfig && /unwrap_or_else\(\s*\|[^|]*\|\s*"development"/.test(rustConfig);
-  const hasRailwayFailsafe = rustConfig && /RAILWAY_/.test(rustConfig);
-  if (hasBypass && insecureDefault && !hasRailwayFailsafe) {
-    return { red: true, detail: 'auth.rs accepts `x-user-id` when is_dev(); config.rs defaults app_env to "development" (NODE_ENV unwrap_or_else) with NO RAILWAY_* fail-safe → fail-OPEN tenant impersonation if NODE_ENV unset.' };
-  }
-  if (hasBypass && insecureDefault) {
-    return { red: true, detail: 'x-user-id bypass present and config defaults to "development"; verify a fail-closed gate exists.' };
-  }
-  return { red: false, detail: 'no fail-open x-user-id bypass detected' };
+  const gatedByExplicit = rustAuth && /config\.dev_auth_bypass/.test(rustAuth);
+  const stillGatedByIsDev = rustAuth && /is_dev\(\)\s*\{[\s\S]{0,200}x-user-id/.test(rustAuth);
+  const hasPolicy = rustConfig && /compute_dev_auth_bypass/.test(rustConfig) && /RAILWAY_/.test(rustConfig);
+  if (insecureDefault) return { red: true, detail: 'config.rs still defaults app_env to "development" (fail-open).' };
+  if (stillGatedByIsDev || !gatedByExplicit) return { red: true, detail: 'auth.rs x-user-id branch is not gated by config.dev_auth_bypass (fail-open).' };
+  if (!hasPolicy) return { red: true, detail: 'config.rs lacks compute_dev_auth_bypass + RAILWAY_* fail-safe.' };
+  return { red: false, detail: 'x-user-id gated by explicit RUST_DEV_AUTH_BYPASS; disabled on Railway; default env = production.' };
 });
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -165,9 +167,14 @@ gate('G05', 'HIGH', 'No plaintext OTP or message body written to logs', () => {
 // G06 — No bare req.user.id / req.user?.id without the userId fallback (JWT signs { userId }).
 gate('G06', 'HIGH', 'No bare req.user.id (JWT claim is userId; bare .id is undefined)', () => {
   if (!serverJs) return { red: true, detail: 'server.js unreadable' };
+  // Ignore comment-only lines so prose mentioning the pattern cannot trip the gate.
+  const codeOnly = serverJs
+    .split('\n')
+    .filter((ln) => !ln.trim().startsWith('//') && !ln.trim().startsWith('*'))
+    .join('\n');
   // Match req.user.id / req.user?.id that is NOT immediately the right side of `userId || `.
   const bareRe = /(?<!userId\s*\|\|\s*)req\.user\??\.id\b/g;
-  const n = count(serverJs, bareRe);
+  const n = count(codeOnly, bareRe);
   if (n > 0) {
     return { red: true, detail: `${n} bare req.user(.|?.)id occurrence(s) not guarded by req.user.userId || fallback → undefined identity. Use req.user?.userId || req.user?.id.` };
   }

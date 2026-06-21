@@ -105,6 +105,7 @@ function normalizeRoute(path) {
 const { safeLog } = require('./lib/observability/logger');
 const { ErrorTaxonomy, SecurityEventTaxonomy, createErrorEvent, logErrorEvent, safeErrorResponse, logSecurityEvent } = require('./lib/observability/error-tracking');
 const { isEnabled: isFeatureEnabled } = require('./lib/featureFlags'); // Vantro Cortex feature flags
+const { guardExternalSend } = require('./lib/safety/externalSend'); // Phase 2C.35-P1 global external-send kill switch
 const app = express();
 app.set('trust proxy', 1); // Railway sits behind a proxy — needed for express-rate-limit to see real IP
 
@@ -521,9 +522,13 @@ function authMiddleware(req, res, next) {
   if (!token) return res.status(401).json({ error: 'Missing token' });
   try {
     req.user = verifyJWT(token);
+    // Phase 2C.35-P1: pre-OTP "preVerify" tokens are NOT full sessions. Reject
+    // them on every protected app/API route (the OTP verify/resend endpoints
+    // decode the token themselves and are unaffected).
+    if (req.user && req.user.preVerify) return res.status(401).json({ error: 'Verification incomplete' });
     req.authSource = source;
     if (!requireCookieCsrf(req, res)) return;
-    
+
     // --- SECURITY: Force identity fields to safe values ---
     if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
       const safeId = req.user.userId || req.user.id;
@@ -553,6 +558,8 @@ function requireOwner(req, res, next) {
   } catch {
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
+  // Phase 2C.35-P1: pre-OTP "preVerify" tokens are NOT full sessions.
+  if (req.user && req.user.preVerify) return res.status(401).json({ error: 'Verification incomplete' });
   if (!requireCookieCsrf(req, res)) return;
   const paramId = req.params.userId;
   if (paramId && req.user.userId !== paramId) {
@@ -845,11 +852,20 @@ if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
 // ============================================
 // creds: optional per-user { interakt_api_key, wati_api_url, wati_token }
 // Falls back to Vantro env vars → Twilio → mock
-async function sendWhatsAppMessage(phone, message, creds = {}) {
+async function sendWhatsAppMessage(phone, message, creds = {}, opts = {}) {
   const digits = String(phone || '').replace(/\D/g, '').replace(/^91/, '');
   if (!digits || digits.length < 10) {
-    console.log('[WA] No valid phone:', message.substring(0, 60));
+    console.log('[WA] No valid phone (message body suppressed from logs)');
     return { success: false, reason: 'no_phone' };
+  }
+  // Phase 2C.35-P1: global fail-closed external-send kill switch at the lowest
+  // boundary. Customer/collections sends are blocked unless
+  // FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED === 'true'. Owner-auth OTP delivery
+  // passes { transactional:true } and is exempt (required for login).
+  const _sendBlock = guardExternalSend('whatsapp', { transactional: opts.transactional === true });
+  if (_sendBlock) {
+    console.log('[WA BLOCKED] external sending disabled (flag off) — not sent');
+    return _sendBlock;
   }
   const interaktKey = creds.interakt_api_key || process.env.INTERAKT_API_KEY;
   const watiUrl     = creds.wati_api_url     || process.env.WATI_API_URL;
@@ -894,8 +910,8 @@ async function sendWhatsAppMessage(phone, message, creds = {}) {
         }
       }
     }
-    // Dev mode fallback
-    console.log(`[WA MOCK] To: 91${digits}\n${message}\n`);
+    // Dev mode fallback — never log the phone or message body (PII/OTP/payment links).
+    console.log(`[WA MOCK] queued (no provider configured) — len=${String(message || '').length}`);
     return { success: true, provider: 'mock' };
   } catch (err) {
     console.error('[WA] Send error:', err.message);
@@ -967,8 +983,8 @@ async function sendOTPEmail(email, name, otp) {
     const data = await res.json().catch(() => ({}));
     console.log(`[EMAIL OTP] Resend → ${email}: ${data.id ? 'sent' : 'failed'}`);
   } else {
-    // Dev mode — OTP visible in logs only
-    console.log(`[EMAIL OTP DEV] To: ${email} | Code: ${otp}`);
+    // Email delivery not configured. NEVER log the OTP value or the recipient.
+    console.log('[EMAIL OTP] delivery not configured (RESEND_API_KEY unset) — OTP not emailed');
   }
 }
 
@@ -1036,9 +1052,9 @@ app.post('/api/auth/signup', async (req, res) => {
     const otp = storeOTP(user.id);
     const otpMsg = `Vantro Flow verification code: *${otp}*\n\nYe code 10 minute mein expire ho jaayega. Kisi ke saath share mat karein.`;
 
-    // WhatsApp OTP
+    // WhatsApp OTP — transactional owner-auth delivery (exempt from external-send kill switch)
     if (user.phone) {
-      sendWhatsAppMessage(user.phone, otpMsg).catch(e => console.error('[OTP WA]', e.message));
+      sendWhatsAppMessage(user.phone, otpMsg, {}, { transactional: true }).catch(e => console.error('[OTP WA]', e.message));
     }
 
     // Email OTP — send via Resend if configured
@@ -1070,7 +1086,7 @@ app.post('/api/auth/resend-otp', async (req, res) => {
     const otp = storeOTP(user.id);
     const otpMsg = `Vantro Flow verification code: *${otp}*\n\nYe code 10 minute mein expire ho jaayega. Kisi ke saath share mat karein.`;
 
-    if (user.phone) sendWhatsAppMessage(user.phone, otpMsg).catch(() => {});
+    if (user.phone) sendWhatsAppMessage(user.phone, otpMsg, {}, { transactional: true }).catch(() => {});
     sendOTPEmail(user.email, user.business_name, otp).catch(() => {});
 
     res.json({ success: true, message: 'OTP sent to your phone and email' });
@@ -6552,6 +6568,11 @@ async function makeAutoCall(userId, invoice) {
       console.log(`[Dunning/call] Twilio not configured — skipping call for ${invoice.customer_name}`);
       return false;
     }
+    // Phase 2C.35-P1: external-send kill switch — no auto voice call unless enabled.
+    if (guardExternalSend('voice')) {
+      console.log('[Dunning/call] external sending disabled (flag off) — call skipped');
+      return false;
+    }
 
     const { data: profile } = await supabase
       .from('users')
@@ -7000,6 +7021,8 @@ function adminOnly(req, res, next) {
   if (!header || !header.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing token' });
   try {
     const decoded = verifyJWT(header.slice(7));
+    // Phase 2C.35-P1: pre-OTP "preVerify" tokens are NOT full sessions.
+    if (decoded && decoded.preVerify) return res.status(401).json({ error: 'Verification incomplete' });
     const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim());
     if (!ADMIN_EMAILS.includes(decoded.email)) return res.status(403).json({ error: 'Forbidden' });
     req.user = decoded;
@@ -7404,6 +7427,9 @@ app.post('/api/voice/call', authMiddleware, async (req, res) => {
         setup_url: 'https://console.twilio.com',
       });
     }
+    // Phase 2C.35-P1: external-send kill switch — no outbound voice call unless enabled.
+    const _voiceBlock = guardExternalSend('voice');
+    if (_voiceBlock) return res.status(503).json({ error: 'External sending is disabled', reason: _voiceBlock.reason });
 
     // Fetch owner voice profile
     const { data: profile } = await supabase.from('users')
@@ -7756,7 +7782,7 @@ app.post('/api/webhooks/whatsapp-inbound', async (req, res) => {
       .eq('id', inv.id)
       .eq('user_id', inv.user_id);
 
-    console.log(`[WA-inbound] Snoozed invoice ${inv.id} (${inv.customer_name}) until ${snoozeUntil} — reply: "${messageText.slice(0, 60)}"`);
+    console.log(`[WA-inbound] Snoozed invoice ${inv.id} until ${snoozeUntil} (customer name + reply body suppressed from logs)`);
   } catch (err) {
     console.error('[WA-inbound] Error:', err.message);
   }
@@ -8573,8 +8599,8 @@ Extract order from Hindi/Hinglish transcript. Return ONLY valid JSON, no comment
       );
     }
 
-    // 7. Auto-call first active worker (if Twilio configured)
-    if (twilioClient && savedOrder) {
+    // 7. Auto-call first active worker (if Twilio configured + external-send enabled)
+    if (twilioClient && savedOrder && !guardExternalSend('voice')) {
       const { data: workers } = await supabase.from('workers')
         .select('name, phone').eq('user_id', userId).eq('is_active', true).limit(1);
 
@@ -9156,17 +9182,23 @@ app.get('/api/user/features', authMiddleware, async (req, res) => {
 app.get('/api/bills/public/:id', async (req, res) => {
   try {
     const token = req.query.token;
-    const requireSigned = process.env.REQUIRE_SIGNED_PUBLIC_BILLS === 'true';
-    if (token && !verifyPublicBillToken(token, req.params.id)) return res.status(403).json({ error: 'Invalid or expired link' });
-    if (!token && requireSigned) return res.status(403).json({ error: 'Signed link required' });
-    if (!token) {
-      res.setHeader('Deprecation', 'true');
-      res.setHeader('Warning', '299 - Unsigned public bill links are deprecated');
+    // Phase 2C.35-P1: fail-closed by default — a valid signed token bound to this
+    // bill id is REQUIRED unless REQUIRE_SIGNED_PUBLIC_BILLS is explicitly 'false'.
+    // This blocks UUID-enumeration cross-tenant PII disclosure (was default-open).
+    const requireSigned = process.env.REQUIRE_SIGNED_PUBLIC_BILLS !== 'false';
+    if (requireSigned) {
+      if (!token) return res.status(403).json({ error: 'Signed link required' });
+      if (!verifyPublicBillToken(token, req.params.id)) return res.status(403).json({ error: 'Invalid or expired link' });
+    } else if (token && !verifyPublicBillToken(token, req.params.id)) {
+      return res.status(403).json({ error: 'Invalid or expired link' });
     }
 
+    // Phase 2C.35-P1: minimise PII on the public payload — do NOT expose customer
+    // phone/email/GSTIN or the owner's personal name. Bill content + seller
+    // business header (needed for a valid GST invoice) only.
     const { data, error } = await supabase
       .from('bills')
-      .select('id, user_id, bill_number, customer_name, customer_phone, customer_email, customer_gstin, invoice_date, due_date, items, subtotal, tax_amount, total_amount, status, notes, paid_at, created_at, users(business_name, gstin, city, business_address, owner_name)')
+      .select('id, user_id, bill_number, customer_name, invoice_date, due_date, items, subtotal, tax_amount, total_amount, status, notes, paid_at, created_at, users(business_name, gstin, city, business_address)')
       .eq('id', req.params.id)
       .single();
     if (error || !data) return res.status(404).json({ error: 'Invoice not found' });
@@ -10968,6 +11000,13 @@ app.post('/api/ai-actions/:id/send-whatsapp', authMiddleware, async (req, res) =
       .single();
     if (fetchErr || !action) return res.status(404).json({ error: 'Action not found' });
 
+    // Phase 2C.35-P1: human-in-the-loop — an AI action must be explicitly approved
+    // by the owner before it can send externally. (External-send flag is enforced
+    // at the sendWhatsAppMessage choke point.)
+    if (action.status !== 'approved') {
+      return res.status(409).json({ error: 'Action must be approved before sending', status: action.status || null });
+    }
+
     const phone   = action.customers?.phone || null;
     const message = action.recommended_message || action.description || action.title;
 
@@ -11519,16 +11558,17 @@ app.get('/api/v1/dashboard/bootstrap', authMiddleware, async (req, res) => {
       { count: lowStockCount },
       { data: topActions }
     ] = await Promise.all([
-      supabase.from('invoices').select('total_amount', { count: 'exact' }).eq('user_id', userId).gte('created_at', new Date(new Date().setHours(0,0,0,0)).toISOString()),
+      supabase.from('invoices').select('invoice_amount', { count: 'exact' }).eq('user_id', userId).gte('created_at', new Date(new Date().setHours(0,0,0,0)).toISOString()),
       supabase.from('purchases').select('*', { count: 'exact', head: true }).eq('user_id', userId).gte('created_at', new Date(new Date().setHours(0,0,0,0)).toISOString()),
-      supabase.from('invoices').select('*', { count: 'exact', head: true }).eq('user_id', userId).eq('payment_status', 'Overdue'),
+      // Phase 2C.35-P1: canonical overdue predicate — no row is ever stored as 'Overdue'.
+      supabase.from('invoices').select('*', { count: 'exact', head: true }).eq('user_id', userId).eq('payment_status', 'Pending').gt('days_overdue', 0),
       supabase.from('products').select('*', { count: 'exact', head: true }).eq('user_id', userId).lt('current_stock', 5), // Simplified low stock query
       supabase.from('ai_actions').select('id, title, priority').eq('user_id', userId).eq('status', 'pending').order('created_at', { ascending: false }).limit(3)
     ]);
 
     const payload = {
       kpis: {
-        todaySales: salesTotal?.reduce((sum, s) => sum + (s.total_amount || 0), 0) || 0,
+        todaySales: salesTotal?.reduce((sum, s) => sum + (s.invoice_amount || 0), 0) || 0,
         todayPurchasesCount: purchasesCount || 0,
         overdueInvoicesCount: overdueCount || 0,
         lowStockCount: lowStockCount || 0
@@ -11556,7 +11596,7 @@ app.get('/api/v1/collections/bootstrap', authMiddleware, async (req, res) => {
       { data: invoices },
       { data: promises }
     ] = await Promise.all([
-      supabase.from('invoices').select('total_amount, amount_paid, payment_status, due_date').eq('user_id', userId).not('payment_status', 'eq', 'Paid'),
+      supabase.from('invoices').select('invoice_amount, payment_amount, payment_status, days_overdue, due_date').eq('user_id', userId).not('payment_status', 'eq', 'Paid'),
       supabase.from('promises').select('id', { count: 'exact', head: true }).eq('user_id', userId).eq('status', 'broken')
     ]);
 
@@ -11567,10 +11607,12 @@ app.get('/api/v1/collections/bootstrap', authMiddleware, async (req, res) => {
     const today = new Date().toISOString().split('T')[0];
 
     (invoices || []).forEach(inv => {
-      const remaining = (inv.total_amount || 0) - (inv.amount_paid || 0);
+      // Phase 2C.35-P1: canonical columns (invoice_amount/payment_amount) and the
+      // real overdue rule (Pending + days_overdue>0); 'Overdue' is never stored.
+      const remaining = (inv.invoice_amount || 0) - (inv.payment_amount || 0);
       totalReceivables += remaining;
-      if (inv.payment_status === 'Overdue') overdueAmount += remaining;
-      if (inv.due_date && inv.due_date.startsWith(today)) dueToday += remaining;
+      if (inv.payment_status === 'Pending' && Number(inv.days_overdue) > 0) overdueAmount += remaining;
+      if (inv.due_date && String(inv.due_date).startsWith(today)) dueToday += remaining;
     });
 
     const payload = {
@@ -11791,7 +11833,10 @@ app.get('/api/agents/core.owner_briefing/preview', authMiddleware, async (req, r
     const { evaluateOwnerBriefingRust } = require('./lib/services/rustAutomation/ownerBriefingAgentClient');
     const auditService = require('./lib/services/orchestrator/audit.service');
     const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-    const userId = req.user?.id;
+    // Phase 2C.35-P1: JWT signs { userId }; the bare .id claim is undefined.
+    // Use the canonical helper and fail closed so the briefing is attributed and audited.
+    const userId = authenticatedUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Invalid token payload' });
 
     const input = {
       briefing_date: new Date().toISOString(),

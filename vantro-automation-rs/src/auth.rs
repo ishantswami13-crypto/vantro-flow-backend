@@ -44,8 +44,12 @@ impl FromRequestParts<AppState> for AuthUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        // Dev / test mode: accept x-user-id bypass for harness tests.
-        if state.config.is_dev() {
+        // LOCAL DEV HARNESS ONLY: accept the x-user-id bypass. Phase 2C.35-P1 makes
+        // this fail-closed via config.dev_auth_bypass — it requires an explicit
+        // RUST_DEV_AUTH_BYPASS=true opt-in, is force-disabled on any Railway
+        // deployment, and is never active in production. Never reachable in
+        // prod/staging, so x-user-id can never impersonate a tenant there.
+        if state.config.dev_auth_bypass {
             if let Some(uid) = parts.headers.get("x-user-id").and_then(|v| v.to_str().ok()) {
                 let user_id = Uuid::parse_str(uid)
                     .map_err(|_| AppError::BadRequest("Invalid x-user-id UUID".into()))?;

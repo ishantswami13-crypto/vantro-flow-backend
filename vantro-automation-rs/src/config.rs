@@ -29,10 +29,26 @@ pub struct Config {
 
     /// Environment: development | staging | production
     pub app_env: String,
+
+    /// x-user-id auth bypass for the LOCAL DEV HARNESS ONLY. Fail-closed:
+    /// requires explicit RUST_DEV_AUTH_BYPASS=true, is force-disabled on any
+    /// Railway deployment, and is never active in production.
+    pub dev_auth_bypass: bool,
 }
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
+        // Phase 2C.35-P1 fail-closed default: an unset NODE_ENV is treated as
+        // PRODUCTION (not development), so the x-user-id auth bypass cannot
+        // silently activate on a misconfigured deployment.
+        let app_env = env::var("NODE_ENV").unwrap_or_else(|_| "production".into());
+        let dev_auth_bypass = compute_dev_auth_bypass(
+            env::var("RUST_DEV_AUTH_BYPASS")
+                .map(|v| v == "true")
+                .unwrap_or(false),
+            is_railway(),
+            &app_env,
+        );
         Ok(Config {
             // Port precedence (Railway-compatible):
             //   1. PORT                 — injected by Railway/PaaS; the port the
@@ -55,7 +71,8 @@ impl Config {
             redis_url: env::var("REDIS_URL").ok(),
             nats_url: env::var("NATS_URL").ok(),
             temporal_host: env::var("TEMPORAL_HOST").ok(),
-            app_env: env::var("NODE_ENV").unwrap_or_else(|_| "development".into()),
+            app_env,
+            dev_auth_bypass,
         })
     }
 
@@ -70,4 +87,50 @@ impl Config {
 
 fn require(key: &str) -> anyhow::Result<String> {
     env::var(key).map_err(|_| anyhow::anyhow!("[Config] Missing required env var: {}", key))
+}
+
+/// True when the service appears to run on a Railway deployment. Any of the
+/// standard Railway-injected vars being present marks a non-local environment.
+fn is_railway() -> bool {
+    env::var("RAILWAY_ENVIRONMENT").is_ok()
+        || env::var("RAILWAY_SERVICE_NAME").is_ok()
+        || env::var("RAILWAY_PROJECT_ID").is_ok()
+        || env::var("RAILWAY_PUBLIC_URL").is_ok()
+}
+
+/// Pure, testable policy for the x-user-id dev auth bypass. Fail-closed: ON only
+/// when explicitly opted in AND not on Railway AND not in production.
+pub fn compute_dev_auth_bypass(explicit_optin: bool, on_railway: bool, app_env: &str) -> bool {
+    explicit_optin && !on_railway && app_env != "production"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_dev_auth_bypass;
+
+    #[test]
+    fn bypass_off_by_default_no_optin() {
+        // No explicit opt-in => bypass off regardless of env.
+        assert!(!compute_dev_auth_bypass(false, false, "development"));
+        assert!(!compute_dev_auth_bypass(false, false, "test"));
+    }
+
+    #[test]
+    fn bypass_off_on_railway_even_with_optin() {
+        // On any Railway deployment the bypass is force-disabled.
+        assert!(!compute_dev_auth_bypass(true, true, "development"));
+        assert!(!compute_dev_auth_bypass(true, true, "staging"));
+        assert!(!compute_dev_auth_bypass(true, true, "production"));
+    }
+
+    #[test]
+    fn bypass_off_in_production() {
+        assert!(!compute_dev_auth_bypass(true, false, "production"));
+    }
+
+    #[test]
+    fn bypass_on_only_explicit_local_dev() {
+        assert!(compute_dev_auth_bypass(true, false, "development"));
+        assert!(compute_dev_auth_bypass(true, false, "test"));
+    }
 }
