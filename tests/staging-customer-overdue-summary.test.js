@@ -64,6 +64,7 @@ function testSafeAggregationShape() {
     generatedAt: new Date('2026-06-23T17:30:00.000Z'),
   });
 
+  assert.strictEqual(payload.ok, true);
   assert.strictEqual(payload.success, true);
   assert.strictEqual(payload.summary.totalOverdueAmount, 430000);
   assert.strictEqual(payload.summary.customersWithOverdue, 2);
