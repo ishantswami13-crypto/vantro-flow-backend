@@ -258,6 +258,10 @@ const { supabase } = require('./lib/config/supabaseClient');
 const { getBusinessContext } = require('./lib/businessContext');
 const salesService = require('./lib/services/SalesService');
 const purchaseService = require('./lib/services/PurchaseService');
+const {
+  createCustomerOverdueSummaryHandler,
+  methodNotAllowed: stagingCustomerOverdueMethodNotAllowed,
+} = require('./lib/staging/customerOverdueSummary');
 
 function isMissingSchemaError(error) {
   const code = error?.code || '';
@@ -11641,6 +11645,10 @@ app.get('/api/v1/collections/bootstrap', authMiddleware, async (req, res) => {
     res.status(500).json({ error: 'Failed to bootstrap collections' });
   }
 });
+
+app.route('/api/staging/customer-overdue-summary')
+  .get(authMiddleware, createCustomerOverdueSummaryHandler({ supabase }))
+  .all(stagingCustomerOverdueMethodNotAllowed);
 
 
 // ── CORTEX ASYNC BACKGROUND ──────────────────────────────────────────────────
