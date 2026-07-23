@@ -815,12 +815,18 @@ const upload = multer({
 });
 
 // Web Push — VAPID
+// Wrapped: a malformed VAPID key must disable push notifications, not crash
+// the entire server at boot (web-push throws synchronously on an invalid key).
 if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
-  webpush.setVapidDetails(
-    `mailto:${process.env.VAPID_EMAIL || 'hello@vantroflow.com'}`,
-    process.env.VAPID_PUBLIC_KEY,
-    process.env.VAPID_PRIVATE_KEY
-  );
+  try {
+    webpush.setVapidDetails(
+      `mailto:${process.env.VAPID_EMAIL || 'hello@vantroflow.com'}`,
+      process.env.VAPID_PUBLIC_KEY,
+      process.env.VAPID_PRIVATE_KEY
+    );
+  } catch (err) {
+    console.error('[SECURITY] Invalid VAPID keys — push notifications disabled:', err.message);
+  }
 }
 
 // ============================================
