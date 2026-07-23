@@ -815,12 +815,18 @@ const upload = multer({
 });
 
 // Web Push — VAPID
+// Wrapped: a malformed VAPID key must disable push notifications, not crash
+// the entire server at boot (web-push throws synchronously on an invalid key).
 if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
-  webpush.setVapidDetails(
-    `mailto:${process.env.VAPID_EMAIL || 'hello@vantroflow.com'}`,
-    process.env.VAPID_PUBLIC_KEY,
-    process.env.VAPID_PRIVATE_KEY
-  );
+  try {
+    webpush.setVapidDetails(
+      `mailto:${process.env.VAPID_EMAIL || 'hello@vantroflow.com'}`,
+      process.env.VAPID_PUBLIC_KEY,
+      process.env.VAPID_PRIVATE_KEY
+    );
+  } catch (err) {
+    console.error('[SECURITY] Invalid VAPID keys — push notifications disabled:', err.message);
+  }
 }
 
 // ============================================
@@ -6569,6 +6575,44 @@ async function makeAutoCall(userId, invoice) {
   }
 }
 
+// ============================================
+// RECONCILING THE TWO DUNNING SYSTEMS (Cortex X, agent auto-execute pass)
+//
+// This legacy runDunningCycle() (config: dunning_rules table, per-user
+// trigger_day/tone/action, gated on users.automation_enabled) and the newer
+// collectionsAgent.js (config: fixed day-bands, ai_actions +
+// FEATURE_AGENT_AUTOEXECUTE_ENABLED, per-customer escalation cap/cooldown)
+// both decide independently, on separate daily schedules, whether to
+// WhatsApp or call the same customer about the same overdue invoice. They
+// were built at different times for different purposes (dunning_rules is
+// the older, fully-autonomous system already relied on by paying customers
+// today; collectionsAgent is the newer Cortex-pipeline-integrated one) and
+// merging them into a single engine is a real redesign -- deciding whose
+// rule config wins, whether dunning_rules gets migrated into ai_actions,
+// is intentionally out of scope for this pass.
+//
+// What IS in scope, and implemented below: neither system should be able
+// to double-contact a customer, and pausing a customer/invoice must
+// actually stop BOTH systems, not just one. Concretely:
+//   1. Both systems now check invoices.dunning_paused (the disputeAgent
+//      safety-net flag) before contacting -- runDunningCycle previously
+//      did not check this at all, meaning a disputed invoice could still
+//      get an autonomous call/WhatsApp from the old cron even though the
+//      new system already correctly paused it. Fixed here.
+//   2. Both systems now check customers.escalation_paused (the new
+//      per-customer kill switch) before contacting -- previously only
+//      collectionsAgent respected it.
+//   3. Both systems now check invoices.last_reminder_sent (a column the
+//      old cron already wrote to, just never read back) as a shared
+//      "already contacted today, by anyone" gate, and both now write to it
+//      after a successful send/call. This makes it a genuine cross-system
+//      lock without either system needing to know the other's internals --
+//      whichever system contacts an invoice first on a given day, the
+//      other sees the fresh timestamp and skips it for the rest of that
+//      day. See collectionsAgent.js's run() and server.js's
+//      autoSendCollectionsReminders()/executeCollectionsMessage() for the
+//      new-system side of this same gate.
+// ============================================
 async function runDunningCycle() {
   console.log('🔔 Dunning cron started:', new Date().toISOString());
   try {
@@ -6576,14 +6620,20 @@ async function runDunningCycle() {
     const { data: allRules } = await supabase.from('dunning_rules').select('*').eq('enabled', true);
     if (!allRules?.length) return;
 
-    // Get all pending invoices (exclude snoozed ones)
+    // Get all pending invoices (exclude snoozed ones and disputed/dunning-paused ones)
     // Also fetch invoice_date so we can compute days_overdue dynamically
     const { data: invoices } = await supabase
       .from('invoices')
-      .select('id, user_id, customer_name, customer_phone, invoice_amount, invoice_date, due_date, days_overdue, payment_link, payment_link_id, reminder_count, snooze_until')
+      .select('id, user_id, customer_name, customer_phone, invoice_amount, invoice_date, due_date, days_overdue, payment_link, payment_link_id, reminder_count, snooze_until, dunning_paused, last_reminder_sent')
       .eq('payment_status', 'Pending')
+      .eq('dunning_paused', false)
       .or(`snooze_until.is.null,snooze_until.lt.${new Date().toISOString()}`);
     if (!invoices?.length) return;
+
+    const todayStr = new Date().toISOString().split('T')[0];
+    const contactedToday = new Set(
+      invoices.filter(i => i.last_reminder_sent && String(i.last_reminder_sent).split('T')[0] === todayStr).map(i => i.id)
+    );
 
     // Compute actual days overdue from invoice_date (not stored static field)
     const today = new Date();
@@ -6613,6 +6663,22 @@ async function runDunningCycle() {
       // Run for: (a) any paid plan user, OR (b) free users who manually enabled automation
       const isPaidPlan = user?.plan && user.plan !== 'free';
       if (!isPaidPlan && !user?.automation_enabled) continue; // skip free users with automation off
+
+      // Cross-system gate: skip if collectionsAgent (or this cron, on a
+      // rerun) already contacted this invoice today via any channel.
+      if (contactedToday.has(invoice.id)) continue;
+
+      // Per-customer pause switch (customers.escalation_paused) — same
+      // check collectionsAgent.js performs, now also honoured here so
+      // pausing a customer actually stops both systems.
+      try {
+        const { resolveCustomerId } = require('./lib/services/orchestrator/scoring.service');
+        const customerId = await resolveCustomerId(invoice.user_id, invoice.customer_name, invoice.customer_phone);
+        if (customerId) {
+          const { data: customer } = await supabase.from('customers').select('escalation_paused').eq('id', customerId).maybeSingle();
+          if (customer?.escalation_paused) continue;
+        }
+      } catch { /* best-effort — if resolution fails, fall through unaffected, same as before this change */ }
 
       // Match rules using dynamically computed days since invoice_date
       const rules = allRules.filter(r => r.user_id === invoice.user_id && r.trigger_day === invoice._computed_days);
@@ -9980,6 +10046,42 @@ app.post('/api/bank/match', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// Bank statement CSV import — parses + auto-reconciles against invoices/purchases.
+// Exact amount+reference matches auto-apply only when FEATURE_BANK_RECONCILIATION_ENABLED
+// is on; everything else is written as 'needs_review' with a requires_approval
+// ai_actions row (see lib/services/reconciliation.service.js for the full policy).
+app.post('/api/bank/transactions/import', authMiddleware, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const ext = path.extname(req.file.originalname || '').toLowerCase();
+    let csvText;
+    if (ext === '.csv') {
+      csvText = req.file.buffer.toString('utf-8');
+    } else {
+      // .xls/.xlsx — convert to CSV first so we reuse one parsing/matching path
+      const XLSX = require('xlsx');
+      const wb = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true, sheetRows: 5001 });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      csvText = XLSX.utils.sheet_to_csv(ws);
+    }
+
+    const { account_id } = req.body;
+    const reconciliation = require('./lib/services/reconciliation.service');
+    const result = await reconciliation.importStatement(req.user.userId, csvText, account_id || null);
+
+    await createActivityLog(req.user.userId, 'bank_statement_imported', {
+      entityType: 'bank_import',
+      source: 'api',
+      ...result,
+    });
+
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('[bank/import] Error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.patch('/api/bank/transactions/:id/ignore', authMiddleware, async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -10012,6 +10114,200 @@ app.delete('/api/bank/transactions/:id', authMiddleware, async (req, res) => {
 });
 
 
+
+// ============================================
+// CLOSING THE LOOP — one-tap ai_actions approval
+//
+// Shared dispatcher for the three "auto-execute" agent action types added in
+// this pass (INVENTORY_PO_READY, PAYABLES_PAYMENT_READY,
+// ESCALATE_COLLECTION_CALL). Each is created by its agent with
+// requires_approval: true (also enforced defense-in-depth by
+// policyGuard.ALWAYS_REQUIRES_APPROVAL) and a signed one-tap link
+// (lib/services/actionApproval.service.js) is sent to the owner via
+// WhatsApp. Tapping the link hits this route, which verifies the token,
+// confirms the action is still 'pending' (single-use), and only then
+// performs the real-world effect.
+//
+// PAYABLES_PAYMENT_READY is intentionally the most conservative of the
+// three: there is no RazorpayX (payout) integration configured in this
+// codebase today, and `purchases`/`suppliers` don't store a supplier bank
+// account or UPI VPA to pay out to even if there were. So approving a
+// payment never silently marks it paid — it marks the ai_action
+// 'approved' and tells the owner payment still needs to be completed
+// manually, honestly reflecting that the last mile (actual money
+// movement) isn't wired to a live payout rail yet. This preserves the
+// hard "recommend only, never execute payment" constraint even after
+// approval.
+// ============================================
+
+function approvalResultPage(title, message, ok = true) {
+  return `<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>${title}</title>
+  <style>body{font-family:-apple-system,sans-serif;background:${ok ? '#f0fdf4' : '#fef2f2'};display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px;}
+  .card{background:#fff;border-radius:12px;padding:32px;max-width:420px;box-shadow:0 2px 12px rgba(0,0,0,0.08);text-align:center;}
+  h1{font-size:20px;color:${ok ? '#166534' : '#991b1b'};margin:0 0 12px;}
+  p{color:#374151;line-height:1.5;}</style></head>
+  <body><div class="card"><h1>${ok ? '✅ ' : '⚠️ '}${title}</h1><p>${message}</p></div></body></html>`;
+}
+
+async function executeInventoryPO(userId, action) {
+  const poId = action.reason_json?.purchase_order_id;
+  if (!poId) return { ok: false, message: 'No purchase order linked to this action.' };
+  const { data: po } = await supabase.from('purchase_orders').select('*').eq('id', poId).eq('user_id', userId).maybeSingle();
+  if (!po) return { ok: false, message: 'Purchase order not found.' };
+  if (po.status !== 'draft') return { ok: false, message: `Purchase order already ${po.status}.` };
+
+  const itemsText = (po.items || []).map(i => `• ${i.qty} ${i.unit || 'units'} ${i.name}`).join('\n');
+  const message = `Naya PO (Purchase Order) — ${itemsText}\n\nEstimated: ₹${Number(po.estimated_amount || 0).toLocaleString('en-IN')}\n\nKripya confirm karein aur delivery date batayein. Dhanyavaad.`;
+
+  let sendResult = { success: false, provider: 'skipped_flag_off' };
+  if (isFeatureEnabled('external_message_sending_enabled') && po.supplier_phone) {
+    sendResult = await sendWhatsAppMessage(po.supplier_phone, message);
+  }
+
+  await supabase.from('purchase_orders').update({ status: 'sent', sent_at: new Date().toISOString() }).eq('id', po.id);
+  return {
+    ok: true,
+    message: sendResult.success
+      ? `Purchase order sent to ${po.supplier_name} on WhatsApp.`
+      : `Purchase order marked sent, but the WhatsApp message was not delivered (${sendResult.provider === 'skipped_flag_off' ? 'external sending is currently off' : 'send failed'}). You may want to contact ${po.supplier_name} directly.`,
+  };
+}
+
+async function executePayablesPayment(userId, action) {
+  const purchaseId = action.related_entity_id;
+  const amount = action.reason_json?.amount;
+  const supplierName = action.reason_json?.supplier_name || 'the supplier';
+
+  const razorpayXConfigured = !!(process.env.RAZORPAYX_KEY_ID && process.env.RAZORPAYX_KEY_SECRET);
+  if (!razorpayXConfigured) {
+    safeLogFallback('[Payables/approve] RazorpayX not configured — approval recorded, payment remains manual', { userId, purchaseId });
+    return {
+      ok: true,
+      message: `Approved. Automatic payout isn't connected yet (no payout gateway configured, and ${supplierName}'s bank/UPI details aren't on file), so please complete this ₹${Number(amount || 0).toLocaleString('en-IN')} payment to ${supplierName} manually and mark it paid from Purchases.`,
+      manualCompletionRequired: true,
+    };
+  }
+
+  // NOTE: even with RazorpayX credentials present, a real payout additionally
+  // needs a RazorpayX fund_account for this supplier (bank account or UPI VPA)
+  // which nothing in this schema captures today. Until that data exists this
+  // branch is unreachable in practice — left in place as the real integration
+  // point rather than removed, so wiring it up later is additive, not a rewrite.
+  return {
+    ok: true,
+    message: `Approved. Automatic payout to ${supplierName} could not be completed (no payout destination on file) — please complete manually and mark paid.`,
+    manualCompletionRequired: true,
+  };
+}
+
+async function executeCollectionCall(userId, action) {
+  const invoiceId = action.related_entity_id;
+  const { data: invoice } = await supabase.from('invoices').select('*').eq('id', invoiceId).eq('user_id', userId).maybeSingle();
+  if (!invoice) return { ok: false, message: 'Invoice not found.' };
+  const placed = await makeAutoCall(userId, invoice);
+  if (placed) {
+    // Shared cross-system "contacted today" gate — see runDunningCycle().
+    await supabase.from('invoices').update({
+      last_reminder_sent: new Date().toISOString(),
+      reminder_count: (invoice.reminder_count || 0) + 1,
+    }).eq('id', invoiceId).eq('user_id', userId).catch(() => {});
+  }
+  return {
+    ok: true,
+    message: placed
+      ? `Call placed to ${invoice.customer_name}.`
+      : `Could not place the call automatically (voice calling isn't configured). Consider calling ${invoice.customer_name} directly.`,
+  };
+}
+
+async function executeCollectionsMessage(userId, action) {
+  const invoiceId = action.related_entity_id;
+  const { data: invoice } = await supabase.from('invoices').select('customer_name, customer_phone, reminder_count').eq('id', invoiceId).eq('user_id', userId).maybeSingle();
+  if (!invoice?.customer_phone) return { ok: false, message: 'No phone number on file for this customer.' };
+  if (!action.recommended_message) return { ok: false, message: 'No message drafted for this action.' };
+
+  if (!isFeatureEnabled('external_message_sending_enabled')) {
+    return { ok: true, message: `Marked sent, but external sending is currently off — no WhatsApp message actually went to ${invoice.customer_name}.` };
+  }
+  const sendResult = await sendWhatsAppMessage(invoice.customer_phone, action.recommended_message);
+  if (sendResult.success) {
+    // Shared cross-system "contacted today" gate — see runDunningCycle().
+    await supabase.from('invoices').update({
+      last_reminder_sent: new Date().toISOString(),
+      reminder_count: (invoice.reminder_count || 0) + 1,
+    }).eq('id', invoiceId).eq('user_id', userId).catch(() => {});
+  }
+  return {
+    ok: true,
+    message: sendResult.success
+      ? `Reminder sent to ${invoice.customer_name} on WhatsApp.`
+      : `Could not deliver the WhatsApp message to ${invoice.customer_name} — you may want to follow up another way.`,
+  };
+}
+
+function safeLogFallback(msg, meta) { try { console.log(msg, JSON.stringify(meta)); } catch { console.log(msg); } }
+
+app.get('/api/actions/:id/approve', async (req, res) => {
+  try {
+    const { verifyActionToken, loadPendingAction } = require('./lib/services/actionApproval.service');
+    const actionService = require('./lib/services/orchestrator/action.service');
+    const actionId = req.params.id;
+    const token = req.query.token;
+
+    if (!verifyActionToken(token, actionId, 'approve')) {
+      return res.status(403).send(approvalResultPage('Link expired or invalid', 'This approval link is no longer valid. Please check your Action Center for the latest status.', false));
+    }
+
+    const { ok, action, reason } = await loadPendingAction(actionId);
+    if (!ok) {
+      const msg = reason === 'already_actioned'
+        ? `This was already ${action?.status || 'actioned'} — no changes made.`
+        : 'This action could not be found.';
+      return res.send(approvalResultPage('Nothing to do', msg));
+    }
+
+    await actionService.updateStatus(action.user_id, actionId, 'approved');
+
+    let result;
+    if (action.action_type === 'INVENTORY_PO_READY') result = await executeInventoryPO(action.user_id, action);
+    else if (action.action_type === 'PAYABLES_PAYMENT_READY') result = await executePayablesPayment(action.user_id, action);
+    else if (action.action_type === 'ESCALATE_COLLECTION_CALL') result = await executeCollectionCall(action.user_id, action);
+    else if (['SEND_POLITE_REMINDER', 'SEND_FIRM_REMINDER', 'ESCALATE_COLLECTION'].includes(action.action_type)) result = await executeCollectionsMessage(action.user_id, action);
+    else result = { ok: true, message: 'Approved.' };
+
+    await actionService.updateStatus(action.user_id, actionId, 'done');
+    await createActivityLog(action.user_id, 'ai_action_approved_and_executed', {
+      entityType: 'ai_action', entityId: actionId, source: 'approval_link', actionType: action.action_type,
+    });
+
+    res.send(approvalResultPage(action.title || 'Approved', result.message, result.ok));
+  } catch (err) {
+    console.error('[actions/approve] Error:', err.message);
+    res.status(500).send(approvalResultPage('Something went wrong', 'Please try again from your Action Center.', false));
+  }
+});
+
+app.get('/api/actions/:id/reject', async (req, res) => {
+  try {
+    const { verifyActionToken, loadPendingAction } = require('./lib/services/actionApproval.service');
+    const actionService = require('./lib/services/orchestrator/action.service');
+    const actionId = req.params.id;
+    const token = req.query.token;
+
+    if (!verifyActionToken(token, actionId, 'reject')) {
+      return res.status(403).send(approvalResultPage('Link expired or invalid', 'This link is no longer valid.', false));
+    }
+    const { ok, action, reason } = await loadPendingAction(actionId);
+    if (!ok) {
+      return res.send(approvalResultPage('Nothing to do', reason === 'already_actioned' ? `This was already ${action?.status}.` : 'Action not found.'));
+    }
+    await actionService.updateStatus(action.user_id, actionId, 'rejected');
+    res.send(approvalResultPage('Declined', 'This suggestion has been dismissed. No action was taken.'));
+  } catch (err) {
+    console.error('[actions/reject] Error:', err.message);
+    res.status(500).send(approvalResultPage('Something went wrong', 'Please try again from your Action Center.', false));
+  }
+});
 
 // ============================================
 // WEEKLY SCORECARD CRON -- Sunday 6pm IST (12:30 UTC)
@@ -10614,8 +10910,20 @@ app.post('/api/promises', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     if (isFeatureEnabled('cortex_enabled')) {
-      const { emitBusinessEvent } = require('./lib/events/EventEngine');
-      emitBusinessEvent(userId, 'PROMISE_CREATED', { promiseId: data.id, promised_date, promised_amount, customer_id });
+      // Use the full Cortex pipeline (module-scope emitBusinessEvent, defined
+      // above) so PROMISE_CREATED actually reaches rules.service.evaluate() --
+      // previously this shadow-imported lib/events/EventEngine's simple
+      // in-process pub/sub instead, which has no registered listeners and is
+      // a no-op beyond logging.
+      emitBusinessEvent(userId, 'PROMISE_CREATED', {
+        entityType:    'promise',
+        entityId:      data.id,
+        promiseId:     data.id,
+        promised_date,
+        promised_amount,
+        customer_id,
+        receivable_id: receivable_id || null,
+      });
     }
     res.status(201).json({ success: true, promise: data });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
@@ -10640,9 +10948,16 @@ app.patch('/api/promises/:id', authMiddleware, async (req, res) => {
     if (error) throw error;
     if (!data) return res.status(404).json({ error: 'Promise not found' });
     if (status && isFeatureEnabled('cortex_enabled')) {
-      const { emitBusinessEvent } = require('./lib/events/EventEngine');
+      // Same fix as POST /api/promises above -- use the live pipeline, not
+      // the shadow EventEngine, so this actually reaches rules.evaluate().
       emitBusinessEvent(userId, status === 'kept' ? 'PROMISE_KEPT' : status === 'broken' ? 'PROMISE_BROKEN' : 'PROMISE_RESCHEDULED',
-        { promiseId: id, customer_id: data.customer_id });
+        {
+          entityType:    'promise',
+          entityId:      id,
+          promiseId:     id,
+          customer_id:   data.customer_id,
+          receivable_id: data.receivable_id || null,
+        });
     }
     res.json({ success: true, promise: data });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
@@ -10784,6 +11099,28 @@ app.get('/api/customers/intelligence', authMiddleware, async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+// One obvious owner-facing kill switch for collectionsAgent's escalation
+// ladder — pausing a customer skips ALL reminder/escalation generation for
+// them (polite included), checked at the top of collectionsAgent.js's run().
+app.patch('/api/customers/:id/escalation-pause', authMiddleware, async (req, res) => {
+  try {
+    const { paused } = req.body;
+    if (typeof paused !== 'boolean') return res.status(400).json({ error: 'paused (boolean) required' });
+    const { data, error } = await supabase
+      .from('customers')
+      .update({ escalation_paused: paused })
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.userId)
+      .select()
+      .single();
+    if (error) throw error;
+    await createActivityLog(req.user.userId, paused ? 'customer_escalation_paused' : 'customer_escalation_resumed', {
+      entityType: 'customer', entityId: req.params.id, source: 'api',
+    });
+    res.json({ success: true, customer: data });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── AI ACTIONS — COUNTS (for dashboard urgency strip) ────────────────────────
@@ -11095,6 +11432,8 @@ app.post('/api/cortex/run-agents', authMiddleware, async (req, res) => {
     const { agents } = req.body; // optional array of agent names to run
     const { runAllAgents } = require('./lib/services/orchestrator/orchestrator.service');
     const result = await runAllAgents(userId, agents || null);
+    await notifyPendingAutoExecuteActions(userId);
+    await autoSendCollectionsReminders(userId);
     res.json({ success: true, ...result });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
@@ -11156,15 +11495,25 @@ cron.schedule('30 3 * * *', async () => {
       .update({ status: 'broken', resolved_at: new Date().toISOString() })
       .eq('status', 'active')
       .lt('promised_date', today)
-      .select('id, user_id, customer_id, promised_amount, promised_date');
+      .select('id, user_id, customer_id, promised_amount, promised_date, receivable_id');
     if (error) { safeLog('error', '[PromiseCron] Update failed', { error: error.message }); return; }
     if (!broken?.length) { safeLog('info', '[PromiseCron] No broken promises today'); return; }
     safeLog('info', '[PromiseCron] Marked broken', { count: broken.length });
-    const { emitBusinessEvent } = require('./lib/events/EventEngine');
+    // Same fix as the /api/promises routes -- this cron previously used the
+    // shadow lib/events/EventEngine pub/sub (no registered listeners, a
+    // no-op) instead of the live, module-scope emitBusinessEvent that
+    // actually reaches rules.service.evaluate().
     const { recalculate } = require('./lib/services/orchestrator/scoring.service');
     for (const p of broken) {
       try {
-        emitBusinessEvent(p.user_id, 'PROMISE_BROKEN', { promiseId: p.id, customer_id: p.customer_id, promised_date: p.promised_date });
+        emitBusinessEvent(p.user_id, 'PROMISE_BROKEN', {
+          entityType:    'promise',
+          entityId:      p.id,
+          promiseId:     p.id,
+          customer_id:   p.customer_id,
+          promised_date: p.promised_date,
+          receivable_id: p.receivable_id || null,
+        });
         if (_isFE('customer_scoring') && p.customer_id) await recalculate(p.user_id, p.customer_id).catch(() => {});
       } catch (e) { safeLog('error', '[PromiseCron] Per-promise error', { error: e.message, promiseId: p.id }); }
     }
@@ -11211,6 +11560,93 @@ cron.schedule('30 1 * * *', async () => {
   } catch (err) { safeLog('error', '[BriefingCron] Fatal', { error: err.message }); }
 }, { timezone: 'UTC' });
 
+// Notify the owner (via WhatsApp) about any pending "closing the loop"
+// actions that haven't been sent to them yet (notified_at IS NULL). Shared by
+// the AgentsCron below and the manual /api/cortex/run-agents trigger, so
+// behaviour is identical whether agents ran on schedule or on demand.
+// Gated on BOTH FEATURE_AGENT_AUTOEXECUTE_ENABLED (the master switch for this
+// new behaviour) and FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED (the existing,
+// already-live switch for any external send) — see lib/featureFlags.js for
+// why both are required rather than reusing just one.
+const AUTO_EXECUTE_ACTION_TYPES = ['INVENTORY_PO_READY', 'PAYABLES_PAYMENT_READY', 'ESCALATE_COLLECTION_CALL'];
+
+async function notifyPendingAutoExecuteActions(userId) {
+  if (!isFeatureEnabled('agent_autoexecute_enabled')) return;
+  try {
+    const { data: pending } = await supabase.from('ai_actions')
+      .select('id, action_type, title, description')
+      .eq('user_id', userId)
+      .eq('status', 'pending')
+      .is('notified_at', null)
+      .in('action_type', AUTO_EXECUTE_ACTION_TYPES);
+    if (!pending?.length) return;
+
+    const { data: owner } = await supabase.from('users')
+      .select('phone, interakt_api_key, wati_api_url, wati_token')
+      .eq('id', userId).single();
+    if (!owner?.phone) return;
+
+    const { buildApprovalLinks } = require('./lib/services/actionApproval.service');
+    const waCreds = { interakt_api_key: owner.interakt_api_key, wati_api_url: owner.wati_api_url, wati_token: owner.wati_token };
+
+    for (const action of pending) {
+      const { approveUrl, rejectUrl } = buildApprovalLinks(action.id);
+      const msg = `${action.title}\n${action.description || ''}\n\n✅ Approve: ${approveUrl}\n\n❌ Skip: ${rejectUrl}`;
+      let sent = { success: false };
+      if (isFeatureEnabled('external_message_sending_enabled')) {
+        sent = await sendWhatsAppMessage(owner.phone, msg, waCreds);
+      }
+      // Mark notified regardless of send success — a failed WhatsApp send
+      // shouldn't cause the same action to be re-sent every cron tick forever.
+      // (It's still visible and actionable from the owner's Action Center.)
+      await supabase.from('ai_actions').update({ notified_at: new Date().toISOString() }).eq('id', action.id);
+      if (!sent.success) safeLog('warn', '[AutoExecute] Notify WhatsApp send failed or skipped', { userId, actionId: action.id, actionType: action.action_type });
+    }
+  } catch (err) {
+    safeLog('error', '[AutoExecute] notifyPendingAutoExecuteActions failed', { error: err.message, userId });
+  }
+}
+
+// Auto-send low-stakes collections reminders (SEND_POLITE_REMINDER only —
+// firm reminders and escalations always require a one-tap approval, both by
+// this agent's own risk_level and by policyGuard.ALWAYS_REQUIRES_APPROVAL).
+// Gated the same way as notifyPendingAutoExecuteActions above.
+async function autoSendCollectionsReminders(userId) {
+  if (!isFeatureEnabled('agent_autoexecute_enabled') || !isFeatureEnabled('external_message_sending_enabled')) return;
+  try {
+    const { data: pending } = await supabase.from('ai_actions')
+      .select('id, related_entity_id, recommended_message')
+      .eq('user_id', userId)
+      .eq('status', 'pending')
+      .eq('action_type', 'SEND_POLITE_REMINDER')
+      .eq('requires_approval', false)
+      .is('notified_at', null);
+    if (!pending?.length) return;
+
+    for (const action of pending) {
+      const { data: invoice } = await supabase.from('invoices').select('customer_name, customer_phone, reminder_count').eq('id', action.related_entity_id).eq('user_id', userId).maybeSingle();
+      let sent = { success: false };
+      if (invoice?.customer_phone && action.recommended_message) {
+        sent = await sendWhatsAppMessage(invoice.customer_phone, action.recommended_message);
+      }
+      if (sent.success) {
+        // Shared cross-system "contacted today" gate — see runDunningCycle().
+        await supabase.from('invoices').update({
+          last_reminder_sent: new Date().toISOString(),
+          reminder_count: (invoice?.reminder_count || 0) + 1,
+        }).eq('id', action.related_entity_id).eq('user_id', userId).catch(() => {});
+      }
+      await supabase.from('ai_actions').update({
+        notified_at: new Date().toISOString(),
+        status: sent.success ? 'done' : 'pending', // leave pending (and eligible for owner to send manually) if auto-send failed
+        completed_at: sent.success ? new Date().toISOString() : null,
+      }).eq('id', action.id);
+    }
+  } catch (err) {
+    safeLog('error', '[AutoExecute] autoSendCollectionsReminders failed', { error: err.message, userId });
+  }
+}
+
 // ── AGENTS CRON — daily 7:15am IST (1:45 UTC) — runs after briefing ──────────
 cron.schedule('45 1 * * *', async () => {
   const { isEnabled: _isFE } = require('./lib/featureFlags');
@@ -11223,7 +11659,9 @@ cron.schedule('45 1 * * *', async () => {
     for (const user of (users || [])) {
       try {
         // Skip briefing (already ran at 7am) and data_quality (weekly)
-        await runAllAgents(user.id, ['collections', 'credit_risk', 'cashflow', 'inventory']);
+        await runAllAgents(user.id, ['collections', 'credit_risk', 'cashflow', 'inventory', 'promise_tracker', 'payables', 'dispute', 'cost_router']);
+        await notifyPendingAutoExecuteActions(user.id);
+        await autoSendCollectionsReminders(user.id);
       } catch (e) { _log('error', '[AgentsCron] Per-user error', { error: e.message, userId: user.id }); }
     }
     _log('info', '[AgentsCron] Done');
@@ -11438,6 +11876,53 @@ async function runAutoMigrations() {
       CREATE INDEX IF NOT EXISTS idx_activity_logs_user ON public.activity_logs(user_id);
       CREATE INDEX IF NOT EXISTS idx_activity_logs_created ON public.activity_logs(user_id, created_at DESC);
 
+      -- ── bank_transactions: reconciliation metadata columns ───────────────
+      ALTER TABLE public.bank_transactions ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'manual';
+      ALTER TABLE public.bank_transactions ADD COLUMN IF NOT EXISTS match_confidence NUMERIC(4,3);
+      ALTER TABLE public.bank_transactions ADD COLUMN IF NOT EXISTS match_method TEXT;
+
+      -- ── inventory: supplier linkage for auto-PO drafting (create if missing
+      --    so the ALTERs below never fail against a table that doesn't exist yet) ──
+      CREATE TABLE IF NOT EXISTS public.inventory (
+        id             BIGSERIAL PRIMARY KEY,
+        user_id        UUID NOT NULL,
+        item_name      TEXT NOT NULL,
+        quantity       NUMERIC(14,2) NOT NULL DEFAULT 0,
+        reorder_level  NUMERIC(14,2) DEFAULT 0,
+        unit           TEXT DEFAULT 'units',
+        created_at     TIMESTAMPTZ DEFAULT NOW()
+      );
+      ALTER TABLE public.inventory ADD COLUMN IF NOT EXISTS supplier_name  TEXT;
+      ALTER TABLE public.inventory ADD COLUMN IF NOT EXISTS supplier_phone TEXT;
+      ALTER TABLE public.inventory ADD COLUMN IF NOT EXISTS default_order_qty NUMERIC(14,2);
+      CREATE INDEX IF NOT EXISTS idx_inventory_user ON public.inventory(user_id);
+
+      -- ── purchase_orders table (create if missing) — drafts awaiting supplier
+      --    confirmation, distinct from purchases which records completed/paid
+      --    purchases. status: draft -> sent -> confirmed / declined / expired.
+      CREATE TABLE IF NOT EXISTS public.purchase_orders (
+        id              BIGSERIAL PRIMARY KEY,
+        user_id         UUID NOT NULL,
+        supplier_name   TEXT NOT NULL,
+        supplier_phone  TEXT,
+        items           JSONB NOT NULL DEFAULT '[]',
+        estimated_amount NUMERIC(14,2),
+        status          TEXT NOT NULL DEFAULT 'draft',
+        related_ai_action_id UUID,
+        sent_at         TIMESTAMPTZ,
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_purchase_orders_user ON public.purchase_orders(user_id);
+      CREATE INDEX IF NOT EXISTS idx_purchase_orders_status ON public.purchase_orders(user_id, status);
+
+      -- ── customers: per-customer escalation pause (closing-the-loop guardrail) ──
+      ALTER TABLE customers ADD COLUMN IF NOT EXISTS escalation_paused BOOLEAN DEFAULT FALSE;
+
+      -- ── ai_actions: one-tap approval token bookkeeping ────────────────────
+      ALTER TABLE ai_actions ADD COLUMN IF NOT EXISTS approval_token_hash TEXT;
+      ALTER TABLE ai_actions ADD COLUMN IF NOT EXISTS approval_expires_at TIMESTAMPTZ;
+      ALTER TABLE ai_actions ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ;
+
       -- ── notifications table (create if missing) ─────────────────────────
       CREATE TABLE IF NOT EXISTS public.notifications (
         id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -11462,6 +11947,7 @@ async function runAutoMigrations() {
 // ── PERFORMANCE BOOTSTRAP ROUTES ─────────────────────────────────────────────
 app.get('/api/v1/dashboard/bootstrap', authMiddleware, async (req, res) => {
   try {
+    const CacheService = require('./lib/cache/cache.service');
     const userId = req.user.userId;
     const cacheKey = `user:${userId}:dashboard_bootstrap`;
     
@@ -11505,6 +11991,7 @@ app.get('/api/v1/dashboard/bootstrap', authMiddleware, async (req, res) => {
 
 app.get('/api/v1/collections/bootstrap', authMiddleware, async (req, res) => {
   try {
+    const CacheService = require('./lib/cache/cache.service');
     const userId = req.user.userId;
     const cacheKey = `user:${userId}:collections_bootstrap`;
     const cached = CacheService.get(cacheKey);

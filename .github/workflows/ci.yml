@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Syntax check
+        run: npm run check
+
+      - name: Lint (informational — see eslint.config.js for why this doesn't block yet)
+        run: npm run lint
+        continue-on-error: true
+
+      - name: Cortex Lab static test suite
+        run: npm run cortex:test
