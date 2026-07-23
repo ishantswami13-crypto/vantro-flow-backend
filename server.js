@@ -10620,8 +10620,20 @@ app.post('/api/promises', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     if (isFeatureEnabled('cortex_enabled')) {
-      const { emitBusinessEvent } = require('./lib/events/EventEngine');
-      emitBusinessEvent(userId, 'PROMISE_CREATED', { promiseId: data.id, promised_date, promised_amount, customer_id });
+      // Use the full Cortex pipeline (module-scope emitBusinessEvent, defined
+      // above) so PROMISE_CREATED actually reaches rules.service.evaluate() --
+      // previously this shadow-imported lib/events/EventEngine's simple
+      // in-process pub/sub instead, which has no registered listeners and is
+      // a no-op beyond logging.
+      emitBusinessEvent(userId, 'PROMISE_CREATED', {
+        entityType:    'promise',
+        entityId:      data.id,
+        promiseId:     data.id,
+        promised_date,
+        promised_amount,
+        customer_id,
+        receivable_id: receivable_id || null,
+      });
     }
     res.status(201).json({ success: true, promise: data });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
@@ -10646,9 +10658,16 @@ app.patch('/api/promises/:id', authMiddleware, async (req, res) => {
     if (error) throw error;
     if (!data) return res.status(404).json({ error: 'Promise not found' });
     if (status && isFeatureEnabled('cortex_enabled')) {
-      const { emitBusinessEvent } = require('./lib/events/EventEngine');
+      // Same fix as POST /api/promises above -- use the live pipeline, not
+      // the shadow EventEngine, so this actually reaches rules.evaluate().
       emitBusinessEvent(userId, status === 'kept' ? 'PROMISE_KEPT' : status === 'broken' ? 'PROMISE_BROKEN' : 'PROMISE_RESCHEDULED',
-        { promiseId: id, customer_id: data.customer_id });
+        {
+          entityType:    'promise',
+          entityId:      id,
+          promiseId:     id,
+          customer_id:   data.customer_id,
+          receivable_id: data.receivable_id || null,
+        });
     }
     res.json({ success: true, promise: data });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
@@ -11162,15 +11181,25 @@ cron.schedule('30 3 * * *', async () => {
       .update({ status: 'broken', resolved_at: new Date().toISOString() })
       .eq('status', 'active')
       .lt('promised_date', today)
-      .select('id, user_id, customer_id, promised_amount, promised_date');
+      .select('id, user_id, customer_id, promised_amount, promised_date, receivable_id');
     if (error) { safeLog('error', '[PromiseCron] Update failed', { error: error.message }); return; }
     if (!broken?.length) { safeLog('info', '[PromiseCron] No broken promises today'); return; }
     safeLog('info', '[PromiseCron] Marked broken', { count: broken.length });
-    const { emitBusinessEvent } = require('./lib/events/EventEngine');
+    // Same fix as the /api/promises routes -- this cron previously used the
+    // shadow lib/events/EventEngine pub/sub (no registered listeners, a
+    // no-op) instead of the live, module-scope emitBusinessEvent that
+    // actually reaches rules.service.evaluate().
     const { recalculate } = require('./lib/services/orchestrator/scoring.service');
     for (const p of broken) {
       try {
-        emitBusinessEvent(p.user_id, 'PROMISE_BROKEN', { promiseId: p.id, customer_id: p.customer_id, promised_date: p.promised_date });
+        emitBusinessEvent(p.user_id, 'PROMISE_BROKEN', {
+          entityType:    'promise',
+          entityId:      p.id,
+          promiseId:     p.id,
+          customer_id:   p.customer_id,
+          promised_date: p.promised_date,
+          receivable_id: p.receivable_id || null,
+        });
         if (_isFE('customer_scoring') && p.customer_id) await recalculate(p.user_id, p.customer_id).catch(() => {});
       } catch (e) { safeLog('error', '[PromiseCron] Per-promise error', { error: e.message, promiseId: p.id }); }
     }
