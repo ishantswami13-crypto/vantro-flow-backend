@@ -11223,7 +11223,7 @@ cron.schedule('45 1 * * *', async () => {
     for (const user of (users || [])) {
       try {
         // Skip briefing (already ran at 7am) and data_quality (weekly)
-        await runAllAgents(user.id, ['collections', 'credit_risk', 'cashflow', 'inventory']);
+        await runAllAgents(user.id, ['collections', 'credit_risk', 'cashflow', 'inventory', 'promise_tracker', 'payables', 'dispute', 'cost_router']);
       } catch (e) { _log('error', '[AgentsCron] Per-user error', { error: e.message, userId: user.id }); }
     }
     _log('info', '[AgentsCron] Done');
