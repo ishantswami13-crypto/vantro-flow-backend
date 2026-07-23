@@ -13,7 +13,8 @@
     "security:audit": "npm audit --audit-level=high",
     "security:cross-user": "node scripts/cross-user-security-test.js",
     "security:smoke": "node scripts/security-smoke-test.js",
-    "cortex:test": "node cortex-lab/run.js"
+    "cortex:test": "node cortex-lab/run.js",
+    "lint": "eslint ."
   },
   "engines": {
     "node": ">=18.0.0"
@@ -36,7 +37,9 @@
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "autocannon": "^8.0.0",
+    "eslint": "^10.7.0",
     "nodemon": "^3.1.10"
   }
 }
