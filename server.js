@@ -9986,6 +9986,42 @@ app.post('/api/bank/match', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// Bank statement CSV import — parses + auto-reconciles against invoices/purchases.
+// Exact amount+reference matches auto-apply only when FEATURE_BANK_RECONCILIATION_ENABLED
+// is on; everything else is written as 'needs_review' with a requires_approval
+// ai_actions row (see lib/services/reconciliation.service.js for the full policy).
+app.post('/api/bank/transactions/import', authMiddleware, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const ext = path.extname(req.file.originalname || '').toLowerCase();
+    let csvText;
+    if (ext === '.csv') {
+      csvText = req.file.buffer.toString('utf-8');
+    } else {
+      // .xls/.xlsx — convert to CSV first so we reuse one parsing/matching path
+      const XLSX = require('xlsx');
+      const wb = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true, sheetRows: 5001 });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      csvText = XLSX.utils.sheet_to_csv(ws);
+    }
+
+    const { account_id } = req.body;
+    const reconciliation = require('./lib/services/reconciliation.service');
+    const result = await reconciliation.importStatement(req.user.userId, csvText, account_id || null);
+
+    await createActivityLog(req.user.userId, 'bank_statement_imported', {
+      entityType: 'bank_import',
+      source: 'api',
+      ...result,
+    });
+
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('[bank/import] Error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.patch('/api/bank/transactions/:id/ignore', authMiddleware, async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -11472,6 +11508,52 @@ async function runAutoMigrations() {
       );
       CREATE INDEX IF NOT EXISTS idx_activity_logs_user ON public.activity_logs(user_id);
       CREATE INDEX IF NOT EXISTS idx_activity_logs_created ON public.activity_logs(user_id, created_at DESC);
+
+      -- ── bank_transactions: reconciliation metadata columns ───────────────
+      ALTER TABLE public.bank_transactions ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'manual';
+      ALTER TABLE public.bank_transactions ADD COLUMN IF NOT EXISTS match_confidence NUMERIC(4,3);
+      ALTER TABLE public.bank_transactions ADD COLUMN IF NOT EXISTS match_method TEXT;
+
+      -- ── inventory: supplier linkage for auto-PO drafting (create if missing
+      --    so the ALTERs below never fail against a table that doesn't exist yet) ──
+      CREATE TABLE IF NOT EXISTS public.inventory (
+        id             BIGSERIAL PRIMARY KEY,
+        user_id        UUID NOT NULL,
+        item_name      TEXT NOT NULL,
+        quantity       NUMERIC(14,2) NOT NULL DEFAULT 0,
+        reorder_level  NUMERIC(14,2) DEFAULT 0,
+        unit           TEXT DEFAULT 'units',
+        created_at     TIMESTAMPTZ DEFAULT NOW()
+      );
+      ALTER TABLE public.inventory ADD COLUMN IF NOT EXISTS supplier_name  TEXT;
+      ALTER TABLE public.inventory ADD COLUMN IF NOT EXISTS supplier_phone TEXT;
+      ALTER TABLE public.inventory ADD COLUMN IF NOT EXISTS default_order_qty NUMERIC(14,2);
+      CREATE INDEX IF NOT EXISTS idx_inventory_user ON public.inventory(user_id);
+
+      -- ── purchase_orders table (create if missing) — drafts awaiting supplier
+      --    confirmation, distinct from purchases which records completed/paid
+      --    purchases. status: draft -> sent -> confirmed / declined / expired.
+      CREATE TABLE IF NOT EXISTS public.purchase_orders (
+        id              BIGSERIAL PRIMARY KEY,
+        user_id         UUID NOT NULL,
+        supplier_name   TEXT NOT NULL,
+        supplier_phone  TEXT,
+        items           JSONB NOT NULL DEFAULT '[]',
+        estimated_amount NUMERIC(14,2),
+        status          TEXT NOT NULL DEFAULT 'draft',
+        related_ai_action_id UUID,
+        sent_at         TIMESTAMPTZ,
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_purchase_orders_user ON public.purchase_orders(user_id);
+      CREATE INDEX IF NOT EXISTS idx_purchase_orders_status ON public.purchase_orders(user_id, status);
+
+      -- ── customers: per-customer escalation pause (closing-the-loop guardrail) ──
+      ALTER TABLE customers ADD COLUMN IF NOT EXISTS escalation_paused BOOLEAN DEFAULT FALSE;
+
+      -- ── ai_actions: one-tap approval token bookkeeping ────────────────────
+      ALTER TABLE ai_actions ADD COLUMN IF NOT EXISTS approval_token_hash TEXT;
+      ALTER TABLE ai_actions ADD COLUMN IF NOT EXISTS approval_expires_at TIMESTAMPTZ;
 
       -- ── notifications table (create if missing) ─────────────────────────
       CREATE TABLE IF NOT EXISTS public.notifications (
