@@ -11317,6 +11317,7 @@ app.post('/api/cortex/run-agents', authMiddleware, async (req, res) => {
     const { agents } = req.body; // optional array of agent names to run
     const { runAllAgents } = require('./lib/services/orchestrator/orchestrator.service');
     const result = await runAllAgents(userId, agents || null);
+    await notifyPendingAutoExecuteActions(userId);
     res.json({ success: true, ...result });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
@@ -11443,6 +11444,53 @@ cron.schedule('30 1 * * *', async () => {
   } catch (err) { safeLog('error', '[BriefingCron] Fatal', { error: err.message }); }
 }, { timezone: 'UTC' });
 
+// Notify the owner (via WhatsApp) about any pending "closing the loop"
+// actions that haven't been sent to them yet (notified_at IS NULL). Shared by
+// the AgentsCron below and the manual /api/cortex/run-agents trigger, so
+// behaviour is identical whether agents ran on schedule or on demand.
+// Gated on BOTH FEATURE_AGENT_AUTOEXECUTE_ENABLED (the master switch for this
+// new behaviour) and FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED (the existing,
+// already-live switch for any external send) — see lib/featureFlags.js for
+// why both are required rather than reusing just one.
+const AUTO_EXECUTE_ACTION_TYPES = ['INVENTORY_PO_READY', 'PAYABLES_PAYMENT_READY', 'ESCALATE_COLLECTION_CALL'];
+
+async function notifyPendingAutoExecuteActions(userId) {
+  if (!isFeatureEnabled('agent_autoexecute_enabled')) return;
+  try {
+    const { data: pending } = await supabase.from('ai_actions')
+      .select('id, action_type, title, description')
+      .eq('user_id', userId)
+      .eq('status', 'pending')
+      .is('notified_at', null)
+      .in('action_type', AUTO_EXECUTE_ACTION_TYPES);
+    if (!pending?.length) return;
+
+    const { data: owner } = await supabase.from('users')
+      .select('phone, interakt_api_key, wati_api_url, wati_token')
+      .eq('id', userId).single();
+    if (!owner?.phone) return;
+
+    const { buildApprovalLinks } = require('./lib/services/actionApproval.service');
+    const waCreds = { interakt_api_key: owner.interakt_api_key, wati_api_url: owner.wati_api_url, wati_token: owner.wati_token };
+
+    for (const action of pending) {
+      const { approveUrl, rejectUrl } = buildApprovalLinks(action.id);
+      const msg = `${action.title}\n${action.description || ''}\n\n✅ Approve: ${approveUrl}\n\n❌ Skip: ${rejectUrl}`;
+      let sent = { success: false };
+      if (isFeatureEnabled('external_message_sending_enabled')) {
+        sent = await sendWhatsAppMessage(owner.phone, msg, waCreds);
+      }
+      // Mark notified regardless of send success — a failed WhatsApp send
+      // shouldn't cause the same action to be re-sent every cron tick forever.
+      // (It's still visible and actionable from the owner's Action Center.)
+      await supabase.from('ai_actions').update({ notified_at: new Date().toISOString() }).eq('id', action.id);
+      if (!sent.success) safeLog('warn', '[AutoExecute] Notify WhatsApp send failed or skipped', { userId, actionId: action.id, actionType: action.action_type });
+    }
+  } catch (err) {
+    safeLog('error', '[AutoExecute] notifyPendingAutoExecuteActions failed', { error: err.message, userId });
+  }
+}
+
 // ── AGENTS CRON — daily 7:15am IST (1:45 UTC) — runs after briefing ──────────
 cron.schedule('45 1 * * *', async () => {
   const { isEnabled: _isFE } = require('./lib/featureFlags');
@@ -11456,6 +11504,7 @@ cron.schedule('45 1 * * *', async () => {
       try {
         // Skip briefing (already ran at 7am) and data_quality (weekly)
         await runAllAgents(user.id, ['collections', 'credit_risk', 'cashflow', 'inventory', 'promise_tracker', 'payables', 'dispute', 'cost_router']);
+        await notifyPendingAutoExecuteActions(user.id);
       } catch (e) { _log('error', '[AgentsCron] Per-user error', { error: e.message, userId: user.id }); }
     }
     _log('info', '[AgentsCron] Done');
@@ -11715,6 +11764,7 @@ async function runAutoMigrations() {
       -- ── ai_actions: one-tap approval token bookkeeping ────────────────────
       ALTER TABLE ai_actions ADD COLUMN IF NOT EXISTS approval_token_hash TEXT;
       ALTER TABLE ai_actions ADD COLUMN IF NOT EXISTS approval_expires_at TIMESTAMPTZ;
+      ALTER TABLE ai_actions ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ;
 
       -- ── notifications table (create if missing) ─────────────────────────
       CREATE TABLE IF NOT EXISTS public.notifications (
