@@ -10056,6 +10056,167 @@ app.delete('/api/bank/transactions/:id', authMiddleware, async (req, res) => {
 
 
 // ============================================
+// CLOSING THE LOOP — one-tap ai_actions approval
+//
+// Shared dispatcher for the three "auto-execute" agent action types added in
+// this pass (INVENTORY_PO_READY, PAYABLES_PAYMENT_READY,
+// ESCALATE_COLLECTION_CALL). Each is created by its agent with
+// requires_approval: true (also enforced defense-in-depth by
+// policyGuard.ALWAYS_REQUIRES_APPROVAL) and a signed one-tap link
+// (lib/services/actionApproval.service.js) is sent to the owner via
+// WhatsApp. Tapping the link hits this route, which verifies the token,
+// confirms the action is still 'pending' (single-use), and only then
+// performs the real-world effect.
+//
+// PAYABLES_PAYMENT_READY is intentionally the most conservative of the
+// three: there is no RazorpayX (payout) integration configured in this
+// codebase today, and `purchases`/`suppliers` don't store a supplier bank
+// account or UPI VPA to pay out to even if there were. So approving a
+// payment never silently marks it paid — it marks the ai_action
+// 'approved' and tells the owner payment still needs to be completed
+// manually, honestly reflecting that the last mile (actual money
+// movement) isn't wired to a live payout rail yet. This preserves the
+// hard "recommend only, never execute payment" constraint even after
+// approval.
+// ============================================
+
+function approvalResultPage(title, message, ok = true) {
+  return `<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>${title}</title>
+  <style>body{font-family:-apple-system,sans-serif;background:${ok ? '#f0fdf4' : '#fef2f2'};display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px;}
+  .card{background:#fff;border-radius:12px;padding:32px;max-width:420px;box-shadow:0 2px 12px rgba(0,0,0,0.08);text-align:center;}
+  h1{font-size:20px;color:${ok ? '#166534' : '#991b1b'};margin:0 0 12px;}
+  p{color:#374151;line-height:1.5;}</style></head>
+  <body><div class="card"><h1>${ok ? '✅ ' : '⚠️ '}${title}</h1><p>${message}</p></div></body></html>`;
+}
+
+async function executeInventoryPO(userId, action) {
+  const poId = action.reason_json?.purchase_order_id;
+  if (!poId) return { ok: false, message: 'No purchase order linked to this action.' };
+  const { data: po } = await supabase.from('purchase_orders').select('*').eq('id', poId).eq('user_id', userId).maybeSingle();
+  if (!po) return { ok: false, message: 'Purchase order not found.' };
+  if (po.status !== 'draft') return { ok: false, message: `Purchase order already ${po.status}.` };
+
+  const itemsText = (po.items || []).map(i => `• ${i.qty} ${i.unit || 'units'} ${i.name}`).join('\n');
+  const message = `Naya PO (Purchase Order) — ${itemsText}\n\nEstimated: ₹${Number(po.estimated_amount || 0).toLocaleString('en-IN')}\n\nKripya confirm karein aur delivery date batayein. Dhanyavaad.`;
+
+  let sendResult = { success: false, provider: 'skipped_flag_off' };
+  if (isFeatureEnabled('external_message_sending_enabled') && po.supplier_phone) {
+    sendResult = await sendWhatsAppMessage(po.supplier_phone, message);
+  }
+
+  await supabase.from('purchase_orders').update({ status: 'sent', sent_at: new Date().toISOString() }).eq('id', po.id);
+  return {
+    ok: true,
+    message: sendResult.success
+      ? `Purchase order sent to ${po.supplier_name} on WhatsApp.`
+      : `Purchase order marked sent, but the WhatsApp message was not delivered (${sendResult.provider === 'skipped_flag_off' ? 'external sending is currently off' : 'send failed'}). You may want to contact ${po.supplier_name} directly.`,
+  };
+}
+
+async function executePayablesPayment(userId, action) {
+  const purchaseId = action.related_entity_id;
+  const amount = action.reason_json?.amount;
+  const supplierName = action.reason_json?.supplier_name || 'the supplier';
+
+  const razorpayXConfigured = !!(process.env.RAZORPAYX_KEY_ID && process.env.RAZORPAYX_KEY_SECRET);
+  if (!razorpayXConfigured) {
+    safeLogFallback('[Payables/approve] RazorpayX not configured — approval recorded, payment remains manual', { userId, purchaseId });
+    return {
+      ok: true,
+      message: `Approved. Automatic payout isn't connected yet (no payout gateway configured, and ${supplierName}'s bank/UPI details aren't on file), so please complete this ₹${Number(amount || 0).toLocaleString('en-IN')} payment to ${supplierName} manually and mark it paid from Purchases.`,
+      manualCompletionRequired: true,
+    };
+  }
+
+  // NOTE: even with RazorpayX credentials present, a real payout additionally
+  // needs a RazorpayX fund_account for this supplier (bank account or UPI VPA)
+  // which nothing in this schema captures today. Until that data exists this
+  // branch is unreachable in practice — left in place as the real integration
+  // point rather than removed, so wiring it up later is additive, not a rewrite.
+  return {
+    ok: true,
+    message: `Approved. Automatic payout to ${supplierName} could not be completed (no payout destination on file) — please complete manually and mark paid.`,
+    manualCompletionRequired: true,
+  };
+}
+
+async function executeCollectionCall(userId, action) {
+  const invoiceId = action.related_entity_id;
+  const { data: invoice } = await supabase.from('invoices').select('*').eq('id', invoiceId).eq('user_id', userId).maybeSingle();
+  if (!invoice) return { ok: false, message: 'Invoice not found.' };
+  const placed = await makeAutoCall(userId, invoice);
+  return {
+    ok: true,
+    message: placed
+      ? `Call placed to ${invoice.customer_name}.`
+      : `Could not place the call automatically (voice calling isn't configured). Consider calling ${invoice.customer_name} directly.`,
+  };
+}
+
+function safeLogFallback(msg, meta) { try { console.log(msg, JSON.stringify(meta)); } catch { console.log(msg); } }
+
+app.get('/api/actions/:id/approve', async (req, res) => {
+  try {
+    const { verifyActionToken, loadPendingAction } = require('./lib/services/actionApproval.service');
+    const actionService = require('./lib/services/orchestrator/action.service');
+    const actionId = req.params.id;
+    const token = req.query.token;
+
+    if (!verifyActionToken(token, actionId, 'approve')) {
+      return res.status(403).send(approvalResultPage('Link expired or invalid', 'This approval link is no longer valid. Please check your Action Center for the latest status.', false));
+    }
+
+    const { ok, action, reason } = await loadPendingAction(actionId);
+    if (!ok) {
+      const msg = reason === 'already_actioned'
+        ? `This was already ${action?.status || 'actioned'} — no changes made.`
+        : 'This action could not be found.';
+      return res.send(approvalResultPage('Nothing to do', msg));
+    }
+
+    await actionService.updateStatus(action.user_id, actionId, 'approved');
+
+    let result;
+    if (action.action_type === 'INVENTORY_PO_READY') result = await executeInventoryPO(action.user_id, action);
+    else if (action.action_type === 'PAYABLES_PAYMENT_READY') result = await executePayablesPayment(action.user_id, action);
+    else if (action.action_type === 'ESCALATE_COLLECTION_CALL') result = await executeCollectionCall(action.user_id, action);
+    else result = { ok: true, message: 'Approved.' };
+
+    await actionService.updateStatus(action.user_id, actionId, 'done');
+    await createActivityLog(action.user_id, 'ai_action_approved_and_executed', {
+      entityType: 'ai_action', entityId: actionId, source: 'approval_link', actionType: action.action_type,
+    });
+
+    res.send(approvalResultPage(action.title || 'Approved', result.message, result.ok));
+  } catch (err) {
+    console.error('[actions/approve] Error:', err.message);
+    res.status(500).send(approvalResultPage('Something went wrong', 'Please try again from your Action Center.', false));
+  }
+});
+
+app.get('/api/actions/:id/reject', async (req, res) => {
+  try {
+    const { verifyActionToken, loadPendingAction } = require('./lib/services/actionApproval.service');
+    const actionService = require('./lib/services/orchestrator/action.service');
+    const actionId = req.params.id;
+    const token = req.query.token;
+
+    if (!verifyActionToken(token, actionId, 'reject')) {
+      return res.status(403).send(approvalResultPage('Link expired or invalid', 'This link is no longer valid.', false));
+    }
+    const { ok, action, reason } = await loadPendingAction(actionId);
+    if (!ok) {
+      return res.send(approvalResultPage('Nothing to do', reason === 'already_actioned' ? `This was already ${action?.status}.` : 'Action not found.'));
+    }
+    await actionService.updateStatus(action.user_id, actionId, 'rejected');
+    res.send(approvalResultPage('Declined', 'This suggestion has been dismissed. No action was taken.'));
+  } catch (err) {
+    console.error('[actions/reject] Error:', err.message);
+    res.status(500).send(approvalResultPage('Something went wrong', 'Please try again from your Action Center.', false));
+  }
+});
+
+// ============================================
 // WEEKLY SCORECARD CRON -- Sunday 6pm IST (12:30 UTC)
 // ============================================
 cron.schedule('30 12 * * 0', async () => {
