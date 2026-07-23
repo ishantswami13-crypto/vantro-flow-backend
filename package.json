@@ -36,6 +36,7 @@
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
+    "autocannon": "^8.0.0",
     "nodemon": "^3.1.10"
   }
 }
