@@ -11468,6 +11468,7 @@ async function runAutoMigrations() {
 // ── PERFORMANCE BOOTSTRAP ROUTES ─────────────────────────────────────────────
 app.get('/api/v1/dashboard/bootstrap', authMiddleware, async (req, res) => {
   try {
+    const CacheService = require('./lib/cache/cache.service');
     const userId = req.user.userId;
     const cacheKey = `user:${userId}:dashboard_bootstrap`;
     
@@ -11511,6 +11512,7 @@ app.get('/api/v1/dashboard/bootstrap', authMiddleware, async (req, res) => {
 
 app.get('/api/v1/collections/bootstrap', authMiddleware, async (req, res) => {
   try {
+    const CacheService = require('./lib/cache/cache.service');
     const userId = req.user.userId;
     const cacheKey = `user:${userId}:collections_bootstrap`;
     const cached = CacheService.get(cacheKey);
