@@ -6575,6 +6575,44 @@ async function makeAutoCall(userId, invoice) {
   }
 }
 
+// ============================================
+// RECONCILING THE TWO DUNNING SYSTEMS (Cortex X, agent auto-execute pass)
+//
+// This legacy runDunningCycle() (config: dunning_rules table, per-user
+// trigger_day/tone/action, gated on users.automation_enabled) and the newer
+// collectionsAgent.js (config: fixed day-bands, ai_actions +
+// FEATURE_AGENT_AUTOEXECUTE_ENABLED, per-customer escalation cap/cooldown)
+// both decide independently, on separate daily schedules, whether to
+// WhatsApp or call the same customer about the same overdue invoice. They
+// were built at different times for different purposes (dunning_rules is
+// the older, fully-autonomous system already relied on by paying customers
+// today; collectionsAgent is the newer Cortex-pipeline-integrated one) and
+// merging them into a single engine is a real redesign -- deciding whose
+// rule config wins, whether dunning_rules gets migrated into ai_actions,
+// is intentionally out of scope for this pass.
+//
+// What IS in scope, and implemented below: neither system should be able
+// to double-contact a customer, and pausing a customer/invoice must
+// actually stop BOTH systems, not just one. Concretely:
+//   1. Both systems now check invoices.dunning_paused (the disputeAgent
+//      safety-net flag) before contacting -- runDunningCycle previously
+//      did not check this at all, meaning a disputed invoice could still
+//      get an autonomous call/WhatsApp from the old cron even though the
+//      new system already correctly paused it. Fixed here.
+//   2. Both systems now check customers.escalation_paused (the new
+//      per-customer kill switch) before contacting -- previously only
+//      collectionsAgent respected it.
+//   3. Both systems now check invoices.last_reminder_sent (a column the
+//      old cron already wrote to, just never read back) as a shared
+//      "already contacted today, by anyone" gate, and both now write to it
+//      after a successful send/call. This makes it a genuine cross-system
+//      lock without either system needing to know the other's internals --
+//      whichever system contacts an invoice first on a given day, the
+//      other sees the fresh timestamp and skips it for the rest of that
+//      day. See collectionsAgent.js's run() and server.js's
+//      autoSendCollectionsReminders()/executeCollectionsMessage() for the
+//      new-system side of this same gate.
+// ============================================
 async function runDunningCycle() {
   console.log('🔔 Dunning cron started:', new Date().toISOString());
   try {
@@ -6582,14 +6620,20 @@ async function runDunningCycle() {
     const { data: allRules } = await supabase.from('dunning_rules').select('*').eq('enabled', true);
     if (!allRules?.length) return;
 
-    // Get all pending invoices (exclude snoozed ones)
+    // Get all pending invoices (exclude snoozed ones and disputed/dunning-paused ones)
     // Also fetch invoice_date so we can compute days_overdue dynamically
     const { data: invoices } = await supabase
       .from('invoices')
-      .select('id, user_id, customer_name, customer_phone, invoice_amount, invoice_date, due_date, days_overdue, payment_link, payment_link_id, reminder_count, snooze_until')
+      .select('id, user_id, customer_name, customer_phone, invoice_amount, invoice_date, due_date, days_overdue, payment_link, payment_link_id, reminder_count, snooze_until, dunning_paused, last_reminder_sent')
       .eq('payment_status', 'Pending')
+      .eq('dunning_paused', false)
       .or(`snooze_until.is.null,snooze_until.lt.${new Date().toISOString()}`);
     if (!invoices?.length) return;
+
+    const todayStr = new Date().toISOString().split('T')[0];
+    const contactedToday = new Set(
+      invoices.filter(i => i.last_reminder_sent && String(i.last_reminder_sent).split('T')[0] === todayStr).map(i => i.id)
+    );
 
     // Compute actual days overdue from invoice_date (not stored static field)
     const today = new Date();
@@ -6619,6 +6663,22 @@ async function runDunningCycle() {
       // Run for: (a) any paid plan user, OR (b) free users who manually enabled automation
       const isPaidPlan = user?.plan && user.plan !== 'free';
       if (!isPaidPlan && !user?.automation_enabled) continue; // skip free users with automation off
+
+      // Cross-system gate: skip if collectionsAgent (or this cron, on a
+      // rerun) already contacted this invoice today via any channel.
+      if (contactedToday.has(invoice.id)) continue;
+
+      // Per-customer pause switch (customers.escalation_paused) — same
+      // check collectionsAgent.js performs, now also honoured here so
+      // pausing a customer actually stops both systems.
+      try {
+        const { resolveCustomerId } = require('./lib/services/orchestrator/scoring.service');
+        const customerId = await resolveCustomerId(invoice.user_id, invoice.customer_name, invoice.customer_phone);
+        if (customerId) {
+          const { data: customer } = await supabase.from('customers').select('escalation_paused').eq('id', customerId).maybeSingle();
+          if (customer?.escalation_paused) continue;
+        }
+      } catch { /* best-effort — if resolution fails, fall through unaffected, same as before this change */ }
 
       // Match rules using dynamically computed days since invoice_date
       const rules = allRules.filter(r => r.user_id === invoice.user_id && r.trigger_day === invoice._computed_days);
@@ -10145,6 +10205,13 @@ async function executeCollectionCall(userId, action) {
   const { data: invoice } = await supabase.from('invoices').select('*').eq('id', invoiceId).eq('user_id', userId).maybeSingle();
   if (!invoice) return { ok: false, message: 'Invoice not found.' };
   const placed = await makeAutoCall(userId, invoice);
+  if (placed) {
+    // Shared cross-system "contacted today" gate — see runDunningCycle().
+    await supabase.from('invoices').update({
+      last_reminder_sent: new Date().toISOString(),
+      reminder_count: (invoice.reminder_count || 0) + 1,
+    }).eq('id', invoiceId).eq('user_id', userId).catch(() => {});
+  }
   return {
     ok: true,
     message: placed
@@ -10155,7 +10222,7 @@ async function executeCollectionCall(userId, action) {
 
 async function executeCollectionsMessage(userId, action) {
   const invoiceId = action.related_entity_id;
-  const { data: invoice } = await supabase.from('invoices').select('customer_name, customer_phone').eq('id', invoiceId).eq('user_id', userId).maybeSingle();
+  const { data: invoice } = await supabase.from('invoices').select('customer_name, customer_phone, reminder_count').eq('id', invoiceId).eq('user_id', userId).maybeSingle();
   if (!invoice?.customer_phone) return { ok: false, message: 'No phone number on file for this customer.' };
   if (!action.recommended_message) return { ok: false, message: 'No message drafted for this action.' };
 
@@ -10163,6 +10230,13 @@ async function executeCollectionsMessage(userId, action) {
     return { ok: true, message: `Marked sent, but external sending is currently off — no WhatsApp message actually went to ${invoice.customer_name}.` };
   }
   const sendResult = await sendWhatsAppMessage(invoice.customer_phone, action.recommended_message);
+  if (sendResult.success) {
+    // Shared cross-system "contacted today" gate — see runDunningCycle().
+    await supabase.from('invoices').update({
+      last_reminder_sent: new Date().toISOString(),
+      reminder_count: (invoice.reminder_count || 0) + 1,
+    }).eq('id', invoiceId).eq('user_id', userId).catch(() => {});
+  }
   return {
     ok: true,
     message: sendResult.success
@@ -11550,10 +11624,17 @@ async function autoSendCollectionsReminders(userId) {
     if (!pending?.length) return;
 
     for (const action of pending) {
-      const { data: invoice } = await supabase.from('invoices').select('customer_name, customer_phone').eq('id', action.related_entity_id).eq('user_id', userId).maybeSingle();
+      const { data: invoice } = await supabase.from('invoices').select('customer_name, customer_phone, reminder_count').eq('id', action.related_entity_id).eq('user_id', userId).maybeSingle();
       let sent = { success: false };
       if (invoice?.customer_phone && action.recommended_message) {
         sent = await sendWhatsAppMessage(invoice.customer_phone, action.recommended_message);
+      }
+      if (sent.success) {
+        // Shared cross-system "contacted today" gate — see runDunningCycle().
+        await supabase.from('invoices').update({
+          last_reminder_sent: new Date().toISOString(),
+          reminder_count: (invoice?.reminder_count || 0) + 1,
+        }).eq('id', action.related_entity_id).eq('user_id', userId).catch(() => {});
       }
       await supabase.from('ai_actions').update({
         notified_at: new Date().toISOString(),
