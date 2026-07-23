@@ -10153,6 +10153,24 @@ async function executeCollectionCall(userId, action) {
   };
 }
 
+async function executeCollectionsMessage(userId, action) {
+  const invoiceId = action.related_entity_id;
+  const { data: invoice } = await supabase.from('invoices').select('customer_name, customer_phone').eq('id', invoiceId).eq('user_id', userId).maybeSingle();
+  if (!invoice?.customer_phone) return { ok: false, message: 'No phone number on file for this customer.' };
+  if (!action.recommended_message) return { ok: false, message: 'No message drafted for this action.' };
+
+  if (!isFeatureEnabled('external_message_sending_enabled')) {
+    return { ok: true, message: `Marked sent, but external sending is currently off — no WhatsApp message actually went to ${invoice.customer_name}.` };
+  }
+  const sendResult = await sendWhatsAppMessage(invoice.customer_phone, action.recommended_message);
+  return {
+    ok: true,
+    message: sendResult.success
+      ? `Reminder sent to ${invoice.customer_name} on WhatsApp.`
+      : `Could not deliver the WhatsApp message to ${invoice.customer_name} — you may want to follow up another way.`,
+  };
+}
+
 function safeLogFallback(msg, meta) { try { console.log(msg, JSON.stringify(meta)); } catch { console.log(msg); } }
 
 app.get('/api/actions/:id/approve', async (req, res) => {
@@ -10180,6 +10198,7 @@ app.get('/api/actions/:id/approve', async (req, res) => {
     if (action.action_type === 'INVENTORY_PO_READY') result = await executeInventoryPO(action.user_id, action);
     else if (action.action_type === 'PAYABLES_PAYMENT_READY') result = await executePayablesPayment(action.user_id, action);
     else if (action.action_type === 'ESCALATE_COLLECTION_CALL') result = await executeCollectionCall(action.user_id, action);
+    else if (['SEND_POLITE_REMINDER', 'SEND_FIRM_REMINDER', 'ESCALATE_COLLECTION'].includes(action.action_type)) result = await executeCollectionsMessage(action.user_id, action);
     else result = { ok: true, message: 'Approved.' };
 
     await actionService.updateStatus(action.user_id, actionId, 'done');
@@ -11008,6 +11027,28 @@ app.get('/api/customers/intelligence', authMiddleware, async (req, res) => {
   }
 });
 
+// One obvious owner-facing kill switch for collectionsAgent's escalation
+// ladder — pausing a customer skips ALL reminder/escalation generation for
+// them (polite included), checked at the top of collectionsAgent.js's run().
+app.patch('/api/customers/:id/escalation-pause', authMiddleware, async (req, res) => {
+  try {
+    const { paused } = req.body;
+    if (typeof paused !== 'boolean') return res.status(400).json({ error: 'paused (boolean) required' });
+    const { data, error } = await supabase
+      .from('customers')
+      .update({ escalation_paused: paused })
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.userId)
+      .select()
+      .single();
+    if (error) throw error;
+    await createActivityLog(req.user.userId, paused ? 'customer_escalation_paused' : 'customer_escalation_resumed', {
+      entityType: 'customer', entityId: req.params.id, source: 'api',
+    });
+    res.json({ success: true, customer: data });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
 // ── AI ACTIONS — COUNTS (for dashboard urgency strip) ────────────────────────
 app.get('/api/ai-actions/counts', authMiddleware, async (req, res) => {
   try {
@@ -11318,6 +11359,7 @@ app.post('/api/cortex/run-agents', authMiddleware, async (req, res) => {
     const { runAllAgents } = require('./lib/services/orchestrator/orchestrator.service');
     const result = await runAllAgents(userId, agents || null);
     await notifyPendingAutoExecuteActions(userId);
+    await autoSendCollectionsReminders(userId);
     res.json({ success: true, ...result });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
@@ -11491,6 +11533,39 @@ async function notifyPendingAutoExecuteActions(userId) {
   }
 }
 
+// Auto-send low-stakes collections reminders (SEND_POLITE_REMINDER only —
+// firm reminders and escalations always require a one-tap approval, both by
+// this agent's own risk_level and by policyGuard.ALWAYS_REQUIRES_APPROVAL).
+// Gated the same way as notifyPendingAutoExecuteActions above.
+async function autoSendCollectionsReminders(userId) {
+  if (!isFeatureEnabled('agent_autoexecute_enabled') || !isFeatureEnabled('external_message_sending_enabled')) return;
+  try {
+    const { data: pending } = await supabase.from('ai_actions')
+      .select('id, related_entity_id, recommended_message')
+      .eq('user_id', userId)
+      .eq('status', 'pending')
+      .eq('action_type', 'SEND_POLITE_REMINDER')
+      .eq('requires_approval', false)
+      .is('notified_at', null);
+    if (!pending?.length) return;
+
+    for (const action of pending) {
+      const { data: invoice } = await supabase.from('invoices').select('customer_name, customer_phone').eq('id', action.related_entity_id).eq('user_id', userId).maybeSingle();
+      let sent = { success: false };
+      if (invoice?.customer_phone && action.recommended_message) {
+        sent = await sendWhatsAppMessage(invoice.customer_phone, action.recommended_message);
+      }
+      await supabase.from('ai_actions').update({
+        notified_at: new Date().toISOString(),
+        status: sent.success ? 'done' : 'pending', // leave pending (and eligible for owner to send manually) if auto-send failed
+        completed_at: sent.success ? new Date().toISOString() : null,
+      }).eq('id', action.id);
+    }
+  } catch (err) {
+    safeLog('error', '[AutoExecute] autoSendCollectionsReminders failed', { error: err.message, userId });
+  }
+}
+
 // ── AGENTS CRON — daily 7:15am IST (1:45 UTC) — runs after briefing ──────────
 cron.schedule('45 1 * * *', async () => {
   const { isEnabled: _isFE } = require('./lib/featureFlags');
@@ -11505,6 +11580,7 @@ cron.schedule('45 1 * * *', async () => {
         // Skip briefing (already ran at 7am) and data_quality (weekly)
         await runAllAgents(user.id, ['collections', 'credit_risk', 'cashflow', 'inventory', 'promise_tracker', 'payables', 'dispute', 'cost_router']);
         await notifyPendingAutoExecuteActions(user.id);
+        await autoSendCollectionsReminders(user.id);
       } catch (e) { _log('error', '[AgentsCron] Per-user error', { error: e.message, userId: user.id }); }
     }
     _log('info', '[AgentsCron] Done');
