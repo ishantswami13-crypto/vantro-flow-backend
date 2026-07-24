@@ -1,0 +1,29 @@
+{
+  "_comment": "Copy this file to config.json and fill in the blanks. Keep config.json private (it has your password).",
+
+  "tally": {
+    "host": "localhost",
+    "port": 9000
+  },
+
+  "companies": [""],
+  "_companies_help": "Put the company name exactly as it appears in Tally, e.g. [\"Chacha Traders\"]. Leave as [\"\"] to use whichever company is currently open in Tally.",
+
+  "starlane": {
+    "apiBase": "http://localhost:8787",
+    "email": "",
+    "password": "",
+    "token": ""
+  },
+  "_starlane_help": "apiBase = where the Starlane backend runs. Log in with your Starlane account email + password. Leave token empty (advanced use only).",
+
+  "voucherTypes": ["Sales", "Purchase", "Receipt", "Payment", "Credit Note", "Debit Note"],
+  "_voucherTypes_help": "Which Tally voucher types to send. Sales->receivables, Purchase->payables, Receipt/Payment->bank money in/out. Stock items on Sales/Purchase vouchers sync inventory automatically.",
+
+  "fromDate": "",
+  "toDate": "",
+  "_dates_help": "Leave blank to auto-use this financial year (1 April) to today. Or set YYYYMMDD, e.g. 20260401.",
+
+  "intervalMinutes": 30,
+  "_interval_help": "For --watch mode: how often to auto-sync, in minutes."
+}
