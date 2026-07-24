@@ -1648,6 +1648,22 @@ app.post('/api/import/excel', authMiddleware, upload.single('file'), async (req,
 });
 
 // Quick manual add — add a single customer/invoice
+// Tally connector ingestion — all voucher types, idempotent. Flag-gated OFF by default.
+app.post('/api/import/tally', authMiddleware, async (req, res) => {
+  try {
+    if (!isFeatureEnabled('tally_import_enabled')) {
+      return res.status(403).json({ error: 'Tally import is not enabled. Set FEATURE_TALLY_IMPORT_ENABLED=true.' });
+    }
+    const { importTallyVouchers } = require('./lib/services/tallyImport.service');
+    const result = await importTallyVouchers(supabase, req.user.userId, req.body?.vouchers);
+    if (result.error) return res.status(result.status || 400).json({ error: result.error });
+    res.json(result);
+  } catch (err) {
+    console.error('Tally import error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.post('/api/import/manual', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
