@@ -53,8 +53,11 @@ function walk(dir) {
     .map(f => path.join(dir, f));
 }
 
-function findViolations() {
+// Returns { violations, scanned } so callers can report how much was actually
+// inspected — "0 violations" means nothing if nothing was scanned.
+function scan() {
   const violations = [];
+  let scanned = 0;
 
   for (const dir of SCAN_DIRS) {
     for (const rel of walk(dir)) {
@@ -74,6 +77,8 @@ function findViolations() {
         if (!/\.select\(/.test(chain)) return;
         if (/\.(insert|upsert|update|delete)\(/.test(chain)) return;
 
+        scanned++;
+
         // An explicit opt-out for the rare intentional cross-tenant read.
         if (/tenant-isolation-exempt/.test(chain)) return;
 
@@ -84,16 +89,17 @@ function findViolations() {
     }
   }
 
-  return violations;
+  return { violations, scanned };
 }
 
 function main() {
   console.log('[SECURITY] Checking tenant isolation on agent/orchestrator reads...');
 
-  const violations = findViolations();
+
+  const { violations, scanned } = scan();
 
   if (violations.length === 0) {
-    console.log('[SECURITY] Tenant Isolation Passed: every scanned read filters on a tenant column.');
+    console.log(`[SECURITY] Tenant Isolation Passed: ${scanned} reads scanned, all tenant-scoped.`);
     return;
   }
 
@@ -109,4 +115,8 @@ function main() {
   process.exit(1);
 }
 
-main();
+// Exported so cortex-lab can report business isolation as a real result rather
+// than "N/A". Only self-executes when run directly.
+module.exports = { scan };
+
+if (require.main === module) main();

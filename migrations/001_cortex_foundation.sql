@@ -250,9 +250,19 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
 );
 CREATE INDEX IF NOT EXISTS idx_idem_user_key ON idempotency_keys(user_id, idem_key);
 
--- ─── RLS (disabled to match existing schema; enable in migration 004) ──────
--- All tenancy enforced at app level via user_id filtering.
--- TODO migration 004: enable RLS with: auth.uid()::text = user_id::text
+-- ─── RLS (disabled; tenancy is enforced at the application layer) ──────────
+-- This originally said "enable in migration 004". Migration 004 shipped and
+-- did not enable RLS, and that remains deliberate rather than pending: the
+-- backend connects with the Supabase service_role key, which bypasses RLS
+-- entirely, so adding policies here would give the appearance of protection
+-- without any effect. Turning RLS on for real means moving the backend to the
+-- anon key and injecting each user's JWT per request — see
+-- SUPABASE_RLS_ROLLOUT_PLAN.md, which also explains why that is not a safe
+-- drop-in change for the cron jobs and background agents.
+--
+-- Until then, every read is scoped by user_id in application code, and that is
+-- enforced mechanically: scripts/check-tenant-isolation.js fails CI on any
+-- unscoped read in the agent, orchestrator or cortex layers.
 ALTER TABLE customers          DISABLE ROW LEVEL SECURITY;
 ALTER TABLE business_events    DISABLE ROW LEVEL SECURITY;
 ALTER TABLE ai_actions         DISABLE ROW LEVEL SECURITY;
