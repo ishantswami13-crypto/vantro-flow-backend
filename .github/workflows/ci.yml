@@ -28,3 +28,8 @@ jobs:
 
       - name: Cortex Lab static test suite
         run: npm run cortex:test
+
+      # Blocking: the service_role key bypasses RLS, so an application-level
+      # tenant filter is the only thing preventing cross-tenant reads.
+      - name: Tenant isolation
+        run: npm run security:tenant-isolation
