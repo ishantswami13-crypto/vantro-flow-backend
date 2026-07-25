@@ -279,13 +279,36 @@ const allowedOrigins = new Set([
   ...extraOrigins,
 ]);
 
+// Vercel preview deployments get a generated subdomain per commit, so they can't
+// be enumerated in ALLOWED_ORIGINS. VERCEL_PROJECT_SLUGS lists the project names
+// whose previews are trusted — set it if the Vercel project is ever renamed,
+// otherwise its preview URLs are rejected and the app can't reach the backend.
+const previewProjectSlugs = (process.env.VERCEL_PROJECT_SLUGS || 'vantro-flow-frontend')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+// Optional hardening: Vercel preview hosts end with the team scope
+// ("<slug>-<hash>-<scope>.vercel.app"). Setting VERCEL_TEAM_SCOPE pins previews
+// to your team. Without it, prefix matching alone cannot distinguish a real
+// preview from a lookalike project someone else deploys under a name starting
+// with the same slug — same limitation the previous regex had.
+const previewTeamScope = (process.env.VERCEL_TEAM_SCOPE || '').trim();
+
+function isTrustedVercelPreview(origin) {
+  const match = /^https:\/\/([a-z0-9-]+)\.vercel\.app$/.exec(origin);
+  if (!match) return false;
+  const host = match[1];
+  if (previewTeamScope && !host.endsWith(`-${previewTeamScope}`)) return false;
+  return previewProjectSlugs.some(slug => host === slug || host.startsWith(`${slug}-`));
+}
+
 const corsOptions = {
   origin(origin, callback) {
     if (!origin || allowedOrigins.has(origin)) {
       return callback(null, true);
     }
-    // Allow all Vercel preview deployments for the vantro-flow-frontend project
-    if (origin && /^https:\/\/vantro-flow-frontend[a-z0-9-]*\.vercel\.app$/.test(origin)) {
+    if (origin && isTrustedVercelPreview(origin)) {
       return callback(null, true);
     }
     return callback(new Error("Not allowed by CORS"));

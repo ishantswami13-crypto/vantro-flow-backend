@@ -7,6 +7,8 @@
     "start": "node server.js",
     "dev": "nodemon server.js",
     "check": "node --check server.js",
+    "verify:connection": "node scripts/verify-connection.js",
+    "setup:database": "node scripts/setup-fresh-database.js",
     "security:secrets": "node scripts/security-secret-scan.js",
     "security:secret-rotation": "node scripts/check-secret-rotation.js",
     "security:supply-chain": "npm audit --audit-level=high",
