@@ -161,6 +161,28 @@ app.use((req, res, next) => {
   next();
 });
 
+// Logs the cause of a 500 before the generic response goes back to the client.
+// The client message stays deliberately opaque, but the server needs the real
+// error to be diagnosable — an unlogged catch turns any failure into a silent
+// 500 with nothing to trace it by. Keyed on requestId so it lines up with the
+// "API Request Error" line the middleware above emits for the same request.
+// Never throws: a logging failure must not mask the error being reported.
+function logRouteError(req, err) {
+  try {
+    safeLog('error', 'Unhandled route error', {
+      requestId: req?.requestId || null,
+      method: req?.method || null,
+      route: normalizeRoute(req?.path || ''),
+      userId: req?.user?.userId || req?.user?.id || null,
+      errorName: err?.name || 'Error',
+      errorMessage: err?.message || String(err),
+      stack: err?.stack || null,
+    });
+  } catch {
+    // Deliberately empty — logging must never break the response path.
+  }
+}
+
 const PORT = process.env.PORT || 3001;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production' || Boolean(
   process.env.RAILWAY_ENVIRONMENT ||
@@ -1259,6 +1281,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
 
     res.json({ success: true, message: 'If that email exists, an OTP has been sent.' });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1290,6 +1313,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
     res.json({ success: true, message: 'Password reset successfully. Please log in.' });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1381,6 +1405,7 @@ app.post('/api/upload-csv', authMiddleware, upload.single('file'), async (req, r
 
     res.json({ success: true, count: invoices.length, invoices: data });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1514,7 +1539,7 @@ app.post('/api/invoices/create', authMiddleware, async (req, res) => {
     }
   } catch (err) {
     console.error('[invoices/create]', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1787,6 +1812,7 @@ app.post('/api/import/manual', authMiddleware, async (req, res) => {
       }
     })();
   } catch (err) {
+    logRouteError(req, err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1828,6 +1854,7 @@ app.get('/api/invoices/:userId', requireOwner, async (req, res) => {
       }
     });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1873,6 +1900,7 @@ app.post('/api/calculate-priority/:userId', requireOwner, async (req, res) => {
 
     res.json({ success: true, priority_list: priorityList });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1937,6 +1965,7 @@ app.post('/api/generate-message', authMiddleware, async (req, res) => {
       message: generatedText.trim()
     });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2063,6 +2092,7 @@ app.post('/api/mark-paid', authMiddleware, async (req, res) => {
     // ─────────────────────────────────────────────────────────────────────────
     res.json({ success: true, data: inv });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
@@ -2101,6 +2131,7 @@ app.post('/api/log-call', authMiddleware, async (req, res) => {
 
     res.json({ success: true, log: data[0] });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2119,6 +2150,7 @@ app.get('/api/calls/:userId', requireOwner, async (req, res) => {
 
     res.json({ success: true, calls: data });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2140,6 +2172,7 @@ app.post('/api/call/:callId/update', authMiddleware, async (req, res) => {
 
     res.json({ success: true, log: data[0] });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2204,6 +2237,7 @@ app.get('/api/metrics/:userId', requireOwner, async (req, res) => {
 
     res.json({ success: true, metrics });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2297,6 +2331,7 @@ app.post('/api/products', authMiddleware, async (req, res) => {
     });
     res.json({ success: true, product: data[0] });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2322,6 +2357,7 @@ app.post('/api/products/:productId', authMiddleware, async (req, res) => {
     });
     res.json({ success: true, product: data[0] });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2338,6 +2374,7 @@ app.post('/api/products/:productId/delete', authMiddleware, async (req, res) => 
     });
     res.json({ success: true });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2384,6 +2421,7 @@ app.post('/api/stock/move', authMiddleware, async (req, res) => {
 
     res.json({ success: true, movement: movement[0], new_stock: newStock });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2400,6 +2438,7 @@ app.get('/api/stock/movements/:userId', requireOwner, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, movements: data });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -4105,6 +4144,7 @@ app.post('/api/suppliers/:supplierId/delete', authMiddleware, async (req, res) =
     if (error) throw error;
     res.json({ success: true });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -4204,6 +4244,7 @@ Calls made: ${totalCalls}, Pick-up rate: ${totalCalls ? Math.round(pickedUp/tota
       insights
     });
   } catch (err) {
+    logRouteError(req, err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -5149,6 +5190,7 @@ app.get('/api/admin/error-events', authMiddleware, adminOnly, async (req, res) =
     if (error) throw error;
     res.json({ success: true, data });
   } catch (err) {
+    logRouteError(req, err);
     res.status(500).json({ error: 'Failed to fetch error events' });
   }
 });
@@ -5159,6 +5201,7 @@ app.patch('/api/admin/error-events/:id/resolve', authMiddleware, adminOnly, asyn
     if (error) throw error;
     res.json({ success: true, data });
   } catch (err) {
+    logRouteError(req, err);
     res.status(500).json({ error: 'Failed to resolve error event' });
   }
 });
@@ -5172,6 +5215,7 @@ app.get('/api/admin/error-summary', authMiddleware, adminOnly, async (req, res) 
     const { count: criticalErrors } = await supabase.from('error_events').select('*', { count: 'exact', head: true }).gte('created_at', today.toISOString()).eq('severity', 'critical');
     res.json({ success: true, summary: { totalErrors, criticalErrors } });
   } catch (err) {
+    logRouteError(req, err);
     res.status(500).json({ error: 'Failed to fetch summary' });
   }
 });
@@ -5359,7 +5403,7 @@ app.post('/api/prospects', authMiddleware, async (req, res) => {
       .select();
     if (error) throw error;
     res.json({ success: true, prospect: data[0] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/prospects/:id', authMiddleware, async (req, res) => {
@@ -5376,7 +5420,7 @@ app.post('/api/prospects/:id', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('prospects').update(updates).eq('id', id).eq('user_id', req.user.userId).select();
     if (error) throw error;
     res.json({ success: true, prospect: data[0] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/prospects/:id/delete', authMiddleware, async (req, res) => {
@@ -5386,7 +5430,7 @@ app.post('/api/prospects/:id/delete', authMiddleware, async (req, res) => {
     const { error } = await supabase.from('prospects').delete().eq('id', id).eq('user_id', req.user.userId);
     if (error) throw error;
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/prospects/:id/notes', authMiddleware, async (req, res) => {
@@ -5406,7 +5450,7 @@ app.post('/api/prospects/:id/notes', authMiddleware, async (req, res) => {
       .select();
     if (error) throw error;
     res.json({ success: true, note: data[0] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -5583,6 +5627,7 @@ CREATE INDEX IF NOT EXISTS idx_bank_transactions_status ON bank_transactions(use
     res.json({ success: true, message: '✅ Migration complete — prospects, ledger and bank tables created' });
   } catch (err) {
     if (client) await client.end().catch(() => {});
+    logRouteError(req, err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -6258,6 +6303,7 @@ app.post('/api/billing/create-order', authMiddleware, async (req, res) => {
     });
     res.json({ success: true, order, key: process.env.RAZORPAY_KEY_ID });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -6282,6 +6328,7 @@ app.post('/api/billing/verify', authMiddleware, async (req, res) => {
     }]);
     res.json({ success: true, message: 'Payment verified, plan upgraded' });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -6293,6 +6340,7 @@ app.get('/api/billing/history', authMiddleware, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, history: data || [] });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -6340,6 +6388,7 @@ app.patch('/api/settings', authMiddleware, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, settings: data[0] });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -6360,6 +6409,7 @@ app.post('/api/settings/twilio', authMiddleware, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, message: 'Twilio credentials saved' });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -6375,6 +6425,7 @@ app.get('/api/dunning/:userId', requireOwner, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, rules: data || [] });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -6408,6 +6459,7 @@ app.post('/api/dunning', authMiddleware, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, rule: data[0] });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -6421,6 +6473,7 @@ app.patch('/api/dunning/:id', authMiddleware, async (req, res) => {
     if (!data?.length) return res.status(404).json({ error: 'Rule not found' });
     res.json({ success: true, rule: data[0] });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -6431,6 +6484,7 @@ app.delete('/api/dunning/:id', authMiddleware, async (req, res) => {
     if (error) throw error;
     res.json({ success: true });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -6539,6 +6593,7 @@ app.post('/api/settings/automation/toggle', authMiddleware, async (req, res) => 
     if (error) throw error;
     res.json({ success: true, automation_enabled: !!enabled });
   } catch (err) {
+    logRouteError(req, err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -7128,6 +7183,7 @@ app.get('/api/admin/stats', adminOnly, async (req, res) => {
       }
     });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -7191,6 +7247,7 @@ app.get('/api/public/profile/:userId', async (req, res) => {
       }
     });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -7562,6 +7619,7 @@ app.post('/api/notifications/subscribe', authMiddleware, async (req, res) => {
       .eq('id', userId);
     res.json({ success: true, message: 'Push subscription saved' });
   } catch (err) {
+    logRouteError(req, err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -8103,7 +8161,7 @@ app.get('/api/transactions/:userId', requireOwner, async (req, res) => {
     res.json({ transactions, summary: buildLedgerSummary(transactions) });
   } catch (err) {
     console.error('[transactions GET]', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -8258,7 +8316,7 @@ app.get('/api/financial-summary/:userId', requireOwner, async (req, res) => {
       categories: catBreakdown.rows,
       recentTransactions: recent.rows,
     });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // AI Financial Monitor
@@ -8307,7 +8365,7 @@ Return JSON only:
     const match = text.match(/\{[\s\S]*\}/);
     const analysis = match ? JSON.parse(match[0]) : { health_score: 50, status: 'warning', summary: 'Insufficient data.', alerts: [], insights: [], top_expenses: [] };
     res.json({ success: true, analysis });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -8330,7 +8388,7 @@ app.get('/api/orders', authMiddleware, async (req, res) => {
     const { data, error } = await query;
     if (error) throw error;
     res.json({ success: true, orders: data || [] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/orders', authMiddleware, async (req, res) => {
@@ -8346,7 +8404,7 @@ app.post('/api/orders', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     res.json({ success: true, order: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/orders/:id', authMiddleware, async (req, res) => {
@@ -8359,14 +8417,14 @@ app.patch('/api/orders/:id', authMiddleware, async (req, res) => {
       .eq('id', req.params.id).eq('user_id', userId).select().single();
     if (error) throw error;
     res.json({ success: true, order: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/orders/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('orders').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -8379,7 +8437,7 @@ app.get('/api/workers', authMiddleware, async (req, res) => {
       .select('*').eq('user_id', req.user.userId).order('name');
     if (error) throw error;
     res.json({ success: true, workers: data || [] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/workers', authMiddleware, async (req, res) => {
@@ -8392,7 +8450,7 @@ app.post('/api/workers', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     res.json({ success: true, worker: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/workers/:id', authMiddleware, async (req, res) => {
@@ -8402,14 +8460,14 @@ app.patch('/api/workers/:id', authMiddleware, async (req, res) => {
       .update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
     res.json({ success: true, worker: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/workers/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('workers').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -8422,7 +8480,7 @@ app.get('/api/vocabulary', authMiddleware, async (req, res) => {
       .select('*').eq('user_id', req.user.userId).order('category').order('term');
     if (error) throw error;
     res.json({ success: true, vocabulary: data || [] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/vocabulary', authMiddleware, async (req, res) => {
@@ -8435,14 +8493,14 @@ app.post('/api/vocabulary', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     res.json({ success: true, item: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/vocabulary/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('business_vocabulary').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Seed starter vocabulary by industry
@@ -8493,7 +8551,7 @@ app.post('/api/vocabulary/seed', authMiddleware, async (req, res) => {
     const { error } = await supabase.from('business_vocabulary').insert(items);
     if (error) throw error;
     res.json({ success: true, seeded: items.length, industry });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -8679,6 +8737,7 @@ app.get('/api/voice/webhook-url', authMiddleware, async (req, res) => {
     const twilioConfigured = envConfigured || !!(dbSid);
     res.json({ success: true, webhook_url: url, twilio_configured: twilioConfigured, twilio_account_sid: dbSid, twilio_phone_number: dbPhone });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -8698,7 +8757,7 @@ app.get('/api/expenses', authMiddleware, async (req, res) => {
     const { data, error } = await q;
     if (error) throw error;
     res.json({ success: true, expenses: data || [] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/expenses', authMiddleware, async (req, res) => {
@@ -8712,7 +8771,7 @@ app.post('/api/expenses', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     res.json({ success: true, expense: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/expenses/:id', authMiddleware, async (req, res) => {
@@ -8723,14 +8782,14 @@ app.patch('/api/expenses/:id', authMiddleware, async (req, res) => {
       .update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
     res.json({ success: true, expense: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/expenses/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('expenses').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -8830,7 +8889,7 @@ app.get('/api/today/summary', authMiddleware, async (req, res) => {
       purchases: purchases || [],
       paid_invoices: paidInvoices || [],
     });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -8843,7 +8902,7 @@ app.get('/api/ai/brain/rules', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('brain_rules').select('*').eq('user_id', req.user.userId).order('created_at');
     if (error) throw error;
     res.json({ success: true, rules: data || [] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/ai/brain/rules', authMiddleware, async (req, res) => {
@@ -8855,14 +8914,14 @@ app.post('/api/ai/brain/rules', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     res.json({ success: true, rule: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/ai/brain/rules/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('brain_rules').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Main Vantro Brain endpoint — full context AI with live tool use
@@ -9200,14 +9259,14 @@ app.post('/api/onboarding/setup', authMiddleware, async (req, res) => {
       { onConflict: 'user_id,term' }
     );
     res.json({ success: true, feature_flags });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/user/features', authMiddleware, async (req, res) => {
   try {
     const { data } = await supabase.from('users').select('feature_flags, industry, business_size, gst_registered, owner_name, city, gstin, business_name, business_address').eq('id', req.user.userId).single();
     res.json({ success: true, ...(data || {}), feature_flags: data?.feature_flags || {} });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -9240,7 +9299,7 @@ app.get('/api/bills/public/:id', async (req, res) => {
       source: token ? 'signed_public_link' : 'legacy_public_link',
     });
     res.json({ success: true, bill: publicBill });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/bills', authMiddleware, async (req, res) => {
@@ -9325,7 +9384,7 @@ app.post('/api/bills', authMiddleware, async (req, res) => {
     });
 
     res.json({ success: true, bill: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/bills/:id', authMiddleware, async (req, res) => {
@@ -9338,7 +9397,7 @@ app.patch('/api/bills/:id', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('bills').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
     res.json({ success: true, bill: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/bills/:id', authMiddleware, async (req, res) => {
@@ -9371,6 +9430,7 @@ app.delete('/api/bills/:id', authMiddleware, async (req, res) => {
     });
     res.json({ success: true });
   } catch (err) {
+    logRouteError(req, err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -9398,7 +9458,7 @@ app.get('/api/bills/gstr1', authMiddleware, async (req, res) => {
     const totalTax = (bills || []).reduce((s, b) => s + Number(b.cgst || 0) + Number(b.sgst || 0) + Number(b.igst || 0), 0);
     const totalSales = (bills || []).reduce((s, b) => s + Number(b.total || 0), 0);
     res.json({ success: true, month: `${m}/${y}`, b2b, b2c, summary: { total_invoices: (bills||[]).length, total_sales: totalSales, total_tax: totalTax } });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -9442,14 +9502,14 @@ app.post('/api/khata/entry', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     res.json({ success: true, entry: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/khata/entry/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('khata_entries').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -9607,7 +9667,7 @@ app.delete('/api/purchases/:id', authMiddleware, async (req, res) => {
       purchaseId: req.params.id,
     });
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Bill Scanner — AI extracts purchase data from photo using vision provider fallback
@@ -9669,7 +9729,7 @@ app.get('/api/sales', authMiddleware, async (req, res) => {
     
     const sales = await salesService.getSales(userId, businessId, { status });
     res.json({ success: true, sales });
-  } catch (err) { res.status(500).json({ error: err.message || 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/sales', authMiddleware, async (req, res) => {
@@ -9738,7 +9798,7 @@ app.post('/api/sales', authMiddleware, async (req, res) => {
     }
     // ─────────────────────────────────────────────────────────────────────────
     res.json({ success: true, sale: { ...sale, total_amount: parseFloat(sale.amount) }, receivable });
-  } catch (err) { res.status(500).json({ error: err.message || 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/sales/:id', authMiddleware, async (req, res) => {
@@ -9798,7 +9858,7 @@ app.patch('/api/sales/:id', authMiddleware, async (req, res) => {
       amount: finalAmount,
     });
     res.json({ success: true, sale: { ...sale, total_amount: parseFloat(sale.amount) }, receivable });
-  } catch (err) { res.status(500).json({ error: err.message || 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/sales/:id', authMiddleware, async (req, res) => {
@@ -9816,6 +9876,7 @@ app.delete('/api/sales/:id', authMiddleware, async (req, res) => {
     });
     res.json({ success: true });
   } catch (err) {
+    logRouteError(req, err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -9882,7 +9943,7 @@ app.get('/api/attendance', authMiddleware, async (req, res) => {
       supabase.from('attendance').select('*').eq('user_id', req.user.userId).gte('attendance_date', from).lte('attendance_date', to),
     ]);
     res.json({ success: true, workers: workers || [], attendance: attendance || [], month, year });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/attendance', authMiddleware, async (req, res) => {
@@ -9894,7 +9955,7 @@ app.post('/api/attendance', authMiddleware, async (req, res) => {
     }], { onConflict: 'worker_id,attendance_date' }).select().single();
     if (error) throw error;
     res.json({ success: true, attendance: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/attendance/salary', authMiddleware, async (req, res) => {
@@ -9921,7 +9982,7 @@ app.get('/api/attendance/salary', authMiddleware, async (req, res) => {
       return { ...w, present_days: present, half_days: half, effective_days: effectiveDays, total_days: daysInMonth, earned_salary: Math.round(earned), advance_deducted: advance, net_salary: Math.round(net) };
     });
     res.json({ success: true, salaries, month, year });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/workers/:id/salary', authMiddleware, async (req, res) => {
@@ -9933,7 +9994,7 @@ app.patch('/api/workers/:id/salary', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('workers').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
     res.json({ success: true, worker: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -9949,7 +10010,7 @@ app.get('/api/bank/accounts', authMiddleware, async (req, res) => {
       .order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ success: true, accounts: data || [] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/bank/accounts', authMiddleware, async (req, res) => {
@@ -9971,7 +10032,7 @@ app.post('/api/bank/accounts', authMiddleware, async (req, res) => {
       .single();
     if (error) throw error;
     res.json({ success: true, account: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/bank/accounts/:id', authMiddleware, async (req, res) => {
@@ -9988,7 +10049,7 @@ app.delete('/api/bank/accounts/:id', authMiddleware, async (req, res) => {
       source: 'api',
     });
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -10004,7 +10065,7 @@ app.get('/api/bank/transactions', authMiddleware, async (req, res) => {
       .order('txn_date', { ascending: false });
     if (error) throw error;
     res.json({ success: true, transactions: data || [] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/bank/transactions', authMiddleware, async (req, res) => {
@@ -10032,7 +10093,7 @@ app.post('/api/bank/transactions', authMiddleware, async (req, res) => {
       type,
     });
     res.json({ success: true, transaction: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/bank/match', authMiddleware, async (req, res) => {
@@ -10082,7 +10143,7 @@ app.post('/api/bank/match', authMiddleware, async (req, res) => {
       matchId: String(match_id),
     });
     res.json({ success: true, message: 'Matched and marked as paid' });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Bank statement CSV import — parses + auto-reconciles against invoices/purchases.
@@ -10132,7 +10193,7 @@ app.patch('/api/bank/transactions/:id/ignore', authMiddleware, async (req, res) 
       .single();
     if (error) throw error;
     res.json({ success: true, transaction: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/bank/transactions/:id', authMiddleware, async (req, res) => {
@@ -10149,7 +10210,7 @@ app.delete('/api/bank/transactions/:id', authMiddleware, async (req, res) => {
       source: 'api',
     });
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 
@@ -10394,7 +10455,7 @@ app.get('/api/payment-plans', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('payment_plans').select('*').eq('user_id', req.user.userId).order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ success: true, plans: data || [] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/payment-plans', authMiddleware, async (req, res) => {
@@ -10412,7 +10473,7 @@ app.post('/api/payment-plans', authMiddleware, async (req, res) => {
       await sendWhatsAppMessage(customer_phone, msg);
     }
     res.json({ success: true, plan: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/payment-plans/:id/installment', authMiddleware, async (req, res) => {
@@ -10428,14 +10489,14 @@ app.patch('/api/payment-plans/:id/installment', authMiddleware, async (req, res)
     const { data, error } = await supabase.from('payment_plans').update({ installments, status: allPaid ? 'completed' : 'active', updated_at: new Date() }).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
     res.json({ success: true, plan: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/payment-plans/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('payment_plans').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -10447,7 +10508,7 @@ app.get('/api/disputes', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('disputes').select('*').eq('user_id', req.user.userId).order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ success: true, disputes: data || [] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/disputes', authMiddleware, async (req, res) => {
@@ -10462,7 +10523,7 @@ app.post('/api/disputes', authMiddleware, async (req, res) => {
     if (error) throw error;
     if (invoice_id) await supabase.from('invoices').update({ dunning_paused: true }).eq('id', invoice_id).eq('user_id', req.user.userId);
     res.json({ success: true, dispute: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/disputes/:id', authMiddleware, async (req, res) => {
@@ -10478,14 +10539,14 @@ app.patch('/api/disputes/:id', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('disputes').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
     res.json({ success: true, dispute: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/disputes/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('disputes').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -10504,7 +10565,7 @@ app.post('/api/ca-partners/register', authMiddleware, async (req, res) => {
     }], { onConflict: 'ca_user_id' }).select().single();
     if (error) throw error;
     res.json({ success: true, partner: data, referral_code });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/ca-partners/dashboard', authMiddleware, async (req, res) => {
@@ -10515,7 +10576,7 @@ app.get('/api/ca-partners/dashboard', authMiddleware, async (req, res) => {
     const { count: paidCount } = await supabase.from('users').select('id', { count: 'exact', head: true }).eq('referred_by', req.user.userId).neq('plan', 'free');
     const monthlyCommission = (paidCount || 0) * 300;
     res.json({ success: true, ca: caData, stats: { total_clients: clientCount || 0, paid_clients: paidCount || 0, monthly_commission: monthlyCommission, referral_code: caData.referral_code } });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/ca-partners/clients', authMiddleware, async (req, res) => {
@@ -10523,7 +10584,7 @@ app.get('/api/ca-partners/clients', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('users').select('id, business_name, phone, plan, industry, created_at').eq('referred_by', req.user.userId).order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ success: true, clients: data || [] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -10539,7 +10600,7 @@ app.get('/api/referrals/my-stats', authMiddleware, async (req, res) => {
     const freeMonthsEarned = (rewards || []).filter(r => r.type === 'free_month').length;
     const referralCode = 'VF' + userId.replace(/-/g, '').substring(0, 8).toUpperCase();
     res.json({ success: true, stats: { total_referrals: totalReferrals || 0, paid_referrals: paidReferrals || 0, free_months_earned: freeMonthsEarned, referral_code: referralCode, referral_link: 'https://vantroflow.app/signup?ref=' + referralCode, rewards: rewards || [] } });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/referrals/claim-reward', authMiddleware, async (req, res) => {
@@ -10552,7 +10613,7 @@ app.post('/api/referrals/claim-reward', authMiddleware, async (req, res) => {
     const rewardRows = Array.from({ length: newRewards }, () => ({ referrer_id: userId, type: 'free_month', value: 1, status: 'granted', created_at: new Date() }));
     await supabase.from('referral_rewards').insert(rewardRows);
     res.json({ success: true, rewards_granted: newRewards, message: newRewards + ' free month(s) added!' });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -10569,7 +10630,7 @@ app.get('/api/bad-debt-flags/:userId', requireOwner, async (req, res) => {
       return { ...inv, risk_level: risk, recommendation };
     });
     res.json({ success: true, flagged });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -10581,7 +10642,7 @@ app.get('/api/team/members', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('team_members').select('*').eq('owner_id', req.user.userId).order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ success: true, members: data || [] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/team/members', authMiddleware, async (req, res) => {
@@ -10601,7 +10662,7 @@ app.post('/api/team/members', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     res.json({ success: true, member: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/team/members/:id', authMiddleware, async (req, res) => {
@@ -10612,14 +10673,14 @@ app.patch('/api/team/members/:id', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('team_members').update(updates).eq('id', req.params.id).eq('owner_id', req.user.userId).select().single();
     if (error) throw error;
     res.json({ success: true, member: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/team/members/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('team_members').delete().eq('id', req.params.id).eq('owner_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -10632,7 +10693,7 @@ app.post('/api/whatsapp/send', authMiddleware, async (req, res) => {
     if (!phone || !message) return res.status(400).json({ error: 'phone and message required' });
     const result = await sendWhatsAppMessage(phone, message);
     res.json({ success: true, result });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/whatsapp/status', authMiddleware, (req, res) => {
@@ -10929,7 +10990,7 @@ app.get('/api/promises', authMiddleware, async (req, res) => {
     const { data, error } = await query;
     if (error) throw error;
     res.json({ success: true, promises: data || [] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/promises', authMiddleware, async (req, res) => {
@@ -10965,7 +11026,7 @@ app.post('/api/promises', authMiddleware, async (req, res) => {
       });
     }
     res.status(201).json({ success: true, promise: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/promises/:id', authMiddleware, async (req, res) => {
@@ -10999,7 +11060,7 @@ app.patch('/api/promises/:id', authMiddleware, async (req, res) => {
         });
     }
     res.json({ success: true, promise: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── AI ACTIONS ───────────────────────────────────────────────────────────────
@@ -11024,7 +11085,7 @@ app.get('/api/ai-actions', authMiddleware, async (req, res) => {
     const counts = {};
     (summary || []).forEach(r => { counts[r.priority] = (counts[r.priority] || 0) + 1; });
     res.json({ success: true, actions: data || [], counts, total: (data || []).length });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/ai-actions/:id', authMiddleware, async (req, res) => {
@@ -11042,7 +11103,7 @@ app.patch('/api/ai-actions/:id', authMiddleware, async (req, res) => {
     if (error) throw error;
     if (!data) return res.status(404).json({ error: 'Action not found' });
     res.json({ success: true, action: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── CUSTOMER INTELLIGENCE (behavioral profile for customers page) ────────────
@@ -11136,6 +11197,7 @@ app.get('/api/customers/intelligence', authMiddleware, async (req, res) => {
       memories: memories.slice(0, 10),
     });
   } catch (err) {
+    logRouteError(req, err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -11159,7 +11221,7 @@ app.patch('/api/customers/:id/escalation-pause', authMiddleware, async (req, res
       entityType: 'customer', entityId: req.params.id, source: 'api',
     });
     res.json({ success: true, customer: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── AI ACTIONS — COUNTS (for dashboard urgency strip) ────────────────────────
@@ -11212,7 +11274,7 @@ app.get('/api/ai-actions/counts', authMiddleware, async (req, res) => {
     }
 
     res.json({ urgent, high, total: rows.length });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── CUSTOMER SCORES (for collections + customers pages) ──────────────────────
@@ -11263,7 +11325,7 @@ app.get('/api/customer-scores', authMiddleware, async (req, res) => {
     }
 
     res.json({ scores: stripCortexTestRows(scores) });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── SCORE ALL CUSTOMERS (one-time backfill / manual re-score) ─────────────────
@@ -11283,7 +11345,7 @@ app.post('/api/cortex/score-all', authMiddleware, async (req, res) => {
       try { await recalculate(userId, c.id); scored++; } catch {}
     }
     res.json({ success: true, scored, total: list.length });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── SEND WHATSAPP FOR AI ACTION ───────────────────────────────────────────────
@@ -11323,7 +11385,7 @@ app.post('/api/ai-actions/:id/send-whatsapp', authMiddleware, async (req, res) =
       .eq('user_id', userId);
 
     res.json({ success: true, sid: sendResult.sid || null, provider: sendResult.provider });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── MANUAL BRIEFING TRIGGER (runs daily briefing logic now for the calling user) ─
@@ -11366,7 +11428,7 @@ app.post('/api/cortex/run-briefing', authMiddleware, async (req, res) => {
 
     safeLog('info', '[ManualBriefing] Created via API', { userId, actionId: action?.id });
     res.json({ success: true, created: 1, action });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── CORTEX: CASHFLOW WEEK PREVIEW ────────────────────────────────────────────
@@ -11394,7 +11456,7 @@ app.get('/api/cortex/cashflow-week', authMiddleware, async (req, res) => {
       net_gap:          Math.round(forecast.expected_inflow - forecast.expected_outflow),
       overdue_payables: Math.round(overduePayables),
     });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── CORTEX: SIMULATE (dry-run rule engine) ───────────────────────────────────
@@ -11406,7 +11468,7 @@ app.post('/api/cortex/simulate', authMiddleware, async (req, res) => {
     const { simulate } = require('./lib/services/orchestrator/simulationEngine.service');
     const result = await simulate(userId, eventType, payload);
     res.json({ success: true, ...result });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── CORTEX: LIST AVAILABLE TOOLS ─────────────────────────────────────────────
@@ -11416,7 +11478,7 @@ app.get('/api/cortex/tools', authMiddleware, async (req, res) => {
     const { getAvailable } = require('./lib/services/orchestrator/toolRegistry.service');
     const tools = getAvailable(FLAGS);
     res.json({ success: true, tools });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── CORTEX: MEMORY READ ───────────────────────────────────────────────────────
@@ -11437,7 +11499,7 @@ app.get('/api/cortex/memory', authMiddleware, async (req, res) => {
     const { data, error } = await q;
     if (error) throw error;
     res.json({ success: true, memories: data || [] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── CORTEX: MEMORY WRITE ──────────────────────────────────────────────────────
@@ -11459,7 +11521,7 @@ app.post('/api/cortex/memory', authMiddleware, async (req, res) => {
     }], { onConflict: 'user_id,entity_type,entity_id,memory_key' });
     if (error) throw error;
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── CORTEX: RUN ALL AGENTS (manual trigger / admin) ──────────────────────────
@@ -11474,7 +11536,7 @@ app.post('/api/cortex/run-agents', authMiddleware, async (req, res) => {
     await notifyPendingAutoExecuteActions(userId);
     await autoSendCollectionsReminders(userId);
     res.json({ success: true, ...result });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── CORTEX: HEALTH ────────────────────────────────────────────────────────────
@@ -11518,7 +11580,7 @@ app.get('/api/cortex/health', authMiddleware, async (req, res) => {
         ineffective_count:   ineffectiveCount,
       },
     });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── BROKEN PROMISE DETECTION CRON — daily 9am IST (3:30 UTC) ────────────────
@@ -12070,6 +12132,7 @@ app.get('/api/v1/collections/bootstrap', authMiddleware, async (req, res) => {
     CacheService.set(cacheKey, payload, 45); // 45 second cache
     res.json(payload);
   } catch (err) {
+    logRouteError(req, err);
     res.status(500).json({ error: 'Failed to bootstrap collections' });
   }
 });

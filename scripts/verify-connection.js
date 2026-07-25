@@ -165,6 +165,40 @@ async function main() {
     }
   }
 
+  // ── 7. Feature flags ──────────────────────────────────────────────────────
+  // Not a pass/fail check — every AI feature defaults off, so "nothing is
+  // happening" is usually this rather than a broken install.
+  let flags = null;
+  try {
+    ({ FLAGS: flags } = require('../lib/featureFlags'));
+  } catch {
+    // featureFlags is only importable from a checkout; skip quietly otherwise.
+  }
+
+  if (flags) {
+    const on = Object.entries(flags).filter(([, v]) => v === true).map(([k]) => k);
+    const off = Object.entries(flags).filter(([, v]) => v !== true).map(([k]) => k);
+    console.log(`\n🧠 Cortex / AI features — ${on.length} on, ${off.length} off`);
+
+    if (!flags.cortex_enabled) {
+      console.log('   ⚠️  FEATURE_CORTEX_ENABLED is off — the master switch. No agents run,');
+      console.log('      no AI actions are created, and the app behaves as plain CRUD.');
+    }
+    if (flags.cortex_enabled && !flags.agent_planner_enabled) {
+      console.log('   ℹ️  Planner off — plans come from rules rather than the LLM.');
+    }
+    if (flags.agent_planner_enabled && isPlaceholder(process.env.ANTHROPIC_API_KEY)) {
+      console.log('   ⚠️  Planner is on but ANTHROPIC_API_KEY is unset — it will fall back to rules.');
+    }
+    if (flags.external_message_sending_enabled) {
+      console.log('   🚨 External message sending is ON — agents can contact real customers.');
+    }
+    if (on.length) console.log(`   on:  ${on.join(', ')}`);
+    if (off.length) console.log(`   off: ${off.join(', ')}`);
+  } else {
+    skip('Feature flags', 'run from the backend checkout to inspect them');
+  }
+
   // ── Summary ───────────────────────────────────────────────────────────────
   const failed = results.filter(r => !r.ok);
   console.log(`\n${failed.length === 0 ? '🎉' : '⚠️ '} ${results.length - failed.length}/${results.length} checks passed`);
