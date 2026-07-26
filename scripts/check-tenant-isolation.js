@@ -22,15 +22,28 @@ const path = require('path');
 
 const ROOT = path.join(__dirname, '..');
 
-// Directories whose queries always run on behalf of one user.
+// Directories whose queries always run on behalf of one user, so "every read is
+// tenant-scoped" holds without exception and can be enforced mechanically.
+//
+// server.js is deliberately not scanned. It legitimately reads across tenants in
+// several places — admin routes behind adminOnly, and the dunning cron that
+// walks every user's rules — so enforcing the same rule there would mean ~58
+// exemption annotations and the signal would drown. Its reads were reviewed by
+// hand instead: all are either scoped, admin-gated, or cron-by-design.
 const SCAN_DIRS = [
   'lib/services/agents',
   'lib/services/orchestrator',
   'lib/cortex',
 ];
 
-// Columns that scope a row to a single tenant.
-const TENANT_COLUMNS = ['user_id', 'business_id'];
+// Columns that scope a row to a single tenant. Most tables use user_id, but a
+// few name the owner differently, and a query filtered on one of those is just
+// as scoped — omitting them here would report a false violation and invite
+// someone to "fix" it by adding a column the table does not have.
+//   owner_id     team_members
+//   referrer_id  referral_rewards
+//   referred_by  users, when listing accounts a user referred
+const TENANT_COLUMNS = ['user_id', 'business_id', 'owner_id', 'referrer_id', 'referred_by'];
 
 // Tables that are not tenant-owned — global config, catalogues, and tables
 // keyed only by their own id. Reads against these do not need a tenant filter.

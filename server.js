@@ -2773,7 +2773,10 @@ async function ensureConnectedBusinessData(userId) {
     // 4. RECALCULATE STOCK
     const { data: products } = await supabase.from('products').select('id, name').eq('user_id', userId);
     for (const prod of (products || [])) {
-      const { data: movements } = await supabase.from('stock_movements').select('movement_type, quantity').eq('product_id', prod.id);
+      // Scoped by owner as well as product: products above are already fetched
+      // for this user, but with RLS bypassed the user_id filter is what actually
+      // keeps another tenant's movements out of the recount.
+      const { data: movements } = await supabase.from('stock_movements').select('movement_type, quantity').eq('product_id', prod.id).eq('user_id', userId);
       let stock = 0;
       (movements || []).forEach(m => {
         if (m.movement_type === 'in') stock += toMoney(m.quantity);
@@ -6769,7 +6772,12 @@ async function runDunningCycle() {
         const { resolveCustomerId } = require('./lib/services/orchestrator/scoring.service');
         const customerId = await resolveCustomerId(invoice.user_id, invoice.customer_name, invoice.customer_phone);
         if (customerId) {
-          const { data: customer } = await supabase.from('customers').select('escalation_paused').eq('id', customerId).maybeSingle();
+          // Owner filter repeated on purpose, matching collectionsAgent: the
+          // service_role key bypasses RLS, so this is the only barrier if the
+          // resolved id is ever wrong. It matters more here than in the agent —
+          // this runs in the dunning cron, which walks every user's invoices, so
+          // a mismatched id would read across tenants rather than within one.
+          const { data: customer } = await supabase.from('customers').select('escalation_paused').eq('id', customerId).eq('user_id', invoice.user_id).maybeSingle();
           if (customer?.escalation_paused) continue;
         }
       } catch { /* best-effort — if resolution fails, fall through unaffected, same as before this change */ }
@@ -8087,7 +8095,10 @@ app.post('/api/reconcile/backfill', requireAdmin, async (req, res) => {
     if (!isDryRun) {
       const { data: products } = await supabase.from('products').select('id, name').eq('user_id', userId);
       for (const prod of (products || [])) {
-        const { data: movements } = await supabase.from('stock_movements').select('movement_type, quantity').eq('product_id', prod.id);
+        // Scoped by owner as well as product: products above are already
+        // fetched for this user, but with RLS bypassed the user_id filter is
+        // what actually keeps another tenant's movements out of the recount.
+        const { data: movements } = await supabase.from('stock_movements').select('movement_type, quantity').eq('product_id', prod.id).eq('user_id', userId);
         let stock = 0;
         (movements || []).forEach(m => {
           if (m.movement_type === 'in') stock += toMoney(m.quantity);
