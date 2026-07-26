@@ -22,9 +22,12 @@ jobs:
       - name: Syntax check
         run: npm run check
 
-      - name: Lint (informational — see eslint.config.js for why this doesn't block yet)
+      # Blocking. The config deliberately errors only on real correctness bugs —
+      # undefined variables, duplicate keys, unreachable code — and leaves
+      # stylistic findings as warnings, so a failure here means something is
+      # actually broken rather than merely untidy.
+      - name: Lint
         run: npm run lint
-        continue-on-error: true
 
       - name: Cortex Lab static test suite
         run: npm run cortex:test
