@@ -1,7 +1,7 @@
 {
   "name": "vantro-flow-backend",
   "version": "1.0.0",
-  "description": "Vantro Flow Express backend — deployed to Railway",
+  "description": "Vantro Flow Express backend \u2014 deployed to Railway",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -17,7 +17,8 @@
     "security:cross-user": "node scripts/cross-user-security-test.js",
     "security:smoke": "node scripts/security-smoke-test.js",
     "cortex:test": "node cortex-lab/run.js",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "security:audit-gate": "node scripts/check-dependency-audit.js"
   },
   "engines": {
     "node": ">=18.0.0"

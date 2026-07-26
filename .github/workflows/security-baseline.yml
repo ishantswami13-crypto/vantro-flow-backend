@@ -21,9 +21,13 @@ jobs:
 
       - run: npm run check
 
-      - name: npm audit report
-        run: npm audit --audit-level=high
-        continue-on-error: true
+      # Blocking. This previously ran `npm audit --audit-level=high` under
+      # continue-on-error, which printed findings and passed regardless — a
+      # high-severity advisory in a shipped dependency looked the same as a
+      # clean run. The gate fails on anything high or critical that is not
+      # explicitly allowlisted with a reason in the script.
+      - name: Dependency audit gate
+        run: npm run security:audit-gate
 
       - name: Ensure env files are not tracked
         shell: bash
