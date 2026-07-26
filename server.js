@@ -2638,6 +2638,23 @@ async function syncInventoryFromSale(userId, sale) {
       }]);
       synced.push({ product_id: product.id, name: productName, quantity: qty });
 
+      // Record the reduction itself, not just the low-stock case below. Stock
+      // leaving on a sale is a business event, and cortex-lab's
+      // credit-sale-orchestration scenario has asserted STOCK_REDUCED since it
+      // was written while nothing emitted it. Per product, matching
+      // LOW_STOCK_DETECTED, since a sale can move several lines.
+      setImmediate(() => {
+        emitBusinessEvent(userId, 'STOCK_REDUCED', {
+          entityType: 'product',
+          entityId:   product.id,
+          product_id: product.id,
+          product_name: productName,
+          quantity:   qty,
+          stock_after: nextStock,
+          reference:  sale.invoice_number || String(sale.id || ''),
+        }).catch(err => console.warn('[STOCK_REDUCED emit]', err.message));
+      });
+
       // Emit LOW_STOCK_DETECTED if stock dropped to or below the reorder threshold
       const minStock = product.low_stock_alert || product.reorder_level || 0;
       if (minStock > 0 && nextStock <= minStock) {

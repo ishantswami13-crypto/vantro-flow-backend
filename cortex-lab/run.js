@@ -50,16 +50,26 @@ function checkOrchestration(scenarios) {
   }
   const allowedActions = planner.ALLOWED_ACTION_TYPES || new Set();
 
-  // Any event the backend actually names, gathered from source rather than a
-  // hand-maintained list — event.service takes the type as a parameter, so
+  // Every event name the backend actually uses, gathered from source rather than
+  // a hand-maintained list — event.service takes the type as a parameter, so
   // there is no central enum to compare against.
+  //
+  // Only quoted string literals count, and comments are stripped first.
+  // Substring-matching raw text looks equivalent and is not: a mention in a
+  // comment — including a comment explaining that the event is emitted — would
+  // satisfy the check while nothing emits it, which is precisely the drift this
+  // is supposed to catch.
   const roots = [path.join(__dirname, '..', 'server.js'), path.join(__dirname, '..', 'lib')];
-  let corpus = '';
+  const emitted = new Set();
   const readAll = (p) => {
     if (!fs.existsSync(p)) return;
     const stat = fs.statSync(p);
     if (stat.isDirectory()) return fs.readdirSync(p).forEach(f => readAll(path.join(p, f)));
-    if (p.endsWith('.js')) corpus += fs.readFileSync(p, 'utf8');
+    if (!p.endsWith('.js')) return;
+    const src = fs.readFileSync(p, 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')   // block comments
+      .replace(/(^|[^:])\/\/[^\n]*/g, '$1'); // line comments, sparing "http://"
+    for (const m of src.matchAll(/['"`]([A-Z][A-Z0-9_]{3,})['"`]/g)) emitted.add(m[1]);
   };
   roots.forEach(readAll);
 
@@ -74,7 +84,7 @@ function checkOrchestration(scenarios) {
     }
     for (const e of (data.expected_events || [])) {
       checked++;
-      if (!corpus.includes(e)) misses.push({ file, kind: 'event', name: e });
+      if (!emitted.has(e)) misses.push({ file, kind: 'event', name: e });
     }
   }
 
@@ -177,9 +187,9 @@ function main() {
   console.log(`Orchestration wiring:     ${orch.ok ? 'OK' : `${orch.misses.length} unresolved`}  (${orch.checked} expectations checked)`);
   orch.misses.forEach(m => console.log(`  - ${m.file}: ${m.kind} "${m.name}" is not emitted or allowed anywhere in the codebase`));
   if (!orch.ok) {
-    console.log('  (reported, not failed: this is pre-existing drift, either behaviour that was');
-    console.log('   never built or names that changed without the scenarios following. Make this');
-    console.log('   blocking once the count reaches zero, the same way tenant isolation is.)');
+    console.log('  (a scenario asserts something the code cannot produce: either the behaviour');
+    console.log('   was never built, or a name changed and the scenario did not follow. Fix');
+    console.log('   whichever is actually wrong — do not delete the expectation to go green.)');
   }
 
   if (LIVE) {
@@ -188,7 +198,7 @@ function main() {
     console.log('end-to-end checks by seeding two users and asserting each sees only its own rows.');
   }
 
-  const pass = scen.errors.length === 0 && pg.ok && llmV.ok && iso.ok;
+  const pass = scen.errors.length === 0 && pg.ok && llmV.ok && iso.ok && orch.ok;
   console.log('\n' + banner);
   console.log('  RESULT: ' + (pass ? 'PASS' : 'FAIL'));
   console.log('  Policy Safety:            ' + (llmV.ok ? '100%' : '<100%'));
