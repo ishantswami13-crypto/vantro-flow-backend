@@ -180,6 +180,24 @@ function escapeHtml(value) {
     .replace(/'/g, '&#39;');
 }
 
+// Escapes a value for interpolation into TwiML. Separate from escapeHtml
+// because the sink is different: this XML is executed by Twilio, not rendered by
+// a browser, so the risk is a business_name containing </Say><Play>… making the
+// platform play attacker-chosen audio or dial on the caller's behalf, rather
+// than script execution. Handles the five XML predefined entities, so it is
+// safe in both element text and quoted attributes.
+//
+// The TwiML sites were previously inconsistent: two escaped & < >, one stripped
+// them, and one escaped only &, which is the one that left a hole.
+function escapeXml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
 // Neutralises spreadsheet formula injection for CSV export. Excel, LibreOffice
 // and Sheets evaluate a cell beginning =, +, - or @ as a formula when the file
 // is opened — including payloads like =cmd|'/c calc'!A1 — and quoting does not
@@ -1033,7 +1051,7 @@ async function sendOTPEmail(email, name, otp) {
         </tr>
         <tr>
           <td style="padding:32px;">
-            <p style="margin:0 0 8px;color:#e0e0e8;font-size:16px;">Hi ${displayName},</p>
+            <p style="margin:0 0 8px;color:#e0e0e8;font-size:16px;">Hi ${escapeHtml(displayName)},</p>
             <p style="margin:0 0 24px;color:#9090a0;font-size:14px;line-height:1.6;">
               Use this OTP to verify your Vantro Flow account. It expires in <strong style="color:#e0e0e8;">10 minutes</strong>.
             </p>
@@ -1341,7 +1359,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
           from: 'Vantro Flow <onboarding@resend.dev>',
           to: email,
           subject: `Your Vantro OTP: ${otp}`,
-          html: `<p>Hi ${user.business_name},</p><p>Your OTP to reset your Vantro Flow password is: <strong style="font-size:24px">${otp}</strong></p><p>Valid for 15 minutes. Do not share this with anyone.</p>`
+          html: `<p>Hi ${escapeHtml(user.business_name)},</p><p>Your OTP to reset your Vantro Flow password is: <strong style="font-size:24px">${otp}</strong></p><p>Valid for 15 minutes. Do not share this with anyone.</p>`
         })
       });
     } else {
@@ -6624,10 +6642,10 @@ async function makeAutoCall(userId, invoice) {
 
     const phone = String(invoice.customer_phone).replace(/\D/g, '');
     const toPhone = phone.length === 10 ? `+91${phone}` : `+${phone}`;
-    const safeScript = openingScript.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const safeScript = escapeXml(openingScript);
     const payLink = invoice.payment_link;
     const payPrompt = payLink
-      ? `<Say voice="Polly.Aditi" language="hi-IN">Is link pe click kar ke abhi pay karein: ${payLink.replace(/https?:\/\//, '')}</Say><Pause length="1"/>`
+      ? `<Say voice="Polly.Aditi" language="hi-IN">Is link pe click kar ke abhi pay karein: ${escapeXml(payLink.replace(/https?:\/\//, ''))}</Say><Pause length="1"/>`
       : '';
 
     await twilioClient.calls.create({
@@ -7546,7 +7564,7 @@ app.post('/api/voice/call', authMiddleware, async (req, res) => {
 
     const phone = String(customer_phone).replace(/\D/g, '');
     const toPhone = phone.length === 10 ? `+91${phone}` : `+${phone}`;
-    const safeScript = openingScript.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const safeScript = escapeXml(openingScript);
 
     const call = await twilioClient.calls.create({
       to: toPhone,
@@ -8567,12 +8585,14 @@ app.post('/api/voice/inbound', async (req, res) => {
         .select('business_name, owner_name').eq('id', userId).single();
       if (u?.business_name) greeting = u.business_name;
     }
-    const cbUrl = `${process.env.RAILWAY_PUBLIC_URL || 'https://vantro-flow-backend-production.up.railway.app'}/api/voice/recording?uid=${userId || ''}`;
+    // uid comes from req.query — encoded for the URL, then escaped for the XML
+    // attribute it is placed in. Either alone is insufficient.
+    const cbUrl = `${process.env.RAILWAY_PUBLIC_URL || 'https://vantro-flow-backend-production.up.railway.app'}/api/voice/recording?uid=${encodeURIComponent(userId || '')}`;
     res.set('Content-Type', 'text/xml');
     res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Aditi" language="hi-IN">Namaste! ${greeting.replace(/&/g,'and')} mein aapka swagat hai. Beep ke baad apna order boliye — apna naam, kya chahiye, kitna chahiye, aur address batayein.</Say>
-  <Record maxLength="180" action="${cbUrl}" transcribe="false" playBeep="true" finishOnKey="*"/>
+  <Say voice="Polly.Aditi" language="hi-IN">Namaste! ${escapeXml(greeting)} mein aapka swagat hai. Beep ke baad apna order boliye — apna naam, kya chahiye, kitna chahiye, aur address batayein.</Say>
+  <Record maxLength="180" action="${escapeXml(cbUrl)}" transcribe="false" playBeep="true" finishOnKey="*"/>
   <Say voice="Polly.Aditi" language="hi-IN">Dhanyavaad! Aapka order note ho gaya. Hum jald sampark karenge.</Say>
 </Response>`);
   } catch (err) {
@@ -8699,7 +8719,7 @@ Extract order from Hindi/Hinglish transcript. Return ONLY valid JSON, no comment
         const toPhone = wPhone.length === 10 ? `+91${wPhone}` : `+${wPhone}`;
         const itemsDesc = (extracted.items || []).map(i => `${i.quantity} ${i.unit} ${i.local_name || i.name}`).join(', ');
         const script = `${w.name} ji, naya order aaya hai. Customer: ${extracted.customer_name || 'customer'}. Maal: ${itemsDesc || 'details app mein hain'}. Address: ${extracted.delivery_address || 'confirm karo'}. Delivery: ${extracted.delivery_time || 'jaldi se'}. Vantro app check karo.`;
-        const safe = script.replace(/&/g,'and').replace(/</g,'').replace(/>/g,'');
+        const safe = escapeXml(script);
         try {
           await twilioClient.calls.create({
             to: toPhone, from: process.env.TWILIO_PHONE_NUMBER,
