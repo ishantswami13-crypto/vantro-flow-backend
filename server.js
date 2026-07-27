@@ -10875,21 +10875,40 @@ app.get('/api/reports/export', authMiddleware, async (req, res) => {
         gst: 'GST Summary', cashflow: 'Cash Flow Forecast',
         calls: 'Call Activity Log', customer: 'Customer Statement',
       };
+      // Every value below is interpolated into a response served as text/html
+      // from the API origin, so it has to be escaped. Two sources are genuinely
+      // attacker-influenced: row values come from the database (a crafted
+      // customer name imported from a spreadsheet reaches a <td> verbatim), and
+      // fromDate/toDate come straight off req.query with no validation. The
+      // rest — sheet names, column headers, the report title — are code
+      // constants today, but they are escaped too so that the invariant is
+      // "nothing reaches this template unescaped" rather than a per-value
+      // judgement that has to be re-made every time a column is added.
+      //
+      // This matters more than a typical reflected XSS: the script would run on
+      // the backend origin, which is where the auth and CSRF cookies live.
+      const esc = (v) => String(v ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+
       // Flatten all sheets into one HTML table per sheet
       const sheetsHtml = wb.SheetNames.map(sheetName => {
         const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName]);
-        if (!rows.length) return `<h3>${sheetName}</h3><p style="color:#888">No data</p>`;
+        if (!rows.length) return `<h3>${esc(sheetName)}</h3><p style="color:#888">No data</p>`;
         const headers = Object.keys(rows[0]);
         return `
-          <h3 style="margin:24px 0 8px;font-size:14px;color:#0066FF">${sheetName}</h3>
+          <h3 style="margin:24px 0 8px;font-size:14px;color:#0066FF">${esc(sheetName)}</h3>
           <table>
-            <thead><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead>
-            <tbody>${rows.map(row => `<tr>${headers.map(h => `<td>${row[h] ?? ''}</td>`).join('')}</tr>`).join('')}</tbody>
+            <thead><tr>${headers.map(h => `<th>${esc(h)}</th>`).join('')}</tr></thead>
+            <tbody>${rows.map(row => `<tr>${headers.map(h => `<td>${esc(row[h])}</td>`).join('')}</tr>`).join('')}</tbody>
           </table>`;
       }).join('');
 
       const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
-<title>Vantro — ${REPORT_NAMES[report] || report}</title>
+<title>Vantro — ${esc(REPORT_NAMES[report] || report)}</title>
 <style>
   body{font-family:system-ui,sans-serif;padding:32px;color:#111;max-width:960px;margin:0 auto}
   h1{font-size:20px;font-weight:800;margin-bottom:2px}
@@ -10901,8 +10920,8 @@ app.get('/api/reports/export', authMiddleware, async (req, res) => {
   @media print{body{padding:0} button{display:none}}
 </style></head><body>
 <button onclick="window.print()" style="float:right;padding:8px 16px;background:#0066FF;color:#fff;border:none;border-radius:8px;font-weight:600;cursor:pointer;font-size:13px">🖨 Print / Save PDF</button>
-<h1>Vantro Flow — ${REPORT_NAMES[report] || report}</h1>
-<p class="meta">Period: ${fromDate} to ${toDate} &nbsp;·&nbsp; Generated: ${new Date().toLocaleDateString('en-IN', { day:'numeric',month:'long',year:'numeric' })}</p>
+<h1>Vantro Flow — ${esc(REPORT_NAMES[report] || report)}</h1>
+<p class="meta">Period: ${esc(fromDate)} to ${esc(toDate)} &nbsp;·&nbsp; Generated: ${new Date().toLocaleDateString('en-IN', { day:'numeric',month:'long',year:'numeric' })}</p>
 ${sheetsHtml}
 </body></html>`;
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
