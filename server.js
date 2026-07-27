@@ -10084,12 +10084,32 @@ app.get('/api/bank/transactions', authMiddleware, async (req, res) => {
 
 app.post('/api/bank/transactions', authMiddleware, async (req, res) => {
   try {
-    const { txn_date, description, amount, type } = req.body;
+    const { txn_date, description, amount, type, account_id } = req.body;
     if (!amount || !type) return res.status(400).json({ error: 'amount and type required' });
+
+    // account_id was accepted from the caller and then dropped, so every
+    // transaction created through this route — including every row of an
+    // imported statement — landed with a null account and could not be
+    // attributed to the bank it came from. Verified against the caller's own
+    // accounts before use: the column is a foreign key, so an unchecked value
+    // would otherwise let one tenant point a row at another tenant's account.
+    let accountId = null;
+    if (account_id != null && account_id !== '') {
+      const { data: acct } = await supabase
+        .from('bank_accounts')
+        .select('id')
+        .eq('id', account_id)
+        .eq('user_id', req.user.userId)
+        .maybeSingle();
+      if (!acct) return res.status(400).json({ error: 'Unknown bank account' });
+      accountId = acct.id;
+    }
+
     const { data, error } = await supabase
       .from('bank_transactions')
       .insert([{
         user_id: req.user.userId,
+        account_id: accountId,
         txn_date: txn_date || new Date().toISOString().split('T')[0],
         description: description || '',
         amount: parseFloat(amount),
