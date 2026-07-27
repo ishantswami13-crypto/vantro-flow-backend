@@ -455,7 +455,12 @@ const publicBillLimiter = makeLimiter({ windowMs: 10 * 60 * 1000, max: 80 });
 const heavyReadLimiter = makeLimiter({ windowMs: 5 * 60 * 1000, max: 90 });
 app.use('/api/auth', authLimiter);
 app.use('/api', apiLimiter);
-app.use(['/api/upload-csv', '/api/import/excel', '/api/scan-document', '/api/purchases/scan', '/api/sales/scan', '/api/transactions/scan', '/api/ai/extract-voice'], uploadLimiter);
+// /api/bank/transactions/import belongs here with the other upload routes: it
+// takes a multipart file and parses .xls/.xlsx through the same library. It was
+// missing, so it fell through to apiLimiter at 120 requests/minute rather than
+// 20 per 15 minutes — the loosest limit on the most expensive parse in the app,
+// and the one spreadsheet endpoint whose input is fully attacker-controlled.
+app.use(['/api/upload-csv', '/api/import/excel', '/api/bank/transactions/import', '/api/scan-document', '/api/purchases/scan', '/api/sales/scan', '/api/transactions/scan', '/api/ai/extract-voice'], uploadLimiter);
 app.use(['/api/ai-chat', '/api/ml/briefing', '/api/ai/brain', '/api/ai/call-script', '/api/ai/bulk-whatsapp'], aiLimiter);
 app.use('/api/bills/public', publicBillLimiter);
 app.use(['/api/analytics', '/api/cash-forecast', '/api/reports/export', '/api/reconcile/backfill'], heavyReadLimiter);

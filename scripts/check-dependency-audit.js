@@ -32,20 +32,28 @@ const ALLOWLIST = [
       'fix and reports fixAvailable: false. Newer builds are distributed only from ' +
       'cdn.sheetjs.com.',
     reachable:
-      'Yes. XLSX.read() runs on user-uploaded buffers at POST /api/import/excel and the ' +
-      'transactions import. Both require authentication and sit behind the upload rate ' +
-      'limiter (20 requests / 15 min), which narrows abuse but does not remove it.',
+      'Yes. XLSX.read() runs on user-uploaded buffers at POST /api/import/excel and POST ' +
+      '/api/bank/transactions/import. Both require authentication and are capped at 5001 ' +
+      'rows by the sheetRows option, and both now sit behind the upload rate limiter — the ' +
+      'bank import did not until it was added to the uploadLimiter list, having previously ' +
+      'fallen through to the general 120/min limit. Narrowed, not removed.',
     removeWhen:
-      'The dependency moves to the SheetJS CDN tarball (npm i https://cdn.sheetjs.com/...) ' +
-      'or the code migrates to a maintained parser such as exceljs. Both need a deploy ' +
-      'environment that can reach the chosen source.',
+      'A fixed build becomes installable from an environment that can reach cdn.sheetjs.com. ' +
+      'Migrating to exceljs was assessed and rejected: it cannot read legacy BIFF .xls at ' +
+      'all, which is what Tally and Indian bank portals export and which ' +
+      'ALLOWED_UPLOAD_EXTENSIONS still accepts, and workbook.xlsx.load() has no row cap, so ' +
+      'it would materialise an unbounded sheet before any size guard could run.',
   },
   {
     id: 'GHSA-5pgg-2g8v-p4x9',
     package: 'xlsx',
     title: 'SheetJS regular expression denial of service',
     reason: 'Same package and same distribution problem as the entry above — fixed in >= 0.20.2, unavailable on npm.',
-    reachable: 'Yes, via the same upload paths.',
+    reachable:
+      'Yes, via the same two upload paths, with the same 5001-row cap and upload rate limit. ' +
+      'This is the advisory the rate limit matters most for: a ReDoS is cheap to trigger ' +
+      'repeatedly, which is why the bank import falling outside the upload limiter was worth ' +
+      'fixing on its own.',
     removeWhen: 'Same as above.',
   },
 ];
