@@ -457,13 +457,45 @@ app.use('/api/auth', authLimiter);
 app.use('/api', apiLimiter);
 // /api/bank/transactions/import belongs here with the other upload routes: it
 // takes a multipart file and parses .xls/.xlsx through the same library. It was
-// missing, so it fell through to apiLimiter at 120 requests/minute rather than
-// 20 per 15 minutes — the loosest limit on the most expensive parse in the app,
-// and the one spreadsheet endpoint whose input is fully attacker-controlled.
+// missing, so it fell through to apiLimiter at 120 requests/minute.
+//
+// Note what this budget actually is: uploadLimiter is a single rateLimit()
+// instance mounted across all these prefixes, so they share one counter per key
+// — 20 per 15 minutes pooled across every upload route, not 20 each. A user who
+// has just run the onboarding import and scanned a few documents arrives here
+// with far fewer than 20 left.
+//
+// Two limits on how much this is worth: every limiter here keys on IP (no
+// keyGenerator is set), so an office behind one NAT shares a budget while a
+// client rotating IPs sidesteps it entirely; and the default MemoryStore is
+// per-process, so the effective limit multiplies by the replica count and
+// resets on every deploy.
 app.use(['/api/upload-csv', '/api/import/excel', '/api/bank/transactions/import', '/api/scan-document', '/api/purchases/scan', '/api/sales/scan', '/api/transactions/scan', '/api/ai/extract-voice'], uploadLimiter);
-app.use(['/api/ai-chat', '/api/ml/briefing', '/api/ai/brain', '/api/ai/call-script', '/api/ai/bulk-whatsapp'], aiLimiter);
+// /api/voice/call places a real outbound PSTN call. It takes customer_phone
+// straight from the request body and dials through getTwilio() with no
+// arguments, which falls back to the platform's own TWILIO_ACCOUNT_SID rather
+// than the caller's credentials. On the general limiter that was 120 calls a
+// minute to arbitrary numbers, billed to this account — the classic shape of
+// premium-rate toll fraud. This limit is a mitigation, not a considered policy:
+// the right number depends on how many collection calls a real user makes, and
+// it should key on userId rather than IP before it is relied on.
+//
+// ai-insights, ai-deep-analysis and ai-financial-monitor were simply missed from
+// this list. Each does uncapped select('*') queries and then a 70B model call —
+// strictly more expensive than /api/ml/briefing, which has been limited here all
+// along, so they were running at 30x the rate of a cheaper sibling.
+app.use([
+  '/api/ai-chat', '/api/ml/briefing', '/api/ai/brain', '/api/ai/call-script', '/api/ai/bulk-whatsapp',
+  '/api/voice/call', '/api/ai-insights', '/api/ai-deep-analysis', '/api/ai-financial-monitor',
+], aiLimiter);
 app.use('/api/bills/public', publicBillLimiter);
-app.use(['/api/analytics', '/api/cash-forecast', '/api/reports/export', '/api/reconcile/backfill'], heavyReadLimiter);
+// cortex/score-all walks up to 200 customers with several queries each, and
+// cortex/run-agents runs ten agents and can send WhatsApp messages as a side
+// effect. Both were on the general limiter.
+app.use([
+  '/api/analytics', '/api/cash-forecast', '/api/reports/export', '/api/reconcile/backfill',
+  '/api/cortex/score-all', '/api/cortex/run-agents',
+], heavyReadLimiter);
 
 // Lightweight Performance Endpoint
 app.get('/api/performance/summary', requireAdmin, (req, res) => {
