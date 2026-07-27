@@ -161,6 +161,38 @@ app.use((req, res, next) => {
   next();
 });
 
+// Escapes a value for interpolation into HTML *element text*. Module-level
+// because more than one endpoint builds HTML by hand, and the previous local
+// copy meant the next one had nothing to reach for.
+//
+// Note the limit: this is context-blind and is only safe for element text or a
+// quoted attribute. It is NOT sufficient inside an unquoted attribute (a space
+// ends the value, so `x onmouseover=alert(1)` needs no quote characters), in a
+// <script> block (entities are not decoded in a JS string), or in a URL
+// position (`javascript:` survives all five replacements). Do not reach for it
+// in those places and assume it holds.
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// Neutralises spreadsheet formula injection for CSV export. Excel, LibreOffice
+// and Sheets evaluate a cell beginning =, +, - or @ as a formula when the file
+// is opened — including payloads like =cmd|'/c calc'!A1 — and quoting does not
+// prevent it. Prefixing with an apostrophe forces the cell to be read as text.
+//
+// Only needed on the CSV path: the .xlsx writer types these cells as strings
+// ({t:'s'}), so Excel already renders them inert there, and prefixing would put
+// a visible stray quote in front of legitimate values.
+function csvSafeCell(value) {
+  const s = String(value ?? '');
+  return /^[=+\-@\t\r]/.test(s) ? `'${s}` : s;
+}
+
 // Logs the cause of a 500 before the generic response goes back to the client.
 // The client message stays deliberately opaque, but the server needs the real
 // error to be diagnosable — an unlogged catch turns any failure into a silent
@@ -10202,13 +10234,20 @@ app.delete('/api/bank/transactions/:id', authMiddleware, async (req, res) => {
 // approval.
 // ============================================
 
+// title and message are built from agent output that embeds imported customer,
+// supplier and product names, so both are attacker-influenceable. This page is
+// served by GET /api/actions/:id/approve, which has no authMiddleware — only a
+// signed token delivered over WhatsApp — and lands on the origin that holds the
+// auth and CSRF cookies.
 function approvalResultPage(title, message, ok = true) {
-  return `<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>${title}</title>
+  const t = escapeHtml(title);
+  const m = escapeHtml(message);
+  return `<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>${t}</title>
   <style>body{font-family:-apple-system,sans-serif;background:${ok ? '#f0fdf4' : '#fef2f2'};display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px;}
   .card{background:#fff;border-radius:12px;padding:32px;max-width:420px;box-shadow:0 2px 12px rgba(0,0,0,0.08);text-align:center;}
   h1{font-size:20px;color:${ok ? '#166534' : '#991b1b'};margin:0 0 12px;}
   p{color:#374151;line-height:1.5;}</style></head>
-  <body><div class="card"><h1>${ok ? '✅ ' : '⚠️ '}${title}</h1><p>${message}</p></div></body></html>`;
+  <body><div class="card"><h1>${ok ? '✅ ' : '⚠️ '}${t}</h1><p>${m}</p></div></body></html>`;
 }
 
 async function executeInventoryPO(userId, action) {
@@ -10674,9 +10713,16 @@ app.get('/api/reports/export', authMiddleware, async (req, res) => {
     const userId = req.user.userId;
     const { report = 'outstanding', format = 'xlsx', from, to } = req.query;
 
-    // Build date filter
-    const fromDate = from || new Date(Date.now() - 30 * 86400000).toISOString().split('T')[0];
-    const toDate   = to   || new Date().toISOString().split('T')[0];
+    // Validated at the source rather than escaped at each use. These reach a
+    // Supabase filter, the HTML report body, and the Content-Disposition
+    // filename on the csv and xlsx branches — where a quote character lets a
+    // caller append their own filename* parameter, which RFC 6266 says wins
+    // over filename, choosing the downloaded file's name and extension.
+    // Anything not an ISO date falls back to the default window.
+    const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+    const cleanDate = (v, fallback) => (typeof v === 'string' && ISO_DATE.test(v)) ? v : fallback;
+    const fromDate = cleanDate(from, new Date(Date.now() - 30 * 86400000).toISOString().split('T')[0]);
+    const toDate   = cleanDate(to,   new Date().toISOString().split('T')[0]);
 
     let wb;
 
@@ -10887,28 +10933,21 @@ app.get('/api/reports/export', authMiddleware, async (req, res) => {
       //
       // This matters more than a typical reflected XSS: the script would run on
       // the backend origin, which is where the auth and CSRF cookies live.
-      const esc = (v) => String(v ?? '')
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
-
       // Flatten all sheets into one HTML table per sheet
       const sheetsHtml = wb.SheetNames.map(sheetName => {
         const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName]);
-        if (!rows.length) return `<h3>${esc(sheetName)}</h3><p style="color:#888">No data</p>`;
+        if (!rows.length) return `<h3>${escapeHtml(sheetName)}</h3><p style="color:#888">No data</p>`;
         const headers = Object.keys(rows[0]);
         return `
-          <h3 style="margin:24px 0 8px;font-size:14px;color:#0066FF">${esc(sheetName)}</h3>
+          <h3 style="margin:24px 0 8px;font-size:14px;color:#0066FF">${escapeHtml(sheetName)}</h3>
           <table>
-            <thead><tr>${headers.map(h => `<th>${esc(h)}</th>`).join('')}</tr></thead>
-            <tbody>${rows.map(row => `<tr>${headers.map(h => `<td>${esc(row[h])}</td>`).join('')}</tr>`).join('')}</tbody>
+            <thead><tr>${headers.map(h => `<th>${escapeHtml(h)}</th>`).join('')}</tr></thead>
+            <tbody>${rows.map(row => `<tr>${headers.map(h => `<td>${escapeHtml(row[h])}</td>`).join('')}</tr>`).join('')}</tbody>
           </table>`;
       }).join('');
 
       const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
-<title>Vantro — ${esc(REPORT_NAMES[report] || report)}</title>
+<title>Vantro — ${escapeHtml(REPORT_NAMES[report] || report)}</title>
 <style>
   body{font-family:system-ui,sans-serif;padding:32px;color:#111;max-width:960px;margin:0 auto}
   h1{font-size:20px;font-weight:800;margin-bottom:2px}
@@ -10920,8 +10959,8 @@ app.get('/api/reports/export', authMiddleware, async (req, res) => {
   @media print{body{padding:0} button{display:none}}
 </style></head><body>
 <button onclick="window.print()" style="float:right;padding:8px 16px;background:#0066FF;color:#fff;border:none;border-radius:8px;font-weight:600;cursor:pointer;font-size:13px">🖨 Print / Save PDF</button>
-<h1>Vantro Flow — ${esc(REPORT_NAMES[report] || report)}</h1>
-<p class="meta">Period: ${esc(fromDate)} to ${esc(toDate)} &nbsp;·&nbsp; Generated: ${new Date().toLocaleDateString('en-IN', { day:'numeric',month:'long',year:'numeric' })}</p>
+<h1>Vantro Flow — ${escapeHtml(REPORT_NAMES[report] || report)}</h1>
+<p class="meta">Period: ${escapeHtml(fromDate)} to ${escapeHtml(toDate)} &nbsp;·&nbsp; Generated: ${new Date().toLocaleDateString('en-IN', { day:'numeric',month:'long',year:'numeric' })}</p>
 ${sheetsHtml}
 </body></html>`;
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -10930,7 +10969,19 @@ ${sheetsHtml}
 
     if (format === 'csv') {
       const firstSheet = wb.Sheets[wb.SheetNames[0]];
-      const csv = XLSX.utils.sheet_to_csv(firstSheet);
+      // Rebuilt from rows rather than using sheet_to_csv directly, so every cell
+      // can be passed through csvSafeCell first — sheet_to_csv emits values
+      // verbatim, which lets a crafted customer name become a live formula when
+      // the export is opened in Excel.
+      const csvRows = XLSX.utils.sheet_to_json(firstSheet, { defval: '' });
+      const csvHeaders = csvRows.length ? Object.keys(csvRows[0]) : [];
+      const quote = (v) => {
+        const cell = csvSafeCell(v);
+        return /[",\n\r]/.test(cell) ? `"${cell.replace(/"/g, '""')}"` : cell;
+      };
+      const csv = csvRows.length
+        ? [csvHeaders.map(quote).join(','), ...csvRows.map(r => csvHeaders.map(h => quote(r[h])).join(','))].join('\n')
+        : XLSX.utils.sheet_to_csv(firstSheet);
       const filename = `vantro-${report}-${fromDate}.csv`;
       res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
       res.setHeader('Content-Type', 'text/csv');
