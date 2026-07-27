@@ -503,6 +503,11 @@ const uploadLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, max: 20 });
 const aiLimiter = makeLimiter({ windowMs: 10 * 60 * 1000, max: 40 });
 const publicBillLimiter = makeLimiter({ windowMs: 10 * 60 * 1000, max: 80 });
 const heavyReadLimiter = makeLimiter({ windowMs: 5 * 60 * 1000, max: 90 });
+// Dedicated rather than reusing uploadLimiter: that is one pooled instance
+// shared across eight upload prefixes, so putting a statement import on it would
+// spend the same budget document scanning needs. Low count, because each request
+// is a whole statement rather than a row.
+const bulkImportLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, max: 10 });
 app.use('/api/auth', authLimiter);
 app.use('/api', apiLimiter);
 // /api/bank/transactions/import belongs here with the other upload routes: it
@@ -10082,6 +10087,150 @@ app.get('/api/bank/transactions', authMiddleware, async (req, res) => {
   } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// Bulk insert for statement import. The bank page parsed the CSV client-side and
+// then posted one request per row, which meant a 150-row statement made 150
+// requests against a 120/min limit and lost the tail to 429s. This takes the
+// whole selection in one request.
+//
+// Deliberately NOT routed through reconciliation.importStatement, even though
+// that exists and does more. Its parser is materially worse on real Indian
+// statements: it matches headers by exact equality rather than substring, so a
+// column called "Txn Date (DD/MM/YYYY)" is not found, it assumes line 0 is the
+// header rather than scanning for it, so any preamble rows break it entirely,
+// and it writes the raw date cell into a DATE column without normalising
+// dd/mm/yyyy. The client parser handles all three. Routing through the server
+// parser would be a regression, so the better parser stays on the hot path.
+//
+// The consequence, stated rather than hidden: rows created here are not
+// reconciled. They land unmatched with source 'csv_import', so they are at least
+// distinguishable from manual entries, and they never reach the auto-apply or
+// ai_actions paths that importStatement drives. Closing that gap needs the
+// client parser to capture a reference column first — it has no such field
+// today, so the exact-reference match branch is unreachable from here either way.
+app.post('/api/bank/transactions/bulk', bulkImportLimiter, authMiddleware, async (req, res) => {
+  try {
+    const { account_id, transactions } = req.body;
+    if (!Array.isArray(transactions)) return res.status(400).json({ error: 'transactions array required' });
+    if (transactions.length === 0) return res.status(400).json({ error: 'transactions array is empty' });
+    // Sized for a bank statement, not for the JSON body limit — 1000 rows is
+    // roughly 150KB against a 10mb cap. The binding constraint is how long a
+    // chain of inserts can run inside one request.
+    if (transactions.length > 1000) {
+      return res.status(400).json({ error: 'Too many transactions in one request. Import 1000 rows or fewer at a time.' });
+    }
+
+    // account_id is a foreign key with no tenant column of its own, and the
+    // service-role key bypasses RLS, so ownership is checked here or nowhere.
+    let accountId = null;
+    if (account_id != null && account_id !== '') {
+      const { data: acct } = await supabase
+        .from('bank_accounts').select('id')
+        .eq('id', account_id).eq('user_id', req.user.userId).maybeSingle();
+      if (!acct) return res.status(400).json({ error: 'Unknown bank account' });
+      accountId = acct.id;
+    }
+
+    // Validated in JS before any insert. A multi-row INSERT is atomic, so one
+    // bad row would roll back the whole batch and return a single error with no
+    // row index — per-row feedback has to be produced before the database is
+    // touched, not after.
+    const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+    const rejected = [];
+    const candidates = [];
+
+    transactions.forEach((t, index) => {
+      const amount = parseFloat(t?.amount);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return rejected.push({ index, reason: 'amount must be a positive number' });
+      }
+      if (t?.type !== 'credit' && t?.type !== 'debit') {
+        // The column has a CHECK constraint on these two values.
+        return rejected.push({ index, reason: "type must be 'credit' or 'debit'" });
+      }
+      const txnDate = typeof t?.txn_date === 'string' && ISO_DATE.test(t.txn_date)
+        ? t.txn_date
+        : null;
+      if (!txnDate) return rejected.push({ index, reason: 'txn_date must be YYYY-MM-DD' });
+
+      candidates.push({
+        index,
+        row: {
+          user_id: req.user.userId,
+          account_id: accountId,
+          txn_date: txnDate,
+          description: String(t.description || '').slice(0, 500),
+          amount,
+          type: t.type,
+          status: 'unmatched',
+          source: 'csv_import',
+        },
+      });
+    });
+
+    // Re-importing the same statement is an easy mistake and there is no unique
+    // constraint to catch it, so duplicates are filtered here against what the
+    // account already holds. Matching the natural key of a statement line.
+    let duplicates = 0;
+    if (candidates.length) {
+      const dates = [...new Set(candidates.map(c => c.row.txn_date))];
+      let existingQuery = supabase
+        .from('bank_transactions')
+        .select('txn_date, amount, type, description, account_id')
+        .eq('user_id', req.user.userId)
+        .in('txn_date', dates);
+      const { data: existing } = await existingQuery;
+
+      const key = (r) => [r.account_id ?? '', r.txn_date, Number(r.amount).toFixed(2), r.type, (r.description || '').trim()].join('|');
+      const seen = new Set((existing || []).map(key));
+
+      for (let i = candidates.length - 1; i >= 0; i--) {
+        const k = key(candidates[i].row);
+        if (seen.has(k)) {
+          duplicates++;
+          candidates.splice(i, 1);
+        } else {
+          // Also guards duplicates within the submitted batch itself.
+          seen.add(k);
+        }
+      }
+    }
+
+    // Chunked so one statement cannot become a single oversized insert.
+    const CHUNK = 500;
+    let inserted = 0;
+    const failedChunks = [];
+    for (let i = 0; i < candidates.length; i += CHUNK) {
+      const slice = candidates.slice(i, i + CHUNK);
+      const { data, error } = await supabase
+        .from('bank_transactions')
+        .insert(slice.map(c => c.row))
+        .select('id');
+      if (error) {
+        failedChunks.push({ from: slice[0].index, to: slice[slice.length - 1].index, reason: error.message });
+      } else {
+        inserted += (data || []).length;
+      }
+    }
+
+    // One activity log for the import, not one per row.
+    if (inserted) {
+      await createActivityLog(req.user.userId, 'bank_statement_imported', {
+        entityType: 'bank_import',
+        source: 'bulk_api',
+        inserted, duplicates, rejected: rejected.length,
+      });
+    }
+
+    res.json({
+      success: failedChunks.length === 0,
+      inserted,
+      duplicates,
+      rejected,
+      failed_chunks: failedChunks,
+    });
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
 app.post('/api/bank/transactions', authMiddleware, async (req, res) => {
   try {
     const { txn_date, description, amount, type, account_id } = req.body;
@@ -10199,9 +10348,22 @@ app.post('/api/bank/transactions/import', authMiddleware, upload.single('file'),
       csvText = XLSX.utils.sheet_to_csv(ws);
     }
 
+    // Ownership check, same reason as the bulk route: account_id is a foreign
+    // key with no tenant column, and the service-role key bypasses RLS, so an
+    // unchecked value here would attach one tenant's statement rows to another
+    // tenant's bank account.
     const { account_id } = req.body;
+    let importAccountId = null;
+    if (account_id != null && account_id !== '') {
+      const { data: acct } = await supabase
+        .from('bank_accounts').select('id')
+        .eq('id', account_id).eq('user_id', req.user.userId).maybeSingle();
+      if (!acct) return res.status(400).json({ error: 'Unknown bank account' });
+      importAccountId = acct.id;
+    }
+
     const reconciliation = require('./lib/services/reconciliation.service');
-    const result = await reconciliation.importStatement(req.user.userId, csvText, account_id || null);
+    const result = await reconciliation.importStatement(req.user.userId, csvText, importAccountId);
 
     await createActivityLog(req.user.userId, 'bank_statement_imported', {
       entityType: 'bank_import',
