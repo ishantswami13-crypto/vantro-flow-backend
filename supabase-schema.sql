@@ -39,6 +39,62 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS language TEXT DEFAULT 'hinglish';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS contact_time TEXT DEFAULT 'morning';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 
+-- Columns the application reads and writes that this file never created. Found
+-- by extracting every users column referenced in server.js and diffing it
+-- against information_schema on a database built from this file — 26 of them
+-- existed only in the code. GET /api/settings survives because it catches the
+-- missing-column error and retries with a core-column list, but PATCH
+-- /api/settings has no such fallback: it writes business_address, owner_name and
+-- city directly, so saving business or voice settings returned 500 on every
+-- database provisioned from this schema. Onboarding (feature_flags,
+-- business_size, onboarding_done) failed the same way, which is why the feature
+-- flags it computes never took effect.
+--
+-- sells_on_credit and primary_pain are deliberately absent: onboarding accepts
+-- them in the request body but only feeds them to buildFeatureFlags, and never
+-- persists them.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS owner_name          TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS city                TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS business_address    TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS business_size       TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS business_type       TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS gst_registered      BOOLEAN;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS has_workers         BOOLEAN;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_done     BOOLEAN DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_verified      BOOLEAN DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified      BOOLEAN DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS automation_enabled  BOOLEAN DEFAULT FALSE;
+
+-- buildFeatureFlags() returns an object and the row is written with it directly,
+-- so this has to be JSONB — a TEXT column would coerce it to "[object Object]"
+-- and every flag lookup would read undefined.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS feature_flags       JSONB DEFAULT '{}'::jsonb;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS push_subscription   JSONB;
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS voice_style         TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS ai_persona          TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS upi_id              TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS invoice_prefix      TEXT;
+
+-- Per-tenant integration credentials. These are stored in plaintext, which is
+-- how the application already treats them: GET /api/settings masks
+-- interakt_api_key and wati_token on the way out, so the values are only ever
+-- read server-side. Creating the columns does not change that exposure, but it
+-- does mean the service_role key now guards real secrets — worth encrypting at
+-- rest before this table grows.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS wa_provider         TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS wati_api_url        TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS wati_token          TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS interakt_api_key    TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS twilio_account_sid  TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS twilio_auth_token   TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS twilio_phone_number TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS razorpay_key_id     TEXT;
+-- Written by POST /api/settings/razorpay. The comment on GET /api/settings
+-- claiming this is "never stored per-user" is wrong — it is stored. It is not
+-- in that endpoint's column list, so it is never returned to the client.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS razorpay_key_secret TEXT;
+
 -- ─── PASSWORD RESET TOKENS ───────────────────────────────────
 CREATE TABLE IF NOT EXISTS password_reset_tokens (
   id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -327,6 +383,113 @@ CREATE INDEX IF NOT EXISTS idx_bank_transactions_user ON bank_transactions(user_
 CREATE INDEX IF NOT EXISTS idx_bank_transactions_date ON bank_transactions(user_id, txn_date DESC);
 CREATE INDEX IF NOT EXISTS idx_bank_transactions_status ON bank_transactions(user_id, status);
 
+
+-- ─── GST BILLS ───────────────────────────────────────────────
+-- This table was queried by ten call sites across eight endpoints and created
+-- nowhere: not here, not in migrations/, not in runAutoMigrations. On a database
+-- provisioned by scripts/setup-fresh-database.js it simply did not exist, so
+-- GET /api/bills returned an empty list through its missing-schema fallback
+-- while every other bills endpoint returned 500.
+--
+-- The column set is derived from actual usage, and covers two vocabularies the
+-- code uses for the same values: writes go through bill_date/total/cgst+sgst+igst
+-- (POST /api/bills), while reads expect invoice_date/total_amount/tax_amount
+-- (the public bill view and the GSTR-1 export). Those three are generated rather
+-- than stored separately so a bill can never carry two disagreeing totals — the
+-- alternative, plain nullable columns, would leave them NULL forever, which
+-- makes the GST report return nothing and the customer-facing invoice show zero.
+CREATE TABLE IF NOT EXISTS bills (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id          UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  bill_number      TEXT,
+  customer_name    TEXT NOT NULL,
+  customer_gstin   TEXT,
+  customer_address TEXT,
+  customer_phone   TEXT,
+  customer_email   TEXT,
+  items            JSONB,
+  gst_rate         NUMERIC(6,2),
+  subtotal         NUMERIC(14,2) DEFAULT 0,
+  cgst             NUMERIC(14,2) DEFAULT 0,
+  sgst             NUMERIC(14,2) DEFAULT 0,
+  igst             NUMERIC(14,2) DEFAULT 0,
+  total            NUMERIC(14,2) DEFAULT 0,
+  is_interstate    BOOLEAN DEFAULT FALSE,
+  bill_date        DATE,
+  due_date         DATE,
+  status           TEXT DEFAULT 'unpaid' CHECK (status IN ('unpaid','paid','cancelled')),
+  paid_at          TIMESTAMPTZ,
+  notes            TEXT,
+  created_at       TIMESTAMPTZ DEFAULT NOW(),
+
+  invoice_date     DATE          GENERATED ALWAYS AS (bill_date) STORED,
+  tax_amount       NUMERIC(14,2) GENERATED ALWAYS AS
+                     (COALESCE(cgst,0) + COALESCE(sgst,0) + COALESCE(igst,0)) STORED,
+  total_amount     NUMERIC(14,2) GENERATED ALWAYS AS (total) STORED
+);
+
+-- Repair path for any database where bills was created by hand outside version
+-- control: CREATE TABLE IF NOT EXISTS is a silent no-op there, so the columns
+-- have to be added individually. Same pattern as the users block above. Note
+-- this cannot repair a type mismatch — check information_schema.columns first if
+-- the table already exists.
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS customer_gstin   TEXT;
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS customer_address TEXT;
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS customer_phone   TEXT;
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS customer_email   TEXT;
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS items            JSONB;
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS gst_rate         NUMERIC(6,2);
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS subtotal         NUMERIC(14,2) DEFAULT 0;
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS cgst             NUMERIC(14,2) DEFAULT 0;
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS sgst             NUMERIC(14,2) DEFAULT 0;
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS igst             NUMERIC(14,2) DEFAULT 0;
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS total            NUMERIC(14,2) DEFAULT 0;
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS is_interstate    BOOLEAN DEFAULT FALSE;
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS bill_date        DATE;
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS due_date         DATE;
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS status           TEXT DEFAULT 'unpaid';
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS paid_at          TIMESTAMPTZ;
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS notes            TEXT;
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS created_at       TIMESTAMPTZ DEFAULT NOW();
+
+-- The read-side columns, added last because their expressions reference the
+-- columns above. Without these three the repair path finishes reporting success
+-- while GET /api/bills/public/:id and the GSTR-1 export stay broken — verified
+-- against Postgres 16 by dropping bills, recreating it with four columns by
+-- hand, and re-running this file: it exited 0 and printed "Schema migration
+-- complete" with all three still absent. They must be generated here too, not
+-- plain nullable, or every pre-existing bill reports zero tax on a GST filing.
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS invoice_date DATE          GENERATED ALWAYS AS (bill_date) STORED;
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS tax_amount   NUMERIC(14,2) GENERATED ALWAYS AS
+  (COALESCE(cgst,0) + COALESCE(sgst,0) + COALESCE(igst,0)) STORED;
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS total_amount NUMERIC(14,2) GENERATED ALWAYS AS (total) STORED;
+
+-- CREATE TABLE carries the status CHECK; ALTER TABLE ADD COLUMN IF NOT EXISTS
+-- does not, and there is no ADD CONSTRAINT IF NOT EXISTS. Existing rows are
+-- normalised first so the constraint cannot fail on legacy data — an unknown
+-- status becomes 'unpaid', which is what the missing-schema fallback already
+-- assumed. This is the only DO block in the file; everything else is idempotent
+-- on its own.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conrelid = 'bills'::regclass AND conname = 'bills_status_check'
+  ) THEN
+    UPDATE bills SET status = 'unpaid' WHERE status IS NULL OR status NOT IN ('unpaid','paid','cancelled');
+    ALTER TABLE bills ADD CONSTRAINT bills_status_check CHECK (status IN ('unpaid','paid','cancelled'));
+  END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_bills_user_created ON bills(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_bills_user_date    ON bills(user_id, bill_date DESC);
+CREATE INDEX IF NOT EXISTS idx_bills_user_status  ON bills(user_id, status);
+
+-- GST requires unique consecutive invoice numbers per taxpayer. The generator at
+-- POST /api/bills reads the last number and increments, which is a race under
+-- concurrency; this turns a duplicate into an error rather than a bad filing.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bills_user_number
+  ON bills(user_id, bill_number) WHERE bill_number IS NOT NULL;
+
 -- ─── RLS for new tables (disabled for now) ───────────────────
 ALTER TABLE payment_plans  DISABLE ROW LEVEL SECURITY;
 ALTER TABLE disputes       DISABLE ROW LEVEL SECURITY;
@@ -336,6 +499,7 @@ ALTER TABLE team_members   DISABLE ROW LEVEL SECURITY;
 ALTER TABLE transactions   DISABLE ROW LEVEL SECURITY;
 ALTER TABLE bank_accounts  DISABLE ROW LEVEL SECURITY;
 ALTER TABLE bank_transactions DISABLE ROW LEVEL SECURITY;
+ALTER TABLE bills          DISABLE ROW LEVEL SECURITY;
 
 -- Done! ✓
 SELECT 'Schema migration complete' AS status;

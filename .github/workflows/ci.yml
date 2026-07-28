@@ -36,3 +36,9 @@ jobs:
       # tenant filter is the only thing preventing cross-tenant reads.
       - name: Tenant isolation
         run: npm run security:tenant-isolation
+
+      # Blocking. A table that is queried but never provisioned surfaces as a
+      # generic 500 rather than a schema error, so it is invisible in review —
+      # `bills` reached production that way with ten call sites against it.
+      - name: Schema drift
+        run: npm run security:schema-drift

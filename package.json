@@ -18,7 +18,8 @@
     "security:smoke": "node scripts/security-smoke-test.js",
     "cortex:test": "node cortex-lab/run.js",
     "lint": "eslint .",
-    "security:audit-gate": "node scripts/check-dependency-audit.js"
+    "security:audit-gate": "node scripts/check-dependency-audit.js",
+    "security:schema-drift": "node scripts/check-schema-drift.js"
   },
   "engines": {
     "node": ">=18.0.0"

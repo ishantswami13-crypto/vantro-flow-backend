@@ -33,6 +33,17 @@ Nothing below belongs in git. Set them in the hosting dashboards.
 `JWT_SECRET` signs every session token. Changing it logs everyone out.
 The backend refuses to start without it.
 
+`DATABASE_URL` is easy to skip because the backend starts and serves requests
+without it — but it is not optional. Eight tables (`purchases`, `sales`,
+`suppliers`, `khata_entries`, `purchase_orders`, `notifications`, `inventory`,
+`prospect_notes`) are created by a migration that runs at boot over a direct
+Postgres connection, and that connection is only opened when `DATABASE_URL` is
+set. Without it the migration logs `[migrate] No DATABASE_URL — skipping
+auto-migration` and those tables never exist, so roughly sixty query sites fail
+with a generic 500.
+`npm run verify:connection` checks for this, and `npm run security:schema-drift`
+lists exactly which tables depend on it.
+
 ### Vercel (frontend)
 
 | Variable | Value |

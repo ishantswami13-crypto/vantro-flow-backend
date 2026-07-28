@@ -55,13 +55,26 @@ async function main() {
   console.log(`\n🔍 Verifying connection\n   backend: ${API}\n   origin:  ${ORIGIN}\n`);
 
   // ── 1. Environment ────────────────────────────────────────────────────────
-  const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET'];
+  // DATABASE_URL belongs here even though the app serves requests without it.
+  // Eight tables — purchases, sales, suppliers, khata_entries, purchase_orders,
+  // notifications, inventory, prospect_notes — are created only by DDL inside
+  // server.js, and that DDL runs through a pg Pool that is never constructed
+  // when DATABASE_URL is unset. Between them they back 60 query sites. Leaving
+  // it out of this list meant a deployment with only the SUPABASE_* variables
+  // reported a clean verification while a third of the product's tables did not
+  // exist. npm run security:schema-drift lists the affected tables.
+  const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET', 'DATABASE_URL'];
   const missing = required.filter(k => isPlaceholder(process.env[k]));
   record(
     'Environment variables set',
     missing.length === 0,
     missing.length ? `missing or placeholder: ${missing.join(', ')}` : required.join(', ')
   );
+  if (missing.includes('DATABASE_URL')) {
+    console.log('   ⚠️  Without DATABASE_URL the boot migration is skipped and purchases, sales,');
+    console.log('       suppliers, khata_entries, purchase_orders, notifications, inventory and');
+    console.log('       prospect_notes are never created — those endpoints will return 500.');
+  }
 
   if (process.env.JWT_SECRET && process.env.JWT_SECRET.length < 32) {
     console.log('   ⚠️  JWT_SECRET is shorter than 32 chars — generate one with: openssl rand -hex 32');
@@ -74,6 +87,7 @@ async function main() {
   if (isPlaceholder(supabaseUrl) || isPlaceholder(serviceKey)) {
     skip('Supabase reachable', 'SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not configured');
     skip('users table queryable', 'Supabase not configured');
+    skip('boot-migration tables present', 'Supabase not configured');
   } else {
     try {
       const res = await fetch(`${supabaseUrl.replace(/\/$/, '')}/rest/v1/users?select=id&limit=1`, {
@@ -90,9 +104,30 @@ async function main() {
         record('users table queryable', false,
           missingTable ? 'table missing — run: node scripts/setup-fresh-database.js' : `HTTP ${res.status} ${body.slice(0, 120)}`);
       }
+      // Setting DATABASE_URL is necessary but not sufficient — the boot
+      // migration can still have failed, or never run because the process was
+      // deployed before it was added. Probing one of the tables it owns is the
+      // only way to tell the difference from outside. `purchases` is the
+      // heaviest of them at 21 query sites, so it is the most useful canary.
+      try {
+        const bootRes = await fetch(`${supabaseUrl.replace(/\/$/, '')}/rest/v1/purchases?select=id&limit=1`, {
+          headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` },
+        });
+        if (bootRes.ok) {
+          record('boot-migration tables present', true, 'purchases queryable');
+        } else {
+          const body = await bootRes.text().catch(() => '');
+          record('boot-migration tables present', false,
+            'purchases missing — set DATABASE_URL and restart the backend so runAutoMigrations() runs ' +
+            `(HTTP ${bootRes.status} ${body.slice(0, 80)})`);
+        }
+      } catch (e) {
+        skip('boot-migration tables present', e.message);
+      }
     } catch (e) {
       record('Supabase reachable', false, e.message);
       skip('users table queryable', 'Supabase unreachable');
+      skip('boot-migration tables present', 'Supabase unreachable');
     }
   }
 

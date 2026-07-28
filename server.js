@@ -6379,7 +6379,14 @@ app.get('/api/settings', authMiddleware, async (req, res) => {
     const settings = { ...data };
     if (settings.interakt_api_key) settings.interakt_api_key = '••••••••';
     if (settings.wati_token)       settings.wati_token       = '••••••••';
-    // razorpay_key_id is safe to return (public key), razorpay_key_secret never stored per-user
+    // whatsapp_token is a WhatsApp Cloud API access token and was being returned
+    // in full alongside the two masked above — same kind of credential, same
+    // endpoint, no masking. The settings page only renders whether a token is
+    // set, so it never needed the value.
+    if (settings.whatsapp_token)   settings.whatsapp_token   = '••••••••';
+    // razorpay_key_id is safe to return (it is the public key). The secret is
+    // stored on this row but deliberately absent from fullColumns above, so it
+    // is never read back out here.
     res.json({ success: true, settings });
   } catch (error) {
     console.error('[settings get]', error);
@@ -9307,7 +9314,15 @@ app.get('/api/bills/public/:id', async (req, res) => {
 
     const { data, error } = await supabase
       .from('bills')
-      .select('id, user_id, bill_number, customer_name, customer_phone, customer_email, customer_gstin, invoice_date, due_date, items, subtotal, tax_amount, total_amount, status, notes, paid_at, created_at, users(business_name, gstin, city, business_address, owner_name)')
+      // The embed selected users(city, business_address, owner_name). None of
+      // those three columns exist — the users table has `address`, and no city
+      // or owner_name at all (verified against information_schema, not by
+      // reading the CREATE TABLE). PostgREST fails the whole request on an
+      // unknown embedded column, and the handler below maps any error to 404,
+      // so every public invoice link returned "Invoice not found" regardless of
+      // whether the bill existed. logo_url is added because the invoice view
+      // renders the seller's letterhead.
+      .select('id, user_id, bill_number, customer_name, customer_phone, customer_email, customer_gstin, invoice_date, due_date, items, subtotal, tax_amount, total_amount, status, notes, paid_at, created_at, users(business_name, gstin, address, phone, email, logo_url)')
       .eq('id', req.params.id)
       .single();
     if (error || !data) return res.status(404).json({ error: 'Invoice not found' });
@@ -9408,10 +9423,14 @@ app.post('/api/bills', authMiddleware, async (req, res) => {
 
 app.patch('/api/bills/:id', authMiddleware, async (req, res) => {
   try {
+    // invoice_date, tax_amount and total_amount are generated columns — they
+    // mirror bill_date, the GST components and total, so writing to them raises
+    // 428C9. They were in this allowlist while the table did not exist, so it
+    // never surfaced. Nothing sends them: the bills page patches status only.
     const updates = pickAllowed(req.body, [
       'customer_name', 'customer_phone', 'customer_email', 'customer_gstin',
-      'invoice_date', 'due_date', 'items', 'subtotal', 'tax_amount',
-      'total_amount', 'status', 'notes', 'paid_at'
+      'bill_date', 'due_date', 'items', 'subtotal',
+      'status', 'notes', 'paid_at'
     ]);
     const { data, error } = await supabase.from('bills').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
@@ -9460,9 +9479,24 @@ app.get('/api/bills/gstr1', authMiddleware, async (req, res) => {
     const { month, year } = req.query;
     const m = String(month || new Date().getMonth() + 1).padStart(2, '0');
     const y = year || new Date().getFullYear();
-    const from = `${y}-${m}-01`;
-    const to = `${y}-${m}-31`;
-    const { data: bills } = await supabase.from('bills').select('*').eq('user_id', req.user.userId).gte('bill_date', from).lte('bill_date', to).eq('status', 'unpaid').neq('status', 'cancelled');
+    // Half-open range on the first of the next month. The previous bound was
+    // `${y}-${m}-31`, which is not a real date in February, April, June,
+    // September or November — Postgres rejects it with 22008 against a DATE
+    // column. The error was also unbound, so it was discarded and the endpoint
+    // returned 200 with an empty filing for five months of every year.
+    const monthStart = new Date(Date.UTC(Number(y), Number(m) - 1, 1));
+    const nextMonth = new Date(Date.UTC(Number(y), Number(m), 1));
+    const from = monthStart.toISOString().split('T')[0];
+    const to = nextMonth.toISOString().split('T')[0];
+
+    // Cancelled bills are excluded; paid ones are not. GST is owed on the
+    // invoice being issued, not on it being collected, so filtering to unpaid
+    // left every settled sale out of the return.
+    const { data: bills, error: billsErr } = await supabase.from('bills').select('*')
+      .eq('user_id', req.user.userId)
+      .gte('bill_date', from).lt('bill_date', to)
+      .neq('status', 'cancelled');
+    if (billsErr) throw billsErr;
     const b2b = (bills || []).filter(b => b.customer_gstin).map(b => ({
       'GSTIN of Recipient': b.customer_gstin, 'Receiver Name': b.customer_name,
       'Invoice Number': b.bill_number, 'Invoice Date': b.bill_date,
