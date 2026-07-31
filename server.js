@@ -6358,6 +6358,27 @@ app.get('/api/billing/history', authMiddleware, async (req, res) => {
 // SETTINGS
 // ============================================
 
+// Per-tenant integration credentials are returned as this sentinel rather than
+// in full, so the settings page can show that a token is set without the value
+// crossing the wire. whatsapp_token was the odd one out — masked nowhere, while
+// the two beside it were masked — despite being the same kind of credential.
+const MASKED_SECRET = '••••••••';
+const MASKED_SETTING_KEYS = ['interakt_api_key', 'wati_token', 'whatsapp_token'];
+
+// Masking a field that PATCH also accepts creates a way to destroy it: a client
+// that reads settings, edits one field and sends the object back writes the
+// sentinel itself into the column, and because GET masks the result there is no
+// way to notice afterwards. No caller does that today — the settings page sends
+// explicit literals — but whatsapp_token is in the PATCH allowlist (unlike the
+// other two, which only a dedicated endpoint writes), so the path exists. Drop
+// any masked value instead of storing it; a real token is never this string.
+function dropMaskedSecrets(updates) {
+  for (const key of MASKED_SETTING_KEYS) {
+    if (updates[key] === MASKED_SECRET) delete updates[key];
+  }
+  return updates;
+}
+
 app.get('/api/settings', authMiddleware, async (req, res) => {
   try {
     const fullColumns = 'id, email, phone, business_name, gstin, plan, whatsapp_phone, whatsapp_token, logo_url, address, business_address, created_at, owner_name, city, voice_style, ai_persona, upi_id, invoice_prefix, industry, interakt_api_key, wati_api_url, wati_token, wa_provider, razorpay_key_id, automation_enabled';
@@ -6377,13 +6398,9 @@ app.get('/api/settings', authMiddleware, async (req, res) => {
     if (!data) return res.status(404).json({ error: 'User not found' });
     // Mask secrets — only return whether they are set, not the actual values
     const settings = { ...data };
-    if (settings.interakt_api_key) settings.interakt_api_key = '••••••••';
-    if (settings.wati_token)       settings.wati_token       = '••••••••';
-    // whatsapp_token is a WhatsApp Cloud API access token and was being returned
-    // in full alongside the two masked above — same kind of credential, same
-    // endpoint, no masking. The settings page only renders whether a token is
-    // set, so it never needed the value.
-    if (settings.whatsapp_token)   settings.whatsapp_token   = '••••••••';
+    for (const key of MASKED_SETTING_KEYS) {
+      if (settings[key]) settings[key] = MASKED_SECRET;
+    }
     // razorpay_key_id is safe to return (it is the public key). The secret is
     // stored on this row but deliberately absent from fullColumns above, so it
     // is never read back out here.
@@ -6399,6 +6416,7 @@ app.patch('/api/settings', authMiddleware, async (req, res) => {
     const allowed = ['business_name', 'phone', 'gstin', 'address', 'business_address', 'logo_url', 'whatsapp_phone', 'whatsapp_token', 'industry', 'language', 'contact_time', 'owner_name', 'city', 'voice_style', 'ai_persona', 'upi_id', 'invoice_prefix', 'wa_provider', 'wati_api_url', 'razorpay_key_id', 'automation_enabled'];
     const updates = {};
     allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
+    dropMaskedSecrets(updates);
     updates.updated_at = new Date();
     const { data, error } = await supabase.from('users').update(updates).eq('id', req.user.userId).select('id, email, phone, business_name, gstin, plan');
     if (error) throw error;
@@ -9314,15 +9332,23 @@ app.get('/api/bills/public/:id', async (req, res) => {
 
     const { data, error } = await supabase
       .from('bills')
-      // The embed selected users(city, business_address, owner_name). None of
-      // those three columns exist — the users table has `address`, and no city
-      // or owner_name at all (verified against information_schema, not by
-      // reading the CREATE TABLE). PostgREST fails the whole request on an
-      // unknown embedded column, and the handler below maps any error to 404,
-      // so every public invoice link returned "Invoice not found" regardless of
-      // whether the bill existed. logo_url is added because the invoice view
-      // renders the seller's letterhead.
-      .select('id, user_id, bill_number, customer_name, customer_phone, customer_email, customer_gstin, invoice_date, due_date, items, subtotal, tax_amount, total_amount, status, notes, paid_at, created_at, users(business_name, gstin, address, phone, email, logo_url)')
+      // This embed previously selected users(city, business_address, owner_name)
+      // when none of those columns existed. PostgREST fails the whole request on
+      // an unknown embedded column and the handler below maps any error to 404,
+      // so every public invoice link returned "Invoice not found". The migration
+      // in this change creates all three, so they are selected again — they are
+      // the seller's letterhead, and the equivalent view for `invoices` renders
+      // exactly these fields.
+      //
+      // users.email and users.phone are deliberately NOT here. This route has no
+      // authMiddleware and unsigned links still work unless
+      // REQUIRE_SIGNED_PUBLIC_BILLS is set, so everything selected is readable by
+      // anyone holding a bill id. users.email is the account login identifier —
+      // UNIQUE NOT NULL, and what the password lookup keys on — so including it
+      // would hand out a credential-stuffing target with a link meant to be
+      // pasted into WhatsApp. The business contact number is whatsapp_phone, not
+      // the personal users.phone, and no consumer asks for either.
+      .select('id, user_id, bill_number, customer_name, customer_phone, customer_email, customer_gstin, invoice_date, due_date, items, subtotal, tax_amount, total_amount, status, notes, paid_at, created_at, users(business_name, gstin, address, business_address, city, owner_name, logo_url)')
       .eq('id', req.params.id)
       .single();
     if (error || !data) return res.status(404).json({ error: 'Invoice not found' });
@@ -9479,23 +9505,38 @@ app.get('/api/bills/gstr1', authMiddleware, async (req, res) => {
     const { month, year } = req.query;
     const m = String(month || new Date().getMonth() + 1).padStart(2, '0');
     const y = year || new Date().getFullYear();
+    // Validate before doing date arithmetic: ?month=abc makes Date.UTC return
+    // NaN and toISOString() throw a RangeError, which the catch below turns into
+    // a 500 for what is plainly a bad request.
+    const mNum = Number(m);
+    const yNum = Number(y);
+    if (!Number.isInteger(mNum) || mNum < 1 || mNum > 12) {
+      return res.status(400).json({ error: 'month must be an integer between 1 and 12' });
+    }
+    if (!Number.isInteger(yNum) || yNum < 2000 || yNum > 2100) {
+      return res.status(400).json({ error: 'year must be an integer between 2000 and 2100' });
+    }
     // Half-open range on the first of the next month. The previous bound was
     // `${y}-${m}-31`, which is not a real date in February, April, June,
     // September or November — Postgres rejects it with 22008 against a DATE
     // column. The error was also unbound, so it was discarded and the endpoint
     // returned 200 with an empty filing for five months of every year.
-    const monthStart = new Date(Date.UTC(Number(y), Number(m) - 1, 1));
-    const nextMonth = new Date(Date.UTC(Number(y), Number(m), 1));
+    const monthStart = new Date(Date.UTC(yNum, mNum - 1, 1));
+    const nextMonth = new Date(Date.UTC(yNum, mNum, 1));
     const from = monthStart.toISOString().split('T')[0];
     const to = nextMonth.toISOString().split('T')[0];
 
     // Cancelled bills are excluded; paid ones are not. GST is owed on the
     // invoice being issued, not on it being collected, so filtering to unpaid
     // left every settled sale out of the return.
+    // The NULL branch matters: SQL `status <> 'cancelled'` evaluates to NULL for
+    // a NULL status, so a plain .neq() drops those rows from the return instead
+    // of including them. A bill omitted from a GST filing is the more expensive
+    // error of the two, so anything that is not explicitly cancelled is filed.
     const { data: bills, error: billsErr } = await supabase.from('bills').select('*')
       .eq('user_id', req.user.userId)
       .gte('bill_date', from).lt('bill_date', to)
-      .neq('status', 'cancelled');
+      .or('status.is.null,status.neq.cancelled');
     if (billsErr) throw billsErr;
     const b2b = (bills || []).filter(b => b.customer_gstin).map(b => ({
       'GSTIN of Recipient': b.customer_gstin, 'Receiver Name': b.customer_name,

@@ -71,7 +71,11 @@ CREATE TABLE IF NOT EXISTS ai_actions (
   related_entity_type   TEXT,
   related_entity_id     TEXT,
   customer_id           UUID REFERENCES customers(id) ON DELETE SET NULL,
-  supplier_id           UUID REFERENCES suppliers(id) ON DELETE SET NULL,
+  -- BIGINT, not UUID: suppliers.id is BIGSERIAL in both places it is defined.
+  -- As UUID this foreign key could not be implemented even once suppliers
+  -- existed, so the whole CREATE TABLE aborted and every statement after it
+  -- failed with `relation "ai_actions" does not exist`.
+  supplier_id           BIGINT REFERENCES suppliers(id) ON DELETE SET NULL,
   status                TEXT NOT NULL DEFAULT 'pending'
                           CHECK (status IN ('pending','approved','rejected','done','expired','system_blocked')),
   suggested_by          TEXT NOT NULL DEFAULT 'rule'

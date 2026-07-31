@@ -64,6 +64,10 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_done     BOOLEAN DEFAULT F
 ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_verified      BOOLEAN DEFAULT FALSE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified      BOOLEAN DEFAULT FALSE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS automation_enabled  BOOLEAN DEFAULT FALSE;
+-- Written by POST /api/billing/verify immediately after the Razorpay signature
+-- checks out. Without it that update throws and the handler returns 500, so the
+-- customer has paid, the signature verified, and the plan is never applied.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_updated_at     TIMESTAMPTZ;
 
 -- buildFeatureFlags() returns an object and the row is written with it directly,
 -- so this has to be JSONB — a TEXT column would coerce it to "[object Object]"
@@ -395,9 +399,20 @@ CREATE INDEX IF NOT EXISTS idx_bank_transactions_status ON bank_transactions(use
 -- code uses for the same values: writes go through bill_date/total/cgst+sgst+igst
 -- (POST /api/bills), while reads expect invoice_date/total_amount/tax_amount
 -- (the public bill view and the GSTR-1 export). Those three are generated rather
--- than stored separately so a bill can never carry two disagreeing totals — the
+-- than stored separately so the two vocabularies cannot drift apart — the
 -- alternative, plain nullable columns, would leave them NULL forever, which
 -- makes the GST report return nothing and the customer-facing invoice show zero.
+--
+-- To be precise about what that does and does not guarantee: total_amount always
+-- equals total, and tax_amount always equals the sum of the three GST
+-- components, because each is derived. It does NOT guarantee
+-- subtotal + tax_amount = total_amount. Nothing enforces that, and it is already
+-- violated on the happy path — POST /api/bills rounds cgst and sgst
+-- independently but computes total from the unrounded tax, so a ₹100.06 line at
+-- 18% lands a paisa out. A CHECK on that identity would fail against real rows
+-- today; it is worth adding once the rounding in the handler is fixed, along
+-- with CHECK (NOT is_interstate OR (cgst = 0 AND sgst = 0)), which nothing
+-- currently enforces either.
 CREATE TABLE IF NOT EXISTS bills (
   id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id          UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -430,9 +445,18 @@ CREATE TABLE IF NOT EXISTS bills (
 
 -- Repair path for any database where bills was created by hand outside version
 -- control: CREATE TABLE IF NOT EXISTS is a silent no-op there, so the columns
--- have to be added individually. Same pattern as the users block above. Note
--- this cannot repair a type mismatch — check information_schema.columns first if
--- the table already exists.
+-- have to be added individually. Same pattern as the users block above.
+--
+-- Everything below this point is written to be non-destructive and to refuse
+-- loudly rather than guess. An earlier version of this block normalised
+-- non-conforming status values to 'unpaid' before adding the CHECK constraint.
+-- On a table holding 'Paid', 'canceled', 'void' or 'overdue' that rewrote every
+-- one of them: settled invoices came back as unpaid, and cancelled invoices
+-- stopped matching the .neq('status','cancelled') filter in the GSTR-1 export,
+-- so they were filed as live outward supplies. A schema file must not rewrite
+-- financial records — it now reports what it found and leaves the data alone.
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS bill_number      TEXT;
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS customer_name    TEXT;
 ALTER TABLE bills ADD COLUMN IF NOT EXISTS customer_gstin   TEXT;
 ALTER TABLE bills ADD COLUMN IF NOT EXISTS customer_address TEXT;
 ALTER TABLE bills ADD COLUMN IF NOT EXISTS customer_phone   TEXT;
@@ -452,31 +476,95 @@ ALTER TABLE bills ADD COLUMN IF NOT EXISTS paid_at          TIMESTAMPTZ;
 ALTER TABLE bills ADD COLUMN IF NOT EXISTS notes            TEXT;
 ALTER TABLE bills ADD COLUMN IF NOT EXISTS created_at       TIMESTAMPTZ DEFAULT NOW();
 
--- The read-side columns, added last because their expressions reference the
--- columns above. Without these three the repair path finishes reporting success
--- while GET /api/bills/public/:id and the GSTR-1 export stay broken — verified
--- against Postgres 16 by dropping bills, recreating it with four columns by
--- hand, and re-running this file: it exited 0 and printed "Schema migration
--- complete" with all three still absent. They must be generated here too, not
--- plain nullable, or every pre-existing bill reports zero tax on a GST filing.
-ALTER TABLE bills ADD COLUMN IF NOT EXISTS invoice_date DATE          GENERATED ALWAYS AS (bill_date) STORED;
-ALTER TABLE bills ADD COLUMN IF NOT EXISTS tax_amount   NUMERIC(14,2) GENERATED ALWAYS AS
-  (COALESCE(cgst,0) + COALESCE(sgst,0) + COALESCE(igst,0)) STORED;
-ALTER TABLE bills ADD COLUMN IF NOT EXISTS total_amount NUMERIC(14,2) GENERATED ALWAYS AS (total) STORED;
-
--- CREATE TABLE carries the status CHECK; ALTER TABLE ADD COLUMN IF NOT EXISTS
--- does not, and there is no ADD CONSTRAINT IF NOT EXISTS. Existing rows are
--- normalised first so the constraint cannot fail on legacy data — an unknown
--- status becomes 'unpaid', which is what the missing-schema fallback already
--- assumed. This is the only DO block in the file; everything else is idempotent
--- on its own.
+-- The read side (invoice_date / tax_amount / total_amount) and the two
+-- constraints, all guarded. Each guard exists because the unguarded version was
+-- tested against a hand-made bills table and failed silently: the file has no
+-- ON_ERROR_STOP and no surrounding transaction, so a mid-file error still ends
+-- with exit 0 and "Schema migration complete".
+--
+-- Adding a STORED generated column rewrites the whole table under ACCESS
+-- EXCLUSIVE, which blocks reads as well as writes. Measured at roughly 1s per
+-- column per 300k rows, three columns, ~2x peak disk. On Supabase the SQL Editor
+-- also applies a statement_timeout, so on a large existing bills table run this
+-- in a maintenance window and raise the timeout first:
+--   SET statement_timeout = '10min';
+-- On a fresh database all of this is free — the columns come from CREATE TABLE.
 DO $$
+DECLARE
+  src_type    TEXT;
+  plain_cols  TEXT[] := '{}';
+  bad_status  BIGINT;
+  bad_values  TEXT;
+  dup_numbers BIGINT;
 BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint WHERE conrelid = 'bills'::regclass AND conname = 'bills_status_check'
-  ) THEN
-    UPDATE bills SET status = 'unpaid' WHERE status IS NULL OR status NOT IN ('unpaid','paid','cancelled');
-    ALTER TABLE bills ADD CONSTRAINT bills_status_check CHECK (status IN ('unpaid','paid','cancelled'));
+  -- ── generated columns ────────────────────────────────────────────────────
+  -- ADD COLUMN IF NOT EXISTS no-ops when the column already exists as a plain
+  -- one, which is the likely shape of a hand-made table: it would keep the read
+  -- vocabulary and never populate it again, so every new bill would show a blank
+  -- date and zero total forever. That case is reported, not silently accepted.
+  SELECT array_agg(column_name ORDER BY column_name) INTO plain_cols
+  FROM information_schema.columns
+  WHERE table_name = 'bills' AND is_generated = 'NEVER'
+    AND column_name IN ('invoice_date','tax_amount','total_amount');
+
+  IF plain_cols <> '{}' THEN
+    RAISE WARNING 'bills: % already exist as plain columns, so they were left alone. '
+                  'Nothing writes them, so they will stay stale. Migrate the data into '
+                  'bill_date/total/cgst+sgst+igst, drop them, and re-run this file.',
+                  array_to_string(plain_cols, ', ');
+  ELSE
+    -- The expressions are typed, so a source column of the wrong type aborts the
+    -- whole block. bill_date as TEXT is the realistic case and was fatal before.
+    SELECT data_type INTO src_type FROM information_schema.columns
+    WHERE table_name = 'bills' AND column_name = 'bill_date';
+    IF src_type IS DISTINCT FROM 'date' THEN
+      RAISE WARNING 'bills.bill_date is %, expected date — skipping generated columns. '
+                    'Fix the column type first; ALTER ... ADD COLUMN cannot repair it.', src_type;
+    ELSE
+      ALTER TABLE bills ADD COLUMN IF NOT EXISTS invoice_date DATE          GENERATED ALWAYS AS (bill_date) STORED;
+      ALTER TABLE bills ADD COLUMN IF NOT EXISTS tax_amount   NUMERIC(14,2) GENERATED ALWAYS AS
+        (COALESCE(cgst,0) + COALESCE(sgst,0) + COALESCE(igst,0)) STORED;
+      ALTER TABLE bills ADD COLUMN IF NOT EXISTS total_amount NUMERIC(14,2) GENERATED ALWAYS AS (total) STORED;
+    END IF;
+  END IF;
+
+  -- ── status CHECK ─────────────────────────────────────────────────────────
+  -- CREATE TABLE carries this constraint; ADD COLUMN IF NOT EXISTS does not, and
+  -- there is no ADD CONSTRAINT IF NOT EXISTS. It is only added when every
+  -- existing row already satisfies it. Non-conforming rows are reported and left
+  -- untouched — they are the operator's call, not this file's.
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                 WHERE conrelid = 'bills'::regclass AND conname = 'bills_status_check') THEN
+    SELECT count(*), string_agg(DISTINCT COALESCE(status, '<NULL>'), ', ')
+      INTO bad_status, bad_values
+    FROM bills WHERE status IS NULL OR status NOT IN ('unpaid','paid','cancelled');
+
+    IF bad_status = 0 THEN
+      ALTER TABLE bills ADD CONSTRAINT bills_status_check CHECK (status IN ('unpaid','paid','cancelled'));
+    ELSE
+      RAISE WARNING 'bills: % row(s) hold a status outside (unpaid, paid, cancelled) — [%]. '
+                    'Constraint NOT added and no data was changed. Note the GSTR-1 export '
+                    'excludes only the exact string ''cancelled'', so variants like ''canceled'' '
+                    'or ''void'' are being filed as live supplies today.', bad_status, bad_values;
+    END IF;
+  END IF;
+
+  -- ── unique bill_number per user ──────────────────────────────────────────
+  -- GST requires unique invoice numbers per taxpayer, and the generator at
+  -- POST /api/bills reads-then-increments, which races. Creating the index fails
+  -- on exactly the databases that already have duplicates, so check first.
+  IF to_regclass('idx_bills_user_number') IS NULL THEN
+    SELECT count(*) INTO dup_numbers FROM (
+      SELECT 1 FROM bills WHERE bill_number IS NOT NULL
+      GROUP BY user_id, bill_number HAVING count(*) > 1
+    ) d;
+
+    IF dup_numbers = 0 THEN
+      CREATE UNIQUE INDEX idx_bills_user_number ON bills(user_id, bill_number) WHERE bill_number IS NOT NULL;
+    ELSE
+      RAISE WARNING 'bills: % duplicate (user_id, bill_number) group(s) — unique index NOT created. '
+                    'Duplicate invoice numbers are a GST filing defect; resolve them, then re-run.', dup_numbers;
+    END IF;
   END IF;
 END $$;
 
@@ -484,11 +572,28 @@ CREATE INDEX IF NOT EXISTS idx_bills_user_created ON bills(user_id, created_at D
 CREATE INDEX IF NOT EXISTS idx_bills_user_date    ON bills(user_id, bill_date DESC);
 CREATE INDEX IF NOT EXISTS idx_bills_user_status  ON bills(user_id, status);
 
--- GST requires unique consecutive invoice numbers per taxpayer. The generator at
--- POST /api/bills reads the last number and increments, which is a race under
--- concurrency; this turns a duplicate into an error rather than a bad filing.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_bills_user_number
-  ON bills(user_id, bill_number) WHERE bill_number IS NOT NULL;
+-- ─── SUPPLIERS ───────────────────────────────────────────────
+-- Defined here as well as in the boot migration in server.js, and the two
+-- definitions must stay identical (id is BIGSERIAL, not UUID). It has to exist
+-- by the time migrations/001_cortex_foundation.sql runs, because ai_actions
+-- carries a foreign key to it. Until this was added, that migration failed with
+-- `relation "suppliers" does not exist` and ai_actions — the table behind the AI
+-- Action Center, with 43 query sites — was never created on any database. The
+-- boot migration's CREATE TABLE IF NOT EXISTS then no-ops over this one, so
+-- nothing changes for a deployment that already has it.
+CREATE TABLE IF NOT EXISTS suppliers (
+  id            BIGSERIAL PRIMARY KEY,
+  user_id       UUID NOT NULL,
+  name          TEXT NOT NULL,
+  phone         TEXT,
+  email         TEXT,
+  address       TEXT,
+  payment_terms INTEGER DEFAULT 30,
+  gstin         TEXT,
+  created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_suppliers_user ON suppliers(user_id);
+CREATE INDEX IF NOT EXISTS idx_suppliers_name ON suppliers(user_id, name);
 
 -- ─── RLS for new tables (disabled for now) ───────────────────
 ALTER TABLE payment_plans  DISABLE ROW LEVEL SECURITY;
