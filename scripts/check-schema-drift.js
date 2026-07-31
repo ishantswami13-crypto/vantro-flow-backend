@@ -57,18 +57,12 @@ try {
 }
 
 // Tables known to be missing and tracked separately. Each records what it breaks
-// so the cost of leaving it stays visible on every run.
-const KNOWN_MISSING = [
-  { table: 'orders',              breaks: 'order endpoints 500' },
-  { table: 'workers',             breaks: 'staff endpoints 500' },
-  { table: 'expenses',            breaks: 'expense tracking 500' },
-  { table: 'business_vocabulary', breaks: 'onboarding upsert throws after the users update has committed' },
-  { table: 'brain_rules',         breaks: 'rules engine reads return empty' },
-  { table: 'attendance',          breaks: 'attendance endpoints 500' },
-  { table: 'billing_history',     breaks: 'POST /api/billing/verify 500s after a verified payment — may be billing_records renamed on one side' },
-  { table: 'dunning_logs',        breaks: 'dunning log write discarded' },
-  { table: 'error_events',        breaks: 'defined only in supabase-error-events-rollout.sql, which setup:database does not run — error tracking writes are discarded until it is applied by hand' },
-];
+// so the cost of leaving it stays visible on every run. As of the schema change
+// that added orders/workers/expenses/business_vocabulary/brain_rules/attendance/
+// dunning_logs and renamed billing_records to billing_history, this list is
+// empty — kept as an array (not deleted) because the next genuinely-missing
+// table belongs here, not silently in the passing case.
+const KNOWN_MISSING = [];
 
 // ── SQL comment stripping that understands quoting ──────────────────────────
 // A naive /\/\*[\s\S]*?\*\//g deletes everything between a `/*` that happens to

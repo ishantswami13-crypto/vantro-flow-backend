@@ -41,6 +41,13 @@ const SQL_FILES = [
   'migrations/004_schema_repair.sql',
   'migrations/005_cortex_x_extensions.sql',
   'supabase-phase2c32-schema.sql',
+  // Was written, reviewed, and never wired in here — error_events existed only
+  // on paper. GET/PATCH /api/admin/error-events and the error-tracking helpers
+  // in lib/observability and lib/cortex all queried a table nothing created.
+  // It is self-contained (creates its own extension, indexes, and RLS policies)
+  // and already denies anon/authenticated access, matching how every write here
+  // goes through the service_role client, which bypasses RLS regardless.
+  'supabase-error-events-rollout.sql',
 ];
 
 async function main() {

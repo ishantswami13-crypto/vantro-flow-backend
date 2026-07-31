@@ -224,8 +224,22 @@ CREATE TABLE IF NOT EXISTS dunning_rules (
   created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
--- ─── BILLING RECORDS ─────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS billing_records (
+-- ─── BILLING HISTORY ──────────────────────────────────────────
+-- Named billing_records here but billing_history everywhere it is actually
+-- queried — POST /api/billing/verify, GET /api/billing/history, and the admin
+-- MRR aggregate, three call sites total. Nothing in this repo ever queries
+-- billing_records, so this was a naming mismatch, not two tables: renamed
+-- rather than adding a duplicate. The DO block only fires on a database that
+-- already ran an earlier version of this file and has billing_records sitting
+-- under the old name — safe, because nothing ever wrote to it either.
+DO $$
+BEGIN
+  IF to_regclass('billing_records') IS NOT NULL AND to_regclass('billing_history') IS NULL THEN
+    ALTER TABLE billing_records RENAME TO billing_history;
+  END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS billing_history (
   id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id     UUID REFERENCES users(id) ON DELETE CASCADE,
   plan        TEXT NOT NULL,
@@ -238,11 +252,11 @@ CREATE TABLE IF NOT EXISTS billing_records (
   created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Add missing columns to existing billing_records table
-ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS period TEXT;
-ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS amount NUMERIC;
-ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'INR';
-ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS order_id TEXT;
+-- Add missing columns to existing billing_history table
+ALTER TABLE billing_history ADD COLUMN IF NOT EXISTS period TEXT;
+ALTER TABLE billing_history ADD COLUMN IF NOT EXISTS amount NUMERIC;
+ALTER TABLE billing_history ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'INR';
+ALTER TABLE billing_history ADD COLUMN IF NOT EXISTS order_id TEXT;
 
 -- ─── INDEXES for performance ─────────────────────────────────
 CREATE INDEX IF NOT EXISTS idx_invoices_user_id ON invoices(user_id);
@@ -259,7 +273,7 @@ ALTER TABLE products       DISABLE ROW LEVEL SECURITY;
 ALTER TABLE stock_movements DISABLE ROW LEVEL SECURITY;
 ALTER TABLE prospects      DISABLE ROW LEVEL SECURITY;
 ALTER TABLE dunning_rules  DISABLE ROW LEVEL SECURITY;
-ALTER TABLE billing_records DISABLE ROW LEVEL SECURITY;
+ALTER TABLE billing_history DISABLE ROW LEVEL SECURITY;
 
 -- ─── PAYMENT PLANS (EMI / Installments) ─────────────────────
 CREATE TABLE IF NOT EXISTS payment_plans (
@@ -595,7 +609,143 @@ CREATE TABLE IF NOT EXISTS suppliers (
 CREATE INDEX IF NOT EXISTS idx_suppliers_user ON suppliers(user_id);
 CREATE INDEX IF NOT EXISTS idx_suppliers_name ON suppliers(user_id, name);
 
+-- ─── WORKERS ─────────────────────────────────────────────────
+-- 9 call sites (GET/POST/PATCH/DELETE /api/workers, salary PATCH, attendance,
+-- the AI Brain context loader) queried a table this file never created.
+-- Referenced by orders.worker_id and attendance.worker_id below, so it has to
+-- come first.
+CREATE TABLE IF NOT EXISTS workers (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name            TEXT NOT NULL,
+  phone           TEXT,
+  role            TEXT DEFAULT 'delivery',
+  is_active       BOOLEAN DEFAULT TRUE,
+  monthly_salary  NUMERIC(14,2),
+  advance_balance NUMERIC(14,2) DEFAULT 0,
+  created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_workers_user   ON workers(user_id);
+CREATE INDEX IF NOT EXISTS idx_workers_active ON workers(user_id, is_active);
+
+-- ─── ORDERS ──────────────────────────────────────────────────
+-- 10 call sites: the manual order form, the AI voice-call order extractor,
+-- today's P&L summary, the AI Brain context loader, and search. status has no
+-- CHECK — POST accepts whatever the AI extraction or the form sends and PATCH
+-- validates nothing either, so constraining it here would just be a constraint
+-- the application doesn't actually uphold.
+CREATE TABLE IF NOT EXISTS orders (
+  id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id              UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  customer_name        TEXT,
+  customer_phone       TEXT,
+  delivery_address     TEXT,
+  items                JSONB DEFAULT '[]',
+  total_amount         NUMERIC(14,2),
+  delivery_time        TEXT,
+  special_instructions TEXT,
+  worker_id            UUID REFERENCES workers(id) ON DELETE SET NULL,
+  call_recording_url   TEXT,
+  call_transcript      TEXT,
+  source               TEXT DEFAULT 'manual',
+  status               TEXT DEFAULT 'new',
+  order_date           DATE NOT NULL DEFAULT CURRENT_DATE,
+  created_at           TIMESTAMPTZ DEFAULT NOW(),
+  updated_at           TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_orders_user_date   ON orders(user_id, order_date);
+CREATE INDEX IF NOT EXISTS idx_orders_user_status ON orders(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_orders_worker      ON orders(worker_id);
+
+-- ─── ATTENDANCE ──────────────────────────────────────────────
+-- 3 call sites. POST upserts on (worker_id, attendance_date) — the unique
+-- index below is that ON CONFLICT target, not decoration; without it the
+-- upsert itself fails at the database.
+CREATE TABLE IF NOT EXISTS attendance (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id          UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  worker_id        UUID NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+  attendance_date  DATE NOT NULL,
+  status           TEXT DEFAULT 'present',
+  created_at       TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_worker_date ON attendance(worker_id, attendance_date);
+CREATE INDEX IF NOT EXISTS idx_attendance_user_date ON attendance(user_id, attendance_date);
+
+-- ─── EXPENSES ────────────────────────────────────────────────
+-- 8 call sites (CRUD, today's P&L summary, the AI Brain context loader, an AI
+-- tool-call insert). category is unconstrained for the same reason as
+-- orders.status: EXPENSE_CATEGORIES in server.js is only used as an AI tool
+-- schema enum, never validated against on POST or PATCH.
+CREATE TABLE IF NOT EXISTS expenses (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  description   TEXT NOT NULL,
+  amount        NUMERIC(14,2) NOT NULL,
+  category      TEXT DEFAULT 'misc',
+  notes         TEXT,
+  expense_date  DATE NOT NULL,
+  created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_expenses_user_date ON expenses(user_id, expense_date);
+
+-- ─── BUSINESS VOCABULARY ─────────────────────────────────────
+-- 7 call sites: the vocabulary CRUD endpoints, the industry seed list, the
+-- voice-call and AI Brain context loaders, and onboarding's upsert on
+-- (user_id, term) — again the ON CONFLICT target for a real upsert, not
+-- optional. aliases is JSONB, matching how every other array-valued column in
+-- this file is stored (items, permissions, installments), not a Postgres
+-- TEXT[]; the code only ever reads it back as a JS array via supabase-js, so
+-- either would work, but JSONB keeps the convention in one place.
+CREATE TABLE IF NOT EXISTS business_vocabulary (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  term        TEXT NOT NULL,
+  meaning     TEXT NOT NULL,
+  category    TEXT DEFAULT 'product',
+  aliases     JSONB DEFAULT '[]',
+  created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vocabulary_user_term ON business_vocabulary(user_id, term);
+
+-- ─── BRAIN RULES ─────────────────────────────────────────────
+-- 4 call sites: the rules CRUD endpoints and the AI Brain context loader that
+-- feeds them into every AI response for the tenant.
+CREATE TABLE IF NOT EXISTS brain_rules (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  rule        TEXT NOT NULL,
+  category    TEXT DEFAULT 'general',
+  created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_brain_rules_user ON brain_rules(user_id);
+
+-- ─── DUNNING LOGS ────────────────────────────────────────────
+-- 1 call site, already wrapped in .catch(() => {}) so a missing table failed
+-- silently rather than 500ing — the write was simply discarded, which is why
+-- this sat unnoticed despite being the audit trail for every automated
+-- collections message the app sends on a tenant's behalf.
+CREATE TABLE IF NOT EXISTS dunning_logs (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  rule_id       UUID REFERENCES dunning_rules(id) ON DELETE SET NULL,
+  invoice_id    UUID REFERENCES invoices(id) ON DELETE SET NULL,
+  customer_name TEXT,
+  action        TEXT,
+  message       TEXT,
+  whatsapp_url  TEXT,
+  sent_at       TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_dunning_logs_user ON dunning_logs(user_id, sent_at DESC);
+
 -- ─── RLS for new tables (disabled for now) ───────────────────
+ALTER TABLE workers             DISABLE ROW LEVEL SECURITY;
+ALTER TABLE orders              DISABLE ROW LEVEL SECURITY;
+ALTER TABLE attendance          DISABLE ROW LEVEL SECURITY;
+ALTER TABLE expenses            DISABLE ROW LEVEL SECURITY;
+ALTER TABLE business_vocabulary DISABLE ROW LEVEL SECURITY;
+ALTER TABLE brain_rules         DISABLE ROW LEVEL SECURITY;
+ALTER TABLE dunning_logs        DISABLE ROW LEVEL SECURITY;
 ALTER TABLE payment_plans  DISABLE ROW LEVEL SECURITY;
 ALTER TABLE disputes       DISABLE ROW LEVEL SECURITY;
 ALTER TABLE ca_partners    DISABLE ROW LEVEL SECURITY;

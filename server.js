@@ -10026,15 +10026,27 @@ Rules: numbers without rupee symbol or commas (147630 not 1,47,630). Dates as YY
 // ATTENDANCE + SALARY
 // ============================================
 
+// `${y}-${m}-31` is not a real date in February, April, June, September or
+// November — Postgres rejects it with 22008 against a DATE column, the same
+// bug fixed for GSTR-1 above. Both attendance endpoints built their range this
+// way; centralised so a third copy can't reintroduce it. Returns a half-open
+// [from, to) pair on the first of the next month.
+function monthDateRange(year, month) {
+  const y = Number(year);
+  const m = Number(month);
+  const from = new Date(Date.UTC(y, m - 1, 1)).toISOString().split('T')[0];
+  const to = new Date(Date.UTC(y, m, 1)).toISOString().split('T')[0];
+  return { from, to };
+}
+
 app.get('/api/attendance', authMiddleware, async (req, res) => {
   try {
     const month = req.query.month || String(new Date().getMonth() + 1).padStart(2, '0');
     const year = req.query.year || new Date().getFullYear();
-    const from = `${year}-${String(month).padStart(2, '0')}-01`;
-    const to = `${year}-${String(month).padStart(2, '0')}-31`;
+    const { from, to } = monthDateRange(year, month);
     const [{ data: workers }, { data: attendance }] = await Promise.all([
       supabase.from('workers').select('*').eq('user_id', req.user.userId).eq('is_active', true),
-      supabase.from('attendance').select('*').eq('user_id', req.user.userId).gte('attendance_date', from).lte('attendance_date', to),
+      supabase.from('attendance').select('*').eq('user_id', req.user.userId).gte('attendance_date', from).lt('attendance_date', to),
     ]);
     res.json({ success: true, workers: workers || [], attendance: attendance || [], month, year });
   } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
@@ -10056,11 +10068,10 @@ app.get('/api/attendance/salary', authMiddleware, async (req, res) => {
   try {
     const month = req.query.month || String(new Date().getMonth() + 1).padStart(2, '0');
     const year = req.query.year || new Date().getFullYear();
-    const from = `${year}-${String(month).padStart(2, '0')}-01`;
-    const to = `${year}-${String(month).padStart(2, '0')}-31`;
+    const { from, to } = monthDateRange(year, month);
     const [{ data: workers }, { data: attendance }] = await Promise.all([
       supabase.from('workers').select('*').eq('user_id', req.user.userId).eq('is_active', true),
-      supabase.from('attendance').select('*').eq('user_id', req.user.userId).gte('attendance_date', from).lte('attendance_date', to),
+      supabase.from('attendance').select('*').eq('user_id', req.user.userId).gte('attendance_date', from).lt('attendance_date', to),
     ]);
     // Count working days in month
     const daysInMonth = new Date(Number(year), Number(month), 0).getDate();
