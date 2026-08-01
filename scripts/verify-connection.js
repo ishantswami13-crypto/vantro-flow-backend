@@ -104,11 +104,13 @@ async function main() {
         record('users table queryable', false,
           missingTable ? 'table missing — run: node scripts/setup-fresh-database.js' : `HTTP ${res.status} ${body.slice(0, 120)}`);
       }
-      // Setting DATABASE_URL is necessary but not sufficient — the boot
-      // migration can still have failed, or never run because the process was
-      // deployed before it was added. Probing one of the tables it owns is the
-      // only way to tell the difference from outside. `purchases` is the
-      // heaviest of them at 21 query sites, so it is the most useful canary.
+      // purchases is now created two ways: migrations/006_boot_migration_promoted.sql
+      // (part of setup:database, no DATABASE_URL needed to create the table) and
+      // runAutoMigrations() in server.js at boot (needs DATABASE_URL, and keeps
+      // patching a long-running deployment that hasn't re-run setup:database).
+      // Either path failing to have run is still worth surfacing, so this stays —
+      // `purchases` is the heaviest of the tables either path owns, at 21 query
+      // sites, so it is the most useful canary.
       try {
         const bootRes = await fetch(`${supabaseUrl.replace(/\/$/, '')}/rest/v1/purchases?select=id&limit=1`, {
           headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` },
@@ -118,7 +120,7 @@ async function main() {
         } else {
           const body = await bootRes.text().catch(() => '');
           record('boot-migration tables present', false,
-            'purchases missing — set DATABASE_URL and restart the backend so runAutoMigrations() runs ' +
+            'purchases missing — run: node scripts/setup-fresh-database.js ' +
             `(HTTP ${bootRes.status} ${body.slice(0, 80)})`);
         }
       } catch (e) {

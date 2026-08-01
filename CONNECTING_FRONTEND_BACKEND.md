@@ -34,15 +34,21 @@ Nothing below belongs in git. Set them in the hosting dashboards.
 The backend refuses to start without it.
 
 `DATABASE_URL` is easy to skip because the backend starts and serves requests
-without it — but it is not optional. Eight tables (`purchases`, `sales`,
-`suppliers`, `khata_entries`, `purchase_orders`, `notifications`, `inventory`,
-`prospect_notes`) are created by a migration that runs at boot over a direct
-Postgres connection, and that connection is only opened when `DATABASE_URL` is
-set. Without it the migration logs `[migrate] No DATABASE_URL — skipping
-auto-migration` and those tables never exist, so roughly sixty query sites fail
-with a generic 500.
-`npm run verify:connection` checks for this, and `npm run security:schema-drift`
-lists exactly which tables depend on it.
+without it — but it is not optional. `purchases`, `sales`, `khata_entries`,
+`purchase_orders`, `notifications`, `inventory` and `prospect_notes` are also
+created by `npm run setup:database` now (see
+`migrations/006_boot_migration_promoted.sql`), so a fresh setup no longer
+depends on `DATABASE_URL` for those tables to exist — but `POST
+/api/invoices/migrate`, `GET /api/financial-summary/:userId` and `GET
+/api/ai-financial-monitor/:userId` query Postgres directly through a
+connection pool that is only opened when `DATABASE_URL` is set, and
+`runAutoMigrations()` still runs at every boot to keep patching a
+long-running deployment that hasn't re-run `setup:database` since. Without
+`DATABASE_URL` those three endpoints 500 and schema drift over time goes
+unpatched, even though the tables themselves exist from setup.
+`npm run verify:connection` checks for both — configuration and whether the
+tables actually exist — and `npm run security:schema-drift` lists exactly
+which tables and columns depend on which path.
 
 ### Vercel (frontend)
 

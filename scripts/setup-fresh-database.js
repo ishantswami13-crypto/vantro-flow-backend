@@ -48,6 +48,14 @@ const SQL_FILES = [
   // and already denies anon/authenticated access, matching how every write here
   // goes through the service_role client, which bypasses RLS regardless.
   'supabase-error-events-rollout.sql',
+  // Promotes DDL that used to run only inside runAutoMigrations() in
+  // server.js, which is gated on DATABASE_URL — a variable separate from the
+  // SUPABASE_* ones the rest of the app needs, and easy to leave unset.
+  // khata_entries, purchases, sales, inventory, purchase_orders and
+  // notifications existed nowhere without it. Must run last: it alters
+  // customers and ai_actions, which only exist after
+  // migrations/001_cortex_foundation.sql.
+  'migrations/006_boot_migration_promoted.sql',
 ];
 
 async function main() {
