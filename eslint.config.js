@@ -5,8 +5,11 @@
 // syntax patterns, duplicate keys, unreachable code) rather than to
 // enforce a style guide or fail CI on the huge volume of pre-existing
 // stylistic issues (unused vars, etc.) that would need a dedicated cleanup
-// pass. See .github/workflows/ci.yml for how this runs in CI
-// (continue-on-error: true — informational, not a hard gate, on purpose).
+// pass.
+//
+// The error-level rules are now clean, so CI runs this as a blocking step: a
+// failure means a real bug, not style debt. The warn-level rules stay
+// informational and are free to accumulate without breaking a build.
 const js = require('@eslint/js');
 
 module.exports = [
@@ -58,6 +61,16 @@ module.exports = [
       'no-case-declarations': 'warn',
       'no-constant-condition': 'warn',
       'no-prototype-builtins': 'warn',
+    },
+  },
+  {
+    // .mjs is ES modules by definition, so parsing it as commonjs fails on the
+    // first import — a config gap rather than a problem with those files. Both
+    // .mjs files in the repo (the Tally connector and its test) were reported
+    // as errors purely because of this.
+    files: ['**/*.mjs'],
+    languageOptions: {
+      sourceType: 'module',
     },
   },
 ];

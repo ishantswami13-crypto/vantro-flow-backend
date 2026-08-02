@@ -36,6 +36,68 @@ function loadScenarios() {
 
 // ── Static checks ──────────────────────────────────────────
 
+// Orchestration accuracy, measured statically.
+//
+// The end-to-end version — seed a user, fire the command, diff the database —
+// needs a live Supabase and is what LIVE mode would add. But the part that
+// actually rots is the wiring: a scenario expecting an action the planner can
+// never emit, or an event nothing in the codebase ever fires, is drift whether
+// or not a database is attached. Both are decidable from source.
+function checkOrchestration(scenarios) {
+  const planner = tryRequire('../lib/services/orchestrator/llmPlanner.service');
+  if (planner.__err) {
+    return { ok: false, reason: 'llmPlanner not loadable: ' + planner.__err.message, checked: 0, misses: [] };
+  }
+  const allowedActions = planner.ALLOWED_ACTION_TYPES || new Set();
+
+  // Every event name the backend actually uses, gathered from source rather than
+  // a hand-maintained list — event.service takes the type as a parameter, so
+  // there is no central enum to compare against.
+  //
+  // Only quoted string literals count, and comments are stripped first.
+  // Substring-matching raw text looks equivalent and is not: a mention in a
+  // comment — including a comment explaining that the event is emitted — would
+  // satisfy the check while nothing emits it, which is precisely the drift this
+  // is supposed to catch.
+  const roots = [path.join(__dirname, '..', 'server.js'), path.join(__dirname, '..', 'lib')];
+  const emitted = new Set();
+  const readAll = (p) => {
+    if (!fs.existsSync(p)) return;
+    const stat = fs.statSync(p);
+    if (stat.isDirectory()) return fs.readdirSync(p).forEach(f => readAll(path.join(p, f)));
+    if (!p.endsWith('.js')) return;
+    const src = fs.readFileSync(p, 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')   // block comments
+      .replace(/(^|[^:])\/\/[^\n]*/g, '$1'); // line comments, sparing "http://"
+    for (const m of src.matchAll(/['"`]([A-Z][A-Z0-9_]{3,})['"`]/g)) emitted.add(m[1]);
+  };
+  roots.forEach(readAll);
+
+  const misses = [];
+  let checked = 0;
+
+  for (const { file, data } of scenarios) {
+    if (!data) continue;
+    for (const t of (data.expected_action_types || [])) {
+      checked++;
+      if (!allowedActions.has(t)) misses.push({ file, kind: 'action_type', name: t });
+    }
+    for (const e of (data.expected_events || [])) {
+      checked++;
+      if (!emitted.has(e)) misses.push({ file, kind: 'event', name: e });
+    }
+  }
+
+  return { ok: misses.length === 0, checked, misses };
+}
+
+function checkTenantIsolation() {
+  const mod = tryRequire('../scripts/check-tenant-isolation');
+  if (mod.__err) return { ok: false, checked: 0, violations: [], reason: mod.__err.message };
+  const { violations, scanned } = mod.scan();
+  return { ok: violations.length === 0, checked: scanned, violations };
+}
+
 function checkPromptGuard() {
   if (promptGuard.__err) return { ok: false, reason: 'promptGuard not loadable: ' + promptGuard.__err.message };
   const samples = [
@@ -112,18 +174,37 @@ function main() {
   console.log(`LLMPlanner validation:    ${llmV.ok ? 'OK' : 'FAIL'}`);
   if (!llmV.ok) console.log('  details:', JSON.stringify(llmV, null, 2));
 
-  if (LIVE) {
-    console.log('\nLIVE mode requested but not yet implemented in this build.');
-    console.log('TODO: wire scenario.command → existing endpoints with seed user_id.');
+  // Business isolation is checked statically. The backend uses the service_role
+  // key, so RLS is bypassed and an application-level user_id filter is the only
+  // thing separating tenants — which means the property is decidable by reading
+  // the queries, without seeding two users and diffing what each can see.
+  const iso = checkTenantIsolation();
+  console.log(`Tenant isolation:         ${iso.ok ? 'OK' : 'FAIL'}  (${iso.checked} reads scanned)`);
+  if (!iso.ok) iso.violations.forEach(v => console.log(`  - ${v.file}:${v.line} reads ${v.table} unscoped`));
+
+  const orch = checkOrchestration(scenarios);
+  const orchPct = orch.checked ? Math.round(((orch.checked - orch.misses.length) / orch.checked) * 100) : 0;
+  console.log(`Orchestration wiring:     ${orch.ok ? 'OK' : `${orch.misses.length} unresolved`}  (${orch.checked} expectations checked)`);
+  orch.misses.forEach(m => console.log(`  - ${m.file}: ${m.kind} "${m.name}" is not emitted or allowed anywhere in the codebase`));
+  if (!orch.ok) {
+    console.log('  (a scenario asserts something the code cannot produce: either the behaviour');
+    console.log('   was never built, or a name changed and the scenario did not follow. Fix');
+    console.log('   whichever is actually wrong — do not delete the expectation to go green.)');
   }
 
-  const pass = scen.errors.length === 0 && pg.ok && llmV.ok;
+  if (LIVE) {
+    console.log('\nLIVE mode requested but not yet implemented in this build.');
+    console.log('Static isolation above covers query scoping; live mode would add');
+    console.log('end-to-end checks by seeding two users and asserting each sees only its own rows.');
+  }
+
+  const pass = scen.errors.length === 0 && pg.ok && llmV.ok && iso.ok && orch.ok;
   console.log('\n' + banner);
   console.log('  RESULT: ' + (pass ? 'PASS' : 'FAIL'));
   console.log('  Policy Safety:            ' + (llmV.ok ? '100%' : '<100%'));
   console.log('  AI Hallucination Block:   ' + (llmV.halluc_blocked ? '100%' : '<100%'));
-  console.log('  Business Isolation:       ' + (LIVE ? 'requires live mode' : 'N/A (static)'));
-  console.log('  Orchestration Accuracy:   ' + (LIVE ? 'requires live mode' : 'N/A (static)'));
+  console.log('  Business Isolation:       ' + (iso.ok ? '100% (static: every agent read is tenant-scoped)' : 'FAIL'));
+  console.log('  Orchestration Accuracy:   ' + `${orchPct}% (static: scenario expectations resolvable in code)`);
   console.log(banner);
 
   process.exit(pass ? 0 : 1);
