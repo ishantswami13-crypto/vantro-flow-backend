@@ -464,13 +464,36 @@ app.use('/api', (req, res, next) => {
   next();
 });
 
-function makeLimiter({ windowMs, max, skipSuccessfulRequests = false }) {
+// Rate limiters normally key on IP, which is wrong for an authenticated,
+// abuse-prone route: an office behind one NAT shares a budget, and a client
+// that rotates IPs (or just has a dynamic one) sidesteps it entirely. This
+// verifies the caller's JWT — using the same getAuthToken/verifyJWT pair
+// authMiddleware itself uses, so it can never disagree with who the request
+// actually authenticates as — and keys on userId when that succeeds. It runs
+// ahead of authMiddleware in the chain (limiters are mounted globally, auth is
+// per-route), so this is the only way a limiter can see identity at all;
+// an invalid, missing, or unverifiable token falls back to req.ip exactly as
+// before, so unauthenticated routes are unaffected.
+function authAwareKey(req) {
+  try {
+    const { token } = getAuthToken(req);
+    if (!token) return req.ip;
+    const decoded = verifyJWT(token);
+    const userId = decoded?.userId || decoded?.id;
+    return userId ? `user:${userId}` : req.ip;
+  } catch {
+    return req.ip;
+  }
+}
+
+function makeLimiter({ windowMs, max, skipSuccessfulRequests = false, keyGenerator }) {
   return rateLimit({
     windowMs,
     max,
     standardHeaders: true,
     legacyHeaders: false,
     skipSuccessfulRequests,
+    ...(keyGenerator ? { keyGenerator } : {}),
     handler: (req, res, next, options) => {
       const requestId = req.requestId || crypto.randomUUID();
       res.status(options.statusCode).json({
@@ -500,7 +523,7 @@ const authLimiter = rateLimit({
 });
 const apiLimiter = makeLimiter({ windowMs: 60 * 1000, max: 120 });
 const uploadLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, max: 20 });
-const aiLimiter = makeLimiter({ windowMs: 10 * 60 * 1000, max: 40 });
+const aiLimiter = makeLimiter({ windowMs: 10 * 60 * 1000, max: 40, keyGenerator: authAwareKey });
 const publicBillLimiter = makeLimiter({ windowMs: 10 * 60 * 1000, max: 80 });
 const heavyReadLimiter = makeLimiter({ windowMs: 5 * 60 * 1000, max: 90 });
 // Dedicated rather than reusing uploadLimiter: that is one pooled instance
@@ -531,9 +554,12 @@ app.use(['/api/upload-csv', '/api/import/excel', '/api/bank/transactions/import'
 // arguments, which falls back to the platform's own TWILIO_ACCOUNT_SID rather
 // than the caller's credentials. On the general limiter that was 120 calls a
 // minute to arbitrary numbers, billed to this account — the classic shape of
-// premium-rate toll fraud. This limit is a mitigation, not a considered policy:
-// the right number depends on how many collection calls a real user makes, and
-// it should key on userId rather than IP before it is relied on.
+// premium-rate toll fraud. It also requires authMiddleware, so this is now
+// budgeted per account rather than per IP (aiLimiter uses authAwareKey,
+// defined above) — a fresh signup, not a fresh IP, is what buys another 40
+// calls per 10 minutes. The number itself is still just a mitigation, not a
+// considered policy: it hasn't been sized against how many collection calls a
+// real business actually makes in a day.
 //
 // ai-insights, ai-deep-analysis and ai-financial-monitor were simply missed from
 // this list. Each does uncapped select('*') queries and then a 70B model call —
