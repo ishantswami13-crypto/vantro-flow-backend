@@ -1661,24 +1661,85 @@ app.post('/api/invoices/create', authMiddleware, async (req, res) => {
   }
 });
 
+const BILL_STATUS_TO_PAYMENT_STATUS = { unpaid: 'Pending', paid: 'Paid', cancelled: 'Cancelled' };
+
+// Bills (GST invoices, table `bills`) and legacy invoices (table `invoices`)
+// are two different records with two different shapes sharing one viewer
+// page. Normalizes a `bills` row into the same envelope
+// GET /api/invoice/:invoiceId already returns, adding the GST fields
+// (customer_gstin, subtotal, cgst/sgst/igst, per-item hsn) the legacy shape
+// never had, so the frontend can render a tax breakdown when they're present
+// and fall back to a plain total when they're not.
+function normalizeBillToInvoice(bill) {
+  const billDate = bill.bill_date ? new Date(bill.bill_date) : new Date();
+  const daysOverdue = Math.max(0, Math.floor((Date.now() - billDate.getTime()) / 86400000));
+  const items = Array.isArray(bill.items) ? bill.items.map(it => ({
+    name: it.description || it.name || '',
+    hsn: it.hsn || null,
+    qty: Number(it.quantity ?? it.qty) || 1,
+    unit: it.unit || 'unit',
+    rate: Number(it.rate) || 0,
+    amount: Number(it.amount) || 0,
+  })) : null;
+
+  return {
+    id: bill.id,
+    user_id: bill.user_id,
+    customer_name: bill.customer_name,
+    customer_phone: bill.customer_phone || null,
+    customer_email: bill.customer_email || null,
+    customer_gstin: bill.customer_gstin || null,
+    customer_address: bill.customer_address || null,
+    invoice_amount: Number(bill.total) || 0,
+    invoice_number: bill.bill_number || null,
+    payment_status: BILL_STATUS_TO_PAYMENT_STATUS[bill.status] || 'Pending',
+    days_overdue: daysOverdue,
+    invoice_date: bill.bill_date,
+    due_date: bill.due_date || null,
+    payment_date: bill.paid_at || null,
+    notes: bill.notes || null,
+    items,
+    gst_rate: bill.gst_rate != null ? Number(bill.gst_rate) : null,
+    is_interstate: !!bill.is_interstate,
+    subtotal: Number(bill.subtotal) || 0,
+    cgst: Number(bill.cgst) || 0,
+    sgst: Number(bill.sgst) || 0,
+    igst: Number(bill.igst) || 0,
+  };
+}
+
 // ── Get single invoice by ID (authenticated, owner check) ────────────────────
+// Checks `invoices` first, then falls back to `bills` — the GST invoice flow
+// (POST /api/bills) creates rows only `bills` has, but its View/Print/
+// WhatsApp/Copy Link buttons all open /invoice/:id against this endpoint, so
+// without the fallback every GST invoice 404s the moment anyone tries to
+// open, print, or share it.
 app.get('/api/invoice/:invoiceId', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { invoiceId } = req.params;
 
-    const { data, error } = await supabase
+    let { data, error } = await supabase
       .from('invoices')
       .select('*')
       .eq('id', invoiceId)
       .eq('user_id', userId)
       .single();
 
-    if (error || !data) return res.status(404).json({ error: 'Invoice not found' });
-
-    // Parse items if stored as string
-    if (data.items && typeof data.items === 'string') {
-      try { data.items = JSON.parse(data.items); } catch { data.items = []; }
+    if (data && !error) {
+      // Parse items if stored as string
+      if (data.items && typeof data.items === 'string') {
+        try { data.items = JSON.parse(data.items); } catch { data.items = []; }
+      }
+    } else {
+      const { data: bill, error: billError } = await supabase
+        .from('bills')
+        .select('*')
+        .eq('id', invoiceId)
+        .eq('user_id', userId)
+        .single();
+      if (billError || !bill) return res.status(404).json({ error: 'Invoice not found' });
+      data = normalizeBillToInvoice(bill);
     }
 
     // Fetch owner profile (business name, address, gstin, upi_id)
