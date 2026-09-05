@@ -10791,10 +10791,12 @@ app.get('/api/customers/intelligence', authMiddleware, async (req, res) => {
 
     // Resolve customer UUID from Cortex customers table
     const { recalculate, resolveCustomerId } = require('./lib/services/orchestrator/scoring.service');
+    const { getRecent } = require('./lib/services/orchestrator/event.service');
+    const { isEnabled: _isFERevenue } = require('./lib/featureFlags');
     const customerId = await resolveCustomerId(userId, name, phone || null);
 
     // Parallel fetch all intelligence
-    const [scoreRes, promisesRes, actionsRes, invoicesRes, memoryRes] = await Promise.all([
+    const [scoreRes, promisesRes, actionsRes, invoicesRes, memoryRes, scoreHistoryRes, riskEventsRes] = await Promise.all([
       // Score
       customerId
         ? supabase.from('customer_scores').select('*').eq('user_id', userId).eq('customer_id', customerId).maybeSingle()
@@ -10817,6 +10819,16 @@ app.get('/api/customers/intelligence', authMiddleware, async (req, res) => {
       customerId
         ? supabase.from('business_memory').select('memory_key, memory_value, updated_at').eq('user_id', userId).eq('entity_type', 'customer').eq('entity_id', customerId).order('updated_at', { ascending: false }).limit(20)
         : { data: [] },
+
+      // Score history (Phase 3B) — trend of credit-risk/promise-reliability snapshots over time
+      customerId
+        ? supabase.from('customer_score_history').select('*').eq('user_id', userId).eq('customer_id', customerId).order('recorded_at', { ascending: false }).limit(10)
+        : { data: [] },
+
+      // Credit-risk tier-change events (Phase 3C), via the existing Cortex event store reader
+      customerId
+        ? getRecent(userId, { eventType: 'CREDIT_RISK_TIER_CHANGED', entityType: 'customer', entityId: customerId, limit: 10 })
+        : [],
     ]);
 
     const score = scoreRes.data;
@@ -10824,6 +10836,8 @@ app.get('/api/customers/intelligence', authMiddleware, async (req, res) => {
     const actions  = actionsRes.data  || [];
     const invoices = invoicesRes.data  || [];
     const memories = memoryRes.data   || [];
+    const scoreHistory = scoreHistoryRes.data || [];
+    const riskEvents = riskEventsRes || [];
 
     // Derive tier from score
     const creditRiskScore = parseFloat(score?.credit_risk_score || 0);
@@ -10841,6 +10855,25 @@ app.get('/api/customers/intelligence', authMiddleware, async (req, res) => {
     if (creditRiskScore >= 70) creditRecommendation = '⚠️ High risk — request advance payment';
     else if (creditRiskScore >= 50) creditRecommendation = '⚡ Medium risk — reduce credit limit';
     else if (brokenPromises >= 2) creditRecommendation = '⚠️ Broken promises — owner approval required';
+
+    // Phase 10 — Customer & Revenue Intelligence: additive `revenue` block,
+    // computed only when the feature flag is on (fail-closed, matches every
+    // other per-section flag gate on this endpoint's neighbors).
+    let revenue = null;
+    if (_isFERevenue('customer_revenue_intelligence') && customerId) {
+      try {
+        const { getRevenueIntelligenceForCustomer } = require('./lib/services/orchestrator/revenueIntelligence.service');
+        const { classifyScoreTrajectory, countRecentTierChanges } = require('./lib/services/agents/creditRiskAgent');
+        const trajectory = classifyScoreTrajectory(scoreHistory);
+        const sustainedDeterioration = trajectory === 'DETERIORATING' && countRecentTierChanges(riskEvents) >= 2;
+        revenue = await getRevenueIntelligenceForCustomer(userId, customerId, name, {
+          creditRiskScore, trajectory, sustainedDeterioration,
+        });
+      } catch (revErr) {
+        const { safeLog } = require('./lib/observability/logger');
+        safeLog('warn', '[Phase10] revenue block computation failed', { error: revErr.message, customerId, userId });
+      }
+    }
 
     res.json({
       success:        true,
@@ -10868,6 +10901,10 @@ app.get('/api/customers/intelligence', authMiddleware, async (req, res) => {
       actions:  pendingActions.slice(0, 5),
       invoices: invoices.slice(0, 5),
       memories: memories.slice(0, 10),
+      scoreHistory,
+      riskEvents,
+      scoreReason: score?.score_reason_json ?? null,
+      revenue,
     });
   } catch (err) {
     res.status(500).json({ error: 'Internal server error' });
@@ -10974,8 +11011,65 @@ app.get('/api/customer-scores', authMiddleware, async (req, res) => {
       }
     }
 
+    // Phase 10 — Customer & Revenue Intelligence: additive `health_label` per
+    // row, computed from the same reused signals (see revenueIntelligence.service.js).
+    // Fail-closed and additive-only: any per-customer computation failure leaves
+    // health_label null for that row without breaking the response.
+    if (_isFE('customer_revenue_intelligence') && scores.length) {
+      try {
+        const { getRevenueIntelligenceForCustomer } = require('./lib/services/orchestrator/revenueIntelligence.service');
+        const { classifyScoreTrajectory, countRecentTierChanges } = require('./lib/services/agents/creditRiskAgent');
+        const { getRecent } = require('./lib/services/orchestrator/event.service');
+        scores = await Promise.all(scores.map(async (row) => {
+          try {
+            const [historyRes, riskEvents] = await Promise.all([
+              supabase.from('customer_score_history').select('credit_risk_score').eq('user_id', userId).eq('customer_id', row.customer_id).order('recorded_at', { ascending: false }).limit(10),
+              getRecent(userId, { eventType: 'CREDIT_RISK_TIER_CHANGED', entityType: 'customer', entityId: row.customer_id, limit: 10 }),
+            ]);
+            const trajectory = classifyScoreTrajectory(historyRes.data || []);
+            const sustainedDeterioration = trajectory === 'DETERIORATING' && countRecentTierChanges(riskEvents || []) >= 2;
+            const revenue = await getRevenueIntelligenceForCustomer(userId, row.customer_id, row.customer_name, {
+              creditRiskScore: row.score, trajectory, sustainedDeterioration,
+            });
+            return { ...row, health_label: revenue?.health?.label ?? null };
+          } catch {
+            return { ...row, health_label: null };
+          }
+        }));
+      } catch (healthErr) {
+        const { safeLog } = require('./lib/observability/logger');
+        safeLog('warn', '[CustomerScores] health_label computation failed', { error: healthErr.message });
+      }
+    }
+
     res.json({ scores: stripCortexTestRows(scores) });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── CUSTOMER REVENUE PORTFOLIO (STARLANE Phase 10) ────────────────────────────
+// Portfolio-level view: revenue concentration (top-1/3/5 share), a deterministic
+// attention-ranked customer list (economic importance + risk, explicit formula,
+// see revenueIntelligence.service.js computeAttentionScore), each with an
+// evidence array. Read-only, recommendation-only — creates zero ai_actions.
+// Strictly tenant-scoped via authMiddleware's req.user.userId, same pattern as
+// every other endpoint in this file. Fail-closed behind the same feature flag
+// that gates the revenue block on /api/customers/intelligence and the
+// health_label field on /api/customer-scores.
+app.get('/api/customers/portfolio', authMiddleware, async (req, res) => {
+  try {
+    const { isEnabled: _isFE } = require('./lib/featureFlags');
+    if (!_isFE('customer_revenue_intelligence')) {
+      return res.json({ enabled: false, customers: [], tenantRevenue: 0, top1SharePct: 0, top3SharePct: 0, top5SharePct: 0, concentrationRiskCount: 0 });
+    }
+    const userId = req.user.userId;
+    const { computePortfolio } = require('./lib/services/orchestrator/revenueIntelligence.service');
+    const portfolio = await computePortfolio(userId);
+    res.json({ enabled: true, ...portfolio });
+  } catch (err) {
+    const { safeLog } = require('./lib/observability/logger');
+    safeLog('error', '[Phase10] /api/customers/portfolio failed', { error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // ── SCORE ALL CUSTOMERS (one-time backfill / manual re-score) ─────────────────
