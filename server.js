@@ -11298,7 +11298,7 @@ app.get('/api/cortex/health', authMiddleware, async (req, res) => {
       supabase.from('ai_actions').select('priority, status').eq('user_id', userId).in('status', ['pending', 'done']).limit(200),
       supabase.from('customer_scores').select('id', { count: 'exact', head: true }).eq('user_id', userId),
       supabase.from('ai_plans').select('id', { count: 'exact', head: true }).eq('user_id', userId).eq('status', 'active'),
-      supabase.from('ai_actions').select('outcome').eq('user_id', userId).not('outcome', 'is', null).limit(100),
+      supabase.from('ai_actions').select('outcome, action_type').eq('user_id', userId).not('outcome', 'is', null).limit(100),
       supabase.from('business_memory').select('id', { count: 'exact', head: true }).eq('user_id', userId),
     ]);
 
@@ -11314,6 +11314,21 @@ app.get('/api/cortex/health', authMiddleware, async (req, res) => {
       ? Math.round((effectiveCount / evalActions.length) * 100)
       : null;
 
+    // Group already-fetched evalActions by action_type (in-memory, no extra query)
+    const byActionType = {};
+    evalActions.forEach(a => {
+      const type = a.action_type || 'UNKNOWN';
+      if (!byActionType[type]) byActionType[type] = { effective: 0, ineffective: 0, unknown: 0 };
+      if (a.outcome === 'effective') byActionType[type].effective++;
+      else if (a.outcome === 'ineffective') byActionType[type].ineffective++;
+      else byActionType[type].unknown++;
+    });
+    Object.keys(byActionType).forEach(type => {
+      const t = byActionType[type];
+      const total = t.effective + t.ineffective + t.unknown;
+      t.rate = total > 0 ? Math.round((t.effective / total) * 100) : null;
+    });
+
     res.json({
       success: true,
       flags: FLAGS,
@@ -11327,6 +11342,7 @@ app.get('/api/cortex/health', authMiddleware, async (req, res) => {
         effectiveness_rate:  effectivenessRate, // null if not enough data
         effective_count:     effectiveCount,
         ineffective_count:   ineffectiveCount,
+        by_action_type:      byActionType,
       },
     });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
