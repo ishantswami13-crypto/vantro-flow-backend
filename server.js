@@ -8293,7 +8293,12 @@ app.get('/api/orders', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { date, from, to, status } = req.query;
-    let query = supabase.from('orders').select('*, workers(name, phone)')
+    // Plain select — no PostgREST embed syntax ('*, workers(name, phone)'), since
+    // pgSupabaseShim.js (local dev) has no embed/join parsing: it comma-splits and
+    // quote-identifies each select token, so `workers(name`/`phone)` would be
+    // treated as literal (invalid) column names. Worker name/phone are merged in
+    // below with a small follow-up query instead.
+    let query = supabase.from('orders').select('*')
       .eq('user_id', userId).order('created_at', { ascending: false });
     if (status) query = query.eq('status', status);
     if (from && to) {
@@ -8304,7 +8309,26 @@ app.get('/api/orders', authMiddleware, async (req, res) => {
     }
     const { data, error } = await query;
     if (error) throw error;
-    res.json({ success: true, orders: data || [] });
+    const orders = data || [];
+
+    // Merge worker name/phone into each order, scoped by the same user_id (defensive
+    // against a cross-tenant worker_id collision, even though UUIDs make that
+    // astronomically unlikely). Orders with a null/missing worker_id are left as-is.
+    const workerIds = [...new Set(orders.map(o => o.worker_id).filter(Boolean))];
+    if (workerIds.length) {
+      const { data: workerRows } = await supabase.from('workers')
+        .select('id, name, phone').eq('user_id', userId).in('id', workerIds);
+      const workerById = {};
+      (workerRows || []).forEach(w => { workerById[w.id] = w; });
+      orders.forEach(o => {
+        const w = o.worker_id ? workerById[o.worker_id] : null;
+        o.workers = w ? { name: w.name, phone: w.phone } : null;
+      });
+    } else {
+      orders.forEach(o => { o.workers = null; });
+    }
+
+    res.json({ success: true, orders });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
