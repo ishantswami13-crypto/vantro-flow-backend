@@ -183,6 +183,7 @@ function generateOTP() { return String(Math.floor(100000 + Math.random() * 90000
 function storeOTP(userId) {
   const code = generateOTP();
   otpStore.set(userId, { code, expiresAt: Date.now() + 10 * 60 * 1000, attempts: 0 });
+  if (process.env.DEV_LOG_OTP === 'true') console.log(`[DEV_LOG_OTP] userId=${userId} otp=${code}`);
   return code;
 }
 function verifyOTP(userId, code) {
@@ -258,6 +259,7 @@ const { supabase } = require('./lib/config/supabaseClient');
 const { getBusinessContext } = require('./lib/businessContext');
 const salesService = require('./lib/services/SalesService');
 const purchaseService = require('./lib/services/PurchaseService');
+const { buildActionTypeBreakdown } = require('./lib/services/cortexCore/actionTypeBreakdown');
 const {
   createCustomerOverdueSummaryHandler,
   methodNotAllowed: stagingCustomerOverdueMethodNotAllowed,
@@ -284,8 +286,10 @@ const allowedOrigins = new Set([
   'https://vantro-flow-frontend.vercel.app',
   'http://localhost:3000',
   'http://localhost:3001',
+  'http://localhost:3100',
   'http://127.0.0.1:3000',
   'http://127.0.0.1:3001',
+  'http://127.0.0.1:3100',
   ...extraOrigins,
 ]);
 
@@ -1447,10 +1451,18 @@ app.post('/api/invoices/create', authMiddleware, async (req, res) => {
     const seq = String((count || 0) + 1).padStart(4, '0');
     const invoiceNumber = `${prefix}-${ym}-${seq}`;
 
+    // ── Wave 2: resolve-or-create the canonical customer entity ────────────
+    const normalizedPhone = customer_phone ? String(customer_phone).replace(/\D/g, '').slice(-10) : null;
+    const linkedCustomer = await ensureCustomerFromInvoice(userId, {
+      customer_name,
+      customer_phone: normalizedPhone,
+    }).catch(() => null);
+
     const record = {
       user_id:        userId,
+      customer_id:    linkedCustomer?.id || null,
       customer_name:  customer_name.trim(),
-      customer_phone: customer_phone ? String(customer_phone).replace(/\D/g, '').slice(-10) : null,
+      customer_phone: normalizedPhone,
       customer_email: customer_email || null,
       invoice_amount: Math.round(total * 100) / 100,
       invoice_date:   invDate.toISOString().split('T')[0],
@@ -2226,6 +2238,59 @@ app.get('/api/analytics/:userId', requireOwner, async (req, res) => {
 });
 
 // ============================================
+// STARLANE BRAIN — read-only intelligence summary
+// ============================================
+const { loadBrainSummary } = require('./lib/brain/brainSummary');
+
+app.get('/api/brain/summary', authMiddleware, async (req, res) => {
+  try {
+    if (!isFeatureEnabled('brain_dashboard_enabled')) {
+      return res.status(404).json({ error: 'not_found' });
+    }
+    const userId = authenticatedUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Invalid token payload' });
+
+    const cacheKey = buildBusinessCacheKey(userId, 'brain-summary');
+    const cached = getCache(cacheKey);
+    if (cached) return res.json({ success: true, brain: cached, _cached: true });
+
+    await ensureConnectedBusinessData(userId);
+    const brain = await loadBrainSummary(supabase, userId);
+    setCache(cacheKey, brain, 60); // 60s TTL
+
+    res.json({ success: true, brain });
+  } catch (error) {
+    console.error('[brain summary]', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// ── Business State — read-composition only, no new computation ──────────────
+// Assembles ai_actions (rules engine + agents), customer_scores, and
+// cashflow.service.getWeekForecast() into one ranked view. See
+// lib/domain/intelligence/businessState.js for the composition logic.
+app.get('/api/business-state', authMiddleware, async (req, res) => {
+  try {
+    const userId = authenticatedUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Invalid token payload' });
+
+    const cacheKey = buildBusinessCacheKey(userId, 'business-state');
+    const cached = getCache(cacheKey);
+    if (cached) return res.json({ success: true, businessState: cached, _cached: true });
+
+    await ensureConnectedBusinessData(userId);
+    const { loadBusinessState } = require('./lib/domain/intelligence/businessState');
+    const businessState = await loadBusinessState(supabase, userId);
+    setCache(cacheKey, businessState, 30); // 30s TTL — shorter than brain's 60s since actions change more often
+
+    res.json({ success: true, businessState });
+  } catch (error) {
+    console.error('[business state]', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// ============================================
 // INVENTORY MANAGEMENT
 // ============================================
 
@@ -2800,8 +2865,12 @@ async function emitBusinessEvent(userId, eventType, payload = {}) {
             const actionService  = require('./lib/services/orchestrator/action.service');
             const auditService   = require('./lib/services/orchestrator/audit.service');
             const { isEnabled: _fe } = require('./lib/featureFlags');
+            const { safeLog: _cxLog } = require('./lib/observability/logger');
 
             const normalizedType = eventSvc.normalizeLegacyEventType(eventType);
+
+            // Phase 9 liveness checkpoint: orchestrator pipeline started (real HTTP path).
+            _cxLog('info', '[Orchestrator] Pipeline started', { userId, eventType: normalizedType });
 
             // 1. Persist to business_events
             const savedEvent = await eventSvc.emit(userId, {
@@ -2815,13 +2884,23 @@ async function emitBusinessEvent(userId, eventType, payload = {}) {
 
             if (!savedEvent) return; // persistence failed — stop, don't run rules on nothing
 
+            // Phase 9 liveness checkpoint: eligible event persisted.
+            _cxLog('info', '[Orchestrator] Eligible event received', { userId, eventType: normalizedType, eventId: savedEvent.id });
+
             // 2. Evaluate rules → persist actions through policyGuard
             const rawActions = await rulesService.evaluate(userId, savedEvent);
+            _cxLog('info', '[Orchestrator] Rules evaluated', { userId, eventType: normalizedType, actionsProposed: rawActions.length });
             for (const raw of rawActions) {
               try {
                 const safe = await policyGuard.validate(raw, userId);
+                _cxLog('info', '[Orchestrator] Action decision generated', {
+                  userId, actionType: safe.action_type, status: safe.status, requiresApproval: safe.requires_approval,
+                });
                 if (safe.status !== 'system_blocked') {
-                  await actionService.create(userId, safe);
+                  const created = await actionService.create(userId, safe);
+                  _cxLog('info', '[Orchestrator] ai_actions row created', {
+                    userId, actionId: created?.id, actionType: safe.action_type, status: created?.status, requiresApproval: created?.requires_approval,
+                  });
                 }
               } catch (actionErr) {
                 console.warn('[Cortex] action create failed:', actionErr.message, { actionType: raw.action_type });
@@ -3800,8 +3879,16 @@ async function syncReceivableFromSale(userId, sale) {
   const invoiceDate = sale.sale_date || new Date().toISOString().split('T')[0];
   const dueDate = sale.due_date || invoiceDate;
 
+  // ── Wave 2: resolve-or-create the canonical customer entity ──────────────
+  const linkedCustomer = await ensureCustomerFromInvoice(userId, {
+    customer_name: customerName,
+    customer_phone: sale.customer_phone || null,
+    customer_gstin: sale.customer_gstin || null,
+  }).catch(() => null);
+
   const payload = {
     user_id: userId,
+    customer_id: linkedCustomer?.id || null,
     customer_name: customerName,
     customer_phone: sale.customer_phone || null,
     customer_gstin: sale.customer_gstin || null,
@@ -3914,6 +4001,74 @@ async function ensureSupplierFromPurchase(userId, purchase) {
 
   if (inserted.error) {
     console.warn('Supplier sync failed:', inserted.error.message);
+    return null;
+  }
+
+  return inserted.data;
+}
+
+// Mirrors ensureSupplierFromPurchase() exactly, for the receivables side.
+// Resolves-or-creates a `customers` row and returns it (with .id for the
+// caller to persist onto invoices.customer_id). Never throws.
+async function ensureCustomerFromInvoice(userId, { customer_name, customer_phone, customer_gstin } = {}) {
+  const name = normalizePartyName(customer_name);
+  if (!userId || !name) return null;
+
+  const existingResult = await supabase
+    .from('customers')
+    .select('*')
+    .eq('user_id', userId)
+    .ilike('name', name)
+    .limit(1)
+    .maybeSingle();
+
+  const existing = existingResult.error ? null : existingResult.data;
+  if (existing) {
+    const updates = {};
+    if (customer_phone && !existing.phone) updates.phone = customer_phone;
+    if (customer_gstin && !existing.gstin) updates.gstin = customer_gstin;
+
+    if (Object.keys(updates).length === 0) return existing;
+
+    let updated = await supabase
+      .from('customers')
+      .update(updates)
+      .eq('id', existing.id)
+      .eq('user_id', userId)
+      .select()
+      .single();
+
+    if (updated.error && updates.gstin) {
+      delete updates.gstin;
+      updated = await supabase
+        .from('customers')
+        .update(updates)
+        .eq('id', existing.id)
+        .eq('user_id', userId)
+        .select()
+        .single();
+    }
+
+    return updated.error ? existing : updated.data;
+  }
+
+  const payload = {
+    user_id: userId,
+    name,
+    phone: customer_phone || null,
+    email: null,
+    address: null,
+    gstin: customer_gstin || null,
+  };
+
+  let inserted = await supabase.from('customers').insert([payload]).select().single();
+  if (inserted.error && payload.gstin) {
+    delete payload.gstin;
+    inserted = await supabase.from('customers').insert([payload]).select().single();
+  }
+
+  if (inserted.error) {
+    console.warn('Customer sync failed:', inserted.error.message);
     return null;
   }
 
@@ -9507,6 +9662,13 @@ app.post('/api/purchases', authMiddleware, async (req, res) => {
       ensureSupplierFromPurchase(req.user.userId, data),
       items !== undefined ? syncInventoryFromPurchase(req.user.userId, data) : Promise.resolve([]),
     ]);
+    // Wave 2: persist the canonical supplier_id back onto the purchase row
+    // (ensureSupplierFromPurchase already resolved/created the supplier —
+    // it was simply never saved back before this).
+    if (supplier?.id) {
+      await supabase.from('purchases').update({ supplier_id: supplier.id, updated_at: new Date() }).eq('id', data.id).eq('user_id', req.user.userId).catch(() => {});
+      data.supplier_id = supplier.id;
+    }
     await emitBusinessEvent(req.user.userId, 'purchase.created', {
       purchase: data,
       amount: finalAmount,
@@ -9549,7 +9711,7 @@ app.patch('/api/purchases/:id', authMiddleware, async (req, res) => {
     const newPaid   = finalPaid   ?? parseFloat(current.paid_amount);
     const newStatus = newPaid >= newAmount ? 'paid' : newPaid > 0 ? 'partial' : 'unpaid';
 
-    const updates = { amount: newAmount, paid_amount: newPaid, status: newStatus };
+    const updates = { amount: newAmount, paid_amount: newPaid, status: newStatus, updated_at: new Date() };
     if (supplier_name  !== undefined) updates.supplier_name  = supplier_name;
     if (purchase_date  !== undefined) updates.purchase_date  = purchase_date  || null;
     if (due_date       !== undefined) updates.due_date       = due_date       || null;
@@ -9572,6 +9734,10 @@ app.patch('/api/purchases/:id', authMiddleware, async (req, res) => {
       ensureSupplierFromPurchase(req.user.userId, data),
       items !== undefined ? syncInventoryFromPurchase(req.user.userId, data) : Promise.resolve([]),
     ]);
+    if (supplier?.id && data.supplier_id !== supplier.id) {
+      await supabase.from('purchases').update({ supplier_id: supplier.id, updated_at: new Date() }).eq('id', data.id).eq('user_id', req.user.userId).catch(() => {});
+      data.supplier_id = supplier.id;
+    }
     await emitBusinessEvent(req.user.userId, 'purchase.updated', {
       purchase: data,
       amount: newAmount,
@@ -9694,12 +9860,22 @@ app.post('/api/sales', authMiddleware, async (req, res) => {
     if (!sale.invoice_number && receivable?.invoice_number) {
       const updatedSale = await supabase
         .from('sales')
-        .update({ invoice_number: receivable.invoice_number })
+        .update({ invoice_number: receivable.invoice_number, updated_at: new Date() })
         .eq('id', sale.id)
         .eq('user_id', req.user.userId)
         .select()
         .single();
       if (!updatedSale.error && updatedSale.data) sale = updatedSale.data;
+    }
+    if (receivable?.customer_id && sale.customer_id !== receivable.customer_id) {
+      const updatedSaleCustomer = await supabase
+        .from('sales')
+        .update({ customer_id: receivable.customer_id, updated_at: new Date() })
+        .eq('id', sale.id)
+        .eq('user_id', req.user.userId)
+        .select()
+        .single();
+      if (!updatedSaleCustomer.error && updatedSaleCustomer.data) sale = updatedSaleCustomer.data;
     }
     await emitBusinessEvent(req.user.userId, 'sale.created', {
       sale: sale,
@@ -9736,7 +9912,7 @@ app.patch('/api/sales/:id', authMiddleware, async (req, res) => {
       .single();
     if (currentError || !current) return res.status(404).json({ error: 'Sale not found' });
 
-    const updates = {};
+    const updates = { updated_at: new Date() };
     if (customer_name  !== undefined) updates.customer_name  = customer_name;
     if (sale_date      !== undefined) updates.sale_date      = sale_date || null;
     if (due_date       !== undefined) updates.due_date       = due_date || null;
@@ -9769,12 +9945,22 @@ app.patch('/api/sales/:id', authMiddleware, async (req, res) => {
     if (!sale.invoice_number && receivable?.invoice_number) {
       const updatedSale = await supabase
         .from('sales')
-        .update({ invoice_number: receivable.invoice_number })
+        .update({ invoice_number: receivable.invoice_number, updated_at: new Date() })
         .eq('id', sale.id)
         .eq('user_id', req.user.userId)
         .select()
         .single();
       if (!updatedSale.error && updatedSale.data) sale = updatedSale.data;
+    }
+    if (receivable?.customer_id && sale.customer_id !== receivable.customer_id) {
+      const updatedSaleCustomer = await supabase
+        .from('sales')
+        .update({ customer_id: receivable.customer_id, updated_at: new Date() })
+        .eq('id', sale.id)
+        .eq('user_id', req.user.userId)
+        .select()
+        .single();
+      if (!updatedSaleCustomer.error && updatedSaleCustomer.data) sale = updatedSaleCustomer.data;
     }
     await emitBusinessEvent(req.user.userId, 'sale.updated', {
       sale: sale,
@@ -11315,19 +11501,7 @@ app.get('/api/cortex/health', authMiddleware, async (req, res) => {
       : null;
 
     // Group already-fetched evalActions by action_type (in-memory, no extra query)
-    const byActionType = {};
-    evalActions.forEach(a => {
-      const type = a.action_type || 'UNKNOWN';
-      if (!byActionType[type]) byActionType[type] = { effective: 0, ineffective: 0, unknown: 0 };
-      if (a.outcome === 'effective') byActionType[type].effective++;
-      else if (a.outcome === 'ineffective') byActionType[type].ineffective++;
-      else byActionType[type].unknown++;
-    });
-    Object.keys(byActionType).forEach(type => {
-      const t = byActionType[type];
-      const total = t.effective + t.ineffective + t.unknown;
-      t.rate = total > 0 ? Math.round((t.effective / total) * 100) : null;
-    });
+    const byActionType = buildActionTypeBreakdown(evalActions);
 
     res.json({
       success: true,
