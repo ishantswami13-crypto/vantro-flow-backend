@@ -185,14 +185,41 @@ async function main() {
 
   // ============ Event revision propagation ============
   const revBefore = await getSignalEvidenceChain(persistedA_eq[0].signal.id);
-  await pool.query(
-    `INSERT INTO world_event_revisions (event_id, field_name, previous_value, new_value) VALUES ($1,'magnitude','3.7','4.1')`,
+  const revInsert = await pool.query(
+    `INSERT INTO world_event_revisions (event_id, field_name, previous_value, new_value) VALUES ($1,'magnitude','3.7','4.1') RETURNING id`,
     [fx.eqEventId]
   );
   const revAfter = await getSignalEvidenceChain(persistedA_eq[0].signal.id);
   check('Event revision: evidence chain still resolves correctly through a revised event', revAfter.complete === true && revAfter.worldEvents.some(e => e.id === fx.eqEventId));
 
   console.log(`\n=== RESULTS: ${pass} passed, ${fail} failed (of ${pass + fail}) ===`);
+
+  // ── Cleanup audit fix (World Intelligence Phase 3, Part B) ──
+  // This file previously left residue on every run: scripts/world-phase2-fixtures.js
+  // reuses two FIXED tenant users (by design, matched by email) but
+  // resolveAndRecordExposure/persistCandidates have no dedup-across-runs
+  // guard, so re-running this test kept inserting new business_exposure and
+  // business_signals rows for the same fixture tenants forever, plus a
+  // synthetic world_event_revisions row against a REAL world_events row.
+  // Fix: delete all business_exposure/business_signals/candidates data for
+  // the two fixture tenants and the synthetic revision row at the end of
+  // every run. The fixture USERS rows themselves are intentionally kept
+  // (they are the stable, idempotent fixture the mission's Phase 11 proof
+  // was built around, matched by fixed email — not synthetic per-run junk).
+  await pool.query(`DELETE FROM world_event_revisions WHERE id = $1`, [revInsert.rows[0].id]);
+  const fixtureTenantIds = [fx.tenantAId, fx.tenantBId];
+  await pool.query(`DELETE FROM business_signal_status_history WHERE signal_id IN (SELECT id FROM business_signals WHERE user_id = ANY($1::uuid[]))`, [fixtureTenantIds]);
+  await pool.query(`DELETE FROM business_signals WHERE user_id = ANY($1::uuid[])`, [fixtureTenantIds]);
+  await pool.query(`DELETE FROM business_exposure_candidates WHERE user_id = ANY($1::uuid[])`, [fixtureTenantIds]);
+  await pool.query(`DELETE FROM business_exposure WHERE user_id = ANY($1::uuid[])`, [fixtureTenantIds]);
+  const residueCheck = await pool.query(
+    `SELECT (SELECT COUNT(*) FROM business_exposure WHERE user_id = ANY($1::uuid[])) AS bexp,
+            (SELECT COUNT(*) FROM business_signals WHERE user_id = ANY($1::uuid[])) AS bsig,
+            (SELECT COUNT(*) FROM world_event_revisions WHERE id = $2) AS rev`,
+    [fixtureTenantIds, revInsert.rows[0].id]
+  );
+  console.log('Cleanup residue check (bexp/bsig/rev must be 0):', residueCheck.rows[0]);
+
   process.exit(fail > 0 ? 1 : 0);
 }
 
