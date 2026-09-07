@@ -13,6 +13,21 @@ require('dotenv').config();
 const { randomUUID } = require('crypto');
 const { getPool } = require('../lib/db/pg');
 const { resolveAndRecordExposure } = require('../lib/world/businessEntityResolution');
+const { verifyExposure } = require('../lib/world/exposureRegistry');
+
+// World Intelligence Phase 3 (Part A) added a WHERE verification_status =
+// 'VERIFIED' gate to loadExposuresForTenant, so an exposure must be
+// explicitly verified before it can ever drive a real signal. These fixtures
+// represent a tenant who HAS verified their exposure data (that's the
+// honest scenario the Phase 2 proof is meant to represent), so every
+// exposure this script creates/reuses must be explicitly marked VERIFIED —
+// idempotent no-op if it already is.
+async function ensureVerified(userId, exposureResult) {
+  const exposure = exposureResult.exposure;
+  if (exposure.verification_status === 'VERIFIED') return exposureResult;
+  const verified = await verifyExposure(userId, exposure.id, { verifiedByUserId: userId });
+  return { ...exposureResult, exposure: verified };
+}
 
 async function ensureTestUser(pool, email, businessName) {
   const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
@@ -71,7 +86,7 @@ async function main() {
     `SELECT * FROM business_exposure WHERE user_id=$1 AND business_entity_id=$2 AND exposure_type='LOCATED_IN'`,
     [tenantAId, supplierAId]
   );
-  const locExposure = existingLoc.rows.length
+  const locExposureRaw = existingLoc.rows.length
     ? { exposure: existingLoc.rows[0] }
     : await resolveAndRecordExposure({
         userId: tenantAId,
@@ -84,12 +99,13 @@ async function main() {
         sourceOfFact: 'test_fixture',
         evidenceNotes: 'Phase 11 fixture: supplier explicitly recorded as located in ' + eq.code,
       });
+  const locExposure = await ensureVerified(tenantAId, locExposureRaw);
 
   const existingFx = await pool.query(
     `SELECT * FROM business_exposure WHERE user_id=$1 AND business_entity_id=$2 AND exposure_type='CURRENCY_DENOMINATED'`,
     [tenantAId, purchaseAId]
   );
-  const fxExposure = existingFx.rows.length
+  const fxExposureRaw = existingFx.rows.length
     ? { exposure: existingFx.rows[0] }
     : await resolveAndRecordExposure({
         userId: tenantAId,
@@ -102,6 +118,7 @@ async function main() {
         sourceOfFact: 'test_fixture',
         evidenceNotes: 'Phase 11 fixture: purchase explicitly recorded as denominated in ' + fx.code,
       });
+  const fxExposure = await ensureVerified(tenantAId, fxExposureRaw);
 
   // Tenant B: a supplier located in a DIFFERENT, non-matching country —
   // proves negative/tenant-isolation, not just absence of any exposure.
@@ -110,7 +127,7 @@ async function main() {
     `SELECT * FROM business_exposure WHERE user_id=$1 AND business_entity_id=$2 AND exposure_type='LOCATED_IN'`,
     [tenantBId, supplierBId]
   );
-  const noMatchExposure = existingNoMatch.rows.length
+  const noMatchExposureRaw = existingNoMatch.rows.length
     ? { exposure: existingNoMatch.rows[0] }
     : await resolveAndRecordExposure({
         userId: tenantBId,
@@ -123,6 +140,10 @@ async function main() {
         sourceOfFact: 'test_fixture',
         evidenceNotes: 'Phase 11 fixture: negative control, deliberately non-matching country',
       });
+  // Also verify tenant B's exposure — the negative control must prove
+  // tenant/country isolation, not accidentally pass only because it happens
+  // to be unverified.
+  const noMatchExposure = await ensureVerified(tenantBId, noMatchExposureRaw);
 
   console.log(JSON.stringify({
     tenantAId, tenantBId,
