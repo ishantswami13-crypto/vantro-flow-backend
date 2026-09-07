@@ -11126,42 +11126,41 @@ app.post('/api/ai-actions/:id/send-whatsapp', authMiddleware, async (req, res) =
     const userId = req.user.userId;
     const { id } = req.params;
 
-    const { data: action, error: fetchErr } = await supabase
-      .from('ai_actions')
-      .select('*, customers(name, phone)')
-      .eq('id', id)
-      .eq('user_id', userId)
-      .single();
-    if (fetchErr || !action) return res.status(404).json({ error: 'Action not found' });
+    // Phase C — Verified Execution Loop V1 (Receivables): dispatched through
+    // commandBus's EXECUTE_RECEIVABLES_ACTION so this route shares one
+    // audited, idempotent, approval-gated execution path with any other
+    // caller instead of duplicating the logic inline. `realSender` is passed
+    // in so the handler never needs to require server.js itself; it is only
+    // ever invoked if guardExternalSend() genuinely authorizes a real send
+    // (off by default in this environment).
+    const commandBus = require('./lib/services/orchestrator/commandBus.service');
+    const { success, result, error, errorCode, errorMeta } = await commandBus.dispatch(userId, 'EXECUTE_RECEIVABLES_ACTION', {
+      actionId: id,
+      idempotencyKey: id,
+      realSender: sendWhatsAppMessage,
+    });
 
-    // Phase 2C.35-P1: human-in-the-loop — an AI action must be explicitly approved
-    // by the owner before it can send externally. (External-send flag is enforced
-    // at the sendWhatsAppMessage choke point.)
-    if (action.status !== 'approved') {
-      return res.status(409).json({ error: 'Action must be approved before sending', status: action.status || null });
+    if (!success) {
+      // Preserve the pre-existing response shape/status codes for each
+      // failure class so existing callers of this route see no behavior change.
+      const msg = error || 'Internal server error';
+      if (errorCode === 'NOT_FOUND')     return res.status(404).json({ error: 'Action not found' });
+      if (errorCode === 'NOT_APPROVED')  return res.status(409).json({ error: msg, status: (errorMeta && errorMeta.status) || null });
+      if (errorCode === 'NO_PHONE')      return res.status(422).json({ error: msg });
+      if (errorCode === 'NO_MESSAGE')    return res.status(422).json({ error: msg });
+      if (errorCode === 'NOT_CONFIGURED') return res.status(503).json({ error: msg });
+      if (errorCode === 'SEND_FAILED')   return res.status(502).json({ error: 'WhatsApp send failed', detail: (errorMeta && errorMeta.detail) || null });
+      return res.status(500).json({ error: 'Internal server error' });
     }
 
-    const phone   = action.customers?.phone || null;
-    const message = action.recommended_message || action.description || action.title;
-
-    if (!phone)   return res.status(422).json({ error: 'No customer phone on record' });
-    if (!message) return res.status(422).json({ error: 'No message content to send' });
-    if (!process.env.TWILIO_WHATSAPP_NUMBER) {
-      return res.status(503).json({ error: 'WhatsApp not configured — set TWILIO_WHATSAPP_NUMBER in Railway' });
+    if (result?.duplicate) {
+      // Already executed (idempotent replay) — same success shape, no re-send.
+      const rec = result.executionRecord;
+      return res.json({ success: true, sid: rec?.provider_message_id || null, provider: rec?.channel === 'test' ? 'test-fake-adapter' : 'twilio', duplicate: true });
     }
 
-    const sendResult = await sendWhatsAppMessage(phone, message);
-    if (!sendResult?.success) {
-      return res.status(502).json({ error: 'WhatsApp send failed', detail: sendResult });
-    }
-
-    await supabase
-      .from('ai_actions')
-      .update({ status: 'done', completed_at: new Date().toISOString(), updated_at: new Date().toISOString() })
-      .eq('id', id)
-      .eq('user_id', userId);
-
-    res.json({ success: true, sid: sendResult.sid || null, provider: sendResult.provider });
+    const sendResult = result?.sendResult;
+    res.json({ success: true, sid: sendResult?.sid || null, provider: sendResult?.provider || null });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
