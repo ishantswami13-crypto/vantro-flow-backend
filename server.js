@@ -8338,7 +8338,7 @@ app.post('/api/orders', authMiddleware, async (req, res) => {
     const { customer_name, customer_phone, delivery_address, items, total_amount, delivery_time, special_instructions, worker_id } = req.body;
     const { data, error } = await supabase.from('orders').insert([{
       user_id: userId, customer_name, customer_phone,
-      delivery_address, items: items || [], total_amount: total_amount || null,
+      delivery_address, items: JSON.stringify(items || []), total_amount: total_amount || null,
       delivery_time, special_instructions, worker_id: worker_id || null,
       source: 'manual', status: 'new',
       order_date: new Date().toISOString().split('T')[0], created_at: new Date(),
@@ -8352,6 +8352,7 @@ app.patch('/api/orders/:id', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
     const updates = pickAllowed(req.body, ['customer_name', 'customer_phone', 'delivery_address', 'items', 'total_amount', 'delivery_time', 'special_instructions', 'worker_id', 'status']);
+    if (updates.items !== undefined) updates.items = JSON.stringify(updates.items || []);
     updates.updated_at = new Date();
     const { data, error } = await supabase.from('orders')
       .update(updates)
@@ -8614,7 +8615,7 @@ Extract order from Hindi/Hinglish transcript. Return ONLY valid JSON, no comment
       customer_name: extracted.customer_name || callerPhone || 'Unknown',
       customer_phone: extracted.customer_phone || (callerPhone ? callerPhone.replace('+91', '').replace(/\D/g, '') : null),
       delivery_address: extracted.delivery_address || null,
-      items: extracted.items || [],
+      items: JSON.stringify(extracted.items || []),
       delivery_time: extracted.delivery_time || null,
       special_instructions: extracted.special_instructions || null,
       call_recording_url: RecordingUrl,
