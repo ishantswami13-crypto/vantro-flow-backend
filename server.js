@@ -5145,6 +5145,29 @@ app.get('/api/health/deep', async (req, res) => {
   }
 });
 
+// ── World Intelligence source freshness probe (read-only, tenant-agnostic) ──
+// world_sources rows are global registry data (which external providers
+// STARLANE ingests from), not per-user data, so this mirrors /api/health/deep's
+// no-tenant-auth pattern rather than /api/cortex/health's authMiddleware.
+// Pure DB read + deterministic comparison (lib/world/freshnessCheck.js) —
+// no external calls, no LLM, never mutates anything.
+app.get('/api/world/health', async (req, res) => {
+  try {
+    const { checkSourceFreshness } = require('./lib/world/freshnessCheck');
+    const results = await checkSourceFreshness();
+    const staleCount = results.filter(r => r.status !== 'FRESH').length;
+    res.json({
+      success: true,
+      sources: results,
+      stale_count: staleCount,
+      timestamp: new Date().toISOString(),
+      request_id: req.requestId || null,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
 app.post('/api/client-errors', async (req, res) => {
   const { path, message, error_id, browser_info, stack_hash, type = ErrorTaxonomy.CLIENT_UI_ERROR } = req.body;
   
@@ -11624,6 +11647,26 @@ cron.schedule('0 17 * * *', async () => {
     const result = await ingest();
     _log('info', '[WorldFXCron] Done', result.stats);
   } catch (err) { _log('error', '[WorldFXCron] Fatal', { error: err.message }); }
+}, { timezone: 'UTC' });
+
+// World source freshness check — daily at 06:00 UTC. Piggybacks on the same
+// world_intelligence_enabled flag: this only reads/logs data the two crons
+// above already write (world_sources.last_successful_ingestion_at/
+// last_failure_at), so it makes no sense to run it when world intelligence
+// ingestion itself is off. Pure DB read + deterministic comparison, no
+// external calls. See lib/world/freshnessCheck.js for the threshold logic.
+cron.schedule('0 6 * * *', async () => {
+  const { isEnabled: _isFE } = require('./lib/featureFlags');
+  if (!_isFE('world_intelligence_enabled')) return;
+  const { safeLog: _log } = require('./lib/observability/logger');
+  try {
+    const { checkSourceFreshness } = require('./lib/world/freshnessCheck');
+    const results = await checkSourceFreshness();
+    _log('info', '[WorldFreshnessCron] Done', {
+      sources_checked: results.length,
+      stale_count: results.filter(r => r.status !== 'FRESH').length,
+    });
+  } catch (err) { _log('error', '[WorldFreshnessCron] Fatal', { error: err.message }); }
 }, { timezone: 'UTC' });
 
 // ============================================
