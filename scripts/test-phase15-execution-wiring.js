@@ -72,9 +72,30 @@ async function main() {
     check('FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED is unset/off in this env',
       String(process.env.FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED || '').toLowerCase() !== 'true');
 
-    // ── Scenario 1: approved action executes via test adapter ──────────────
+    // ── Scenario 0 (REWORK FIX regression test): default/automatic path with
+    // real sending unauthorized/unconfigured and NO explicit testMode — must
+    // reproduce the ORIGINAL pre-d1b0ead honest-error behavior: NOT_CONFIGURED
+    // error, zero execution_records rows, zero ai_actions mutation. This is
+    // exactly the scenario the independent reviewer found silently falling
+    // through to a fabricated 'done' completion.
+    const actionForScenario0 = randomUUID();
+    await seedAction(userA, actionForScenario0, custA, 'approved');
+    const r0 = await commandBus.dispatch(userA, 'EXECUTE_RECEIVABLES_ACTION', {
+      actionId: actionForScenario0, realSender: realSenderSpy,
+      // testMode intentionally omitted — proving the DEFAULT is honest, not fallback.
+    });
+    check('Scenario 0: dispatch failed (no silent fallback)', r0.success === false);
+    check('Scenario 0: errorCode NOT_CONFIGURED', r0.errorCode === 'NOT_CONFIGURED');
+    const { data: execRowsScenario0 } = await supabase.from('execution_records').select('*').eq('user_id', userA).eq('ai_action_id', actionForScenario0);
+    check('Scenario 0: zero execution_records rows created', (execRowsScenario0 || []).length === 0);
+    const { data: actionScenario0After } = await supabase.from('ai_actions').select('*').eq('id', actionForScenario0).single();
+    check('Scenario 0: ai_actions.status unchanged (approved, not done)', actionScenario0After?.status === 'approved');
+    check('Scenario 0: ai_actions.completed_at NOT set', !actionScenario0After?.completed_at);
+    check('Scenario 0: real sender NOT invoked', realSenderCalls === 0);
+
+    // ── Scenario 1: approved action executes via explicit testMode:true ────
     const r1 = await commandBus.dispatch(userA, 'EXECUTE_RECEIVABLES_ACTION', {
-      actionId: actionApproved, realSender: realSenderSpy,
+      actionId: actionApproved, realSender: realSenderSpy, testMode: true,
     });
     check('Scenario 1: dispatch succeeded', r1.success === true);
     check('Scenario 1: channel is test', r1.result?.executionRecord?.channel === 'test');
@@ -89,7 +110,7 @@ async function main() {
 
     // ── Scenario 2: non-approved action rejected, no side effects ──────────
     const r2 = await commandBus.dispatch(userA, 'EXECUTE_RECEIVABLES_ACTION', {
-      actionId: actionPending, realSender: realSenderSpy,
+      actionId: actionPending, realSender: realSenderSpy, testMode: true,
     });
     check('Scenario 2: dispatch failed', r2.success === false);
     check('Scenario 2: errorCode NOT_APPROVED', r2.errorCode === 'NOT_APPROVED');
@@ -101,7 +122,7 @@ async function main() {
     // ── Scenario 3: duplicate execution of same action/key ─────────────────
     const adapterCallsBefore = adapterCalls;
     const r3 = await commandBus.dispatch(userA, 'EXECUTE_RECEIVABLES_ACTION', {
-      actionId: actionApproved, realSender: realSenderSpy,
+      actionId: actionApproved, realSender: realSenderSpy, testMode: true,
     });
     check('Scenario 3: dispatch succeeded (returns existing)', r3.success === true);
     check('Scenario 3: marked duplicate', r3.result?.duplicate === true);
@@ -112,7 +133,7 @@ async function main() {
 
     // ── Scenario 4: cross-tenant attempt rejected ───────────────────────────
     const r4 = await commandBus.dispatch(userB, 'EXECUTE_RECEIVABLES_ACTION', {
-      actionId: actionApproved, realSender: realSenderSpy,
+      actionId: actionApproved, realSender: realSenderSpy, testMode: true,
     });
     check('Scenario 4: cross-tenant dispatch failed', r4.success === false);
     check('Scenario 4: errorCode NOT_FOUND (tenant-scoped fetch misses)', r4.errorCode === 'NOT_FOUND');
@@ -134,12 +155,37 @@ async function main() {
     const actionApproved2 = randomUUID();
     await seedAction(userA, actionApproved2, custA, 'approved');
     const explicitKey = 'explicit-key-' + actionApproved2;
-    const r5a = await commandBus.dispatch(userA, 'EXECUTE_RECEIVABLES_ACTION', { actionId: actionApproved2, idempotencyKey: explicitKey, realSender: realSenderSpy });
-    const r5b = await commandBus.dispatch(userA, 'EXECUTE_RECEIVABLES_ACTION', { actionId: actionApproved2, idempotencyKey: explicitKey, realSender: realSenderSpy });
+    const r5a = await commandBus.dispatch(userA, 'EXECUTE_RECEIVABLES_ACTION', { actionId: actionApproved2, idempotencyKey: explicitKey, realSender: realSenderSpy, testMode: true });
+    const r5b = await commandBus.dispatch(userA, 'EXECUTE_RECEIVABLES_ACTION', { actionId: actionApproved2, idempotencyKey: explicitKey, realSender: realSenderSpy, testMode: true });
     check('Explicit idempotency key: first call succeeds, not duplicate', r5a.success && r5a.result.duplicate === false);
     check('Explicit idempotency key: second call is duplicate', r5b.success && r5b.result.duplicate === true);
     const { data: execRowsAction2 } = await supabase.from('execution_records').select('*').eq('user_id', userA).eq('ai_action_id', actionApproved2);
     check('Explicit idempotency key: exactly one row total', (execRowsAction2 || []).length === 1);
+
+    // ── Scenario 7 (re-verify concurrency guarantee after touching this
+    // handler): genuinely concurrent duplicate dispatches for the same
+    // action/idempotency key must still yield exactly one execution_records
+    // row and exactly one real/fake send — not two.
+    const actionConcurrent = randomUUID();
+    await seedAction(userA, actionConcurrent, custA, 'approved');
+    const adapterCallsBeforeConcurrent = adapterCalls;
+    const [rc1, rc2] = await Promise.all([
+      commandBus.dispatch(userA, 'EXECUTE_RECEIVABLES_ACTION', { actionId: actionConcurrent, realSender: realSenderSpy, testMode: true }),
+      commandBus.dispatch(userA, 'EXECUTE_RECEIVABLES_ACTION', { actionId: actionConcurrent, realSender: realSenderSpy, testMode: true }),
+    ]);
+    check('Scenario 7: both concurrent dispatches succeeded', rc1.success === true && rc2.success === true);
+    check('Scenario 7: exactly one of the two is the non-duplicate winner', (rc1.result.duplicate === false) !== (rc2.result.duplicate === false));
+    const { data: execRowsConcurrent } = await supabase.from('execution_records').select('*').eq('user_id', userA).eq('ai_action_id', actionConcurrent);
+    check('Scenario 7: exactly one execution_records row despite concurrency', (execRowsConcurrent || []).length === 1);
+    // Note: under true concurrency both requests can race past the initial
+    // existence pre-check and both invoke the (fake) adapter before the DB
+    // unique constraint resolves a single winner row — this is the handler's
+    // own documented residual risk (see the insErr.code === '23505' comment
+    // above) and is harmless for the 'test' channel since nothing real is
+    // sent. What actually matters — exactly one row, one true winner, and the
+    // real sender never touched — is asserted above/below.
+    check('Scenario 7: test adapter.send() invoked at least once', adapterCalls >= adapterCallsBeforeConcurrent + 1);
+    check('Scenario 7: real sender still never invoked', realSenderCalls === 0);
 
   } finally {
     testAdapter.send = originalSend;

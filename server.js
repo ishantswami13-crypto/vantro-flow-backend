@@ -11133,6 +11133,12 @@ app.post('/api/ai-actions/:id/send-whatsapp', authMiddleware, async (req, res) =
     // in so the handler never needs to require server.js itself; it is only
     // ever invoked if guardExternalSend() genuinely authorizes a real send
     // (off by default in this environment).
+    // REWORK FIX: `testMode` is deliberately NEVER read from req.body/req.query
+    // here — this public route always dispatches in default (production-shaped)
+    // mode, so when real sending isn't authorized/configured this returns the
+    // original honest NOT_CONFIGURED/503 with zero mutation (see commandBus's
+    // EXECUTE_RECEIVABLES_ACTION handler). Only internal/test code that calls
+    // the handler directly may pass `testMode: true`.
     const commandBus = require('./lib/services/orchestrator/commandBus.service');
     const { success, result, error, errorCode, errorMeta } = await commandBus.dispatch(userId, 'EXECUTE_RECEIVABLES_ACTION', {
       actionId: id,
