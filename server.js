@@ -3745,6 +3745,20 @@ async function safeInvoiceInsert(payload) {
 }
 
 async function safeInvoiceUpdate(invoiceId, userId, payload) {
+  // Global Context + Temporal Foundation, Part E — capture the pre-update
+  // row so a meaningful change (status/due_date) can be recorded as history
+  // additively below. Never blocks the actual update on failure to read it.
+  let previousRow = null;
+  try {
+    const prev = await supabase
+      .from('invoices')
+      .select('payment_status,due_date,payment_date,payment_amount')
+      .eq('id', invoiceId)
+      .eq('user_id', userId)
+      .single();
+    previousRow = prev.data || null;
+  } catch (_) { /* non-fatal — history write below just no-ops if this failed */ }
+
   let result = await supabase
     .from('invoices')
     .update(payload)
@@ -3752,16 +3766,37 @@ async function safeInvoiceUpdate(invoiceId, userId, payload) {
     .eq('user_id', userId)
     .select()
     .single();
-  if (!result.error) return result;
+  if (result.error) {
+    const retry = await supabase
+      .from('invoices')
+      .update(stripOptionalInvoiceColumns(payload))
+      .eq('id', invoiceId)
+      .eq('user_id', userId)
+      .select()
+      .single();
+    result = retry.error ? result : retry;
+  }
 
-  const retry = await supabase
-    .from('invoices')
-    .update(stripOptionalInvoiceColumns(payload))
-    .eq('id', invoiceId)
-    .eq('user_id', userId)
-    .select()
-    .single();
-  return retry.error ? result : retry;
+  if (!result.error && previousRow) {
+    try {
+      const { recordEntityStateChange } = require('./lib/domain/temporal/entityStateHistory');
+      const eventType = previousRow.payment_status !== payload.payment_status
+        ? 'invoice_status_changed'
+        : (previousRow.due_date !== payload.due_date ? 'invoice_due_date_changed' : 'invoice_updated');
+      await recordEntityStateChange({
+        userId,
+        entityType: 'invoice',
+        entityId: invoiceId,
+        eventType,
+        previousRow,
+        newRow: payload,
+        fields: ['payment_status', 'due_date', 'payment_date', 'payment_amount'],
+        source: 'server.js:safeInvoiceUpdate',
+      });
+    } catch (histErr) { console.error('[entity_state_history] safeInvoiceUpdate write failed:', histErr.message); }
+  }
+
+  return result;
 }
 
 async function findLinkedSalesInvoice(userId, sale) {
@@ -5762,14 +5797,32 @@ Summarise actions clearly after doing them.${voiceContext}${overdueContext}`;
         case 'mark_invoice_paid': {
           let inv;
           if (args.invoice_id) {
-            const { data } = await supabase.from('invoices').select('id,customer_name,invoice_amount').eq('id',args.invoice_id).eq('user_id',user_id).single();
+            const { data } = await supabase.from('invoices').select('id,customer_name,invoice_amount,payment_status,payment_date,due_date').eq('id',args.invoice_id).eq('user_id',user_id).single();
             inv = data;
           } else if (args.customer_name) {
-            const { data } = await supabase.from('invoices').select('id,customer_name,invoice_amount').eq('user_id',user_id).ilike('customer_name',`%${args.customer_name}%`).eq('payment_status','Pending').order('days_overdue',{ascending:false}).limit(1);
+            const { data } = await supabase.from('invoices').select('id,customer_name,invoice_amount,payment_status,payment_date,due_date').eq('user_id',user_id).ilike('customer_name',`%${args.customer_name}%`).eq('payment_status','Pending').order('days_overdue',{ascending:false}).limit(1);
             inv = data?.[0];
           }
           if (!inv) return { error: 'Invoice not found' };
-          await supabase.from('invoices').update({ payment_status:'Paid', payment_date:new Date().toISOString().split('T')[0], payment_amount:inv.invoice_amount }).eq('id',inv.id).eq('user_id',user_id);
+          const newPaymentDate = new Date().toISOString().split('T')[0];
+          await supabase.from('invoices').update({ payment_status:'Paid', payment_date:newPaymentDate, payment_amount:inv.invoice_amount }).eq('id',inv.id).eq('user_id',user_id);
+          // Global Context + Temporal Foundation, Part E — additive history
+          // write alongside the existing UPDATE above. Never blocks the
+          // actual business operation on failure.
+          try {
+            const { recordEntityStateChange } = require('./lib/domain/temporal/entityStateHistory');
+            await recordEntityStateChange({
+              userId: user_id,
+              entityType: 'invoice',
+              entityId: inv.id,
+              eventType: 'payment_received',
+              previousRow: inv,
+              newRow: { ...inv, payment_status: 'Paid', payment_date: newPaymentDate, payment_amount: inv.invoice_amount },
+              fields: ['payment_status', 'payment_date', 'payment_amount'],
+              source: 'server.js:mark_invoice_paid',
+              actor: 'ai_assistant',
+            });
+          } catch (histErr) { console.error('[entity_state_history] mark_invoice_paid write failed:', histErr.message); }
           actions.push(`✅ Marked ${inv.customer_name} invoice (₹${Number(inv.invoice_amount).toLocaleString('en-IN')}) as paid`);
           return { success:true, message:`Marked ${inv.customer_name} as paid`, amount:inv.invoice_amount };
         }
