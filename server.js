@@ -11595,6 +11595,37 @@ cron.schedule('30 2 * * 0', async () => {
   } catch (err) { _log('error', '[DataQualityCron] Fatal', { error: err.message }); }
 }, { timezone: 'UTC' });
 
+// ── WORLD INTELLIGENCE CRONS — STARLANE Phase 1 ──────────────────────────
+// Two independent vertical-slice sources, each individually flag-gated so a
+// bad external source can be killed without a deploy. Tenant-agnostic —
+// these populate world_events (not per-user data), so there is no per-user
+// loop here unlike the crons above.
+// USGS significant-earthquakes feed — hourly at :10 (05:30 IST offset varies with DST, UTC is canonical).
+cron.schedule('10 * * * *', async () => {
+  const { isEnabled: _isFE } = require('./lib/featureFlags');
+  if (!_isFE('world_intelligence_enabled')) return;
+  const { safeLog: _log } = require('./lib/observability/logger');
+  _log('info', '[WorldUSGSCron] Running USGS earthquake ingestion');
+  try {
+    const { ingest } = require('./lib/world/sources/usgsEarthquakes');
+    const result = await ingest();
+    _log('info', '[WorldUSGSCron] Done', result.stats);
+  } catch (err) { _log('error', '[WorldUSGSCron] Fatal', { error: err.message }); }
+}, { timezone: 'UTC' });
+
+// Frankfurter/ECB FX reference rates — daily at 17:00 UTC (after ECB's ~16:00 CET publication).
+cron.schedule('0 17 * * *', async () => {
+  const { isEnabled: _isFE } = require('./lib/featureFlags');
+  if (!_isFE('world_intelligence_enabled')) return;
+  const { safeLog: _log } = require('./lib/observability/logger');
+  _log('info', '[WorldFXCron] Running FX reference rate ingestion');
+  try {
+    const { ingest } = require('./lib/world/sources/fxRates');
+    const result = await ingest();
+    _log('info', '[WorldFXCron] Done', result.stats);
+  } catch (err) { _log('error', '[WorldFXCron] Fatal', { error: err.message }); }
+}, { timezone: 'UTC' });
+
 // ============================================
 // START SERVER
 // ============================================
