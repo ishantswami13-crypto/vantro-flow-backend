@@ -51,6 +51,40 @@ async function main() {
   check('country: "Vietnam" resolves to VN', (await resolveCountryValue('Vietnam')).code === 'VN');
   check('country: "Viet Nam" (ISO official short name) resolves to VN', (await resolveCountryValue('Viet Nam')).code === 'VN');
   check('country: unknown gibberish is unresolved (never guessed)', (await resolveCountryValue('Freedonia')) === null);
+
+  // ============ ISO alpha-3 country code support (HARDEN finding) ============
+  // "VNM"/"VN"/"Vietnam"/"Viet Nam" must all resolve to the identical
+  // canonical country entity — same worldEntityId, same code — proving
+  // alpha-3 input is not a second, divergent identity for the same country.
+  {
+    const viaAlpha3 = await resolveCountryValue('VNM');
+    const viaAlpha2 = await resolveCountryValue('VN');
+    const viaName = await resolveCountryValue('Vietnam');
+    check('country: alpha-3 "VNM" resolves to VN', viaAlpha3 && viaAlpha3.code === 'VN');
+    check('country: alpha-3 "VNM" matches the same world_entity as alpha-2 "VN"', viaAlpha3.worldEntityId === viaAlpha2.worldEntityId);
+    check('country: alpha-3 "VNM" matches the same world_entity as name "Vietnam"', viaAlpha3.worldEntityId === viaName.worldEntityId);
+  }
+  {
+    const viaAlpha3 = await resolveCountryValue('USA');
+    const viaAlpha2 = await resolveCountryValue('US');
+    check('country: alpha-3 "USA" resolves to US and matches alpha-2', viaAlpha3.code === 'US' && viaAlpha3.worldEntityId === viaAlpha2.worldEntityId);
+  }
+  {
+    const viaAlpha3 = await resolveCountryValue('CHN');
+    const viaName = await resolveCountryValue('China');
+    check('country: alpha-3 "CHN" resolves to CN and matches name-based resolution', viaAlpha3.code === 'CN' && viaAlpha3.worldEntityId === viaName.worldEntityId);
+  }
+  {
+    const viaAlpha3 = await resolveCountryValue('DEU');
+    const viaName = await resolveCountryValue('Germany');
+    check('country: alpha-3 "DEU" resolves to DE and matches name-based resolution', viaAlpha3.code === 'DE' && viaAlpha3.worldEntityId === viaName.worldEntityId);
+  }
+  {
+    const viaAlpha3 = await resolveCountryValue('GBR');
+    const viaAlpha2 = await resolveCountryValue('GB');
+    check('country: alpha-3 "GBR" resolves to GB and matches alpha-2', viaAlpha3.code === 'GB' && viaAlpha3.worldEntityId === viaAlpha2.worldEntityId);
+  }
+  check('country: unmapped/uncertain alpha-3-shaped gibberish stays unresolved (never guessed)', (await resolveCountryValue('XYZ')) === null);
   check('currency: "USD" resolves', (await resolveCurrencyValue('USD')).code === 'USD');
   check('currency: "US Dollar" resolves to USD', (await resolveCurrencyValue('US Dollar')).code === 'USD');
   check('currency: euro symbol resolves to EUR', (await resolveCurrencyValue('€')).code === 'EUR');
