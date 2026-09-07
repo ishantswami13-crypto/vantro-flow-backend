@@ -288,16 +288,48 @@ async function main() {
   // Teardown -- delete everything this test created. Zero residue.
   // ===================================================================
   console.log('\n--- Cleanup ---');
-  await pool.query(`DELETE FROM entity_state_history WHERE user_id = ANY($1::uuid[])`, [createdUserIds]);
-  await pool.query(`DELETE FROM invoices WHERE id = ANY($1::uuid[])`, [createdInvoiceIds]);
-  await pool.query(`DELETE FROM customers WHERE id = ANY($1::uuid[])`, [createdCustomerIds]);
-  await pool.query(`DELETE FROM suppliers WHERE id = ANY($1::uuid[])`, [createdSupplierIds]);
-  await pool.query(`DELETE FROM business_exposure WHERE user_id = ANY($1::uuid[])`, [createdUserIds]);
-  await pool.query(`DELETE FROM organizations WHERE owner_user_id = ANY($1::uuid[])`, [createdUserIds]);
-  await pool.query(`DELETE FROM users WHERE id = ANY($1::uuid[])`, [createdUserIds]);
+  // Delete-with-retry: a dropped connection mid-query on this network path
+  // has previously left rows behind despite the residue check reporting
+  // success (the check only ever looked at THIS run's own tag, and a
+  // failed/retried DELETE was never distinguished from a successful one).
+  // Retry each delete up to 3x and surface the actual affected row count.
+  async function deleteWithRetry(sql, params, label) {
+    let lastErr;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const res = await pool.query(sql, params);
+        return res.rowCount;
+      } catch (e) {
+        lastErr = e;
+        console.warn(`  [cleanup retry ${attempt}/3] ${label}: ${e.message}`);
+        await new Promise(r => setTimeout(r, 300 * attempt));
+      }
+    }
+    console.error(`  [cleanup FAILED after 3 attempts] ${label}: ${lastErr?.message}`);
+    return -1; // signals failure distinctly from "0 rows affected"
+  }
 
+  await deleteWithRetry(`DELETE FROM entity_state_history WHERE user_id = ANY($1::uuid[])`, [createdUserIds], 'entity_state_history');
+  await deleteWithRetry(`DELETE FROM invoices WHERE id = ANY($1::uuid[])`, [createdInvoiceIds], 'invoices');
+  await deleteWithRetry(`DELETE FROM customers WHERE id = ANY($1::uuid[])`, [createdCustomerIds], 'customers');
+  await deleteWithRetry(`DELETE FROM suppliers WHERE id = ANY($1::uuid[])`, [createdSupplierIds], 'suppliers');
+  await deleteWithRetry(`DELETE FROM business_exposure WHERE user_id = ANY($1::uuid[])`, [createdUserIds], 'business_exposure');
+  await deleteWithRetry(`DELETE FROM organizations WHERE owner_user_id = ANY($1::uuid[])`, [createdUserIds], 'organizations');
+  const usersDeleted = await deleteWithRetry(`DELETE FROM users WHERE id = ANY($1::uuid[])`, [createdUserIds], 'users');
+
+  // Residue check now covers TWO things: (1) this run's own tag, same as
+  // before, and (2) any stale rows from a PREVIOUS run of this same script
+  // that failed to clean up (matched via the stable prefix, not the
+  // timestamp-unique full tag) -- this is what actually would have caught
+  // the real leftover rows found in review.
   const residueCheck = await pool.query(`SELECT COUNT(*)::int AS c FROM users WHERE email LIKE $1`, [`${TEST_TAG}%`]);
-  check('Cleanup: zero residual test rows remain in users', residueCheck.rows[0].c === 0);
+  check('Cleanup: this run deleted all its own users (rowCount matches)', usersDeleted === createdUserIds.length,
+    `expected=${createdUserIds.length} actual=${usersDeleted}`);
+  check('Cleanup: zero residual test rows remain in users (this run\'s tag)', residueCheck.rows[0].c === 0);
+
+  const stalePriorRunResidue = await pool.query(`SELECT COUNT(*)::int AS c FROM users WHERE email LIKE 'gctf-test-%'`);
+  check('Cleanup: zero stale rows from any PRIOR run of this script remain', stalePriorRunResidue.rows[0].c === 0,
+    `count=${stalePriorRunResidue.rows[0].c}`);
 
   console.log(`\n=== RESULTS: ${pass} passed, ${fail} failed ===\n`);
   await pool.end();
