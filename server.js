@@ -259,6 +259,7 @@ const { getBusinessContext } = require('./lib/businessContext');
 const salesService = require('./lib/services/SalesService');
 const purchaseService = require('./lib/services/PurchaseService');
 const { buildActionTypeBreakdown } = require('./lib/services/cortexCore/actionTypeBreakdown');
+const { buildReceivablesExecutionMetrics } = require('./lib/services/cortexCore/receivablesExecutionMetrics');
 const {
   createCustomerOverdueSummaryHandler,
   methodNotAllowed: stagingCustomerOverdueMethodNotAllowed,
@@ -11410,12 +11411,14 @@ app.get('/api/cortex/health', authMiddleware, async (req, res) => {
     const { FLAGS } = require('./lib/featureFlags');
     const userId = req.user.userId;
 
-    const [actionsRes, scoresRes, plansRes, evalRes, memRes] = await Promise.all([
+    const [actionsRes, scoresRes, plansRes, evalRes, memRes, executionRecordsRes, promisesRes] = await Promise.all([
       supabase.from('ai_actions').select('priority, status').eq('user_id', userId).in('status', ['pending', 'done']).limit(200),
       supabase.from('customer_scores').select('id', { count: 'exact', head: true }).eq('user_id', userId),
       supabase.from('ai_plans').select('id', { count: 'exact', head: true }).eq('user_id', userId).eq('status', 'active'),
       supabase.from('ai_actions').select('outcome, action_type').eq('user_id', userId).not('outcome', 'is', null).limit(100),
       supabase.from('business_memory').select('id', { count: 'exact', head: true }).eq('user_id', userId),
+      supabase.from('execution_records').select('channel, status').eq('user_id', userId).limit(200),
+      supabase.from('promises').select('status').eq('user_id', userId).limit(200),
     ]);
 
     const actions     = actionsRes.data  || [];
@@ -11433,6 +11436,12 @@ app.get('/api/cortex/health', authMiddleware, async (req, res) => {
     // Group already-fetched evalActions by action_type (in-memory, no extra query)
     const byActionType = buildActionTypeBreakdown(evalActions);
 
+    // Aggregate already-fetched execution_records/promises (in-memory, no extra query)
+    const receivablesExecution = buildReceivablesExecutionMetrics({
+      executionRecords: executionRecordsRes.data || [],
+      promises:         promisesRes.data         || [],
+    });
+
     res.json({
       success: true,
       flags: FLAGS,
@@ -11447,6 +11456,7 @@ app.get('/api/cortex/health', authMiddleware, async (req, res) => {
         effective_count:     effectiveCount,
         ineffective_count:   ineffectiveCount,
         by_action_type:      byActionType,
+        receivables_execution: receivablesExecution,
       },
     });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
