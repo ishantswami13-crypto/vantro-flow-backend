@@ -11405,6 +11405,16 @@ app.post('/api/cortex/run-agents', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// ── BUSINESS STATE: composed tenant-scoped view (rankedActions/cashflow/brain) ──
+app.get('/api/business-state', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { loadBusinessState } = require('./lib/domain/intelligence/businessState');
+    const businessState = await loadBusinessState(supabase, userId);
+    res.json({ success: true, businessState });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
 // ── CORTEX: HEALTH ────────────────────────────────────────────────────────────
 app.get('/api/cortex/health', authMiddleware, async (req, res) => {
   try {
