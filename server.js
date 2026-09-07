@@ -6093,6 +6093,91 @@ app.post('/api/collections/send-reminder', authMiddleware, async (req, res) => {
   }
 });
 
+// ============================================
+// PHASE D — Verified Execution Loop V1 (Receivables): manual promise-to-pay
+// recording. This is the ONLY way a `promises` row gets created in this
+// phase — never inferred from generated message text or any AI output (per
+// the mission's explicit rule). It exists because this codebase has no real
+// inbound customer-interaction channel (no WhatsApp inbound webhook, no
+// customer portal) — so the sole real-world source of "the customer promised
+// to pay by X" is an owner/staff member typing it in after hearing it
+// directly (e.g. over a phone call).
+// ============================================
+app.post('/api/customers/:customerId/promises', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { customerId } = req.params;
+    const { receivable_id, promised_amount, promised_date, notes, source } = req.body;
+
+    // ── Validate tenant owns the customer ──────────────────────────────────
+    const { data: customer, error: custErr } = await supabase
+      .from('customers')
+      .select('id')
+      .eq('id', customerId)
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (custErr) { console.error('[promises/create] customer lookup error:', custErr); return res.status(500).json({ error: 'Internal server error' }); }
+    if (!customer) return res.status(404).json({ error: 'Customer not found' });
+
+    // ── Validate promised_amount: a sane positive finite number ────────────
+    const amount = Number(promised_amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'promised_amount must be a positive number' });
+    }
+
+    // ── Validate promised_date: a real, parseable calendar date ────────────
+    if (!promised_date || typeof promised_date !== 'string') {
+      return res.status(400).json({ error: 'promised_date is required' });
+    }
+    const parsedDate = new Date(promised_date);
+    if (isNaN(parsedDate.getTime())) {
+      return res.status(400).json({ error: 'promised_date is not a valid date' });
+    }
+
+    // ── If a receivable (invoice) is given, it MUST belong to this tenant ──
+    // Tenant isolation: never allow a promise to be attached to another
+    // tenant's invoice, even if the customer_id check above already passed.
+    let receivableId = null;
+    if (receivable_id) {
+      const { data: invoice, error: invErr } = await supabase
+        .from('invoices')
+        .select('id')
+        .eq('id', receivable_id)
+        .eq('user_id', userId)
+        .maybeSingle();
+      if (invErr) { console.error('[promises/create] invoice lookup error:', invErr); return res.status(500).json({ error: 'Internal server error' }); }
+      if (!invoice) return res.status(404).json({ error: 'Invoice not found for this tenant' });
+      receivableId = invoice.id;
+    }
+
+    const noteParts = [];
+    if (source) noteParts.push(`Source: ${String(source).slice(0, 200)}`);
+    if (notes)  noteParts.push(String(notes).slice(0, 2000));
+
+    const { data: promise, error: insErr } = await supabase
+      .from('promises')
+      .insert([{
+        user_id:         userId,
+        customer_id:     customerId,
+        receivable_id:   receivableId,
+        promised_amount: amount,
+        promised_date:   parsedDate.toISOString().split('T')[0],
+        promise_note:    noteParts.length ? noteParts.join(' | ') : null,
+        status:          'active',
+        created_by:      userId,
+      }])
+      .select('*')
+      .single();
+
+    if (insErr) { console.error('[promises/create] insert error:', insErr); return res.status(500).json({ error: 'Internal server error' }); }
+
+    res.status(201).json({ success: true, promise });
+  } catch (err) {
+    console.error('[promises/create] unexpected error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Bulk reminder: send to all overdue invoices (respects min_days filter)
 app.post('/api/collections/bulk-remind', authMiddleware, async (req, res) => {
   try {
