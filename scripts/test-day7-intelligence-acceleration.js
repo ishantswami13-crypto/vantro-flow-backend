@@ -31,9 +31,56 @@ async function del(table, column, value) {
   await supabase.from(table).delete().eq(column, value);
 }
 
+// Sweep any orphaned fixture rows left behind by a previous interrupted
+// (crashed/killed) run of this script, BEFORE creating this run's fixtures.
+// Scoped tightly to this test's own fixture markers only:
+//   - users.email LIKE 'day7-test-%@test.starlane.local' (this script is the
+//     only writer of that email pattern)
+//   - world_events/world_event_entities/business_exposure rows carrying the
+//     literal 'Day7 test fixture' marker this script stamps into
+//     title/evidence_notes (see the FX fixture below)
+// Never touches any row without one of these exact markers, so it cannot
+// reach real production-shaped data.
+async function sweepOrphanedFixtures() {
+  const { data: orphanedUsers } = await supabase
+    .from('users')
+    .select('id')
+    .like('email', 'day7-test-%@test.starlane.local');
+  const orphanedUserIds = (orphanedUsers || []).map(u => u.id);
+  if (orphanedUserIds.length) {
+    console.log(`(residue sweep) found ${orphanedUserIds.length} orphaned fixture user(s) from a previous run — cleaning up first`);
+  }
+  for (const uid of orphanedUserIds) {
+    // Children first (FK order), same tables this script itself fixtures.
+    for (const table of [
+      'payment_allocations', 'customer_score_history', 'customer_scores',
+      'invoices', 'sales', 'business_exposure', 'suppliers', 'customers',
+    ]) {
+      try { await del(table, 'user_id', uid); } catch (e) { /* table may not have user_id or no rows — ignore */ }
+    }
+    try { await del('users', 'id', uid); } catch (e) { /* ignore */ }
+  }
+
+  // Orphaned FX-narrative world_events/business_exposure fixtures, marked by
+  // the literal title/evidence_notes prefix this script always uses.
+  const { data: orphanedEvents } = await supabase
+    .from('world_events')
+    .select('id')
+    .like('title', 'Day7 test fixture%');
+  for (const ev of orphanedEvents || []) {
+    try { await del('world_event_entities', 'event_id', ev.id); } catch (e) { /* ignore */ }
+    try { await del('world_events', 'id', ev.id); } catch (e) { /* ignore */ }
+  }
+  try {
+    await supabase.from('business_exposure').delete().like('evidence_notes', 'Day7 test fixture%');
+  } catch (e) { /* ignore */ }
+}
+
 async function main() {
   console.log('=== Day 7 Intelligence Acceleration — real-DB tests ===');
   console.log('Tenant A (fixture):', TENANT_A);
+
+  await sweepOrphanedFixtures();
 
   // Fixture tenants themselves (users table FK requirement) — created and
   // torn down alongside every other fixture row.
@@ -202,6 +249,7 @@ async function main() {
     await supabase.from('suppliers').insert({ id: fxSupplierId, user_id: TENANT_A, name: 'Day7 FX Test Supplier' }).then(r => r, () => {});
     const { data: countryEntity } = await supabase.from('world_entities').select('id').eq('entity_type', 'COUNTRY').eq('name', 'CN').maybeSingle();
     let fxResult = null;
+    let fixtureEventId = null;
     const { data: macroSource } = await supabase.from('world_sources').select('id').eq('data_category', 'MACROECONOMICS').limit(1).maybeSingle();
     if (countryEntity && macroSource) {
       const exposureId = randomUUID();
@@ -212,6 +260,7 @@ async function main() {
         provenance_type: 'OWNER_ENTERED', evidence_notes: 'Day7 test fixture — clearly-labeled synthetic pair, no real match existed in DB at test time',
       });
       const eventId = randomUUID();
+      fixtureEventId = eventId;
       const weRes = await supabase.from('world_events').insert({
         id: eventId, event_type: 'MACROECONOMICS', title: 'Day7 test fixture — synthetic macro event',
         source_id: macroSource.id, observed_at: new Date().toISOString(), magnitude: 2.5, confidence: 0.8, severity: 'moderate',
@@ -238,11 +287,21 @@ async function main() {
     }
     cleanup.push(['suppliers', 'id', fxSupplierId]);
 
-    // No real match sanity check (using an unrelated tenant + one real event id, if any exist)
-    const { data: realEvent } = await supabase.from('world_events').select('id').eq('event_type', 'MACROECONOMICS').limit(1).maybeSingle();
+    // No real match sanity check: fetch a REAL pre-existing MACROECONOMICS
+    // event that is NOT the fixture event we just inserted above (excluded
+    // via .neq so this doesn't accidentally re-match the fixture's own CN
+    // exposure and silently pass for the wrong reason). TENANT_B has no
+    // business_exposure rows at all, so a real, unrelated event checked
+    // against TENANT_B must be insufficientEvidence — a genuine guardrail
+    // check, not a hardcoded pass.
+    let realEventQuery = supabase.from('world_events').select('id').eq('event_type', 'MACROECONOMICS').limit(1);
+    if (fixtureEventId) realEventQuery = realEventQuery.neq('id', fixtureEventId);
+    const { data: realEvent } = await realEventQuery.maybeSingle();
     if (realEvent) {
-      const noMatch = await buildFxExposureNarrative({ userId: TENANT_A, eventId: realEvent.id });
-      check('FX guardrail: real event w/ no real exposure match -> insufficientEvidence (before fixture noise)', true /* documented via fixture isolation above; TENANT_A now has the fixture exposure only for CN, unrelated event may or may not match */);
+      const noMatch = await buildFxExposureNarrative({ userId: TENANT_B, eventId: realEvent.id });
+      check('FX guardrail: real event w/ no real exposure match -> insufficientEvidence', noMatch.insufficientEvidence === true);
+    } else {
+      console.log('(skipped FX guardrail check: no real MACROECONOMICS world_events row exists besides the fixture)');
     }
 
   } finally {
