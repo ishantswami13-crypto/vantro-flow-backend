@@ -188,8 +188,28 @@ async function main() {
       );
       // this "cross join" is only run to prove such a query is never used by
       // app code (queries.js has no such join) -- the DB *can* answer it,
-      // but lib/world/queries.js never constructs it. Documented, not exploited.
-      check('Tenant isolation: app-level query functions always filter by user_id (manual code review)', true);
+      // but lib/world/queries.js never constructs it.
+      //
+      // Phase 3B fix (was previously check(..., true) — a hardcoded-true
+      // "manual code review" assertion that always passed regardless of
+      // actual behavior). Replaced with a REAL exercise of the actual
+      // app-level query function (signalQueries.getActiveSignalsForTenant),
+      // called once per tenant, asserting each tenant sees only its own row
+      // and never the other tenant's — this genuinely fails if the
+      // function's WHERE user_id = $1 filter is ever removed or broken.
+      const { getActiveSignalsForTenant } = require('../lib/world/signalQueries');
+      const [tenantASignals, tenantBSignals] = await Promise.all([
+        getActiveSignalsForTenant(tenantA, { limit: 500 }),
+        getActiveSignalsForTenant(tenantB, { limit: 500 }),
+      ]);
+      const tenantAHasOwnRow = tenantASignals.some(s => s.related_entity_id === 'A1');
+      const tenantALeaksB = tenantASignals.some(s => s.related_entity_id === 'B1' || s.user_id !== tenantA);
+      const tenantBHasOwnRow = tenantBSignals.some(s => s.related_entity_id === 'B1');
+      const tenantBLeaksA = tenantBSignals.some(s => s.related_entity_id === 'A1' || s.user_id !== tenantB);
+      check(
+        'Tenant isolation: signalQueries.getActiveSignalsForTenant returns each tenant only its own row, never the other tenant\'s',
+        tenantAHasOwnRow && !tenantALeaksB && tenantBHasOwnRow && !tenantBLeaksA
+      );
       // cleanup
       await pool.query('DELETE FROM business_signals WHERE user_id IN ($1,$2) AND evidence_notes LIKE $3', [tenantA, tenantB, '%tenant % signal%']);
     } else {
