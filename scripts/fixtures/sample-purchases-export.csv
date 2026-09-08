@@ -1,0 +1,16 @@
+Item Code,Supplier,GSTIN,Quantity,Unit Price,Currency,Order Date,Expected Date,Reference
+FIT-SKU-001,Bright Traders Pvt Ltd,GSTIN-FIT-001,20,12.50,USD,2026-08-01,2026-08-10,fit-inv-001
+FIT-SKU-001,Bright Traders Private Limited,GSTIN-FIT-001,15,12.75,USD,2026-08-03,2026-08-12,fit-inv-002
+FIT-SKU-001,Bright Traders Pvt. Ltd,,10,13.00,USD,2026-08-05,2026-08-14,fit-inv-003
+FIT-SKU-002,Coastal Components Ltd,GSTIN-FIT-002,50,4.20,EUR,2026-08-02,2026-08-16,fit-inv-004
+FIT-SKU-002,Coastal Components Limited,GSTIN-FIT-002,30,4.35,EUR,2026-08-06,2026-08-20,fit-inv-005
+FIT-SKU-003,Northline Hardware Co,GSTIN-FIT-003,100,1.10,INR,2026-08-04,2026-08-18,fit-inv-006
+FIT-SKU-003,Northline Hardware Co,GSTIN-FIT-003,75,1.15,INR,2026-08-07,2026-08-21,fit-inv-007
+FIT-SKU-004,Summit Fasteners Inc,GSTIN-FIT-004,200,0.85,USD,2026-08-08,2026-08-22,fit-inv-008
+FIT-SKU-001,Bright Traders Pvt Ltd,GSTIN-FIT-001,25,12.60,₹,2026-08-09,2026-08-23,fit-inv-009
+FIT-SKU-002,Coastal Components Ltd,GSTIN-FIT-002,not-a-number,4.50,EUR,2026-08-10,2026-08-24,fit-inv-010
+FIT-SKU-003,,GSTIN-FIT-003,40,1.20,INR,2026-08-11,2026-08-25,fit-inv-011
+FIT-SKU-004,Summit Fasteners Inc,GSTIN-FIT-004,60,0.90,$,2026-08-12,2026-08-26,fit-inv-012
+FIT-SKU-005,Unrelated Traders,GSTIN-FIT-005,12,7.00,USD,2026-08-13,2026-08-27,fit-inv-013
+FIT-SKU-001,Bright Traders Pvt Ltd,GSTIN-FIT-001,20,12.50,USD,2026-08-01,2026-08-10,fit-inv-001
+FIT-SKU-005,"Unrelated ""Traders"" & Co, LLC",GSTIN-FIT-006,8,7.25,USD,2026-08-14,2026-08-28,fit-inv-014
