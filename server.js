@@ -5121,6 +5121,48 @@ Rules: numbers only, no currency symbols or commas. Dates must be YYYY-MM-DD.`;
   }
 });
 
+// --- Data Connections (Tally / file import / future integrations) ---------
+const {
+  getConnections,
+  upsertConnectionStatus,
+  VALID_SOURCE_TYPES,
+  VALID_STATUSES,
+} = require('./lib/domain/ingestion/connections');
+
+app.get('/api/connections', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const connections = await getConnections(userId);
+    res.json({ success: true, connections });
+  } catch (error) {
+    console.error('[connections list]', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/connections/heartbeat', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { sourceType, status, lastSyncAt, lastSyncError } = req.body || {};
+
+    if (!sourceType || !VALID_SOURCE_TYPES.includes(sourceType)) {
+      return res.status(400).json({ error: `sourceType must be one of ${VALID_SOURCE_TYPES.join(', ')}` });
+    }
+    if (!status || !VALID_STATUSES.includes(status)) {
+      return res.status(400).json({ error: `status must be one of ${VALID_STATUSES.join(', ')}` });
+    }
+
+    const connection = await upsertConnectionStatus(userId, sourceType, status, {
+      lastSyncAt: lastSyncAt || new Date(),
+      lastSyncError: lastSyncError ?? null,
+    });
+    res.json({ success: true, connection });
+  } catch (error) {
+    console.error('[connections heartbeat]', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.get('/api/health', (req, res) => {
   res.json({
     success: true,
