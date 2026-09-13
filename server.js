@@ -11009,6 +11009,129 @@ app.patch('/api/ai-actions/:id', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// ── SUPPLY CHAIN INTELLIGENCE (2xA vertical slice) ──────────────────────────
+// Reuses the real relevance pipeline (lib/world/relevance.js) + deterministic
+// calculations (lib/domain/intelligence/supplyChainImpact.js) + existing
+// ai_actions/predictions tables. No new command/approval abstraction.
+app.get('/api/intelligence/signals', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { getPool } = require('./lib/db/pg');
+    const pool = getPool();
+    const { status = 'CANDIDATE,ACTIVE,UPDATED' } = req.query;
+    const statuses = status.split(',').map((s) => s.trim());
+    const result = await pool.query(
+      `SELECT bs.*, we.title AS event_title, we.event_type, we.observed_at AS event_observed_at
+       FROM business_signals bs LEFT JOIN world_events we ON we.id = bs.world_event_id
+       WHERE bs.user_id = $1 AND bs.status = ANY($2)
+       ORDER BY bs.last_updated_at DESC`,
+      [userId, statuses]
+    );
+    res.json({ success: true, signals: result.rows });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.get('/api/intelligence/signals/:id/impact', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { getSignalImpact } = require('./lib/domain/intelligence/supplyChainOrchestrator');
+    const impact = await getSignalImpact(req.params.id, userId);
+    if (!impact) return res.status(404).json({ error: 'Signal not found' });
+    res.json({ success: true, impact });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/intelligence/signals/:id/forecast', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { getSignalImpact, writeDoNothingForecast } = require('./lib/domain/intelligence/supplyChainOrchestrator');
+    const impact = await getSignalImpact(req.params.id, userId);
+    if (!impact) return res.status(404).json({ error: 'Signal not found' });
+    const predictions = await writeDoNothingForecast(userId, req.params.id, impact);
+    res.json({ success: true, predictions });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/intelligence/signals/:id/actions', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { getSignalImpact, createRecommendedActions } = require('./lib/domain/intelligence/supplyChainOrchestrator');
+    const impact = await getSignalImpact(req.params.id, userId);
+    if (!impact) return res.status(404).json({ error: 'Signal not found' });
+    const actions = await createRecommendedActions(userId, req.params.id, impact);
+    res.json({ success: true, actions });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Approves an ai_action AND executes it through the supply-chain execution
+// adapter in one step (distinct from the generic PATCH /api/ai-actions/:id,
+// which only changes status — this route is specifically for actions that
+// have a real execution side effect attached).
+app.post('/api/intelligence/actions/:id/approve-and-execute', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { getPool } = require('./lib/db/pg');
+    const { executeSupplyChainAction, resolveExecutionMode } = require('./lib/domain/automation/supplyChainExecutionAdapter');
+    const pool = getPool();
+    const actionRes = await pool.query(`SELECT * FROM ai_actions WHERE id = $1 AND user_id = $2`, [req.params.id, userId]);
+    const action = actionRes.rows[0];
+    if (!action) return res.status(404).json({ error: 'Action not found' });
+    if (action.status !== 'pending') return res.status(400).json({ error: `Action is not pending (status=${action.status})` });
+
+    await pool.query(
+      `UPDATE ai_actions SET status='approved', approved_by=$1, approved_at=NOW(), updated_at=NOW() WHERE id=$2`,
+      [userId, action.id]
+    );
+
+    const executionMode = resolveExecutionMode();
+    let executionResult;
+    try {
+      executionResult = await executeSupplyChainAction(userId, action);
+      await pool.query(
+        `UPDATE ai_actions SET status='done', completed_at=NOW(), updated_at=NOW() WHERE id=$1`,
+        [action.id]
+      );
+    } catch (execErr) {
+      await pool.query(
+        `UPDATE ai_actions SET last_execution_error=$1, execution_attempts=execution_attempts+1, updated_at=NOW() WHERE id=$2`,
+        [String(execErr.message || execErr).slice(0, 2000), action.id]
+      );
+      throw execErr;
+    }
+
+    res.json({ success: true, executionMode, execution: executionResult });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Demo control: resets the 2xA tenant and re-runs the seed + trigger scripts
+// via the SAME code paths as the CLI scripts (no bypass/shortcut version).
+// Deliberately authMiddleware only, not adminOnly: this always operates on
+// one hardcoded, isolated demo tenant (owner@2xa-demo-meridian.invalid) —
+// it can never read or modify any other tenant's data, so requiring a
+// separately-configured ADMIN_EMAILS entry would only get in the way of
+// running the demo itself, with no real security benefit.
+app.post('/api/demo/2xa/reset', authMiddleware, async (req, res) => {
+  try {
+    delete require.cache[require.resolve('./scripts/seed-2xa-demo.js')];
+    delete require.cache[require.resolve('./scripts/trigger-2xa-event.js')];
+    await new Promise((resolve, reject) => {
+      const { execFile } = require('child_process');
+      execFile('node', ['scripts/seed-2xa-demo.js'], { cwd: __dirname }, (err, stdout, stderr) => {
+        if (err) return reject(new Error(stderr || err.message));
+        resolve(stdout);
+      });
+    });
+    const triggerOutput = await new Promise((resolve, reject) => {
+      const { execFile } = require('child_process');
+      execFile('node', ['scripts/trigger-2xa-event.js'], { cwd: __dirname }, (err, stdout, stderr) => {
+        if (err) return reject(new Error(stderr || err.message));
+        resolve(stdout);
+      });
+    });
+    res.json({ success: true, triggerOutput });
+  } catch (err) { res.status(500).json({ error: 'Internal server error', detail: String(err.message || err) }); }
+});
+
 // ── CUSTOMER INTELLIGENCE (behavioral profile for customers page) ────────────
 // GET /api/customers/intelligence?name=X&phone=Y
 // Returns aggregated Cortex intelligence for a customer by name.
