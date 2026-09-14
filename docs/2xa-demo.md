@@ -181,13 +181,40 @@ Postgres: world_events, business_exposure, business_signals,
   ODOO entry to `WRITE_SYNC_READY` — intentionally left undone until a real
   Odoo integration exists.
 
+## Outcome verification
+
+`POST /api/intelligence/signals/:id/verify-outcome` (see
+`lib/domain/intelligence/outcomeVerification.js`) closes the loop for real:
+
+- Reuses `forecastEngine.resolvePrediction` (existing, tested prediction-error
+  math) rather than a parallel scoring mechanism.
+- Never resolves a `stockout_within_horizon` prediction before its horizon
+  (`as_of + horizon_days`) has actually elapsed — calling it early is a no-op
+  that reports `AWAITING_OBSERVATION`, proven by
+  `tests/outcomeVerification.test.js`.
+- The only "actual value" a resolved prediction can take is a real, current
+  read of `products.current_stock` for the affected component — never an
+  estimate.
+- Once every relevant horizon for a signal has resolved, the executed
+  `ai_actions` row for that signal is stamped `outcome = 'effective'` (no
+  real stockout occurred) or `'ineffective'` (one did anyway), with a
+  human-readable `outcome_notes` explanation — reusing the existing
+  `ai_actions.outcome` column rather than inventing a new status field.
+
+This is intentionally a small, honest slice of full outcome verification —
+see Known limitations below for what a production version still needs.
+
 ## Known limitations
 
-- **Verification lifecycle is structural only.** The UI shows "Outcome
-  verification: Awaiting observation" after an action executes, but no
-  automated job yet compares `predictions.actual_value` against the
-  forecast after the fact — this is deliberately deferred past the meeting
-  per the mission scope.
+- **Verification is manually triggered, not scheduled.** `verify-outcome`
+  (above) does the real comparison work, but nothing calls it on a timer yet
+  — a production version needs a scheduled job that calls it once per
+  signal per day so outcomes resolve themselves as horizons elapse, instead
+  of waiting for a UI click or API call.
+- **Only one prediction type resolves.** `verifySignalOutcomes` only knows
+  how to observe and resolve `stockout_within_horizon` predictions. Other
+  prediction targets (e.g. a future revenue-exposure forecast) have no
+  observation function yet and would need one before they could resolve.
 - **In-app demo reset can be slow.** Shelling out to two child Node
   processes from inside the Express server has been observed taking
   anywhere from ~15s to over a minute on this host, likely compounded by

@@ -11103,6 +11103,20 @@ app.post('/api/intelligence/actions/:id/approve-and-execute', authMiddleware, as
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// Closes the intelligence loop: resolves any stockout-within-horizon
+// predictions for this signal whose horizon has actually elapsed against
+// real current inventory, and rolls the result up into the outcome of any
+// executed ai_action for the signal. Never resolves early, never guesses —
+// see lib/domain/intelligence/outcomeVerification.js.
+app.post('/api/intelligence/signals/:id/verify-outcome', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { verifySignalOutcomes } = require('./lib/domain/intelligence/outcomeVerification');
+    const result = await verifySignalOutcomes(userId, req.params.id);
+    res.json({ success: true, ...result });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
 // Demo control: resets the 2xA tenant and re-runs the seed + trigger scripts
 // via the SAME code paths as the CLI scripts (no bypass/shortcut version).
 // Deliberately authMiddleware only, not adminOnly: this always operates on
