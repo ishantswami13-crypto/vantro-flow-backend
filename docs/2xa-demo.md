@@ -206,6 +206,19 @@ see Known limitations below for what a production version still needs.
 
 ## Known limitations
 
+- **Predictions are now versioned, not duplicated.** Re-running "Analyze
+  impact" on the same signal used to insert a brand-new, disconnected
+  prediction row every time — a real bug that produced dozens of stale,
+  never-resolving duplicates under repeated testing. `writeDoNothingForecast`
+  now calls `lib/domain/intelligence/predictionVersioning.js`, which supersedes
+  the prior live prediction for each (entity, target, horizon) — the old row
+  is preserved with `superseded_by_id`/`revision_reason`/`revised_at` set,
+  never deleted or overwritten, and `getPredictionHistory()` walks the
+  `supersedes_id` chain back to reconstruct "what did we know at each point
+  in time." An already-`RESOLVED` prediction is a permanent historical fact
+  and is never superseded by a later re-analysis — a fresh chain starts
+  after it instead. `verifySignalOutcomes` only ever resolves the current
+  live head of a chain (`superseded_by_id IS NULL`).
 - **Two prediction types now resolve.** `verifySignalOutcomes` resolves both
   `stockout_within_horizon` (against real `current_stock`) and
   `revenue_exposure_within_horizon` (recomputed against real, current
