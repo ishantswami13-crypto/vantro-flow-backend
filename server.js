@@ -11868,6 +11868,39 @@ cron.schedule('10 * * * *', async () => {
   } catch (err) { _log('error', '[WorldUSGSCron] Fatal', { error: err.message }); }
 }, { timezone: 'UTC' });
 
+// Outcome verification — daily at 03:10 UTC. Iterates every ACTIVE/UPDATED
+// business_signal across all tenants and calls verifySignalOutcomes for
+// each, scoped per-tenant throughout (never a cross-tenant query). This is
+// what makes verification autonomous instead of only callable via the API —
+// see lib/domain/intelligence/outcomeVerification.js. A tenant with no
+// elapsed horizons on a given day is simply a no-op for that run.
+cron.schedule('10 3 * * *', async () => {
+  const { isEnabled: _isFE } = require('./lib/featureFlags');
+  if (!_isFE('world_intelligence_enabled')) return;
+  const { safeLog: _log } = require('./lib/observability/logger');
+  _log('info', '[OutcomeVerificationCron] Running');
+  try {
+    const { getPool } = require('./lib/db/pg');
+    const { verifySignalOutcomes } = require('./lib/domain/intelligence/outcomeVerification');
+    const pool = getPool();
+    const signals = await pool.query(
+      `SELECT DISTINCT user_id, id FROM business_signals WHERE status IN ('CANDIDATE', 'ACTIVE', 'UPDATED')`
+    );
+    let verified = 0, awaiting = 0, errored = 0;
+    for (const row of signals.rows) {
+      try {
+        const result = await verifySignalOutcomes(row.user_id, row.id);
+        if (result.status === 'VERIFIED') verified += 1;
+        else if (result.status === 'AWAITING_OBSERVATION') awaiting += 1;
+      } catch (err) {
+        errored += 1;
+        _log('error', '[OutcomeVerificationCron] Signal failed', { signalId: row.id, error: err.message });
+      }
+    }
+    _log('info', '[OutcomeVerificationCron] Done', { totalSignals: signals.rows.length, verified, awaiting, errored });
+  } catch (err) { _log('error', '[OutcomeVerificationCron] Fatal', { error: err.message }); }
+}, { timezone: 'UTC' });
+
 // Frankfurter/ECB FX reference rates — daily at 17:00 UTC (after ECB's ~16:00 CET publication).
 cron.schedule('0 17 * * *', async () => {
   const { isEnabled: _isFE } = require('./lib/featureFlags');

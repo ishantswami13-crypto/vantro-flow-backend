@@ -206,15 +206,25 @@ see Known limitations below for what a production version still needs.
 
 ## Known limitations
 
-- **Verification is manually triggered, not scheduled.** `verify-outcome`
-  (above) does the real comparison work, but nothing calls it on a timer yet
-  — a production version needs a scheduled job that calls it once per
-  signal per day so outcomes resolve themselves as horizons elapse, instead
-  of waiting for a UI click or API call.
-- **Only one prediction type resolves.** `verifySignalOutcomes` only knows
-  how to observe and resolve `stockout_within_horizon` predictions. Other
-  prediction targets (e.g. a future revenue-exposure forecast) have no
-  observation function yet and would need one before they could resolve.
+- **Two prediction types now resolve.** `verifySignalOutcomes` resolves both
+  `stockout_within_horizon` (against real `current_stock`) and
+  `revenue_exposure_within_horizon` (recomputed against real, current
+  `order_line_items`/`product_components` state — not the original
+  snapshot). Only the stockout target rolls up into the executed action's
+  `effective`/`ineffective` outcome today; the revenue-exposure resolution
+  is real and persisted but has no rollup rule defined yet.
+- **Revenue exposure has no per-horizon decay model.** The 7/14/30-day
+  revenue-exposure predictions all carry the same point estimate today
+  (the current exposure, carried forward) — this is recorded explicitly as
+  an assumption (`assumptions.noDecayModel`) rather than hidden, but a real
+  model would need to account for orders shipping, being cancelled, or new
+  ones appearing between now and each horizon.
+- **Verification now runs on a schedule.** A daily cron (`03:10 UTC`,
+  gated by the existing `world_intelligence_enabled` feature flag) iterates
+  every tenant's active signals and calls the same `verifySignalOutcomes`
+  used by the API route — it is no longer only callable by hand. It can
+  also still be triggered on demand via `POST
+  /api/intelligence/signals/:id/verify-outcome`.
 - **In-app demo reset can be slow.** Shelling out to two child Node
   processes from inside the Express server has been observed taking
   anywhere from ~15s to over a minute on this host, likely compounded by
