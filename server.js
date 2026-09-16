@@ -279,25 +279,11 @@ function isMissingSchemaError(error) {
 }
 
 // Middleware
-const extraOrigins = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim()).filter(Boolean)
-  : [];
-const allowedOrigins = new Set([
-  'https://vantro-flow-frontend.vercel.app',
-  'http://localhost:3000',
-  'http://localhost:3001',
-  'http://127.0.0.1:3000',
-  'http://127.0.0.1:3001',
-  ...extraOrigins,
-]);
+const { isAllowedOrigin } = require('./lib/security/originPolicy');
 
 const corsOptions = {
   origin(origin, callback) {
-    if (!origin || allowedOrigins.has(origin)) {
-      return callback(null, true);
-    }
-    // Allow all Vercel preview deployments for the vantro-flow-frontend project
-    if (origin && /^https:\/\/vantro-flow-frontend[a-z0-9-]*\.vercel\.app$/.test(origin)) {
+    if (isAllowedOrigin(origin)) {
       return callback(null, true);
     }
     return callback(new Error("Not allowed by CORS"));
@@ -655,6 +641,17 @@ if (process.env.DATABASE_URL) {
   const { Pool } = require('pg');
   const { buildSanitizedPgConfig, estimateStartupPacket } = require('./lib/db/pgConfig');
   pgPool = new Pool(buildSanitizedPgConfig(process.env.DATABASE_URL));
+  // Confirmed live: this crashed the entire server process on a routine
+  // Neon idle-connection drop (ECONNRESET) — node-postgres emits 'error' on
+  // the Pool when an idle client's socket closes, and per Node's own
+  // EventEmitter contract, an 'error' event with no listener is *thrown*,
+  // taking down the whole process. This is the pool most of server.js's
+  // routes actually run through, so this was the most severe of the three
+  // unguarded Pool instances found in this codebase (see the matching fix
+  // in lib/db/pg.js and lib/config/pgSupabaseShim.js).
+  pgPool.on('error', (err) => {
+    safeLog('error', '[pg] pool error (idle client connection lost, pool recovers automatically)', { error: err.message });
+  });
   // Phase 2C.31W — sanitized runtime proof of the PG startup-packet size. Logs ONLY field
   // names, presence, and byte lengths (never any value, credential, URL, or PII) so the
   // remaining ESTARTUPPACKETTOOLARGE source can be pinpointed from deployed logs. Never blocks
@@ -1934,10 +1931,17 @@ app.post('/api/generate-message', authMiddleware, async (req, res) => {
 });
 
 // ============================================
+// Settlement mutations remain disabled until payment allocations use a single
+// database transaction with immutable receipts and idempotency guarantees.
+const LEGACY_SETTLEMENT_MUTATIONS_ENABLED = process.env.ENABLE_LEGACY_SETTLEMENT_MUTATIONS === 'true';
+function requireSafeSettlementMutation(req, res, next) {
+  if (LEGACY_SETTLEMENT_MUTATIONS_ENABLED) return next();
+  return res.status(503).json({ error: 'Settlement changes are temporarily disabled while accounting safeguards are upgraded.' });
+}
 // PAYMENT TRACKING
 // ============================================
 
-app.post('/api/mark-paid', authMiddleware, async (req, res) => {
+app.post('/api/mark-paid', authMiddleware, requireSafeSettlementMutation, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { invoice_id, payment_date, payment_amount, payment_method, payment_notes } = req.body;
@@ -2196,6 +2200,83 @@ app.get('/api/metrics/:userId', requireOwner, async (req, res) => {
 
     res.json({ success: true, metrics });
   } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /api/metrics/:userId/trend — real daily activity for the last 14 days,
+// used to draw sparklines on the dashboard's Business Health tiles. This is
+// deliberately NOT a fabricated or interpolated trend: it's a straight
+// group-by-day sum over invoices/purchases/bank_transactions, using each
+// row's own recorded date. Days with no activity are zero, not omitted, so
+// the line reflects real silence rather than a misleadingly smooth curve.
+// Only covers dimensions that are genuinely day-by-day activity (sales,
+// purchases, cash in/out) — Credit Risk and Overdue-30d+ are point-in-time
+// risk assessments, not activity series, and are deliberately NOT given a
+// sparkline here rather than inventing one.
+app.get('/api/metrics/:userId/trend', requireOwner, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { getPool } = require('./lib/db/pg');
+    const pool = getPool();
+
+    // Dates are formatted to plain 'YYYY-MM-DD' text in SQL (to_char), never
+    // handed back as JS Date objects — a Postgres DATE comes back from
+    // node-postgres as a Date at LOCAL midnight, and .toISOString() then
+    // re-renders that in UTC, silently shifting the date by one day in any
+    // timezone ahead of UTC (e.g. IST). Keying everything off a SQL-side
+    // string sidesteps that class of bug entirely instead of trying to get
+    // JS Date/timezone conversion right by hand.
+    const [salesRes, purchasesRes, bankRes] = await Promise.all([
+      pool.query(
+        `SELECT to_char(invoice_date::date, 'YYYY-MM-DD') AS d, COALESCE(SUM(invoice_amount), 0) AS total
+         FROM invoices
+         WHERE user_id = $1 AND invoice_date::date >= (CURRENT_DATE - INTERVAL '13 days')
+         GROUP BY d`,
+        [userId]
+      ),
+      pool.query(
+        `SELECT to_char(purchase_date, 'YYYY-MM-DD') AS d, COALESCE(SUM(amount), 0) AS total
+         FROM purchases
+         WHERE user_id = $1 AND purchase_date >= (CURRENT_DATE - INTERVAL '13 days')
+         GROUP BY d`,
+        [userId]
+      ),
+      pool.query(
+        `SELECT to_char(txn_date, 'YYYY-MM-DD') AS d, type, COALESCE(SUM(amount), 0) AS total
+         FROM bank_transactions
+         WHERE user_id = $1 AND txn_date >= (CURRENT_DATE - INTERVAL '13 days')
+         GROUP BY d, type`,
+        [userId]
+      ),
+    ]);
+
+    function localDateKey(d) {
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    }
+
+    const byDate = new Map();
+    for (let i = 13; i >= 0; i--) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      const key = localDateKey(d);
+      byDate.set(key, { date: key, sales: 0, purchases: 0, cashIn: 0, cashOut: 0 });
+    }
+    for (const row of salesRes.rows) {
+      if (byDate.has(row.d)) byDate.get(row.d).sales = Number(row.total);
+    }
+    for (const row of purchasesRes.rows) {
+      if (byDate.has(row.d)) byDate.get(row.d).purchases = Number(row.total);
+    }
+    for (const row of bankRes.rows) {
+      if (!byDate.has(row.d)) continue;
+      if (row.type === 'credit') byDate.get(row.d).cashIn = Number(row.total);
+      else if (row.type === 'debit') byDate.get(row.d).cashOut = Number(row.total);
+    }
+
+    res.json({ success: true, days: Array.from(byDate.values()) });
+  } catch (error) {
+    console.error('[metrics trend]', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -3857,6 +3938,17 @@ async function syncReceivableFromSale(userId, sale) {
   };
 
   const existing = await findLinkedSalesInvoice(userId, { ...sale, invoice_number: invoiceNumber });
+  // Confirmed live: a Tally Sales voucher's invoice_number (its real
+  // voucherNo) collides with this same field on the matching `sales` row
+  // tallyCommit.js's backfill writes, so findLinkedSalesInvoice's
+  // invoice_number fallback matches the tally-owned invoice. The first fix
+  // attempt (excluding source_type='tally' from that match) just moved the
+  // bug: "not found" then fell through to insert, creating a genuine
+  // duplicate invoice instead of a silent overwrite. Neither is correct —
+  // Tally already owns this invoice's data, so the right behavior is to do
+  // nothing at all: no update (would destroy provenance), no insert (would
+  // duplicate a real invoice that already exists).
+  if (existing && existing.source_type === 'tally') return existing;
   const result = existing
     ? await safeInvoiceUpdate(existing.id, userId, payload)
     : await safeInvoiceInsert(payload);
@@ -5121,6 +5213,164 @@ Rules: numbers only, no currency symbols or commas. Dates must be YYYY-MM-DD.`;
   }
 });
 
+// --- Local connector enrollment and device authentication -------------------
+const { createEnrollment, claimEnrollment, authenticateDevice, listDevices, revokeDevice } = require('./lib/domain/ingestion/deviceEnrollment');
+const connectorClaimLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false });
+
+function connectorOrUserAuth(req, res, next) {
+  const header = String(req.headers.authorization || '');
+  const match = header.match(/^VantroDevice\s+([0-9a-f-]{36})\.([A-Za-z0-9_-]{32,})$/i);
+  if (!match) return authMiddleware(req, res, next);
+  authenticateDevice(match[1], match[2]).then((device) => {
+    if (!device) return res.status(401).json({ error: 'Invalid or revoked connector credential' });
+    req.user = { userId: device.user_id, connectorDeviceId: device.id, connector: true };
+    req.authSource = 'connector';
+    setNoStoreHeaders(res);
+    next();
+  }).catch((error) => {
+    console.error('[connector auth]', error);
+    res.status(503).json({ error: 'Connector authentication is temporarily unavailable' });
+  });
+}
+
+app.post('/api/connectors/tally/enrollment', authMiddleware, async (req, res) => {
+  try {
+    const enrollment = await createEnrollment(req.user.userId);
+    res.status(201).json({ success: true, enrollmentCode: enrollment.enrollmentCode, expiresAt: enrollment.expiresAt });
+  } catch (error) {
+    console.error('[connector enrollment]', error);
+    res.status(503).json({ error: 'Unable to create connector enrollment' });
+  }
+});
+
+app.post('/api/connectors/tally/claim', connectorClaimLimiter, async (req, res) => {
+  try {
+    const { enrollmentCode, deviceName } = req.body || {};
+    const device = await claimEnrollment(enrollmentCode, deviceName);
+    res.status(201).json({ success: true, deviceId: device.deviceId, deviceSecret: device.deviceSecret, apiBase: `${req.protocol}://${req.get('host')}` });
+  } catch (error) {
+    const message = String(error.message || '');
+    const safe = /Enrollment|device name/i.test(message) ? message : 'Unable to claim connector enrollment';
+    res.status(400).json({ error: safe });
+  }
+});
+
+// Self-service visibility + kill switch for connector devices — a device
+// secret has no expiry (see deviceEnrollment.js), so this list+revoke pair
+// is the only way a tenant can see what's connected or shut one off without
+// a direct DB edit. Always authMiddleware (a device credential must never
+// be able to list or revoke devices, including itself).
+app.get('/api/connectors/tally/devices', authMiddleware, async (req, res) => {
+  try {
+    const devices = await listDevices(req.user.userId);
+    res.json({ success: true, devices });
+  } catch (error) {
+    console.error('[connector devices list]', error);
+    res.status(503).json({ error: 'Unable to list connector devices' });
+  }
+});
+
+app.post('/api/connectors/tally/devices/:deviceId/revoke', authMiddleware, async (req, res) => {
+  try {
+    const revoked = await revokeDevice(req.user.userId, req.params.deviceId);
+    if (!revoked) return res.status(404).json({ error: 'Device not found or already revoked' });
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[connector device revoke]', error);
+    res.status(503).json({ error: 'Unable to revoke connector device' });
+  }
+});
+// --- Audit (read-only; audit_logs is written by lib/services/orchestrator/
+// audit.service.js on every financial change — this is the first read path
+// exposed for it). No new table, no migration needed. -----------------------
+app.get('/api/audit', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const before = req.query.before || null; // ISO timestamp cursor for pagination
+
+    let query = supabase
+      .from('audit_logs')
+      .select('id, action, entity_type, entity_id, old_value_json, new_value_json, created_at')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(limit);
+    if (before) query = query.lt('created_at', before);
+
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ success: true, events: data || [] });
+  } catch (error) {
+    console.error('[audit list]', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// --- Investigations (requires migration 042_investigations.sql to be
+// reviewed and applied — until then this 500s with a real Postgres "relation
+// does not exist" error rather than silently returning fake data). ---------
+app.get('/api/investigations', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { data, error } = await supabase
+      .from('investigations')
+      .select('id, source_signal_id, question, status, created_at, updated_at')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(100);
+    if (error) throw error;
+    res.json({ success: true, investigations: data || [] });
+  } catch (error) {
+    console.error('[investigations list]', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/investigations', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { sourceSignalId, question } = req.body || {};
+    if (!sourceSignalId && !(question && question.trim())) {
+      return res.status(400).json({ error: 'Either sourceSignalId or a non-empty question is required' });
+    }
+    const { data, error } = await supabase
+      .from('investigations')
+      .insert([{ user_id: userId, source_signal_id: sourceSignalId || null, question: question || null }])
+      .select('id, source_signal_id, question, status, created_at, updated_at')
+      .single();
+    if (error) throw error;
+    res.json({ success: true, investigation: data });
+  } catch (error) {
+    console.error('[investigations create]', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// --- Agent runs (requires migration 043_agent_runs.sql to be reviewed and
+// applied first). Read-only for now — nothing writes to agent_runs yet;
+// wiring dunning/ai_actions/owner-briefing to actually record a run here is
+// separate follow-up work, not done by this endpoint's existence alone. ---
+app.get('/api/agent-runs', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const agentKey = req.query.agentKey || null;
+    let query = supabase
+      .from('agent_runs')
+      .select('id, agent_key, status, started_at, finished_at, output_json, error_text')
+      .eq('user_id', userId)
+      .order('started_at', { ascending: false })
+      .limit(50);
+    if (agentKey) query = query.eq('agent_key', agentKey);
+
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ success: true, runs: data || [] });
+  } catch (error) {
+    console.error('[agent-runs list]', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // --- Data Connections (Tally / file import / future integrations) ---------
 const {
   getConnections,
@@ -5140,7 +5390,7 @@ app.get('/api/connections', authMiddleware, async (req, res) => {
   }
 });
 
-app.post('/api/connections/heartbeat', authMiddleware, async (req, res) => {
+app.post('/api/connections/heartbeat', connectorOrUserAuth, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { sourceType, status, lastSyncAt, lastSyncError } = req.body || {};
@@ -5159,6 +5409,46 @@ app.post('/api/connections/heartbeat', authMiddleware, async (req, res) => {
     res.json({ success: true, connection });
   } catch (error) {
     console.error('[connections heartbeat]', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/import/tally — accepts already-extracted, already-parsed Tally
+// vouchers (contract: { vouchers: [{ type, date, party, voucherNo, amount,
+// items }] }, date as ISO or Tally's yyyymmdd) from the local Tally
+// connector script (tally-sync.mjs, runs on the shop PC since Tally itself
+// has no public API a hosted backend could reach). Commits via
+// commitTallyVouchers — the same raw_observations/entity-resolution
+// contract csvImport.js uses, not a parallel scheme. sourceQuality is
+// 'REAL' unconditionally: this route only ever receives genuine exports
+// from a live Tally instance, never seeded/demo data.
+app.post('/api/import/tally', connectorOrUserAuth, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { vouchers } = req.body || {};
+    // Keep an explicit route-level cap as a fast, documented guard before
+    // serializing or opening any database work for a large connector request.
+    if (!Array.isArray(vouchers)) return res.status(400).json({ error: 'vouchers must be an array' });
+    if (vouchers.length > 5000) return res.status(400).json({ error: 'too many vouchers in one request (max 5000)' });
+
+    const { validateTallyBatch } = require('./lib/domain/ingestion/tallyBatchContract');
+    const validation = validateTallyBatch(vouchers, {
+      requireStableIdentity: process.env.TALLY_REQUIRE_STABLE_IDENTITIES === 'true',
+    });
+    if (!validation.ok) return res.status(400).json({ error: validation.error });
+
+    const { commitTallyVouchers } = require('./lib/domain/ingestion/adapters/tallyCommit');
+    const result = await commitTallyVouchers(vouchers, { userId, sourceQuality: 'REAL' });
+
+    const { upsertConnectionStatus } = require('./lib/domain/ingestion/connections');
+    await upsertConnectionStatus(userId, 'TALLY', result.errored > 0 && result.imported === 0 ? 'ERROR' : 'CONNECTED', {
+      lastSyncAt: new Date(),
+      lastSyncError: result.errored > 0 ? `${result.errored} voucher(s) failed to import` : null,
+    }).catch((err) => console.error('[import/tally] connection status update failed', err));
+
+    res.json({ success: true, result });
+  } catch (error) {
+    console.error('[import/tally]', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -6517,9 +6807,17 @@ app.get('/api/billing/history', authMiddleware, async (req, res) => {
   try {
     const { data, error } = await supabase.from('billing_history')
       .select('*').eq('user_id', req.user.userId).order('created_at', { ascending: false });
+    // Confirmed live: this table doesn't exist in every environment (same
+    // gap as `bills` — a feature whose migration was never applied here).
+    // A tenant with no billing history yet is a completely normal, expected
+    // state (e.g. anyone still on the free plan) — it must not 500.
+    if (error && isMissingSchemaError(error)) {
+      return res.json({ success: true, history: [] });
+    }
     if (error) throw error;
     res.json({ success: true, history: data || [] });
   } catch (error) {
+    console.error('[billing history]', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -10248,7 +10546,7 @@ app.post('/api/bank/transactions', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.post('/api/bank/match', authMiddleware, async (req, res) => {
+app.post('/api/bank/match', authMiddleware, requireSafeSettlementMutation, async (req, res) => {
   try {
     const { transaction_id, match_type, match_id } = req.body;
     if (!transaction_id || !match_type || !match_id) {
@@ -11647,6 +11945,30 @@ app.post('/api/cortex/memory', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// On-demand Groq planner: authenticated, rate-limited, approval-only preview.
+app.post('/api/cortex/planner/preview', authMiddleware, aiLimiter, async (req, res) => {
+  const { isEnabled } = require('./lib/featureFlags');
+  if (!isEnabled('agent_planner_enabled')) return res.status(403).json({ error: 'Planner is disabled' });
+  const userId = authenticatedUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Authentication required' });
+  const body = req.body || {};
+  if (Object.keys(body).some(k => k !== 'plan_type') ||
+      (body.plan_type !== undefined && body.plan_type !== 'collections_plan')) {
+    return res.status(400).json({ error: 'Only collections_plan is supported; context is loaded from your account' });
+  }
+  const planner = require('./lib/services/orchestrator/llmPlanner.service');
+  if (!planner.isGroqAvailable()) return res.status(503).json({ error: 'Planner provider is not configured' });
+  try {
+    const { previewCollections } = require('./lib/services/orchestrator/plannerPreview.service');
+    const plan = await previewCollections(userId, { db: supabase, planner,
+      policy: require('./lib/services/orchestrator/policyGuard.service') });
+    if (!plan) return res.status(503).json({ error: 'Planner unavailable; no actions were created' });
+    return res.json({ success: true, plan });
+  } catch {
+    return res.status(503).json({ error: 'Planner unavailable; no actions were created' });
+  }
+});
+
 // ── CORTEX: RUN ALL AGENTS (manual trigger / admin) ──────────────────────────
 app.post('/api/cortex/run-agents', authMiddleware, async (req, res) => {
   try {
@@ -11860,11 +12182,12 @@ cron.schedule('10 * * * *', async () => {
   const { isEnabled: _isFE } = require('./lib/featureFlags');
   if (!_isFE('world_intelligence_enabled')) return;
   const { safeLog: _log } = require('./lib/observability/logger');
-  _log('info', '[WorldUSGSCron] Running USGS earthquake ingestion');
+  const { withIngestLock } = require('./lib/world/ingestLock');
   try {
     const { ingest } = require('./lib/world/sources/usgsEarthquakes');
-    const result = await ingest();
-    _log('info', '[WorldUSGSCron] Done', result.stats);
+    const outcome = await withIngestLock('usgs_earthquakes', ingest);
+    if (!outcome.ran) { _log('info', '[WorldUSGSCron] Skipped — previous run still holds the lock'); return; }
+    _log('info', '[WorldUSGSCron] Done', outcome.result.stats);
   } catch (err) { _log('error', '[WorldUSGSCron] Fatal', { error: err.message }); }
 }, { timezone: 'UTC' });
 
@@ -11906,11 +12229,12 @@ cron.schedule('0 17 * * *', async () => {
   const { isEnabled: _isFE } = require('./lib/featureFlags');
   if (!_isFE('world_intelligence_enabled')) return;
   const { safeLog: _log } = require('./lib/observability/logger');
-  _log('info', '[WorldFXCron] Running FX reference rate ingestion');
+  const { withIngestLock } = require('./lib/world/ingestLock');
   try {
     const { ingest } = require('./lib/world/sources/fxRates');
-    const result = await ingest();
-    _log('info', '[WorldFXCron] Done', result.stats);
+    const outcome = await withIngestLock('fx_rates', ingest);
+    if (!outcome.ran) { _log('info', '[WorldFXCron] Skipped — previous run still holds the lock'); return; }
+    _log('info', '[WorldFXCron] Done', outcome.result.stats);
   } catch (err) { _log('error', '[WorldFXCron] Fatal', { error: err.message }); }
 }, { timezone: 'UTC' });
 
@@ -12724,3 +13048,5 @@ app.listen(PORT, () => {
   console.log(`📝 API Base URL: http://localhost:${PORT}`);
   runAutoMigrations();
 });
+
+
