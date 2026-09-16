@@ -11294,7 +11294,7 @@ app.patch('/api/promises/:id', authMiddleware, async (req, res) => {
 app.get('/api/ai-actions', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { status = 'pending', priority, limit: lim = 50, offset: off = 0 } = req.query;
+    const { status = 'pending', priority, action_type, limit: lim = 50, offset: off = 0 } = req.query;
     let query = supabase
       .from('ai_actions')
       .select('*, customers(name, phone)')
@@ -11303,6 +11303,7 @@ app.get('/api/ai-actions', authMiddleware, async (req, res) => {
       .range(Number(off), Number(off) + Number(lim) - 1);
     if (status !== 'all') query = query.eq('status', status);
     if (priority) query = query.eq('priority', priority);
+    if (action_type) query = query.eq('action_type', action_type);
     const { data, error } = await query;
     if (error) throw error;
     // Priority counts for badge display
@@ -11319,8 +11320,8 @@ app.patch('/api/ai-actions/:id', authMiddleware, async (req, res) => {
     const userId = req.user.userId;
     const { id } = req.params;
     const { status } = req.body;
-    const allowed = ['approved', 'rejected', 'done'];
-    if (!allowed.includes(status)) return res.status(400).json({ error: 'Invalid status. Must be: approved, rejected, done' });
+    const allowed = ['approved', 'rejected', 'done', 'cancelled'];
+    if (!allowed.includes(status)) return res.status(400).json({ error: 'Invalid status. Must be: approved, rejected, done, cancelled' });
     const updates = { status, updated_at: new Date().toISOString() };
     if (status === 'approved') { updates.approved_by = userId; updates.approved_at = new Date().toISOString(); }
     if (status === 'done') updates.completed_at = new Date().toISOString();
@@ -11396,15 +11397,39 @@ app.post('/api/intelligence/actions/:id/approve-and-execute', authMiddleware, as
     const { getPool } = require('./lib/db/pg');
     const { executeSupplyChainAction, resolveExecutionMode } = require('./lib/domain/automation/supplyChainExecutionAdapter');
     const pool = getPool();
-    const actionRes = await pool.query(`SELECT * FROM ai_actions WHERE id = $1 AND user_id = $2`, [req.params.id, userId]);
-    const action = actionRes.rows[0];
-    if (!action) return res.status(404).json({ error: 'Action not found' });
-    if (action.status !== 'pending') return res.status(400).json({ error: `Action is not pending (status=${action.status})` });
 
-    await pool.query(
-      `UPDATE ai_actions SET status='approved', approved_by=$1, approved_at=NOW(), updated_at=NOW() WHERE id=$2`,
-      [userId, action.id]
+    // Close the Loop mission: atomic compare-and-swap, not SELECT-then-UPDATE.
+    // The old SELECT-then-UPDATE had a real double-click/concurrent-request
+    // race — two simultaneous requests could both read status='pending'
+    // before either UPDATE committed, and both would go on to execute.
+    // `WHERE status='pending'` inside the UPDATE itself makes only one
+    // request's UPDATE actually match a row; the loser gets 0 rows back and
+    // is told the truth (already approved/executed), never allowed through.
+    const approveRes = await pool.query(
+      `UPDATE ai_actions SET status='approved', approved_by=$1, approved_at=NOW(), updated_at=NOW()
+       WHERE id=$2 AND user_id=$3 AND status='pending' RETURNING *`,
+      [userId, req.params.id, userId]
     );
+    if (approveRes.rows.length === 0) {
+      const existing = await pool.query(`SELECT status FROM ai_actions WHERE id=$1 AND user_id=$2`, [req.params.id, userId]);
+      if (existing.rows.length === 0) return res.status(404).json({ error: 'Action not found' });
+      return res.status(409).json({ error: `Action is not pending (status=${existing.rows[0].status}) — it may already be approved, executing, or completed by another request.`, status: existing.rows[0].status });
+    }
+    const action = approveRes.rows[0];
+
+    // Duplicate-execution guard, defense in depth beyond the atomic approve
+    // above: if an execution_records row already exists for this action
+    // (e.g. a retried request after a client-side timeout, once the row was
+    // already moved past 'pending' by a first attempt that then crashed
+    // before responding), return the EXISTING receipt rather than executing
+    // a second real purchase_orders row. Never duplicate a PO because a
+    // network blip made the client retry.
+    const priorExec = await pool.query(`SELECT * FROM execution_records WHERE ai_action_id = $1 ORDER BY created_at ASC LIMIT 1`, [action.id]);
+    if (priorExec.rows.length > 0) {
+      return res.json({ success: true, executionMode: resolveExecutionMode(), execution: { alreadyExecuted: true, executionRecord: priorExec.rows[0] } });
+    }
+
+    await pool.query(`UPDATE ai_actions SET status='executing', updated_at=NOW() WHERE id=$1`, [action.id]);
 
     const executionMode = resolveExecutionMode();
     let executionResult;
@@ -11415,14 +11440,57 @@ app.post('/api/intelligence/actions/:id/approve-and-execute', authMiddleware, as
         [action.id]
       );
     } catch (execErr) {
+      // Honest failure states: a definite adapter rejection is FAILED; a
+      // timeout/network condition where we genuinely cannot tell whether the
+      // external write happened is EXECUTION_UNKNOWN, never silently
+      // reported as FAILED (which would wrongly invite a blind retry).
+      const isAmbiguous = /timeout|ETIMEDOUT|ECONNRESET|unknown/i.test(String(execErr.message || execErr));
       await pool.query(
-        `UPDATE ai_actions SET last_execution_error=$1, execution_attempts=execution_attempts+1, updated_at=NOW() WHERE id=$2`,
-        [String(execErr.message || execErr).slice(0, 2000), action.id]
+        `UPDATE ai_actions SET status=$1, last_execution_error=$2, execution_attempts=execution_attempts+1, updated_at=NOW() WHERE id=$3`,
+        [isAmbiguous ? 'execution_unknown' : 'failed', String(execErr.message || execErr).slice(0, 2000), action.id]
       );
-      throw execErr;
+      return res.status(502).json({ success: false, status: isAmbiguous ? 'execution_unknown' : 'failed', error: String(execErr.message || execErr) });
     }
 
     res.json({ success: true, executionMode, execution: executionResult });
+  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// "Close the Loop" mission: the full audit trail for ONE action — WHY
+// (reason_json + the originating signal), EVIDENCE (getSignalImpact's real
+// evidence chain), EXPECTED EFFECT, EXACT PAYLOAD (parameters), APPROVAL,
+// EXECUTION RECEIPT (execution_records + purchase_orders if applicable),
+// and VERIFICATION (action_outcomes) — everything the Actions UI's
+// audit-ledger detail view needs in one call, all real rows, nothing
+// synthesized here.
+app.get('/api/intelligence/actions/:id/detail', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { getPool } = require('./lib/db/pg');
+    const pool = getPool();
+    const actionRes = await pool.query(`SELECT * FROM ai_actions WHERE id = $1 AND user_id = $2`, [req.params.id, userId]);
+    const action = actionRes.rows[0];
+    if (!action) return res.status(404).json({ error: 'Action not found' });
+
+    let signalEvidence = null;
+    if (action.related_entity_type === 'business_signal' && action.related_entity_id) {
+      const { getSignalImpact } = require('./lib/domain/intelligence/supplyChainOrchestrator');
+      const impact = await getSignalImpact(action.related_entity_id, userId);
+      signalEvidence = impact ? impact.evidence : null;
+    }
+
+    const executionRes = await pool.query(`SELECT * FROM execution_records WHERE ai_action_id = $1 ORDER BY created_at ASC`, [action.id]);
+    const poRes = await pool.query(`SELECT * FROM purchase_orders WHERE related_ai_action_id = $1 ORDER BY created_at ASC`, [action.id]);
+    const outcomesRes = await pool.query(`SELECT * FROM action_outcomes WHERE action_id = $1 ORDER BY created_at ASC`, [action.id]);
+
+    res.json({
+      success: true,
+      action,
+      evidence: signalEvidence,
+      executionRecords: executionRes.rows,
+      purchaseOrders: poRes.rows,
+      outcomes: outcomesRes.rows,
+    });
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
