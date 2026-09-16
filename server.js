@@ -5518,6 +5518,31 @@ app.get('/api/health/deep', async (req, res) => {
 // no-tenant-auth pattern rather than /api/cortex/health's authMiddleware.
 // Pure DB read + deterministic comparison (lib/world/freshnessCheck.js) —
 // no external calls, no LLM, never mutates anything.
+// ── World Intelligence config diagnostics (read-only, no secrets) ──────────
+// Mission "Close the Loop", part A: Starlane must be able to state plainly
+// whether world intelligence is actually turned on in whatever environment
+// is asking — this was the exact gap found in Phase 3C (the feature flag was
+// simply never set in .env, silently no-oping every cron). Booleans only,
+// same convention as /api/ready above: never the flag's raw string, never
+// any other env var, never a stack trace.
+app.get('/api/world/config', (req, res) => {
+  const { isEnabled: _isFE } = require('./lib/featureFlags');
+  const worldEnabled = _isFE('world_intelligence_enabled');
+  res.json({
+    success: true,
+    world_intelligence_enabled: worldEnabled,
+    usgs_ingestion_enabled: worldEnabled,
+    fx_ingestion_enabled: worldEnabled,
+    freshness_check_enabled: worldEnabled,
+    scheduler_enabled: worldEnabled,
+    note: worldEnabled
+      ? 'World intelligence crons are active in this process.'
+      : 'World intelligence crons are no-ops in this process — set FEATURE_WORLD_INTELLIGENCE_ENABLED=true to enable USGS/FX ingestion and the freshness check.',
+    timestamp: new Date().toISOString(),
+    request_id: req.requestId || null,
+  });
+});
+
 app.get('/api/world/health', async (req, res) => {
   try {
     const { checkSourceFreshness } = require('./lib/world/freshnessCheck');
@@ -13046,6 +13071,13 @@ app.get('/api/atlas/action-approvals/:id', authMiddleware, async (req, res) => {
 app.listen(PORT, () => {
   console.log(`✅ Vantro Flow Backend running on port ${PORT}`);
   console.log(`📝 API Base URL: http://localhost:${PORT}`);
+  // Close the Loop mission, part A: state world-intelligence config plainly
+  // at boot, in every environment (including Railway logs), without
+  // printing the env var's value or any other secret — booleans only, same
+  // rule as GET /api/world/config.
+  const { isEnabled: _isFE } = require('./lib/featureFlags');
+  const _worldEnabled = _isFE('world_intelligence_enabled');
+  console.log(`🌍 World intelligence: ${_worldEnabled ? 'ENABLED' : 'DISABLED'} (USGS ${_worldEnabled ? 'enabled' : 'disabled'}, FX ${_worldEnabled ? 'enabled' : 'disabled'}, scheduler ${_worldEnabled ? 'enabled' : 'disabled'})`);
   runAutoMigrations();
 });
 

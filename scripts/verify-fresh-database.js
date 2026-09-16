@@ -22,22 +22,26 @@
 // regression from this mission's work. Asserted as expected failures below,
 // not silently ignored.
 //
-// GENUINE PRE-EXISTING GAP FOUND BY THIS SCRIPT (not fixed by this mission,
-// reported honestly rather than hidden): migrations 009, 010, 011, 012, 020,
-// 022, and 024 all fail on a genuinely fresh database with "relation
-// purchases/sales does not exist". Root cause: `purchases`, `sales`, and
-// `product_suppliers` are created by server.js's own inline
-// runAutoMigrations() function at server startup, not by any file in this
-// migrations/ directory — this migration chain has never been a complete,
-// standalone bootstrap of this schema from empty, independent of the app
-// actually running once first. This mission's own additions (015, 018, 040,
-// 044) are NOT affected by this gap — they apply cleanly regardless, as the
-// results below show — but the migration chain as a whole is not truly
-// runnable end-to-end without first running the app's inline bootstrap.
-// Fixing that is a distinct, larger undertaking than this mission's two
-// stated critical gaps and is out of scope here; it is reported in the
-// mission's final report as an honest remaining GAP, not silently patched
-// over or hidden by narrowing this script's file list.
+// FIXED (Close the Loop mission, part B): migrations 009, 010, 011, 012,
+// 020, 022, and 024 used to fail here with "relation purchases/sales does
+// not exist" — `purchases`/`sales` were only ever created by server.js's
+// inline runAutoMigrations() at server startup, never by a tracked migration
+// file, so the chain was never a complete standalone bootstrap from empty.
+// migrations/008_purchases_sales_bootstrap.sql now creates the identical
+// shape (copied column-for-column from server.js's inline SQL, not
+// redesigned) as a real, idempotent migration — 008 was an unused number in
+// this chain (007 -> 009), so no renumbering was needed. server.js's inline
+// bootstrap is deliberately left in place and unmodified: both paths are
+// idempotent and agree on shape, so server startup is no longer the ONLY
+// mechanism creating this schema, without breaking any environment that
+// still boots the app before ever running migrate.js.
+//
+// `product_suppliers`/`product_components`/`orders`/`products` remain
+// created only by server.js's inline bootstrap — nothing in migrations/
+// was found to require them pre-existing (unlike purchases/sales, which
+// blocked seven later migration files), so extending this fix to them here
+// would be exactly the "blind bootstrap copy" this mission warned against.
+// Tracked as a known, narrower, still-open gap below.
 require('dotenv').config();
 const { Client } = require('pg');
 const fs = require('fs');
@@ -49,19 +53,10 @@ const freshConnStr = baseUrl.toString();
 
 const EXPECTED_FAILURES = new Set(['migrations/006_cortex_rls.sql', 'migrations/037_atomic_payment_posting.sql']);
 
-// Pre-existing gap (see header comment): these files depend on tables that
-// only exist because server.js's inline runAutoMigrations() created them at
-// some point, never because a tracked migration file did. Listed explicitly,
-// with the real reason, rather than silently skipped.
-const KNOWN_MISSING_BOOTSTRAP_DEPENDENCY = new Set([
-  'migrations/009_customer_supplier_identity.sql',
-  'migrations/010_sales_customer_identity.sql',
-  'migrations/011_temporal_history.sql',
-  'migrations/012_production_reconciliation.sql',
-  'migrations/020_payment_allocations.sql',
-  'migrations/022_entity_geo_currency_context.sql',
-  'migrations/024_product_supplier_purchase_lines.sql',
-]);
+// Now empty: migration 008 closed the purchases/sales bootstrap gap that
+// used to populate this set. Kept as a named, empty set (not deleted) so
+// a future regression shows up as an unexpected FAIL, not a silent skip.
+const KNOWN_MISSING_BOOTSTRAP_DEPENDENCY = new Set([]);
 
 function migrationFiles() {
   const dir = path.join(__dirname, '..', 'migrations');
