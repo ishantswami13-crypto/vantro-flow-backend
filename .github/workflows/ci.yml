@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Syntax check
+        run: npm run check
+
+      # Blocking. The config deliberately errors only on real correctness bugs —
+      # undefined variables, duplicate keys, unreachable code — and leaves
+      # stylistic findings as warnings, so a failure here means something is
+      # actually broken rather than merely untidy.
+      - name: Lint
+        run: npm run lint
+
+      - name: Cortex Lab static test suite
+        run: npm run cortex:test
+
+      # Blocking: the service_role key bypasses RLS, so an application-level
+      # tenant filter is the only thing preventing cross-tenant reads.
+      - name: Tenant isolation
+        run: npm run security:tenant-isolation
+
+      # Blocking. A table that is queried but never provisioned surfaces as a
+      # generic 500 rather than a schema error, so it is invisible in review —
+      # `bills` reached production that way with ten call sites against it.
+      - name: Schema drift
+        run: npm run security:schema-drift

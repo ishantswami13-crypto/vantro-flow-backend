@@ -41,7 +41,14 @@ CREATE INDEX IF NOT EXISTS idx_error_events_fingerprint ON error_events (fingerp
 ALTER TABLE error_events ENABLE ROW LEVEL SECURITY;
 
 -- Policies:
+-- CREATE POLICY has no IF NOT EXISTS in any Postgres version, so a second run
+-- of this file (setup:database is documented as safe to re-run) aborted at the
+-- first CREATE POLICY with "policy ... already exists" — caught by the runner
+-- as a per-file warning rather than fatal, but still not actually idempotent.
+-- Dropping first, matching the pattern the paired rollback file already uses.
+
 -- 1. Service Role / Admin can do everything
+DROP POLICY IF EXISTS "Admins can view and manage error events" ON error_events;
 CREATE POLICY "Admins can view and manage error events"
 ON error_events
 FOR ALL
@@ -50,12 +57,14 @@ USING (auth.jwt() ->> 'role' = 'service_role' OR auth.jwt() ->> 'is_admin' = 'tr
 
 -- 2. Normal users cannot read or write global errors directly via client SDK
 -- (The backend Node.js server using SERVICE_ROLE will write the events)
+DROP POLICY IF EXISTS "Users cannot access error events" ON error_events;
 CREATE POLICY "Users cannot access error events"
 ON error_events
 FOR ALL
 TO authenticated
 USING (false);
 
+DROP POLICY IF EXISTS "Anon cannot access error events" ON error_events;
 CREATE POLICY "Anon cannot access error events"
 ON error_events
 FOR ALL

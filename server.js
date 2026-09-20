@@ -167,6 +167,78 @@ app.use((req, res, next) => {
   next();
 });
 
+// Escapes a value for interpolation into HTML *element text*. Module-level
+// because more than one endpoint builds HTML by hand, and the previous local
+// copy meant the next one had nothing to reach for.
+//
+// Note the limit: this is context-blind and is only safe for element text or a
+// quoted attribute. It is NOT sufficient inside an unquoted attribute (a space
+// ends the value, so `x onmouseover=alert(1)` needs no quote characters), in a
+// <script> block (entities are not decoded in a JS string), or in a URL
+// position (`javascript:` survives all five replacements). Do not reach for it
+// in those places and assume it holds.
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// Escapes a value for interpolation into TwiML. Separate from escapeHtml
+// because the sink is different: this XML is executed by Twilio, not rendered by
+// a browser, so the risk is a business_name containing </Say><Play>… making the
+// platform play attacker-chosen audio or dial on the caller's behalf, rather
+// than script execution. Handles the five XML predefined entities, so it is
+// safe in both element text and quoted attributes.
+//
+// The TwiML sites were previously inconsistent: two escaped & < >, one stripped
+// them, and one escaped only &, which is the one that left a hole.
+function escapeXml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+// Neutralises spreadsheet formula injection for CSV export. Excel, LibreOffice
+// and Sheets evaluate a cell beginning =, +, - or @ as a formula when the file
+// is opened — including payloads like =cmd|'/c calc'!A1 — and quoting does not
+// prevent it. Prefixing with an apostrophe forces the cell to be read as text.
+//
+// Only needed on the CSV path: the .xlsx writer types these cells as strings
+// ({t:'s'}), so Excel already renders them inert there, and prefixing would put
+// a visible stray quote in front of legitimate values.
+function csvSafeCell(value) {
+  const s = String(value ?? '');
+  return /^[=+\-@\t\r]/.test(s) ? `'${s}` : s;
+}
+
+// Logs the cause of a 500 before the generic response goes back to the client.
+// The client message stays deliberately opaque, but the server needs the real
+// error to be diagnosable — an unlogged catch turns any failure into a silent
+// 500 with nothing to trace it by. Keyed on requestId so it lines up with the
+// "API Request Error" line the middleware above emits for the same request.
+// Never throws: a logging failure must not mask the error being reported.
+function logRouteError(req, err) {
+  try {
+    safeLog('error', 'Unhandled route error', {
+      requestId: req?.requestId || null,
+      method: req?.method || null,
+      route: normalizeRoute(req?.path || ''),
+      userId: req?.user?.userId || req?.user?.id || null,
+      errorName: err?.name || 'Error',
+      errorMessage: err?.message || String(err),
+      stack: err?.stack || null,
+    });
+  } catch {
+    // Deliberately empty — logging must never break the response path.
+  }
+}
+
 const PORT = process.env.PORT || 3001;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production' || Boolean(
   process.env.RAILWAY_ENVIRONMENT ||
@@ -281,6 +353,30 @@ function isMissingSchemaError(error) {
 // Middleware
 const { isAllowedOrigin } = require('./lib/security/originPolicy');
 
+// Vercel preview deployments get a generated subdomain per commit, so they can't
+// be enumerated in ALLOWED_ORIGINS. VERCEL_PROJECT_SLUGS lists the project names
+// whose previews are trusted — set it if the Vercel project is ever renamed,
+// otherwise its preview URLs are rejected and the app can't reach the backend.
+const previewProjectSlugs = (process.env.VERCEL_PROJECT_SLUGS || 'vantro-flow-frontend')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+// Optional hardening: Vercel preview hosts end with the team scope
+// ("<slug>-<hash>-<scope>.vercel.app"). Setting VERCEL_TEAM_SCOPE pins previews
+// to your team. Without it, prefix matching alone cannot distinguish a real
+// preview from a lookalike project someone else deploys under a name starting
+// with the same slug — same limitation the previous regex had.
+const previewTeamScope = (process.env.VERCEL_TEAM_SCOPE || '').trim();
+
+function isTrustedVercelPreview(origin) {
+  const match = /^https:\/\/([a-z0-9-]+)\.vercel\.app$/.exec(origin);
+  if (!match) return false;
+  const host = match[1];
+  if (previewTeamScope && !host.endsWith(`-${previewTeamScope}`)) return false;
+  return previewProjectSlugs.some(slug => host === slug || host.startsWith(`${slug}-`));
+}
+
 const corsOptions = {
   origin(origin, callback) {
     if (isAllowedOrigin(origin)) {
@@ -367,13 +463,36 @@ app.use('/api', (req, res, next) => {
   next();
 });
 
-function makeLimiter({ windowMs, max, skipSuccessfulRequests = false }) {
+// Rate limiters normally key on IP, which is wrong for an authenticated,
+// abuse-prone route: an office behind one NAT shares a budget, and a client
+// that rotates IPs (or just has a dynamic one) sidesteps it entirely. This
+// verifies the caller's JWT — using the same getAuthToken/verifyJWT pair
+// authMiddleware itself uses, so it can never disagree with who the request
+// actually authenticates as — and keys on userId when that succeeds. It runs
+// ahead of authMiddleware in the chain (limiters are mounted globally, auth is
+// per-route), so this is the only way a limiter can see identity at all;
+// an invalid, missing, or unverifiable token falls back to req.ip exactly as
+// before, so unauthenticated routes are unaffected.
+function authAwareKey(req) {
+  try {
+    const { token } = getAuthToken(req);
+    if (!token) return req.ip;
+    const decoded = verifyJWT(token);
+    const userId = decoded?.userId || decoded?.id;
+    return userId ? `user:${userId}` : req.ip;
+  } catch {
+    return req.ip;
+  }
+}
+
+function makeLimiter({ windowMs, max, skipSuccessfulRequests = false, keyGenerator }) {
   return rateLimit({
     windowMs,
     max,
     standardHeaders: true,
     legacyHeaders: false,
     skipSuccessfulRequests,
+    ...(keyGenerator ? { keyGenerator } : {}),
     handler: (req, res, next, options) => {
       const requestId = req.requestId || crypto.randomUUID();
       res.status(options.statusCode).json({
@@ -403,15 +522,60 @@ const authLimiter = rateLimit({
 });
 const apiLimiter = makeLimiter({ windowMs: 60 * 1000, max: 120 });
 const uploadLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, max: 20 });
-const aiLimiter = makeLimiter({ windowMs: 10 * 60 * 1000, max: 40 });
+const aiLimiter = makeLimiter({ windowMs: 10 * 60 * 1000, max: 40, keyGenerator: authAwareKey });
 const publicBillLimiter = makeLimiter({ windowMs: 10 * 60 * 1000, max: 80 });
 const heavyReadLimiter = makeLimiter({ windowMs: 5 * 60 * 1000, max: 90 });
+// Dedicated rather than reusing uploadLimiter: that is one pooled instance
+// shared across eight upload prefixes, so putting a statement import on it would
+// spend the same budget document scanning needs. Low count, because each request
+// is a whole statement rather than a row.
+const bulkImportLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, max: 10 });
 app.use('/api/auth', authLimiter);
 app.use('/api', apiLimiter);
-app.use(['/api/upload-csv', '/api/import/excel', '/api/scan-document', '/api/purchases/scan', '/api/sales/scan', '/api/transactions/scan', '/api/ai/extract-voice'], uploadLimiter);
-app.use(['/api/ai-chat', '/api/ml/briefing', '/api/ai/brain', '/api/ai/call-script', '/api/ai/bulk-whatsapp'], aiLimiter);
+// /api/bank/transactions/import belongs here with the other upload routes: it
+// takes a multipart file and parses .xls/.xlsx through the same library. It was
+// missing, so it fell through to apiLimiter at 120 requests/minute.
+//
+// Note what this budget actually is: uploadLimiter is a single rateLimit()
+// instance mounted across all these prefixes, so they share one counter per key
+// — 20 per 15 minutes pooled across every upload route, not 20 each. A user who
+// has just run the onboarding import and scanned a few documents arrives here
+// with far fewer than 20 left.
+//
+// Two limits on how much this is worth: every limiter here keys on IP (no
+// keyGenerator is set), so an office behind one NAT shares a budget while a
+// client rotating IPs sidesteps it entirely; and the default MemoryStore is
+// per-process, so the effective limit multiplies by the replica count and
+// resets on every deploy.
+app.use(['/api/upload-csv', '/api/import/excel', '/api/bank/transactions/import', '/api/scan-document', '/api/purchases/scan', '/api/sales/scan', '/api/transactions/scan', '/api/ai/extract-voice'], uploadLimiter);
+// /api/voice/call places a real outbound PSTN call. It takes customer_phone
+// straight from the request body and dials through getTwilio() with no
+// arguments, which falls back to the platform's own TWILIO_ACCOUNT_SID rather
+// than the caller's credentials. On the general limiter that was 120 calls a
+// minute to arbitrary numbers, billed to this account — the classic shape of
+// premium-rate toll fraud. It also requires authMiddleware, so this is now
+// budgeted per account rather than per IP (aiLimiter uses authAwareKey,
+// defined above) — a fresh signup, not a fresh IP, is what buys another 40
+// calls per 10 minutes. The number itself is still just a mitigation, not a
+// considered policy: it hasn't been sized against how many collection calls a
+// real business actually makes in a day.
+//
+// ai-insights, ai-deep-analysis and ai-financial-monitor were simply missed from
+// this list. Each does uncapped select('*') queries and then a 70B model call —
+// strictly more expensive than /api/ml/briefing, which has been limited here all
+// along, so they were running at 30x the rate of a cheaper sibling.
+app.use([
+  '/api/ai-chat', '/api/ml/briefing', '/api/ai/brain', '/api/ai/call-script', '/api/ai/bulk-whatsapp',
+  '/api/voice/call', '/api/ai-insights', '/api/ai-deep-analysis', '/api/ai-financial-monitor',
+], aiLimiter);
 app.use('/api/bills/public', publicBillLimiter);
-app.use(['/api/analytics', '/api/cash-forecast', '/api/reports/export', '/api/reconcile/backfill'], heavyReadLimiter);
+// cortex/score-all walks up to 200 customers with several queries each, and
+// cortex/run-agents runs ten agents and can send WhatsApp messages as a side
+// effect. Both were on the general limiter.
+app.use([
+  '/api/analytics', '/api/cash-forecast', '/api/reports/export', '/api/reconcile/backfill',
+  '/api/cortex/score-all', '/api/cortex/run-agents',
+], heavyReadLimiter);
 
 // Lightweight Performance Endpoint
 app.get('/api/performance/summary', requireAdmin, (req, res) => {
@@ -840,12 +1004,18 @@ const upload = multer({
 });
 
 // Web Push — VAPID
+// Wrapped: a malformed VAPID key must disable push notifications, not crash
+// the entire server at boot (web-push throws synchronously on an invalid key).
 if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
-  webpush.setVapidDetails(
-    `mailto:${process.env.VAPID_EMAIL || 'hello@vantroflow.com'}`,
-    process.env.VAPID_PUBLIC_KEY,
-    process.env.VAPID_PRIVATE_KEY
-  );
+  try {
+    webpush.setVapidDetails(
+      `mailto:${process.env.VAPID_EMAIL || 'hello@vantroflow.com'}`,
+      process.env.VAPID_PUBLIC_KEY,
+      process.env.VAPID_PRIVATE_KEY
+    );
+  } catch (err) {
+    console.error('[SECURITY] Invalid VAPID keys — push notifications disabled:', err.message);
+  }
 }
 
 // ============================================
@@ -947,7 +1117,7 @@ async function sendOTPEmail(email, name, otp) {
         </tr>
         <tr>
           <td style="padding:32px;">
-            <p style="margin:0 0 8px;color:#e0e0e8;font-size:16px;">Hi ${displayName},</p>
+            <p style="margin:0 0 8px;color:#e0e0e8;font-size:16px;">Hi ${escapeHtml(displayName)},</p>
             <p style="margin:0 0 24px;color:#9090a0;font-size:14px;line-height:1.6;">
               Use this OTP to verify your Vantro Flow account. It expires in <strong style="color:#e0e0e8;">10 minutes</strong>.
             </p>
@@ -1255,7 +1425,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
           from: 'Vantro Flow <onboarding@resend.dev>',
           to: email,
           subject: `Your Vantro OTP: ${otp}`,
-          html: `<p>Hi ${user.business_name},</p><p>Your OTP to reset your Vantro Flow password is: <strong style="font-size:24px">${otp}</strong></p><p>Valid for 15 minutes. Do not share this with anyone.</p>`
+          html: `<p>Hi ${escapeHtml(user.business_name)},</p><p>Your OTP to reset your Vantro Flow password is: <strong style="font-size:24px">${otp}</strong></p><p>Valid for 15 minutes. Do not share this with anyone.</p>`
         })
       });
     } else {
@@ -1264,6 +1434,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
 
     res.json({ success: true, message: 'If that email exists, an OTP has been sent.' });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1295,6 +1466,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
     res.json({ success: true, message: 'Password reset successfully. Please log in.' });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1386,6 +1558,7 @@ app.post('/api/upload-csv', authMiddleware, upload.single('file'), async (req, r
 
     res.json({ success: true, count: invoices.length, invoices: data });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1519,28 +1692,89 @@ app.post('/api/invoices/create', authMiddleware, async (req, res) => {
     }
   } catch (err) {
     console.error('[invoices/create]', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
+const BILL_STATUS_TO_PAYMENT_STATUS = { unpaid: 'Pending', paid: 'Paid', cancelled: 'Cancelled' };
+
+// Bills (GST invoices, table `bills`) and legacy invoices (table `invoices`)
+// are two different records with two different shapes sharing one viewer
+// page. Normalizes a `bills` row into the same envelope
+// GET /api/invoice/:invoiceId already returns, adding the GST fields
+// (customer_gstin, subtotal, cgst/sgst/igst, per-item hsn) the legacy shape
+// never had, so the frontend can render a tax breakdown when they're present
+// and fall back to a plain total when they're not.
+function normalizeBillToInvoice(bill) {
+  const billDate = bill.bill_date ? new Date(bill.bill_date) : new Date();
+  const daysOverdue = Math.max(0, Math.floor((Date.now() - billDate.getTime()) / 86400000));
+  const items = Array.isArray(bill.items) ? bill.items.map(it => ({
+    name: it.description || it.name || '',
+    hsn: it.hsn || null,
+    qty: Number(it.quantity ?? it.qty) || 1,
+    unit: it.unit || 'unit',
+    rate: Number(it.rate) || 0,
+    amount: Number(it.amount) || 0,
+  })) : null;
+
+  return {
+    id: bill.id,
+    user_id: bill.user_id,
+    customer_name: bill.customer_name,
+    customer_phone: bill.customer_phone || null,
+    customer_email: bill.customer_email || null,
+    customer_gstin: bill.customer_gstin || null,
+    customer_address: bill.customer_address || null,
+    invoice_amount: Number(bill.total) || 0,
+    invoice_number: bill.bill_number || null,
+    payment_status: BILL_STATUS_TO_PAYMENT_STATUS[bill.status] || 'Pending',
+    days_overdue: daysOverdue,
+    invoice_date: bill.bill_date,
+    due_date: bill.due_date || null,
+    payment_date: bill.paid_at || null,
+    notes: bill.notes || null,
+    items,
+    gst_rate: bill.gst_rate != null ? Number(bill.gst_rate) : null,
+    is_interstate: !!bill.is_interstate,
+    subtotal: Number(bill.subtotal) || 0,
+    cgst: Number(bill.cgst) || 0,
+    sgst: Number(bill.sgst) || 0,
+    igst: Number(bill.igst) || 0,
+  };
+}
+
 // ── Get single invoice by ID (authenticated, owner check) ────────────────────
+// Checks `invoices` first, then falls back to `bills` — the GST invoice flow
+// (POST /api/bills) creates rows only `bills` has, but its View/Print/
+// WhatsApp/Copy Link buttons all open /invoice/:id against this endpoint, so
+// without the fallback every GST invoice 404s the moment anyone tries to
+// open, print, or share it.
 app.get('/api/invoice/:invoiceId', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { invoiceId } = req.params;
 
-    const { data, error } = await supabase
+    let { data, error } = await supabase
       .from('invoices')
       .select('*')
       .eq('id', invoiceId)
       .eq('user_id', userId)
       .single();
 
-    if (error || !data) return res.status(404).json({ error: 'Invoice not found' });
-
-    // Parse items if stored as string
-    if (data.items && typeof data.items === 'string') {
-      try { data.items = JSON.parse(data.items); } catch { data.items = []; }
+    if (data && !error) {
+      // Parse items if stored as string
+      if (data.items && typeof data.items === 'string') {
+        try { data.items = JSON.parse(data.items); } catch { data.items = []; }
+      }
+    } else {
+      const { data: bill, error: billError } = await supabase
+        .from('bills')
+        .select('*')
+        .eq('id', invoiceId)
+        .eq('user_id', userId)
+        .single();
+      if (billError || !bill) return res.status(404).json({ error: 'Invoice not found' });
+      data = normalizeBillToInvoice(bill);
     }
 
     // Fetch owner profile (business name, address, gstin, upi_id)
@@ -1676,6 +1910,22 @@ app.post('/api/import/excel', authMiddleware, upload.single('file'), async (req,
 });
 
 // Quick manual add — add a single customer/invoice
+// Tally connector ingestion — all voucher types, idempotent. Flag-gated OFF by default.
+app.post('/api/import/tally', authMiddleware, async (req, res) => {
+  try {
+    if (!isFeatureEnabled('tally_import_enabled')) {
+      return res.status(403).json({ error: 'Tally import is not enabled. Set FEATURE_TALLY_IMPORT_ENABLED=true.' });
+    }
+    const { importTallyVouchers } = require('./lib/services/tallyImport.service');
+    const result = await importTallyVouchers(supabase, req.user.userId, req.body?.vouchers);
+    if (result.error) return res.status(result.status || 400).json({ error: result.error });
+    res.json(result);
+  } catch (err) {
+    console.error('Tally import error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.post('/api/import/manual', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -1776,6 +2026,7 @@ app.post('/api/import/manual', authMiddleware, async (req, res) => {
       }
     })();
   } catch (err) {
+    logRouteError(req, err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1817,6 +2068,7 @@ app.get('/api/invoices/:userId', requireOwner, async (req, res) => {
       }
     });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1862,6 +2114,7 @@ app.post('/api/calculate-priority/:userId', requireOwner, async (req, res) => {
 
     res.json({ success: true, priority_list: priorityList });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1926,6 +2179,7 @@ app.post('/api/generate-message', authMiddleware, async (req, res) => {
       message: generatedText.trim()
     });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2059,6 +2313,7 @@ app.post('/api/mark-paid', authMiddleware, requireSafeSettlementMutation, async 
     // ─────────────────────────────────────────────────────────────────────────
     res.json({ success: true, data: inv });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
@@ -2097,6 +2352,7 @@ app.post('/api/log-call', authMiddleware, async (req, res) => {
 
     res.json({ success: true, log: data[0] });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2115,6 +2371,7 @@ app.get('/api/calls/:userId', requireOwner, async (req, res) => {
 
     res.json({ success: true, calls: data });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2136,6 +2393,7 @@ app.post('/api/call/:callId/update', authMiddleware, async (req, res) => {
 
     res.json({ success: true, log: data[0] });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2200,6 +2458,7 @@ app.get('/api/metrics/:userId', requireOwner, async (req, res) => {
 
     res.json({ success: true, metrics });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2370,6 +2629,7 @@ app.post('/api/products', authMiddleware, async (req, res) => {
     });
     res.json({ success: true, product: data[0] });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2395,6 +2655,7 @@ app.post('/api/products/:productId', authMiddleware, async (req, res) => {
     });
     res.json({ success: true, product: data[0] });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2411,6 +2672,7 @@ app.post('/api/products/:productId/delete', authMiddleware, async (req, res) => 
     });
     res.json({ success: true });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2457,6 +2719,7 @@ app.post('/api/stock/move', authMiddleware, async (req, res) => {
 
     res.json({ success: true, movement: movement[0], new_stock: newStock });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2473,6 +2736,7 @@ app.get('/api/stock/movements/:userId', requireOwner, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, movements: data });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2672,6 +2936,23 @@ async function syncInventoryFromSale(userId, sale) {
       }]);
       synced.push({ product_id: product.id, name: productName, quantity: qty });
 
+      // Record the reduction itself, not just the low-stock case below. Stock
+      // leaving on a sale is a business event, and cortex-lab's
+      // credit-sale-orchestration scenario has asserted STOCK_REDUCED since it
+      // was written while nothing emitted it. Per product, matching
+      // LOW_STOCK_DETECTED, since a sale can move several lines.
+      setImmediate(() => {
+        emitBusinessEvent(userId, 'STOCK_REDUCED', {
+          entityType: 'product',
+          entityId:   product.id,
+          product_id: product.id,
+          product_name: productName,
+          quantity:   qty,
+          stock_after: nextStock,
+          reference:  sale.invoice_number || String(sale.id || ''),
+        }).catch(err => console.warn('[STOCK_REDUCED emit]', err.message));
+      });
+
       // Emit LOW_STOCK_DETECTED if stock dropped to or below the reorder threshold
       const minStock = product.low_stock_alert || product.reorder_level || 0;
       if (minStock > 0 && nextStock <= minStock) {
@@ -2807,7 +3088,10 @@ async function ensureConnectedBusinessData(userId) {
     // 4. RECALCULATE STOCK
     const { data: products } = await supabase.from('products').select('id, name').eq('user_id', userId);
     for (const prod of (products || [])) {
-      const { data: movements } = await supabase.from('stock_movements').select('movement_type, quantity').eq('product_id', prod.id);
+      // Scoped by owner as well as product: products above are already fetched
+      // for this user, but with RLS bypassed the user_id filter is what actually
+      // keeps another tenant's movements out of the recount.
+      const { data: movements } = await supabase.from('stock_movements').select('movement_type, quantity').eq('product_id', prod.id).eq('user_id', userId);
       let stock = 0;
       (movements || []).forEach(m => {
         if (m.movement_type === 'in') stock += toMoney(m.quantity);
@@ -4224,6 +4508,7 @@ app.post('/api/suppliers/:supplierId/delete', authMiddleware, async (req, res) =
     if (error) throw error;
     res.json({ success: true });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -4323,6 +4608,7 @@ Calls made: ${totalCalls}, Pick-up rate: ${totalCalls ? Math.round(pickedUp/tota
       insights
     });
   } catch (err) {
+    logRouteError(req, err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -5587,6 +5873,7 @@ app.get('/api/admin/error-events', authMiddleware, adminOnly, async (req, res) =
     if (error) throw error;
     res.json({ success: true, data });
   } catch (err) {
+    logRouteError(req, err);
     res.status(500).json({ error: 'Failed to fetch error events' });
   }
 });
@@ -5597,6 +5884,7 @@ app.patch('/api/admin/error-events/:id/resolve', authMiddleware, adminOnly, asyn
     if (error) throw error;
     res.json({ success: true, data });
   } catch (err) {
+    logRouteError(req, err);
     res.status(500).json({ error: 'Failed to resolve error event' });
   }
 });
@@ -5610,6 +5898,7 @@ app.get('/api/admin/error-summary', authMiddleware, adminOnly, async (req, res) 
     const { count: criticalErrors } = await supabase.from('error_events').select('*', { count: 'exact', head: true }).gte('created_at', today.toISOString()).eq('severity', 'critical');
     res.json({ success: true, summary: { totalErrors, criticalErrors } });
   } catch (err) {
+    logRouteError(req, err);
     res.status(500).json({ error: 'Failed to fetch summary' });
   }
 });
@@ -5631,109 +5920,6 @@ app.get('/metrics', async (req, res) => {
 app.post('/api/seed/:userId', requireOwner, async (req, res) => {
   // Seed endpoint permanently disabled — users provide their own real data
   return res.status(410).json({ error: 'Seed endpoint disabled' });
-
-  const { userId } = req.params; // unreachable below
-
-  try {
-    // Verify user exists
-    const { data: user, error: userErr } = await supabase
-      .from('users').select('id').eq('id', userId).single();
-    if (userErr || !user) return res.status(404).json({ error: 'User not found' });
-
-    const today = new Date();
-    const daysAgo = (n) => {
-      const d = new Date(today);
-      d.setDate(d.getDate() - n);
-      return d.toISOString().split('T')[0];
-    };
-
-    // --- INVOICES ---
-    const invoices = [
-      { user_id: userId, customer_name: 'Ramesh Traders', customer_phone: '9876543210', invoice_amount: 45000, invoice_date: daysAgo(62), payment_status: 'Pending', days_overdue: 62 },
-      { user_id: userId, customer_name: 'Sunita Enterprises', customer_phone: '9823456789', invoice_amount: 28500, invoice_date: daysAgo(47), payment_status: 'Pending', days_overdue: 47 },
-      { user_id: userId, customer_name: 'Kapoor & Sons', customer_phone: '9765432100', invoice_amount: 72000, invoice_date: daysAgo(38), payment_status: 'Pending', days_overdue: 38 },
-      { user_id: userId, customer_name: 'Meena Stores', customer_phone: '9812345678', invoice_amount: 15000, invoice_date: daysAgo(31), payment_status: 'Pending', days_overdue: 31 },
-      { user_id: userId, customer_name: 'Vijay Hardware', customer_phone: '9988776655', invoice_amount: 33500, invoice_date: daysAgo(22), payment_status: 'Pending', days_overdue: 22 },
-      { user_id: userId, customer_name: 'Priya Textiles', customer_phone: '9001234567', invoice_amount: 19000, invoice_date: daysAgo(15), payment_status: 'Pending', days_overdue: 15 },
-      { user_id: userId, customer_name: 'Ashok Medical', customer_phone: '9112233445', invoice_amount: 8500,  invoice_date: daysAgo(7),  payment_status: 'Pending', days_overdue: 7  },
-      { user_id: userId, customer_name: 'Gupta Electricals', customer_phone: '9556677889', invoice_amount: 52000, invoice_date: daysAgo(55), payment_status: 'Paid', days_overdue: 0, payment_date: daysAgo(20), payment_amount: 52000, payment_method: 'UPI', payment_notes: 'Paid via GPay' },
-      { user_id: userId, customer_name: 'Lakshmi Garments', customer_phone: '9443322110', invoice_amount: 24000, invoice_date: daysAgo(40), payment_status: 'Paid', days_overdue: 0, payment_date: daysAgo(10), payment_amount: 24000, payment_method: 'Bank Transfer' },
-      { user_id: userId, customer_name: 'Sharma General Store', customer_phone: '9334455667', invoice_amount: 11000, invoice_date: daysAgo(18), payment_status: 'Paid', days_overdue: 0, payment_date: daysAgo(5), payment_amount: 11000, payment_method: 'Cash' },
-    ];
-
-    const { data: invData, error: invErr } = await supabase.from('invoices').insert(invoices).select();
-    if (invErr) throw invErr;
-
-    // Map customer name → invoice id for call logs
-    const invMap = {};
-    invData.forEach(i => { invMap[i.customer_name] = i.id; });
-
-    // --- CALL LOGS ---
-    const callLogs = [
-      { user_id: userId, invoice_id: invMap['Ramesh Traders'],    customer_name: 'Ramesh Traders',    customer_phone: '9876543210', amount: 45000, did_pick_up: true,  call_duration_minutes: 6, promised_payment_date: daysAgo(-3), promised_amount: 45000, notes: 'Promised to pay by end of week. Said he is waiting for his own payment.' },
-      { user_id: userId, invoice_id: invMap['Sunita Enterprises'],customer_name: 'Sunita Enterprises',customer_phone: '9823456789', amount: 28500, did_pick_up: false, call_duration_minutes: 0, notes: 'No answer. Tried twice.' },
-      { user_id: userId, invoice_id: invMap['Kapoor & Sons'],     customer_name: 'Kapoor & Sons',     customer_phone: '9765432100', amount: 72000, did_pick_up: true,  call_duration_minutes: 12, promised_payment_date: daysAgo(-7), promised_amount: 36000, notes: 'Agreed to pay 50% now, rest in 2 weeks.' },
-      { user_id: userId, invoice_id: invMap['Meena Stores'],      customer_name: 'Meena Stores',      customer_phone: '9812345678', amount: 15000, did_pick_up: true,  call_duration_minutes: 3, notes: 'Disputed 2000 in charges. Will verify and pay rest.' },
-      { user_id: userId, invoice_id: invMap['Vijay Hardware'],    customer_name: 'Vijay Hardware',    customer_phone: '9988776655', amount: 33500, did_pick_up: false, call_duration_minutes: 0, notes: 'Phone switched off.' },
-      { user_id: userId, invoice_id: invMap['Ramesh Traders'],    customer_name: 'Ramesh Traders',    customer_phone: '9876543210', amount: 45000, did_pick_up: true,  call_duration_minutes: 4, notes: 'Follow-up call. He asked for 3 more days.' },
-    ];
-
-    const { error: callErr } = await supabase.from('call_logs').insert(callLogs);
-    if (callErr) throw callErr;
-
-    // --- SUPPLIERS ---
-    const suppliers = [
-      { user_id: userId, name: 'National Steel Works',   phone: '9111222333', email: 'sales@nationalsteel.in',   address: '14, Industrial Area, Pune', payment_terms: 30 },
-      { user_id: userId, name: 'Bharat Polymers Ltd',    phone: '9222333444', email: 'orders@bharatpolymers.com', address: 'MIDC Phase 2, Nashik',      payment_terms: 45 },
-      { user_id: userId, name: 'Rajasthan Textile Mill', phone: '9333444555', email: 'info@rjtextile.co.in',      address: 'Jodhpur Industrial Estate',  payment_terms: 15 },
-      { user_id: userId, name: 'Delhi Packaging Co',     phone: '9444555666', email: 'delhi@packagingco.in',      address: 'Okhla Phase 3, New Delhi',   payment_terms: 30 },
-    ];
-
-    const { error: supErr } = await supabase.from('suppliers').insert(suppliers);
-    if (supErr) throw supErr;
-
-    // --- PRODUCTS ---
-    const products = [
-      { user_id: userId, name: 'Steel Rods 12mm',    sku: 'STL-001', category: 'Raw Material', unit: 'kg',     unit_price: 85,   current_stock: 450,  low_stock_alert: 100 },
-      { user_id: userId, name: 'Polypropylene Bags', sku: 'PKG-002', category: 'Packaging',    unit: 'pcs',    unit_price: 12,   current_stock: 1200, low_stock_alert: 200 },
-      { user_id: userId, name: 'Cotton Fabric Roll', sku: 'TEX-003', category: 'Raw Material', unit: 'meters', unit_price: 145,  current_stock: 80,   low_stock_alert: 100 },
-      { user_id: userId, name: 'Cardboard Boxes L',  sku: 'PKG-004', category: 'Packaging',    unit: 'pcs',    unit_price: 28,   current_stock: 0,    low_stock_alert: 50  },
-      { user_id: userId, name: 'Machine Oil 5L',     sku: 'MNT-005', category: 'Maintenance',  unit: 'cans',   unit_price: 550,  current_stock: 18,   low_stock_alert: 5   },
-      { user_id: userId, name: 'Safety Gloves',      sku: 'SAF-006', category: 'Safety',       unit: 'pairs',  unit_price: 75,   current_stock: 35,   low_stock_alert: 20  },
-    ];
-
-    const { data: prodData, error: prodErr } = await supabase.from('products').insert(products).select();
-    if (prodErr) throw prodErr;
-
-    // --- STOCK MOVEMENTS ---
-    const moves = [
-      { user_id: userId, product_id: prodData[0].id, movement_type: 'in',  quantity: 500,  unit_cost: 82, reference: 'PO-2024-001', notes: 'Received from National Steel' },
-      { user_id: userId, product_id: prodData[0].id, movement_type: 'out', quantity: 50,   reference: 'SO-2024-011', notes: 'Dispatched to Ramesh Traders' },
-      { user_id: userId, product_id: prodData[1].id, movement_type: 'in',  quantity: 1500, unit_cost: 11, reference: 'PO-2024-002', notes: 'Received from Bharat Polymers' },
-      { user_id: userId, product_id: prodData[1].id, movement_type: 'out', quantity: 300,  reference: 'SO-2024-015', notes: 'Packaging for Kapoor & Sons order' },
-      { user_id: userId, product_id: prodData[2].id, movement_type: 'in',  quantity: 150,  unit_cost: 140, reference: 'PO-2024-003', notes: 'From Rajasthan Textile Mill' },
-      { user_id: userId, product_id: prodData[2].id, movement_type: 'out', quantity: 70,   reference: 'SO-2024-018', notes: 'Priya Textiles order' },
-      { user_id: userId, product_id: prodData[3].id, movement_type: 'in',  quantity: 200,  unit_cost: 26, reference: 'PO-2024-004' },
-      { user_id: userId, product_id: prodData[3].id, movement_type: 'out', quantity: 200,  reference: 'SO-2024-020', notes: 'All boxes dispatched' },
-    ];
-
-    const { error: movErr } = await supabase.from('stock_movements').insert(moves);
-    if (movErr) throw movErr;
-
-    res.json({
-      success: true,
-      seeded: {
-        invoices: invData.length,
-        calls: callLogs.length,
-        suppliers: suppliers.length,
-        products: prodData.length,
-        movements: moves.length
-      }
-    });
-  } catch (err) {
-    console.error('Seed error:', err);
-    res.status(500).json({ error: 'Internal server error' });
-  }
 });
 
 // ============================================
@@ -5797,7 +5983,7 @@ app.post('/api/prospects', authMiddleware, async (req, res) => {
       .select();
     if (error) throw error;
     res.json({ success: true, prospect: data[0] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/prospects/:id', authMiddleware, async (req, res) => {
@@ -5814,7 +6000,7 @@ app.post('/api/prospects/:id', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('prospects').update(updates).eq('id', id).eq('user_id', req.user.userId).select();
     if (error) throw error;
     res.json({ success: true, prospect: data[0] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/prospects/:id/delete', authMiddleware, async (req, res) => {
@@ -5824,7 +6010,7 @@ app.post('/api/prospects/:id/delete', authMiddleware, async (req, res) => {
     const { error } = await supabase.from('prospects').delete().eq('id', id).eq('user_id', req.user.userId);
     if (error) throw error;
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/prospects/:id/notes', authMiddleware, async (req, res) => {
@@ -5844,7 +6030,7 @@ app.post('/api/prospects/:id/notes', authMiddleware, async (req, res) => {
       .select();
     if (error) throw error;
     res.json({ success: true, note: data[0] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -6022,6 +6208,7 @@ CREATE INDEX IF NOT EXISTS idx_bank_transactions_status ON bank_transactions(use
     res.json({ success: true, message: '✅ Migration complete — prospects, ledger and bank tables created' });
   } catch (err) {
     if (client) await client.end().catch(() => {});
+    logRouteError(req, err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -6800,6 +6987,7 @@ app.post('/api/billing/create-order', authMiddleware, async (req, res) => {
     });
     res.json({ success: true, order, key: process.env.RAZORPAY_KEY_ID });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -6824,6 +7012,7 @@ app.post('/api/billing/verify', authMiddleware, async (req, res) => {
     }]);
     res.json({ success: true, message: 'Payment verified, plan upgraded' });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -6842,7 +7031,7 @@ app.get('/api/billing/history', authMiddleware, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, history: data || [] });
   } catch (error) {
-    console.error('[billing history]', error);
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -6850,6 +7039,27 @@ app.get('/api/billing/history', authMiddleware, async (req, res) => {
 // ============================================
 // SETTINGS
 // ============================================
+
+// Per-tenant integration credentials are returned as this sentinel rather than
+// in full, so the settings page can show that a token is set without the value
+// crossing the wire. whatsapp_token was the odd one out — masked nowhere, while
+// the two beside it were masked — despite being the same kind of credential.
+const MASKED_SECRET = '••••••••';
+const MASKED_SETTING_KEYS = ['interakt_api_key', 'wati_token', 'whatsapp_token'];
+
+// Masking a field that PATCH also accepts creates a way to destroy it: a client
+// that reads settings, edits one field and sends the object back writes the
+// sentinel itself into the column, and because GET masks the result there is no
+// way to notice afterwards. No caller does that today — the settings page sends
+// explicit literals — but whatsapp_token is in the PATCH allowlist (unlike the
+// other two, which only a dedicated endpoint writes), so the path exists. Drop
+// any masked value instead of storing it; a real token is never this string.
+function dropMaskedSecrets(updates) {
+  for (const key of MASKED_SETTING_KEYS) {
+    if (updates[key] === MASKED_SECRET) delete updates[key];
+  }
+  return updates;
+}
 
 app.get('/api/settings', authMiddleware, async (req, res) => {
   try {
@@ -6870,9 +7080,12 @@ app.get('/api/settings', authMiddleware, async (req, res) => {
     if (!data) return res.status(404).json({ error: 'User not found' });
     // Mask secrets — only return whether they are set, not the actual values
     const settings = { ...data };
-    if (settings.interakt_api_key) settings.interakt_api_key = '••••••••';
-    if (settings.wati_token)       settings.wati_token       = '••••••••';
-    // razorpay_key_id is safe to return (public key), razorpay_key_secret never stored per-user
+    for (const key of MASKED_SETTING_KEYS) {
+      if (settings[key]) settings[key] = MASKED_SECRET;
+    }
+    // razorpay_key_id is safe to return (it is the public key). The secret is
+    // stored on this row but deliberately absent from fullColumns above, so it
+    // is never read back out here.
     res.json({ success: true, settings });
   } catch (error) {
     console.error('[settings get]', error);
@@ -6885,11 +7098,13 @@ app.patch('/api/settings', authMiddleware, async (req, res) => {
     const allowed = ['business_name', 'phone', 'gstin', 'address', 'business_address', 'logo_url', 'whatsapp_phone', 'whatsapp_token', 'industry', 'language', 'contact_time', 'owner_name', 'city', 'voice_style', 'ai_persona', 'upi_id', 'invoice_prefix', 'wa_provider', 'wati_api_url', 'razorpay_key_id', 'automation_enabled'];
     const updates = {};
     allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
+    dropMaskedSecrets(updates);
     updates.updated_at = new Date();
     const { data, error } = await supabase.from('users').update(updates).eq('id', req.user.userId).select('id, email, phone, business_name, gstin, plan');
     if (error) throw error;
     res.json({ success: true, settings: data[0] });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -6910,6 +7125,7 @@ app.post('/api/settings/twilio', authMiddleware, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, message: 'Twilio credentials saved' });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -6925,6 +7141,7 @@ app.get('/api/dunning/:userId', requireOwner, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, rules: data || [] });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -6958,6 +7175,7 @@ app.post('/api/dunning', authMiddleware, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, rule: data[0] });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -6971,6 +7189,7 @@ app.patch('/api/dunning/:id', authMiddleware, async (req, res) => {
     if (!data?.length) return res.status(404).json({ error: 'Rule not found' });
     res.json({ success: true, rule: data[0] });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -6981,6 +7200,7 @@ app.delete('/api/dunning/:id', authMiddleware, async (req, res) => {
     if (error) throw error;
     res.json({ success: true });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -7089,6 +7309,7 @@ app.post('/api/settings/automation/toggle', authMiddleware, async (req, res) => 
     if (error) throw error;
     res.json({ success: true, automation_enabled: !!enabled });
   } catch (err) {
+    logRouteError(req, err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -7138,10 +7359,10 @@ async function makeAutoCall(userId, invoice) {
 
     const phone = String(invoice.customer_phone).replace(/\D/g, '');
     const toPhone = phone.length === 10 ? `+91${phone}` : `+${phone}`;
-    const safeScript = openingScript.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const safeScript = escapeXml(openingScript);
     const payLink = invoice.payment_link;
     const payPrompt = payLink
-      ? `<Say voice="Polly.Aditi" language="hi-IN">Is link pe click kar ke abhi pay karein: ${payLink.replace(/https?:\/\//, '')}</Say><Pause length="1"/>`
+      ? `<Say voice="Polly.Aditi" language="hi-IN">Is link pe click kar ke abhi pay karein: ${escapeXml(payLink.replace(/https?:\/\//, ''))}</Say><Pause length="1"/>`
       : '';
 
     await twilioClient.calls.create({
@@ -7169,6 +7390,44 @@ async function makeAutoCall(userId, invoice) {
   }
 }
 
+// ============================================
+// RECONCILING THE TWO DUNNING SYSTEMS (Cortex X, agent auto-execute pass)
+//
+// This legacy runDunningCycle() (config: dunning_rules table, per-user
+// trigger_day/tone/action, gated on users.automation_enabled) and the newer
+// collectionsAgent.js (config: fixed day-bands, ai_actions +
+// FEATURE_AGENT_AUTOEXECUTE_ENABLED, per-customer escalation cap/cooldown)
+// both decide independently, on separate daily schedules, whether to
+// WhatsApp or call the same customer about the same overdue invoice. They
+// were built at different times for different purposes (dunning_rules is
+// the older, fully-autonomous system already relied on by paying customers
+// today; collectionsAgent is the newer Cortex-pipeline-integrated one) and
+// merging them into a single engine is a real redesign -- deciding whose
+// rule config wins, whether dunning_rules gets migrated into ai_actions,
+// is intentionally out of scope for this pass.
+//
+// What IS in scope, and implemented below: neither system should be able
+// to double-contact a customer, and pausing a customer/invoice must
+// actually stop BOTH systems, not just one. Concretely:
+//   1. Both systems now check invoices.dunning_paused (the disputeAgent
+//      safety-net flag) before contacting -- runDunningCycle previously
+//      did not check this at all, meaning a disputed invoice could still
+//      get an autonomous call/WhatsApp from the old cron even though the
+//      new system already correctly paused it. Fixed here.
+//   2. Both systems now check customers.escalation_paused (the new
+//      per-customer kill switch) before contacting -- previously only
+//      collectionsAgent respected it.
+//   3. Both systems now check invoices.last_reminder_sent (a column the
+//      old cron already wrote to, just never read back) as a shared
+//      "already contacted today, by anyone" gate, and both now write to it
+//      after a successful send/call. This makes it a genuine cross-system
+//      lock without either system needing to know the other's internals --
+//      whichever system contacts an invoice first on a given day, the
+//      other sees the fresh timestamp and skips it for the rest of that
+//      day. See collectionsAgent.js's run() and server.js's
+//      autoSendCollectionsReminders()/executeCollectionsMessage() for the
+//      new-system side of this same gate.
+// ============================================
 async function runDunningCycle() {
   console.log('🔔 Dunning cron started:', new Date().toISOString());
   try {
@@ -7176,14 +7435,20 @@ async function runDunningCycle() {
     const { data: allRules } = await supabase.from('dunning_rules').select('*').eq('enabled', true);
     if (!allRules?.length) return;
 
-    // Get all pending invoices (exclude snoozed ones)
+    // Get all pending invoices (exclude snoozed ones and disputed/dunning-paused ones)
     // Also fetch invoice_date so we can compute days_overdue dynamically
     const { data: invoices } = await supabase
       .from('invoices')
-      .select('id, user_id, customer_name, customer_phone, invoice_amount, invoice_date, due_date, days_overdue, payment_link, payment_link_id, reminder_count, snooze_until')
+      .select('id, user_id, customer_name, customer_phone, invoice_amount, invoice_date, due_date, days_overdue, payment_link, payment_link_id, reminder_count, snooze_until, dunning_paused, last_reminder_sent')
       .eq('payment_status', 'Pending')
+      .eq('dunning_paused', false)
       .or(`snooze_until.is.null,snooze_until.lt.${new Date().toISOString()}`);
     if (!invoices?.length) return;
+
+    const todayStr = new Date().toISOString().split('T')[0];
+    const contactedToday = new Set(
+      invoices.filter(i => i.last_reminder_sent && String(i.last_reminder_sent).split('T')[0] === todayStr).map(i => i.id)
+    );
 
     // Compute actual days overdue from invoice_date (not stored static field)
     const today = new Date();
@@ -7213,6 +7478,27 @@ async function runDunningCycle() {
       // Run for: (a) any paid plan user, OR (b) free users who manually enabled automation
       const isPaidPlan = user?.plan && user.plan !== 'free';
       if (!isPaidPlan && !user?.automation_enabled) continue; // skip free users with automation off
+
+      // Cross-system gate: skip if collectionsAgent (or this cron, on a
+      // rerun) already contacted this invoice today via any channel.
+      if (contactedToday.has(invoice.id)) continue;
+
+      // Per-customer pause switch (customers.escalation_paused) — same
+      // check collectionsAgent.js performs, now also honoured here so
+      // pausing a customer actually stops both systems.
+      try {
+        const { resolveCustomerId } = require('./lib/services/orchestrator/scoring.service');
+        const customerId = await resolveCustomerId(invoice.user_id, invoice.customer_name, invoice.customer_phone);
+        if (customerId) {
+          // Owner filter repeated on purpose, matching collectionsAgent: the
+          // service_role key bypasses RLS, so this is the only barrier if the
+          // resolved id is ever wrong. It matters more here than in the agent —
+          // this runs in the dunning cron, which walks every user's invoices, so
+          // a mismatched id would read across tenants rather than within one.
+          const { data: customer } = await supabase.from('customers').select('escalation_paused').eq('id', customerId).eq('user_id', invoice.user_id).maybeSingle();
+          if (customer?.escalation_paused) continue;
+        }
+      } catch { /* best-effort — if resolution fails, fall through unaffected, same as before this change */ }
 
       // Match rules using dynamically computed days since invoice_date
       const rules = allRules.filter(r => r.user_id === invoice.user_id && r.trigger_day === invoice._computed_days);
@@ -7625,6 +7911,7 @@ app.get('/api/admin/stats', adminOnly, async (req, res) => {
       }
     });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -7688,6 +7975,7 @@ app.get('/api/public/profile/:userId', async (req, res) => {
       }
     });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -7998,7 +8286,7 @@ app.post('/api/voice/call', authMiddleware, async (req, res) => {
 
     const phone = String(customer_phone).replace(/\D/g, '');
     const toPhone = phone.length === 10 ? `+91${phone}` : `+${phone}`;
-    const safeScript = openingScript.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const safeScript = escapeXml(openingScript);
 
     const call = await twilioClient.calls.create({
       to: toPhone,
@@ -8062,6 +8350,7 @@ app.post('/api/notifications/subscribe', authMiddleware, async (req, res) => {
       .eq('id', userId);
     res.json({ success: true, message: 'Push subscription saved' });
   } catch (err) {
+    logRouteError(req, err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -8531,7 +8820,10 @@ app.post('/api/reconcile/backfill', requireAdmin, async (req, res) => {
     if (!isDryRun) {
       const { data: products } = await supabase.from('products').select('id, name').eq('user_id', userId);
       for (const prod of (products || [])) {
-        const { data: movements } = await supabase.from('stock_movements').select('movement_type, quantity').eq('product_id', prod.id);
+        // Scoped by owner as well as product: products above are already
+        // fetched for this user, but with RLS bypassed the user_id filter is
+        // what actually keeps another tenant's movements out of the recount.
+        const { data: movements } = await supabase.from('stock_movements').select('movement_type, quantity').eq('product_id', prod.id).eq('user_id', userId);
         let stock = 0;
         (movements || []).forEach(m => {
           if (m.movement_type === 'in') stock += toMoney(m.quantity);
@@ -8605,7 +8897,7 @@ app.get('/api/transactions/:userId', requireOwner, async (req, res) => {
     res.json({ transactions, summary: buildLedgerSummary(transactions) });
   } catch (err) {
     console.error('[transactions GET]', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -8760,7 +9052,7 @@ app.get('/api/financial-summary/:userId', requireOwner, async (req, res) => {
       categories: catBreakdown.rows,
       recentTransactions: recent.rows,
     });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // AI Financial Monitor
@@ -8809,7 +9101,7 @@ Return JSON only:
     const match = text.match(/\{[\s\S]*\}/);
     const analysis = match ? JSON.parse(match[0]) : { health_score: 50, status: 'warning', summary: 'Insufficient data.', alerts: [], insights: [], top_expenses: [] };
     res.json({ success: true, analysis });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -8856,7 +9148,7 @@ app.get('/api/orders', authMiddleware, async (req, res) => {
     }
 
     res.json({ success: true, orders });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/orders', authMiddleware, async (req, res) => {
@@ -8872,7 +9164,7 @@ app.post('/api/orders', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     res.json({ success: true, order: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/orders/:id', authMiddleware, async (req, res) => {
@@ -8886,14 +9178,14 @@ app.patch('/api/orders/:id', authMiddleware, async (req, res) => {
       .eq('id', req.params.id).eq('user_id', userId).select().single();
     if (error) throw error;
     res.json({ success: true, order: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/orders/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('orders').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -8906,7 +9198,7 @@ app.get('/api/workers', authMiddleware, async (req, res) => {
       .select('*').eq('user_id', req.user.userId).order('name');
     if (error) throw error;
     res.json({ success: true, workers: data || [] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/workers', authMiddleware, async (req, res) => {
@@ -8919,7 +9211,7 @@ app.post('/api/workers', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     res.json({ success: true, worker: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/workers/:id', authMiddleware, async (req, res) => {
@@ -8929,14 +9221,14 @@ app.patch('/api/workers/:id', authMiddleware, async (req, res) => {
       .update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
     res.json({ success: true, worker: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/workers/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('workers').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -8949,7 +9241,7 @@ app.get('/api/vocabulary', authMiddleware, async (req, res) => {
       .select('*').eq('user_id', req.user.userId).order('category').order('term');
     if (error) throw error;
     res.json({ success: true, vocabulary: data || [] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/vocabulary', authMiddleware, async (req, res) => {
@@ -8962,14 +9254,14 @@ app.post('/api/vocabulary', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     res.json({ success: true, item: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/vocabulary/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('business_vocabulary').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Seed starter vocabulary by industry
@@ -9020,7 +9312,7 @@ app.post('/api/vocabulary/seed', authMiddleware, async (req, res) => {
     const { error } = await supabase.from('business_vocabulary').insert(items);
     if (error) throw error;
     res.json({ success: true, seeded: items.length, industry });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -9042,12 +9334,14 @@ app.post('/api/voice/inbound', async (req, res) => {
         .select('business_name, owner_name').eq('id', userId).single();
       if (u?.business_name) greeting = u.business_name;
     }
-    const cbUrl = `${process.env.RAILWAY_PUBLIC_URL || 'https://vantro-flow-backend-production.up.railway.app'}/api/voice/recording?uid=${userId || ''}`;
+    // uid comes from req.query — encoded for the URL, then escaped for the XML
+    // attribute it is placed in. Either alone is insufficient.
+    const cbUrl = `${process.env.RAILWAY_PUBLIC_URL || 'https://vantro-flow-backend-production.up.railway.app'}/api/voice/recording?uid=${encodeURIComponent(userId || '')}`;
     res.set('Content-Type', 'text/xml');
     res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Aditi" language="hi-IN">Namaste! ${greeting.replace(/&/g,'and')} mein aapka swagat hai. Beep ke baad apna order boliye — apna naam, kya chahiye, kitna chahiye, aur address batayein.</Say>
-  <Record maxLength="180" action="${cbUrl}" transcribe="false" playBeep="true" finishOnKey="*"/>
+  <Say voice="Polly.Aditi" language="hi-IN">Namaste! ${escapeXml(greeting)} mein aapka swagat hai. Beep ke baad apna order boliye — apna naam, kya chahiye, kitna chahiye, aur address batayein.</Say>
+  <Record maxLength="180" action="${escapeXml(cbUrl)}" transcribe="false" playBeep="true" finishOnKey="*"/>
   <Say voice="Polly.Aditi" language="hi-IN">Dhanyavaad! Aapka order note ho gaya. Hum jald sampark karenge.</Say>
 </Response>`);
   } catch (err) {
@@ -9174,7 +9468,7 @@ Extract order from Hindi/Hinglish transcript. Return ONLY valid JSON, no comment
         const toPhone = wPhone.length === 10 ? `+91${wPhone}` : `+${wPhone}`;
         const itemsDesc = (extracted.items || []).map(i => `${i.quantity} ${i.unit} ${i.local_name || i.name}`).join(', ');
         const script = `${w.name} ji, naya order aaya hai. Customer: ${extracted.customer_name || 'customer'}. Maal: ${itemsDesc || 'details app mein hain'}. Address: ${extracted.delivery_address || 'confirm karo'}. Delivery: ${extracted.delivery_time || 'jaldi se'}. Vantro app check karo.`;
-        const safe = script.replace(/&/g,'and').replace(/</g,'').replace(/>/g,'');
+        const safe = escapeXml(script);
         try {
           await twilioClient.calls.create({
             to: toPhone, from: process.env.TWILIO_PHONE_NUMBER,
@@ -9206,6 +9500,7 @@ app.get('/api/voice/webhook-url', authMiddleware, async (req, res) => {
     const twilioConfigured = envConfigured || !!(dbSid);
     res.json({ success: true, webhook_url: url, twilio_configured: twilioConfigured, twilio_account_sid: dbSid, twilio_phone_number: dbPhone });
   } catch (error) {
+    logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -9225,7 +9520,7 @@ app.get('/api/expenses', authMiddleware, async (req, res) => {
     const { data, error } = await q;
     if (error) throw error;
     res.json({ success: true, expenses: data || [] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/expenses', authMiddleware, async (req, res) => {
@@ -9239,7 +9534,7 @@ app.post('/api/expenses', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     res.json({ success: true, expense: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/expenses/:id', authMiddleware, async (req, res) => {
@@ -9250,14 +9545,14 @@ app.patch('/api/expenses/:id', authMiddleware, async (req, res) => {
       .update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
     res.json({ success: true, expense: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/expenses/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('expenses').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -9357,7 +9652,7 @@ app.get('/api/today/summary', authMiddleware, async (req, res) => {
       purchases: purchases || [],
       paid_invoices: paidInvoices || [],
     });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -9370,7 +9665,7 @@ app.get('/api/ai/brain/rules', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('brain_rules').select('*').eq('user_id', req.user.userId).order('created_at');
     if (error) throw error;
     res.json({ success: true, rules: data || [] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/ai/brain/rules', authMiddleware, async (req, res) => {
@@ -9382,14 +9677,14 @@ app.post('/api/ai/brain/rules', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     res.json({ success: true, rule: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/ai/brain/rules/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('brain_rules').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Main Vantro Brain endpoint — full context AI with live tool use
@@ -9727,14 +10022,14 @@ app.post('/api/onboarding/setup', authMiddleware, async (req, res) => {
       { onConflict: 'user_id,term' }
     );
     res.json({ success: true, feature_flags });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/user/features', authMiddleware, async (req, res) => {
   try {
     const { data } = await supabase.from('users').select('feature_flags, industry, business_size, gst_registered, owner_name, city, gstin, business_name, business_address').eq('id', req.user.userId).single();
     res.json({ success: true, ...(data || {}), feature_flags: data?.feature_flags || {} });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -9776,7 +10071,7 @@ app.get('/api/bills/public/:id', async (req, res) => {
       source: token ? 'signed_public_link' : 'legacy_public_link',
     });
     res.json({ success: true, bill: publicBill });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/bills', authMiddleware, async (req, res) => {
@@ -9861,20 +10156,24 @@ app.post('/api/bills', authMiddleware, async (req, res) => {
     });
 
     res.json({ success: true, bill: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/bills/:id', authMiddleware, async (req, res) => {
   try {
+    // invoice_date, tax_amount and total_amount are generated columns — they
+    // mirror bill_date, the GST components and total, so writing to them raises
+    // 428C9. They were in this allowlist while the table did not exist, so it
+    // never surfaced. Nothing sends them: the bills page patches status only.
     const updates = pickAllowed(req.body, [
       'customer_name', 'customer_phone', 'customer_email', 'customer_gstin',
-      'invoice_date', 'due_date', 'items', 'subtotal', 'tax_amount',
-      'total_amount', 'status', 'notes', 'paid_at'
+      'bill_date', 'due_date', 'items', 'subtotal',
+      'status', 'notes', 'paid_at'
     ]);
     const { data, error } = await supabase.from('bills').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
     res.json({ success: true, bill: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/bills/:id', authMiddleware, async (req, res) => {
@@ -9907,6 +10206,7 @@ app.delete('/api/bills/:id', authMiddleware, async (req, res) => {
     });
     res.json({ success: true });
   } catch (err) {
+    logRouteError(req, err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -9917,9 +10217,39 @@ app.get('/api/bills/gstr1', authMiddleware, async (req, res) => {
     const { month, year } = req.query;
     const m = String(month || new Date().getMonth() + 1).padStart(2, '0');
     const y = year || new Date().getFullYear();
-    const from = `${y}-${m}-01`;
-    const to = `${y}-${m}-31`;
-    const { data: bills } = await supabase.from('bills').select('*').eq('user_id', req.user.userId).gte('bill_date', from).lte('bill_date', to).eq('status', 'unpaid').neq('status', 'cancelled');
+    // Validate before doing date arithmetic: ?month=abc makes Date.UTC return
+    // NaN and toISOString() throw a RangeError, which the catch below turns into
+    // a 500 for what is plainly a bad request.
+    const mNum = Number(m);
+    const yNum = Number(y);
+    if (!Number.isInteger(mNum) || mNum < 1 || mNum > 12) {
+      return res.status(400).json({ error: 'month must be an integer between 1 and 12' });
+    }
+    if (!Number.isInteger(yNum) || yNum < 2000 || yNum > 2100) {
+      return res.status(400).json({ error: 'year must be an integer between 2000 and 2100' });
+    }
+    // Half-open range on the first of the next month. The previous bound was
+    // `${y}-${m}-31`, which is not a real date in February, April, June,
+    // September or November — Postgres rejects it with 22008 against a DATE
+    // column. The error was also unbound, so it was discarded and the endpoint
+    // returned 200 with an empty filing for five months of every year.
+    const monthStart = new Date(Date.UTC(yNum, mNum - 1, 1));
+    const nextMonth = new Date(Date.UTC(yNum, mNum, 1));
+    const from = monthStart.toISOString().split('T')[0];
+    const to = nextMonth.toISOString().split('T')[0];
+
+    // Cancelled bills are excluded; paid ones are not. GST is owed on the
+    // invoice being issued, not on it being collected, so filtering to unpaid
+    // left every settled sale out of the return.
+    // The NULL branch matters: SQL `status <> 'cancelled'` evaluates to NULL for
+    // a NULL status, so a plain .neq() drops those rows from the return instead
+    // of including them. A bill omitted from a GST filing is the more expensive
+    // error of the two, so anything that is not explicitly cancelled is filed.
+    const { data: bills, error: billsErr } = await supabase.from('bills').select('*')
+      .eq('user_id', req.user.userId)
+      .gte('bill_date', from).lt('bill_date', to)
+      .or('status.is.null,status.neq.cancelled');
+    if (billsErr) throw billsErr;
     const b2b = (bills || []).filter(b => b.customer_gstin).map(b => ({
       'GSTIN of Recipient': b.customer_gstin, 'Receiver Name': b.customer_name,
       'Invoice Number': b.bill_number, 'Invoice Date': b.bill_date,
@@ -9934,7 +10264,7 @@ app.get('/api/bills/gstr1', authMiddleware, async (req, res) => {
     const totalTax = (bills || []).reduce((s, b) => s + Number(b.cgst || 0) + Number(b.sgst || 0) + Number(b.igst || 0), 0);
     const totalSales = (bills || []).reduce((s, b) => s + Number(b.total || 0), 0);
     res.json({ success: true, month: `${m}/${y}`, b2b, b2c, summary: { total_invoices: (bills||[]).length, total_sales: totalSales, total_tax: totalTax } });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -9978,14 +10308,14 @@ app.post('/api/khata/entry', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     res.json({ success: true, entry: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/khata/entry/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('khata_entries').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -10143,7 +10473,7 @@ app.delete('/api/purchases/:id', authMiddleware, async (req, res) => {
       purchaseId: req.params.id,
     });
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Bill Scanner — AI extracts purchase data from photo using vision provider fallback
@@ -10205,7 +10535,7 @@ app.get('/api/sales', authMiddleware, async (req, res) => {
     
     const sales = await salesService.getSales(userId, businessId, { status });
     res.json({ success: true, sales });
-  } catch (err) { res.status(500).json({ error: err.message || 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/sales', authMiddleware, async (req, res) => {
@@ -10274,7 +10604,7 @@ app.post('/api/sales', authMiddleware, async (req, res) => {
     }
     // ─────────────────────────────────────────────────────────────────────────
     res.json({ success: true, sale: { ...sale, total_amount: parseFloat(sale.amount) }, receivable });
-  } catch (err) { res.status(500).json({ error: err.message || 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/sales/:id', authMiddleware, async (req, res) => {
@@ -10334,7 +10664,7 @@ app.patch('/api/sales/:id', authMiddleware, async (req, res) => {
       amount: finalAmount,
     });
     res.json({ success: true, sale: { ...sale, total_amount: parseFloat(sale.amount) }, receivable });
-  } catch (err) { res.status(500).json({ error: err.message || 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/sales/:id', authMiddleware, async (req, res) => {
@@ -10352,6 +10682,7 @@ app.delete('/api/sales/:id', authMiddleware, async (req, res) => {
     });
     res.json({ success: true });
   } catch (err) {
+    logRouteError(req, err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -10407,18 +10738,30 @@ Rules: numbers without rupee symbol or commas (147630 not 1,47,630). Dates as YY
 // ATTENDANCE + SALARY
 // ============================================
 
+// `${y}-${m}-31` is not a real date in February, April, June, September or
+// November — Postgres rejects it with 22008 against a DATE column, the same
+// bug fixed for GSTR-1 above. Both attendance endpoints built their range this
+// way; centralised so a third copy can't reintroduce it. Returns a half-open
+// [from, to) pair on the first of the next month.
+function monthDateRange(year, month) {
+  const y = Number(year);
+  const m = Number(month);
+  const from = new Date(Date.UTC(y, m - 1, 1)).toISOString().split('T')[0];
+  const to = new Date(Date.UTC(y, m, 1)).toISOString().split('T')[0];
+  return { from, to };
+}
+
 app.get('/api/attendance', authMiddleware, async (req, res) => {
   try {
     const month = req.query.month || String(new Date().getMonth() + 1).padStart(2, '0');
     const year = req.query.year || new Date().getFullYear();
-    const from = `${year}-${String(month).padStart(2, '0')}-01`;
-    const to = `${year}-${String(month).padStart(2, '0')}-31`;
+    const { from, to } = monthDateRange(year, month);
     const [{ data: workers }, { data: attendance }] = await Promise.all([
       supabase.from('workers').select('*').eq('user_id', req.user.userId).eq('is_active', true),
-      supabase.from('attendance').select('*').eq('user_id', req.user.userId).gte('attendance_date', from).lte('attendance_date', to),
+      supabase.from('attendance').select('*').eq('user_id', req.user.userId).gte('attendance_date', from).lt('attendance_date', to),
     ]);
     res.json({ success: true, workers: workers || [], attendance: attendance || [], month, year });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/attendance', authMiddleware, async (req, res) => {
@@ -10430,18 +10773,17 @@ app.post('/api/attendance', authMiddleware, async (req, res) => {
     }], { onConflict: 'worker_id,attendance_date' }).select().single();
     if (error) throw error;
     res.json({ success: true, attendance: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/attendance/salary', authMiddleware, async (req, res) => {
   try {
     const month = req.query.month || String(new Date().getMonth() + 1).padStart(2, '0');
     const year = req.query.year || new Date().getFullYear();
-    const from = `${year}-${String(month).padStart(2, '0')}-01`;
-    const to = `${year}-${String(month).padStart(2, '0')}-31`;
+    const { from, to } = monthDateRange(year, month);
     const [{ data: workers }, { data: attendance }] = await Promise.all([
       supabase.from('workers').select('*').eq('user_id', req.user.userId).eq('is_active', true),
-      supabase.from('attendance').select('*').eq('user_id', req.user.userId).gte('attendance_date', from).lte('attendance_date', to),
+      supabase.from('attendance').select('*').eq('user_id', req.user.userId).gte('attendance_date', from).lt('attendance_date', to),
     ]);
     // Count working days in month
     const daysInMonth = new Date(Number(year), Number(month), 0).getDate();
@@ -10457,7 +10799,7 @@ app.get('/api/attendance/salary', authMiddleware, async (req, res) => {
       return { ...w, present_days: present, half_days: half, effective_days: effectiveDays, total_days: daysInMonth, earned_salary: Math.round(earned), advance_deducted: advance, net_salary: Math.round(net) };
     });
     res.json({ success: true, salaries, month, year });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/workers/:id/salary', authMiddleware, async (req, res) => {
@@ -10469,7 +10811,7 @@ app.patch('/api/workers/:id/salary', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('workers').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
     res.json({ success: true, worker: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -10485,7 +10827,7 @@ app.get('/api/bank/accounts', authMiddleware, async (req, res) => {
       .order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ success: true, accounts: data || [] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/bank/accounts', authMiddleware, async (req, res) => {
@@ -10507,7 +10849,7 @@ app.post('/api/bank/accounts', authMiddleware, async (req, res) => {
       .single();
     if (error) throw error;
     res.json({ success: true, account: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/bank/accounts/:id', authMiddleware, async (req, res) => {
@@ -10524,7 +10866,7 @@ app.delete('/api/bank/accounts/:id', authMiddleware, async (req, res) => {
       source: 'api',
     });
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -10540,17 +10882,181 @@ app.get('/api/bank/transactions', authMiddleware, async (req, res) => {
       .order('txn_date', { ascending: false });
     if (error) throw error;
     res.json({ success: true, transactions: data || [] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Bulk insert for statement import. The bank page parsed the CSV client-side and
+// then posted one request per row, which meant a 150-row statement made 150
+// requests against a 120/min limit and lost the tail to 429s. This takes the
+// whole selection in one request.
+//
+// Deliberately NOT routed through reconciliation.importStatement, even though
+// that exists and does more. Its parser is materially worse on real Indian
+// statements: it matches headers by exact equality rather than substring, so a
+// column called "Txn Date (DD/MM/YYYY)" is not found, it assumes line 0 is the
+// header rather than scanning for it, so any preamble rows break it entirely,
+// and it writes the raw date cell into a DATE column without normalising
+// dd/mm/yyyy. The client parser handles all three. Routing through the server
+// parser would be a regression, so the better parser stays on the hot path.
+//
+// The consequence, stated rather than hidden: rows created here are not
+// reconciled. They land unmatched with source 'csv_import', so they are at least
+// distinguishable from manual entries, and they never reach the auto-apply or
+// ai_actions paths that importStatement drives. Closing that gap needs the
+// client parser to capture a reference column first — it has no such field
+// today, so the exact-reference match branch is unreachable from here either way.
+app.post('/api/bank/transactions/bulk', bulkImportLimiter, authMiddleware, async (req, res) => {
+  try {
+    const { account_id, transactions } = req.body;
+    if (!Array.isArray(transactions)) return res.status(400).json({ error: 'transactions array required' });
+    if (transactions.length === 0) return res.status(400).json({ error: 'transactions array is empty' });
+    // Sized for a bank statement, not for the JSON body limit — 1000 rows is
+    // roughly 150KB against a 10mb cap. The binding constraint is how long a
+    // chain of inserts can run inside one request.
+    if (transactions.length > 1000) {
+      return res.status(400).json({ error: 'Too many transactions in one request. Import 1000 rows or fewer at a time.' });
+    }
+
+    // account_id is a foreign key with no tenant column of its own, and the
+    // service-role key bypasses RLS, so ownership is checked here or nowhere.
+    let accountId = null;
+    if (account_id != null && account_id !== '') {
+      const { data: acct } = await supabase
+        .from('bank_accounts').select('id')
+        .eq('id', account_id).eq('user_id', req.user.userId).maybeSingle();
+      if (!acct) return res.status(400).json({ error: 'Unknown bank account' });
+      accountId = acct.id;
+    }
+
+    // Validated in JS before any insert. A multi-row INSERT is atomic, so one
+    // bad row would roll back the whole batch and return a single error with no
+    // row index — per-row feedback has to be produced before the database is
+    // touched, not after.
+    const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+    const rejected = [];
+    const candidates = [];
+
+    transactions.forEach((t, index) => {
+      const amount = parseFloat(t?.amount);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return rejected.push({ index, reason: 'amount must be a positive number' });
+      }
+      if (t?.type !== 'credit' && t?.type !== 'debit') {
+        // The column has a CHECK constraint on these two values.
+        return rejected.push({ index, reason: "type must be 'credit' or 'debit'" });
+      }
+      const txnDate = typeof t?.txn_date === 'string' && ISO_DATE.test(t.txn_date)
+        ? t.txn_date
+        : null;
+      if (!txnDate) return rejected.push({ index, reason: 'txn_date must be YYYY-MM-DD' });
+
+      candidates.push({
+        index,
+        row: {
+          user_id: req.user.userId,
+          account_id: accountId,
+          txn_date: txnDate,
+          description: String(t.description || '').slice(0, 500),
+          amount,
+          type: t.type,
+          status: 'unmatched',
+          source: 'csv_import',
+        },
+      });
+    });
+
+    // Re-importing the same statement is an easy mistake and there is no unique
+    // constraint to catch it, so duplicates are filtered here against what the
+    // account already holds. Matching the natural key of a statement line.
+    let duplicates = 0;
+    if (candidates.length) {
+      const dates = [...new Set(candidates.map(c => c.row.txn_date))];
+      let existingQuery = supabase
+        .from('bank_transactions')
+        .select('txn_date, amount, type, description, account_id')
+        .eq('user_id', req.user.userId)
+        .in('txn_date', dates);
+      const { data: existing } = await existingQuery;
+
+      const key = (r) => [r.account_id ?? '', r.txn_date, Number(r.amount).toFixed(2), r.type, (r.description || '').trim()].join('|');
+      const seen = new Set((existing || []).map(key));
+
+      for (let i = candidates.length - 1; i >= 0; i--) {
+        const k = key(candidates[i].row);
+        if (seen.has(k)) {
+          duplicates++;
+          candidates.splice(i, 1);
+        } else {
+          // Also guards duplicates within the submitted batch itself.
+          seen.add(k);
+        }
+      }
+    }
+
+    // Chunked so one statement cannot become a single oversized insert.
+    const CHUNK = 500;
+    let inserted = 0;
+    const failedChunks = [];
+    for (let i = 0; i < candidates.length; i += CHUNK) {
+      const slice = candidates.slice(i, i + CHUNK);
+      const { data, error } = await supabase
+        .from('bank_transactions')
+        .insert(slice.map(c => c.row))
+        .select('id');
+      if (error) {
+        failedChunks.push({ from: slice[0].index, to: slice[slice.length - 1].index, reason: error.message });
+      } else {
+        inserted += (data || []).length;
+      }
+    }
+
+    // One activity log for the import, not one per row.
+    if (inserted) {
+      await createActivityLog(req.user.userId, 'bank_statement_imported', {
+        entityType: 'bank_import',
+        source: 'bulk_api',
+        inserted, duplicates, rejected: rejected.length,
+      });
+    }
+
+    res.json({
+      success: failedChunks.length === 0,
+      inserted,
+      duplicates,
+      rejected,
+      failed_chunks: failedChunks,
+    });
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/bank/transactions', authMiddleware, async (req, res) => {
   try {
-    const { txn_date, description, amount, type } = req.body;
+    const { txn_date, description, amount, type, account_id } = req.body;
     if (!amount || !type) return res.status(400).json({ error: 'amount and type required' });
+
+    // account_id was accepted from the caller and then dropped, so every
+    // transaction created through this route — including every row of an
+    // imported statement — landed with a null account and could not be
+    // attributed to the bank it came from. Verified against the caller's own
+    // accounts before use: the column is a foreign key, so an unchecked value
+    // would otherwise let one tenant point a row at another tenant's account.
+    let accountId = null;
+    if (account_id != null && account_id !== '') {
+      const { data: acct } = await supabase
+        .from('bank_accounts')
+        .select('id')
+        .eq('id', account_id)
+        .eq('user_id', req.user.userId)
+        .maybeSingle();
+      if (!acct) return res.status(400).json({ error: 'Unknown bank account' });
+      accountId = acct.id;
+    }
+
     const { data, error } = await supabase
       .from('bank_transactions')
       .insert([{
         user_id: req.user.userId,
+        account_id: accountId,
         txn_date: txn_date || new Date().toISOString().split('T')[0],
         description: description || '',
         amount: parseFloat(amount),
@@ -10568,7 +11074,7 @@ app.post('/api/bank/transactions', authMiddleware, async (req, res) => {
       type,
     });
     res.json({ success: true, transaction: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/bank/match', authMiddleware, requireSafeSettlementMutation, async (req, res) => {
@@ -10618,7 +11124,56 @@ app.post('/api/bank/match', authMiddleware, requireSafeSettlementMutation, async
       matchId: String(match_id),
     });
     res.json({ success: true, message: 'Matched and marked as paid' });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Bank statement CSV import — parses + auto-reconciles against invoices/purchases.
+// Exact amount+reference matches auto-apply only when FEATURE_BANK_RECONCILIATION_ENABLED
+// is on; everything else is written as 'needs_review' with a requires_approval
+// ai_actions row (see lib/services/reconciliation.service.js for the full policy).
+app.post('/api/bank/transactions/import', authMiddleware, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const ext = path.extname(req.file.originalname || '').toLowerCase();
+    let csvText;
+    if (ext === '.csv') {
+      csvText = req.file.buffer.toString('utf-8');
+    } else {
+      // .xls/.xlsx — convert to CSV first so we reuse one parsing/matching path
+      const XLSX = require('xlsx');
+      const wb = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true, sheetRows: 5001 });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      csvText = XLSX.utils.sheet_to_csv(ws);
+    }
+
+    // Ownership check, same reason as the bulk route: account_id is a foreign
+    // key with no tenant column, and the service-role key bypasses RLS, so an
+    // unchecked value here would attach one tenant's statement rows to another
+    // tenant's bank account.
+    const { account_id } = req.body;
+    let importAccountId = null;
+    if (account_id != null && account_id !== '') {
+      const { data: acct } = await supabase
+        .from('bank_accounts').select('id')
+        .eq('id', account_id).eq('user_id', req.user.userId).maybeSingle();
+      if (!acct) return res.status(400).json({ error: 'Unknown bank account' });
+      importAccountId = acct.id;
+    }
+
+    const reconciliation = require('./lib/services/reconciliation.service');
+    const result = await reconciliation.importStatement(req.user.userId, csvText, importAccountId);
+
+    await createActivityLog(req.user.userId, 'bank_statement_imported', {
+      entityType: 'bank_import',
+      source: 'api',
+      ...result,
+    });
+
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('[bank/import] Error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 app.patch('/api/bank/transactions/:id/ignore', authMiddleware, async (req, res) => {
@@ -10632,7 +11187,7 @@ app.patch('/api/bank/transactions/:id/ignore', authMiddleware, async (req, res) 
       .single();
     if (error) throw error;
     res.json({ success: true, transaction: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/bank/transactions/:id', authMiddleware, async (req, res) => {
@@ -10649,10 +11204,211 @@ app.delete('/api/bank/transactions/:id', authMiddleware, async (req, res) => {
       source: 'api',
     });
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 
+
+// ============================================
+// CLOSING THE LOOP — one-tap ai_actions approval
+//
+// Shared dispatcher for the three "auto-execute" agent action types added in
+// this pass (INVENTORY_PO_READY, PAYABLES_PAYMENT_READY,
+// ESCALATE_COLLECTION_CALL). Each is created by its agent with
+// requires_approval: true (also enforced defense-in-depth by
+// policyGuard.ALWAYS_REQUIRES_APPROVAL) and a signed one-tap link
+// (lib/services/actionApproval.service.js) is sent to the owner via
+// WhatsApp. Tapping the link hits this route, which verifies the token,
+// confirms the action is still 'pending' (single-use), and only then
+// performs the real-world effect.
+//
+// PAYABLES_PAYMENT_READY is intentionally the most conservative of the
+// three: there is no RazorpayX (payout) integration configured in this
+// codebase today, and `purchases`/`suppliers` don't store a supplier bank
+// account or UPI VPA to pay out to even if there were. So approving a
+// payment never silently marks it paid — it marks the ai_action
+// 'approved' and tells the owner payment still needs to be completed
+// manually, honestly reflecting that the last mile (actual money
+// movement) isn't wired to a live payout rail yet. This preserves the
+// hard "recommend only, never execute payment" constraint even after
+// approval.
+// ============================================
+
+// title and message are built from agent output that embeds imported customer,
+// supplier and product names, so both are attacker-influenceable. This page is
+// served by GET /api/actions/:id/approve, which has no authMiddleware — only a
+// signed token delivered over WhatsApp — and lands on the origin that holds the
+// auth and CSRF cookies.
+function approvalResultPage(title, message, ok = true) {
+  const t = escapeHtml(title);
+  const m = escapeHtml(message);
+  return `<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>${t}</title>
+  <style>body{font-family:-apple-system,sans-serif;background:${ok ? '#f0fdf4' : '#fef2f2'};display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px;}
+  .card{background:#fff;border-radius:12px;padding:32px;max-width:420px;box-shadow:0 2px 12px rgba(0,0,0,0.08);text-align:center;}
+  h1{font-size:20px;color:${ok ? '#166534' : '#991b1b'};margin:0 0 12px;}
+  p{color:#374151;line-height:1.5;}</style></head>
+  <body><div class="card"><h1>${ok ? '✅ ' : '⚠️ '}${t}</h1><p>${m}</p></div></body></html>`;
+}
+
+async function executeInventoryPO(userId, action) {
+  const poId = action.reason_json?.purchase_order_id;
+  if (!poId) return { ok: false, message: 'No purchase order linked to this action.' };
+  const { data: po } = await supabase.from('purchase_orders').select('*').eq('id', poId).eq('user_id', userId).maybeSingle();
+  if (!po) return { ok: false, message: 'Purchase order not found.' };
+  if (po.status !== 'draft') return { ok: false, message: `Purchase order already ${po.status}.` };
+
+  const itemsText = (po.items || []).map(i => `• ${i.qty} ${i.unit || 'units'} ${i.name}`).join('\n');
+  const message = `Naya PO (Purchase Order) — ${itemsText}\n\nEstimated: ₹${Number(po.estimated_amount || 0).toLocaleString('en-IN')}\n\nKripya confirm karein aur delivery date batayein. Dhanyavaad.`;
+
+  let sendResult = { success: false, provider: 'skipped_flag_off' };
+  if (isFeatureEnabled('external_message_sending_enabled') && po.supplier_phone) {
+    sendResult = await sendWhatsAppMessage(po.supplier_phone, message);
+  }
+
+  await supabase.from('purchase_orders').update({ status: 'sent', sent_at: new Date().toISOString() }).eq('id', po.id);
+  return {
+    ok: true,
+    message: sendResult.success
+      ? `Purchase order sent to ${po.supplier_name} on WhatsApp.`
+      : `Purchase order marked sent, but the WhatsApp message was not delivered (${sendResult.provider === 'skipped_flag_off' ? 'external sending is currently off' : 'send failed'}). You may want to contact ${po.supplier_name} directly.`,
+  };
+}
+
+async function executePayablesPayment(userId, action) {
+  const purchaseId = action.related_entity_id;
+  const amount = action.reason_json?.amount;
+  const supplierName = action.reason_json?.supplier_name || 'the supplier';
+
+  const razorpayXConfigured = !!(process.env.RAZORPAYX_KEY_ID && process.env.RAZORPAYX_KEY_SECRET);
+  if (!razorpayXConfigured) {
+    safeLogFallback('[Payables/approve] RazorpayX not configured — approval recorded, payment remains manual', { userId, purchaseId });
+    return {
+      ok: true,
+      message: `Approved. Automatic payout isn't connected yet (no payout gateway configured, and ${supplierName}'s bank/UPI details aren't on file), so please complete this ₹${Number(amount || 0).toLocaleString('en-IN')} payment to ${supplierName} manually and mark it paid from Purchases.`,
+      manualCompletionRequired: true,
+    };
+  }
+
+  // NOTE: even with RazorpayX credentials present, a real payout additionally
+  // needs a RazorpayX fund_account for this supplier (bank account or UPI VPA)
+  // which nothing in this schema captures today. Until that data exists this
+  // branch is unreachable in practice — left in place as the real integration
+  // point rather than removed, so wiring it up later is additive, not a rewrite.
+  return {
+    ok: true,
+    message: `Approved. Automatic payout to ${supplierName} could not be completed (no payout destination on file) — please complete manually and mark paid.`,
+    manualCompletionRequired: true,
+  };
+}
+
+async function executeCollectionCall(userId, action) {
+  const invoiceId = action.related_entity_id;
+  const { data: invoice } = await supabase.from('invoices').select('*').eq('id', invoiceId).eq('user_id', userId).maybeSingle();
+  if (!invoice) return { ok: false, message: 'Invoice not found.' };
+  const placed = await makeAutoCall(userId, invoice);
+  if (placed) {
+    // Shared cross-system "contacted today" gate — see runDunningCycle().
+    await supabase.from('invoices').update({
+      last_reminder_sent: new Date().toISOString(),
+      reminder_count: (invoice.reminder_count || 0) + 1,
+    }).eq('id', invoiceId).eq('user_id', userId).catch(() => {});
+  }
+  return {
+    ok: true,
+    message: placed
+      ? `Call placed to ${invoice.customer_name}.`
+      : `Could not place the call automatically (voice calling isn't configured). Consider calling ${invoice.customer_name} directly.`,
+  };
+}
+
+async function executeCollectionsMessage(userId, action) {
+  const invoiceId = action.related_entity_id;
+  const { data: invoice } = await supabase.from('invoices').select('customer_name, customer_phone, reminder_count').eq('id', invoiceId).eq('user_id', userId).maybeSingle();
+  if (!invoice?.customer_phone) return { ok: false, message: 'No phone number on file for this customer.' };
+  if (!action.recommended_message) return { ok: false, message: 'No message drafted for this action.' };
+
+  if (!isFeatureEnabled('external_message_sending_enabled')) {
+    return { ok: true, message: `Marked sent, but external sending is currently off — no WhatsApp message actually went to ${invoice.customer_name}.` };
+  }
+  const sendResult = await sendWhatsAppMessage(invoice.customer_phone, action.recommended_message);
+  if (sendResult.success) {
+    // Shared cross-system "contacted today" gate — see runDunningCycle().
+    await supabase.from('invoices').update({
+      last_reminder_sent: new Date().toISOString(),
+      reminder_count: (invoice.reminder_count || 0) + 1,
+    }).eq('id', invoiceId).eq('user_id', userId).catch(() => {});
+  }
+  return {
+    ok: true,
+    message: sendResult.success
+      ? `Reminder sent to ${invoice.customer_name} on WhatsApp.`
+      : `Could not deliver the WhatsApp message to ${invoice.customer_name} — you may want to follow up another way.`,
+  };
+}
+
+function safeLogFallback(msg, meta) { try { console.log(msg, JSON.stringify(meta)); } catch { console.log(msg); } }
+
+app.get('/api/actions/:id/approve', async (req, res) => {
+  try {
+    const { verifyActionToken, loadPendingAction } = require('./lib/services/actionApproval.service');
+    const actionService = require('./lib/services/orchestrator/action.service');
+    const actionId = req.params.id;
+    const token = req.query.token;
+
+    if (!verifyActionToken(token, actionId, 'approve')) {
+      return res.status(403).send(approvalResultPage('Link expired or invalid', 'This approval link is no longer valid. Please check your Action Center for the latest status.', false));
+    }
+
+    const { ok, action, reason } = await loadPendingAction(actionId);
+    if (!ok) {
+      const msg = reason === 'already_actioned'
+        ? `This was already ${action?.status || 'actioned'} — no changes made.`
+        : 'This action could not be found.';
+      return res.send(approvalResultPage('Nothing to do', msg));
+    }
+
+    await actionService.updateStatus(action.user_id, actionId, 'approved');
+
+    let result;
+    if (action.action_type === 'INVENTORY_PO_READY') result = await executeInventoryPO(action.user_id, action);
+    else if (action.action_type === 'PAYABLES_PAYMENT_READY') result = await executePayablesPayment(action.user_id, action);
+    else if (action.action_type === 'ESCALATE_COLLECTION_CALL') result = await executeCollectionCall(action.user_id, action);
+    else if (['SEND_POLITE_REMINDER', 'SEND_FIRM_REMINDER', 'ESCALATE_COLLECTION'].includes(action.action_type)) result = await executeCollectionsMessage(action.user_id, action);
+    else result = { ok: true, message: 'Approved.' };
+
+    await actionService.updateStatus(action.user_id, actionId, 'done');
+    await createActivityLog(action.user_id, 'ai_action_approved_and_executed', {
+      entityType: 'ai_action', entityId: actionId, source: 'approval_link', actionType: action.action_type,
+    });
+
+    res.send(approvalResultPage(action.title || 'Approved', result.message, result.ok));
+  } catch (err) {
+    console.error('[actions/approve] Error:', err.message);
+    res.status(500).send(approvalResultPage('Something went wrong', 'Please try again from your Action Center.', false));
+  }
+});
+
+app.get('/api/actions/:id/reject', async (req, res) => {
+  try {
+    const { verifyActionToken, loadPendingAction } = require('./lib/services/actionApproval.service');
+    const actionService = require('./lib/services/orchestrator/action.service');
+    const actionId = req.params.id;
+    const token = req.query.token;
+
+    if (!verifyActionToken(token, actionId, 'reject')) {
+      return res.status(403).send(approvalResultPage('Link expired or invalid', 'This link is no longer valid.', false));
+    }
+    const { ok, action, reason } = await loadPendingAction(actionId);
+    if (!ok) {
+      return res.send(approvalResultPage('Nothing to do', reason === 'already_actioned' ? `This was already ${action?.status}.` : 'Action not found.'));
+    }
+    await actionService.updateStatus(action.user_id, actionId, 'rejected');
+    res.send(approvalResultPage('Declined', 'This suggestion has been dismissed. No action was taken.'));
+  } catch (err) {
+    console.error('[actions/reject] Error:', err.message);
+    res.status(500).send(approvalResultPage('Something went wrong', 'Please try again from your Action Center.', false));
+  }
+});
 
 // ============================================
 // WEEKLY SCORECARD CRON -- Sunday 6pm IST (12:30 UTC)
@@ -10700,7 +11456,7 @@ app.get('/api/payment-plans', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('payment_plans').select('*').eq('user_id', req.user.userId).order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ success: true, plans: data || [] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/payment-plans', authMiddleware, async (req, res) => {
@@ -10718,7 +11474,7 @@ app.post('/api/payment-plans', authMiddleware, async (req, res) => {
       await sendWhatsAppMessage(customer_phone, msg);
     }
     res.json({ success: true, plan: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/payment-plans/:id/installment', authMiddleware, async (req, res) => {
@@ -10734,14 +11490,14 @@ app.patch('/api/payment-plans/:id/installment', authMiddleware, async (req, res)
     const { data, error } = await supabase.from('payment_plans').update({ installments, status: allPaid ? 'completed' : 'active', updated_at: new Date() }).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
     res.json({ success: true, plan: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/payment-plans/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('payment_plans').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -10753,7 +11509,7 @@ app.get('/api/disputes', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('disputes').select('*').eq('user_id', req.user.userId).order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ success: true, disputes: data || [] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/disputes', authMiddleware, async (req, res) => {
@@ -10768,7 +11524,7 @@ app.post('/api/disputes', authMiddleware, async (req, res) => {
     if (error) throw error;
     if (invoice_id) await supabase.from('invoices').update({ dunning_paused: true }).eq('id', invoice_id).eq('user_id', req.user.userId);
     res.json({ success: true, dispute: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/disputes/:id', authMiddleware, async (req, res) => {
@@ -10784,14 +11540,14 @@ app.patch('/api/disputes/:id', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('disputes').update(updates).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
     if (error) throw error;
     res.json({ success: true, dispute: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/disputes/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('disputes').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -10810,7 +11566,7 @@ app.post('/api/ca-partners/register', authMiddleware, async (req, res) => {
     }], { onConflict: 'ca_user_id' }).select().single();
     if (error) throw error;
     res.json({ success: true, partner: data, referral_code });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/ca-partners/dashboard', authMiddleware, async (req, res) => {
@@ -10821,7 +11577,7 @@ app.get('/api/ca-partners/dashboard', authMiddleware, async (req, res) => {
     const { count: paidCount } = await supabase.from('users').select('id', { count: 'exact', head: true }).eq('referred_by', req.user.userId).neq('plan', 'free');
     const monthlyCommission = (paidCount || 0) * 300;
     res.json({ success: true, ca: caData, stats: { total_clients: clientCount || 0, paid_clients: paidCount || 0, monthly_commission: monthlyCommission, referral_code: caData.referral_code } });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/ca-partners/clients', authMiddleware, async (req, res) => {
@@ -10829,7 +11585,7 @@ app.get('/api/ca-partners/clients', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('users').select('id, business_name, phone, plan, industry, created_at').eq('referred_by', req.user.userId).order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ success: true, clients: data || [] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -10845,7 +11601,7 @@ app.get('/api/referrals/my-stats', authMiddleware, async (req, res) => {
     const freeMonthsEarned = (rewards || []).filter(r => r.type === 'free_month').length;
     const referralCode = 'VF' + userId.replace(/-/g, '').substring(0, 8).toUpperCase();
     res.json({ success: true, stats: { total_referrals: totalReferrals || 0, paid_referrals: paidReferrals || 0, free_months_earned: freeMonthsEarned, referral_code: referralCode, referral_link: 'https://vantroflow.app/signup?ref=' + referralCode, rewards: rewards || [] } });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/referrals/claim-reward', authMiddleware, async (req, res) => {
@@ -10858,7 +11614,7 @@ app.post('/api/referrals/claim-reward', authMiddleware, async (req, res) => {
     const rewardRows = Array.from({ length: newRewards }, () => ({ referrer_id: userId, type: 'free_month', value: 1, status: 'granted', created_at: new Date() }));
     await supabase.from('referral_rewards').insert(rewardRows);
     res.json({ success: true, rewards_granted: newRewards, message: newRewards + ' free month(s) added!' });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -10875,7 +11631,7 @@ app.get('/api/bad-debt-flags/:userId', requireOwner, async (req, res) => {
       return { ...inv, risk_level: risk, recommendation };
     });
     res.json({ success: true, flagged });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -10887,7 +11643,7 @@ app.get('/api/team/members', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('team_members').select('*').eq('owner_id', req.user.userId).order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ success: true, members: data || [] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/team/members', authMiddleware, async (req, res) => {
@@ -10907,7 +11663,7 @@ app.post('/api/team/members', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     res.json({ success: true, member: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/team/members/:id', authMiddleware, async (req, res) => {
@@ -10918,14 +11674,14 @@ app.patch('/api/team/members/:id', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('team_members').update(updates).eq('id', req.params.id).eq('owner_id', req.user.userId).select().single();
     if (error) throw error;
     res.json({ success: true, member: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/team/members/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('team_members').delete().eq('id', req.params.id).eq('owner_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============================================
@@ -10938,7 +11694,7 @@ app.post('/api/whatsapp/send', authMiddleware, async (req, res) => {
     if (!phone || !message) return res.status(400).json({ error: 'phone and message required' });
     const result = await sendWhatsAppMessage(phone, message);
     res.json({ success: true, result });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/whatsapp/status', authMiddleware, (req, res) => {
@@ -10957,9 +11713,16 @@ app.get('/api/reports/export', authMiddleware, async (req, res) => {
     const userId = req.user.userId;
     const { report = 'outstanding', format = 'xlsx', from, to } = req.query;
 
-    // Build date filter
-    const fromDate = from || new Date(Date.now() - 30 * 86400000).toISOString().split('T')[0];
-    const toDate   = to   || new Date().toISOString().split('T')[0];
+    // Validated at the source rather than escaped at each use. These reach a
+    // Supabase filter, the HTML report body, and the Content-Disposition
+    // filename on the csv and xlsx branches — where a quote character lets a
+    // caller append their own filename* parameter, which RFC 6266 says wins
+    // over filename, choosing the downloaded file's name and extension.
+    // Anything not an ISO date falls back to the default window.
+    const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+    const cleanDate = (v, fallback) => (typeof v === 'string' && ISO_DATE.test(v)) ? v : fallback;
+    const fromDate = cleanDate(from, new Date(Date.now() - 30 * 86400000).toISOString().split('T')[0]);
+    const toDate   = cleanDate(to,   new Date().toISOString().split('T')[0]);
 
     let wb;
 
@@ -11158,21 +11921,33 @@ app.get('/api/reports/export', authMiddleware, async (req, res) => {
         gst: 'GST Summary', cashflow: 'Cash Flow Forecast',
         calls: 'Call Activity Log', customer: 'Customer Statement',
       };
+      // Every value below is interpolated into a response served as text/html
+      // from the API origin, so it has to be escaped. Two sources are genuinely
+      // attacker-influenced: row values come from the database (a crafted
+      // customer name imported from a spreadsheet reaches a <td> verbatim), and
+      // fromDate/toDate come straight off req.query with no validation. The
+      // rest — sheet names, column headers, the report title — are code
+      // constants today, but they are escaped too so that the invariant is
+      // "nothing reaches this template unescaped" rather than a per-value
+      // judgement that has to be re-made every time a column is added.
+      //
+      // This matters more than a typical reflected XSS: the script would run on
+      // the backend origin, which is where the auth and CSRF cookies live.
       // Flatten all sheets into one HTML table per sheet
       const sheetsHtml = wb.SheetNames.map(sheetName => {
         const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName]);
-        if (!rows.length) return `<h3>${sheetName}</h3><p style="color:#888">No data</p>`;
+        if (!rows.length) return `<h3>${escapeHtml(sheetName)}</h3><p style="color:#888">No data</p>`;
         const headers = Object.keys(rows[0]);
         return `
-          <h3 style="margin:24px 0 8px;font-size:14px;color:#0066FF">${sheetName}</h3>
+          <h3 style="margin:24px 0 8px;font-size:14px;color:#0066FF">${escapeHtml(sheetName)}</h3>
           <table>
-            <thead><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead>
-            <tbody>${rows.map(row => `<tr>${headers.map(h => `<td>${row[h] ?? ''}</td>`).join('')}</tr>`).join('')}</tbody>
+            <thead><tr>${headers.map(h => `<th>${escapeHtml(h)}</th>`).join('')}</tr></thead>
+            <tbody>${rows.map(row => `<tr>${headers.map(h => `<td>${escapeHtml(row[h])}</td>`).join('')}</tr>`).join('')}</tbody>
           </table>`;
       }).join('');
 
       const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
-<title>Vantro — ${REPORT_NAMES[report] || report}</title>
+<title>Vantro — ${escapeHtml(REPORT_NAMES[report] || report)}</title>
 <style>
   body{font-family:system-ui,sans-serif;padding:32px;color:#111;max-width:960px;margin:0 auto}
   h1{font-size:20px;font-weight:800;margin-bottom:2px}
@@ -11184,8 +11959,8 @@ app.get('/api/reports/export', authMiddleware, async (req, res) => {
   @media print{body{padding:0} button{display:none}}
 </style></head><body>
 <button onclick="window.print()" style="float:right;padding:8px 16px;background:#0066FF;color:#fff;border:none;border-radius:8px;font-weight:600;cursor:pointer;font-size:13px">🖨 Print / Save PDF</button>
-<h1>Vantro Flow — ${REPORT_NAMES[report] || report}</h1>
-<p class="meta">Period: ${fromDate} to ${toDate} &nbsp;·&nbsp; Generated: ${new Date().toLocaleDateString('en-IN', { day:'numeric',month:'long',year:'numeric' })}</p>
+<h1>Vantro Flow — ${escapeHtml(REPORT_NAMES[report] || report)}</h1>
+<p class="meta">Period: ${escapeHtml(fromDate)} to ${escapeHtml(toDate)} &nbsp;·&nbsp; Generated: ${new Date().toLocaleDateString('en-IN', { day:'numeric',month:'long',year:'numeric' })}</p>
 ${sheetsHtml}
 </body></html>`;
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -11194,7 +11969,19 @@ ${sheetsHtml}
 
     if (format === 'csv') {
       const firstSheet = wb.Sheets[wb.SheetNames[0]];
-      const csv = XLSX.utils.sheet_to_csv(firstSheet);
+      // Rebuilt from rows rather than using sheet_to_csv directly, so every cell
+      // can be passed through csvSafeCell first — sheet_to_csv emits values
+      // verbatim, which lets a crafted customer name become a live formula when
+      // the export is opened in Excel.
+      const csvRows = XLSX.utils.sheet_to_json(firstSheet, { defval: '' });
+      const csvHeaders = csvRows.length ? Object.keys(csvRows[0]) : [];
+      const quote = (v) => {
+        const cell = csvSafeCell(v);
+        return /[",\n\r]/.test(cell) ? `"${cell.replace(/"/g, '""')}"` : cell;
+      };
+      const csv = csvRows.length
+        ? [csvHeaders.map(quote).join(','), ...csvRows.map(r => csvHeaders.map(h => quote(r[h])).join(','))].join('\n')
+        : XLSX.utils.sheet_to_csv(firstSheet);
       const filename = `vantro-${report}-${fromDate}.csv`;
       res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
       res.setHeader('Content-Type', 'text/csv');
@@ -11235,7 +12022,7 @@ app.get('/api/promises', authMiddleware, async (req, res) => {
     const { data, error } = await query;
     if (error) throw error;
     res.json({ success: true, promises: data || [] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/promises', authMiddleware, async (req, res) => {
@@ -11255,11 +12042,23 @@ app.post('/api/promises', authMiddleware, async (req, res) => {
     }]).select().single();
     if (error) throw error;
     if (isFeatureEnabled('cortex_enabled')) {
-      const { emitBusinessEvent } = require('./lib/events/EventEngine');
-      emitBusinessEvent(userId, 'PROMISE_CREATED', { promiseId: data.id, promised_date, promised_amount, customer_id });
+      // Use the full Cortex pipeline (module-scope emitBusinessEvent, defined
+      // above) so PROMISE_CREATED actually reaches rules.service.evaluate() --
+      // previously this shadow-imported lib/events/EventEngine's simple
+      // in-process pub/sub instead, which has no registered listeners and is
+      // a no-op beyond logging.
+      emitBusinessEvent(userId, 'PROMISE_CREATED', {
+        entityType:    'promise',
+        entityId:      data.id,
+        promiseId:     data.id,
+        promised_date,
+        promised_amount,
+        customer_id,
+        receivable_id: receivable_id || null,
+      });
     }
     res.status(201).json({ success: true, promise: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/promises/:id', authMiddleware, async (req, res) => {
@@ -11281,12 +12080,19 @@ app.patch('/api/promises/:id', authMiddleware, async (req, res) => {
     if (error) throw error;
     if (!data) return res.status(404).json({ error: 'Promise not found' });
     if (status && isFeatureEnabled('cortex_enabled')) {
-      const { emitBusinessEvent } = require('./lib/events/EventEngine');
+      // Same fix as POST /api/promises above -- use the live pipeline, not
+      // the shadow EventEngine, so this actually reaches rules.evaluate().
       emitBusinessEvent(userId, status === 'kept' ? 'PROMISE_KEPT' : status === 'broken' ? 'PROMISE_BROKEN' : 'PROMISE_RESCHEDULED',
-        { promiseId: id, customer_id: data.customer_id });
+        {
+          entityType:    'promise',
+          entityId:      id,
+          promiseId:     id,
+          customer_id:   data.customer_id,
+          receivable_id: data.receivable_id || null,
+        });
     }
     res.json({ success: true, promise: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── AI ACTIONS ───────────────────────────────────────────────────────────────
@@ -11312,7 +12118,7 @@ app.get('/api/ai-actions', authMiddleware, async (req, res) => {
     const counts = {};
     (summary || []).forEach(r => { counts[r.priority] = (counts[r.priority] || 0) + 1; });
     res.json({ success: true, actions: data || [], counts, total: (data || []).length });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/ai-actions/:id', authMiddleware, async (req, res) => {
@@ -11330,7 +12136,7 @@ app.patch('/api/ai-actions/:id', authMiddleware, async (req, res) => {
     if (error) throw error;
     if (!data) return res.status(404).json({ error: 'Action not found' });
     res.json({ success: true, action: data });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── SUPPLY CHAIN INTELLIGENCE (2xA vertical slice) ──────────────────────────
@@ -11665,8 +12471,31 @@ app.get('/api/customers/intelligence', authMiddleware, async (req, res) => {
       revenue,
     });
   } catch (err) {
+    logRouteError(req, err);
     res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+// One obvious owner-facing kill switch for collectionsAgent's escalation
+// ladder — pausing a customer skips ALL reminder/escalation generation for
+// them (polite included), checked at the top of collectionsAgent.js's run().
+app.patch('/api/customers/:id/escalation-pause', authMiddleware, async (req, res) => {
+  try {
+    const { paused } = req.body;
+    if (typeof paused !== 'boolean') return res.status(400).json({ error: 'paused (boolean) required' });
+    const { data, error } = await supabase
+      .from('customers')
+      .update({ escalation_paused: paused })
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.userId)
+      .select()
+      .single();
+    if (error) throw error;
+    await createActivityLog(req.user.userId, paused ? 'customer_escalation_paused' : 'customer_escalation_resumed', {
+      entityType: 'customer', entityId: req.params.id, source: 'api',
+    });
+    res.json({ success: true, customer: data });
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── AI ACTIONS — COUNTS (for dashboard urgency strip) ────────────────────────
@@ -11719,7 +12548,7 @@ app.get('/api/ai-actions/counts', authMiddleware, async (req, res) => {
     }
 
     res.json({ urgent, high, total: rows.length });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── CUSTOMER SCORES (for collections + customers pages) ──────────────────────
@@ -11801,7 +12630,7 @@ app.get('/api/customer-scores', authMiddleware, async (req, res) => {
     }
 
     res.json({ scores: stripCortexTestRows(scores) });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── CUSTOMER REVENUE PORTFOLIO (STARLANE Phase 10) ────────────────────────────
@@ -11847,7 +12676,7 @@ app.post('/api/cortex/score-all', authMiddleware, async (req, res) => {
       try { await recalculate(userId, c.id); scored++; } catch {}
     }
     res.json({ success: true, scored, total: list.length });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── SEND WHATSAPP FOR AI ACTION ───────────────────────────────────────────────
@@ -11899,7 +12728,9 @@ app.post('/api/ai-actions/:id/send-whatsapp', authMiddleware, async (req, res) =
 
     const sendResult = result?.sendResult;
     res.json({ success: true, sid: sendResult?.sid || null, provider: sendResult?.provider || null });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+    await supabase.from('ai_actions').update({ status: 'done', completed_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', id).eq('user_id', userId);
+    res.json({ success: true, sid: sendResult?.sid || null, provider: sendResult?.provider || null });
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── MANUAL BRIEFING TRIGGER (runs daily briefing logic now for the calling user) ─
@@ -11942,7 +12773,7 @@ app.post('/api/cortex/run-briefing', authMiddleware, async (req, res) => {
 
     safeLog('info', '[ManualBriefing] Created via API', { userId, actionId: action?.id });
     res.json({ success: true, created: 1, action });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── CORTEX: CASHFLOW WEEK PREVIEW ────────────────────────────────────────────
@@ -11970,7 +12801,7 @@ app.get('/api/cortex/cashflow-week', authMiddleware, async (req, res) => {
       net_gap:          Math.round(forecast.expected_inflow - forecast.expected_outflow),
       overdue_payables: Math.round(overduePayables),
     });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── CORTEX: SIMULATE (dry-run rule engine) ───────────────────────────────────
@@ -11982,7 +12813,7 @@ app.post('/api/cortex/simulate', authMiddleware, async (req, res) => {
     const { simulate } = require('./lib/services/orchestrator/simulationEngine.service');
     const result = await simulate(userId, eventType, payload);
     res.json({ success: true, ...result });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── CORTEX: LIST AVAILABLE TOOLS ─────────────────────────────────────────────
@@ -11992,7 +12823,7 @@ app.get('/api/cortex/tools', authMiddleware, async (req, res) => {
     const { getAvailable } = require('./lib/services/orchestrator/toolRegistry.service');
     const tools = getAvailable(FLAGS);
     res.json({ success: true, tools });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── CORTEX: MEMORY READ ───────────────────────────────────────────────────────
@@ -12013,7 +12844,7 @@ app.get('/api/cortex/memory', authMiddleware, async (req, res) => {
     const { data, error } = await q;
     if (error) throw error;
     res.json({ success: true, memories: data || [] });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── CORTEX: MEMORY WRITE ──────────────────────────────────────────────────────
@@ -12035,7 +12866,7 @@ app.post('/api/cortex/memory', authMiddleware, async (req, res) => {
     }], { onConflict: 'user_id,entity_type,entity_id,memory_key' });
     if (error) throw error;
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // On-demand Groq planner: authenticated, rate-limited, approval-only preview.
@@ -12071,8 +12902,10 @@ app.post('/api/cortex/run-agents', authMiddleware, async (req, res) => {
     const { agents } = req.body; // optional array of agent names to run
     const { runAllAgents } = require('./lib/services/orchestrator/orchestrator.service');
     const result = await runAllAgents(userId, agents || null);
+    await notifyPendingAutoExecuteActions(userId);
+    await autoSendCollectionsReminders(userId);
     res.json({ success: true, ...result });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── BUSINESS STATE: composed tenant-scoped view (rankedActions/cashflow/brain) ──
@@ -12139,7 +12972,7 @@ app.get('/api/cortex/health', authMiddleware, async (req, res) => {
         receivables_execution: receivablesExecution,
       },
     });
-  } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── BROKEN PROMISE DETECTION CRON — daily 9am IST (3:30 UTC) ────────────────
@@ -12155,15 +12988,25 @@ cron.schedule('30 3 * * *', async () => {
       .update({ status: 'broken', resolved_at: new Date().toISOString() })
       .eq('status', 'active')
       .lt('promised_date', today)
-      .select('id, user_id, customer_id, promised_amount, promised_date');
+      .select('id, user_id, customer_id, promised_amount, promised_date, receivable_id');
     if (error) { safeLog('error', '[PromiseCron] Update failed', { error: error.message }); return; }
     if (!broken?.length) { safeLog('info', '[PromiseCron] No broken promises today'); return; }
     safeLog('info', '[PromiseCron] Marked broken', { count: broken.length });
-    const { emitBusinessEvent } = require('./lib/events/EventEngine');
+    // Same fix as the /api/promises routes -- this cron previously used the
+    // shadow lib/events/EventEngine pub/sub (no registered listeners, a
+    // no-op) instead of the live, module-scope emitBusinessEvent that
+    // actually reaches rules.service.evaluate().
     const { recalculate } = require('./lib/services/orchestrator/scoring.service');
     for (const p of broken) {
       try {
-        emitBusinessEvent(p.user_id, 'PROMISE_BROKEN', { promiseId: p.id, customer_id: p.customer_id, promised_date: p.promised_date });
+        emitBusinessEvent(p.user_id, 'PROMISE_BROKEN', {
+          entityType:    'promise',
+          entityId:      p.id,
+          promiseId:     p.id,
+          customer_id:   p.customer_id,
+          promised_date: p.promised_date,
+          receivable_id: p.receivable_id || null,
+        });
         if (_isFE('customer_scoring') && p.customer_id) await recalculate(p.user_id, p.customer_id).catch(() => {});
       } catch (e) { safeLog('error', '[PromiseCron] Per-promise error', { error: e.message, promiseId: p.id }); }
     }
@@ -12210,6 +13053,93 @@ cron.schedule('30 1 * * *', async () => {
   } catch (err) { safeLog('error', '[BriefingCron] Fatal', { error: err.message }); }
 }, { timezone: 'UTC' });
 
+// Notify the owner (via WhatsApp) about any pending "closing the loop"
+// actions that haven't been sent to them yet (notified_at IS NULL). Shared by
+// the AgentsCron below and the manual /api/cortex/run-agents trigger, so
+// behaviour is identical whether agents ran on schedule or on demand.
+// Gated on BOTH FEATURE_AGENT_AUTOEXECUTE_ENABLED (the master switch for this
+// new behaviour) and FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED (the existing,
+// already-live switch for any external send) — see lib/featureFlags.js for
+// why both are required rather than reusing just one.
+const AUTO_EXECUTE_ACTION_TYPES = ['INVENTORY_PO_READY', 'PAYABLES_PAYMENT_READY', 'ESCALATE_COLLECTION_CALL'];
+
+async function notifyPendingAutoExecuteActions(userId) {
+  if (!isFeatureEnabled('agent_autoexecute_enabled')) return;
+  try {
+    const { data: pending } = await supabase.from('ai_actions')
+      .select('id, action_type, title, description')
+      .eq('user_id', userId)
+      .eq('status', 'pending')
+      .is('notified_at', null)
+      .in('action_type', AUTO_EXECUTE_ACTION_TYPES);
+    if (!pending?.length) return;
+
+    const { data: owner } = await supabase.from('users')
+      .select('phone, interakt_api_key, wati_api_url, wati_token')
+      .eq('id', userId).single();
+    if (!owner?.phone) return;
+
+    const { buildApprovalLinks } = require('./lib/services/actionApproval.service');
+    const waCreds = { interakt_api_key: owner.interakt_api_key, wati_api_url: owner.wati_api_url, wati_token: owner.wati_token };
+
+    for (const action of pending) {
+      const { approveUrl, rejectUrl } = buildApprovalLinks(action.id);
+      const msg = `${action.title}\n${action.description || ''}\n\n✅ Approve: ${approveUrl}\n\n❌ Skip: ${rejectUrl}`;
+      let sent = { success: false };
+      if (isFeatureEnabled('external_message_sending_enabled')) {
+        sent = await sendWhatsAppMessage(owner.phone, msg, waCreds);
+      }
+      // Mark notified regardless of send success — a failed WhatsApp send
+      // shouldn't cause the same action to be re-sent every cron tick forever.
+      // (It's still visible and actionable from the owner's Action Center.)
+      await supabase.from('ai_actions').update({ notified_at: new Date().toISOString() }).eq('id', action.id);
+      if (!sent.success) safeLog('warn', '[AutoExecute] Notify WhatsApp send failed or skipped', { userId, actionId: action.id, actionType: action.action_type });
+    }
+  } catch (err) {
+    safeLog('error', '[AutoExecute] notifyPendingAutoExecuteActions failed', { error: err.message, userId });
+  }
+}
+
+// Auto-send low-stakes collections reminders (SEND_POLITE_REMINDER only —
+// firm reminders and escalations always require a one-tap approval, both by
+// this agent's own risk_level and by policyGuard.ALWAYS_REQUIRES_APPROVAL).
+// Gated the same way as notifyPendingAutoExecuteActions above.
+async function autoSendCollectionsReminders(userId) {
+  if (!isFeatureEnabled('agent_autoexecute_enabled') || !isFeatureEnabled('external_message_sending_enabled')) return;
+  try {
+    const { data: pending } = await supabase.from('ai_actions')
+      .select('id, related_entity_id, recommended_message')
+      .eq('user_id', userId)
+      .eq('status', 'pending')
+      .eq('action_type', 'SEND_POLITE_REMINDER')
+      .eq('requires_approval', false)
+      .is('notified_at', null);
+    if (!pending?.length) return;
+
+    for (const action of pending) {
+      const { data: invoice } = await supabase.from('invoices').select('customer_name, customer_phone, reminder_count').eq('id', action.related_entity_id).eq('user_id', userId).maybeSingle();
+      let sent = { success: false };
+      if (invoice?.customer_phone && action.recommended_message) {
+        sent = await sendWhatsAppMessage(invoice.customer_phone, action.recommended_message);
+      }
+      if (sent.success) {
+        // Shared cross-system "contacted today" gate — see runDunningCycle().
+        await supabase.from('invoices').update({
+          last_reminder_sent: new Date().toISOString(),
+          reminder_count: (invoice?.reminder_count || 0) + 1,
+        }).eq('id', action.related_entity_id).eq('user_id', userId).catch(() => {});
+      }
+      await supabase.from('ai_actions').update({
+        notified_at: new Date().toISOString(),
+        status: sent.success ? 'done' : 'pending', // leave pending (and eligible for owner to send manually) if auto-send failed
+        completed_at: sent.success ? new Date().toISOString() : null,
+      }).eq('id', action.id);
+    }
+  } catch (err) {
+    safeLog('error', '[AutoExecute] autoSendCollectionsReminders failed', { error: err.message, userId });
+  }
+}
+
 // ── AGENTS CRON — daily 7:15am IST (1:45 UTC) — runs after briefing ──────────
 cron.schedule('45 1 * * *', async () => {
   const { isEnabled: _isFE } = require('./lib/featureFlags');
@@ -12222,7 +13152,9 @@ cron.schedule('45 1 * * *', async () => {
     for (const user of (users || [])) {
       try {
         // Skip briefing (already ran at 7am) and data_quality (weekly)
-        await runAllAgents(user.id, ['collections', 'credit_risk', 'cashflow', 'inventory', 'revenue_health']);
+        await runAllAgents(user.id, ['collections', 'credit_risk', 'cashflow', 'inventory', 'revenue_health', 'promise_tracker', 'payables', 'dispute', 'cost_router']);
+        await notifyPendingAutoExecuteActions(user.id);
+        await autoSendCollectionsReminders(user.id);
       } catch (e) { _log('error', '[AgentsCron] Per-user error', { error: e.message, userId: user.id }); }
     }
     _log('info', '[AgentsCron] Done');
@@ -12523,6 +13455,53 @@ async function runAutoMigrations() {
       CREATE INDEX IF NOT EXISTS idx_activity_logs_user ON public.activity_logs(user_id);
       CREATE INDEX IF NOT EXISTS idx_activity_logs_created ON public.activity_logs(user_id, created_at DESC);
 
+      -- ── bank_transactions: reconciliation metadata columns ───────────────
+      ALTER TABLE public.bank_transactions ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'manual';
+      ALTER TABLE public.bank_transactions ADD COLUMN IF NOT EXISTS match_confidence NUMERIC(4,3);
+      ALTER TABLE public.bank_transactions ADD COLUMN IF NOT EXISTS match_method TEXT;
+
+      -- ── inventory: supplier linkage for auto-PO drafting (create if missing
+      --    so the ALTERs below never fail against a table that doesn't exist yet) ──
+      CREATE TABLE IF NOT EXISTS public.inventory (
+        id             BIGSERIAL PRIMARY KEY,
+        user_id        UUID NOT NULL,
+        item_name      TEXT NOT NULL,
+        quantity       NUMERIC(14,2) NOT NULL DEFAULT 0,
+        reorder_level  NUMERIC(14,2) DEFAULT 0,
+        unit           TEXT DEFAULT 'units',
+        created_at     TIMESTAMPTZ DEFAULT NOW()
+      );
+      ALTER TABLE public.inventory ADD COLUMN IF NOT EXISTS supplier_name  TEXT;
+      ALTER TABLE public.inventory ADD COLUMN IF NOT EXISTS supplier_phone TEXT;
+      ALTER TABLE public.inventory ADD COLUMN IF NOT EXISTS default_order_qty NUMERIC(14,2);
+      CREATE INDEX IF NOT EXISTS idx_inventory_user ON public.inventory(user_id);
+
+      -- ── purchase_orders table (create if missing) — drafts awaiting supplier
+      --    confirmation, distinct from purchases which records completed/paid
+      --    purchases. status: draft -> sent -> confirmed / declined / expired.
+      CREATE TABLE IF NOT EXISTS public.purchase_orders (
+        id              BIGSERIAL PRIMARY KEY,
+        user_id         UUID NOT NULL,
+        supplier_name   TEXT NOT NULL,
+        supplier_phone  TEXT,
+        items           JSONB NOT NULL DEFAULT '[]',
+        estimated_amount NUMERIC(14,2),
+        status          TEXT NOT NULL DEFAULT 'draft',
+        related_ai_action_id UUID,
+        sent_at         TIMESTAMPTZ,
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_purchase_orders_user ON public.purchase_orders(user_id);
+      CREATE INDEX IF NOT EXISTS idx_purchase_orders_status ON public.purchase_orders(user_id, status);
+
+      -- ── customers: per-customer escalation pause (closing-the-loop guardrail) ──
+      ALTER TABLE customers ADD COLUMN IF NOT EXISTS escalation_paused BOOLEAN DEFAULT FALSE;
+
+      -- ── ai_actions: one-tap approval token bookkeeping ────────────────────
+      ALTER TABLE ai_actions ADD COLUMN IF NOT EXISTS approval_token_hash TEXT;
+      ALTER TABLE ai_actions ADD COLUMN IF NOT EXISTS approval_expires_at TIMESTAMPTZ;
+      ALTER TABLE ai_actions ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ;
+
       -- ── notifications table (create if missing) ─────────────────────────
       CREATE TABLE IF NOT EXISTS public.notifications (
         id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -12547,6 +13526,7 @@ async function runAutoMigrations() {
 // ── PERFORMANCE BOOTSTRAP ROUTES ─────────────────────────────────────────────
 app.get('/api/v1/dashboard/bootstrap', authMiddleware, async (req, res) => {
   try {
+    const CacheService = require('./lib/cache/cache.service');
     const userId = req.user.userId;
     const cacheKey = `user:${userId}:dashboard_bootstrap`;
     
@@ -12591,6 +13571,7 @@ app.get('/api/v1/dashboard/bootstrap', authMiddleware, async (req, res) => {
 
 app.get('/api/v1/collections/bootstrap', authMiddleware, async (req, res) => {
   try {
+    const CacheService = require('./lib/cache/cache.service');
     const userId = req.user.userId;
     const cacheKey = `user:${userId}:collections_bootstrap`;
     const cached = CacheService.get(cacheKey);
@@ -12632,6 +13613,7 @@ app.get('/api/v1/collections/bootstrap', authMiddleware, async (req, res) => {
     CacheService.set(cacheKey, payload, 45); // 45 second cache
     res.json(payload);
   } catch (err) {
+    logRouteError(req, err);
     res.status(500).json({ error: 'Failed to bootstrap collections' });
   }
 });
