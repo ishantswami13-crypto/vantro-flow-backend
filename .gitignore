@@ -4,6 +4,7 @@ node_modules/
 .env.production
 .env.development
 .env*.local
+.env.bak-*
 !.env.example
 *.log
 *.pem
