@@ -6235,7 +6235,7 @@ const AI_TOOLS = [
   { type:'function', function:{ name:'get_calls', description:'Get recent call history and performance stats', parameters:{ type:'object', properties:{ limit:{ type:'number' } } } } },
   { type:'function', function:{ name:'get_cash_forecast', description:'Get 3-scenario cash flow forecast for the next N days', parameters:{ type:'object', properties:{ days:{ type:'number', description:'Forecast horizon in days (14/30/60/90)' } } } } },
   { type:'function', function:{ name:'get_overdue', description:'Get customers with overdue invoices sorted by days overdue or amount', parameters:{ type:'object', properties:{ min_days:{ type:'number', description:'Minimum days overdue (e.g. 30)' } } } } },
-  { type:'function', function:{ name:'navigate_to', description:'Navigate the user to a specific page in the app', parameters:{ type:'object', properties:{ page:{ type:'string', enum:['dashboard','payments','calls','priority','message','analytics','inventory','metrics','prospects','forecast','pricing'] }, reason:{ type:'string', description:'Why you are navigating there' } }, required:['page'] } } },
+  { type:'function', function:{ name:'navigate_to', description:'Navigate the user to a specific page in the app because they explicitly asked to go there or see that page (e.g. "take me to invoices", "open the pricing page"). Never call this to answer a question the other tools cannot answer — navigating somewhere is not a substitute for admitting you do not have the data.', parameters:{ type:'object', properties:{ page:{ type:'string', enum:['dashboard','payments','calls','priority','message','analytics','inventory','metrics','prospects','forecast','pricing'] }, reason:{ type:'string', description:'Why you are navigating there' } }, required:['page'] } } },
   { type:'function', function:{ name:'get_suppliers', description:'Get all suppliers with name, phone, email, payment terms', parameters:{ type:'object', properties:{} } } },
   { type:'function', function:{ name:'send_whatsapp', description:'Compose and prepare a WhatsApp message to any contact (customer or supplier). The message will be opened ready-to-send in WhatsApp.', parameters:{ type:'object', properties:{ to:{ type:'string', description:'Recipient name' }, phone:{ type:'string', description:'Phone number (digits only or with spaces)' }, message:{ type:'string', description:'The full message text — write it naturally in Hindi/English mix if appropriate' } }, required:['to','phone','message'] } } },
   { type:'function', function:{ name:'send_collection_reminder', description:'Compose a tailored payment reminder WhatsApp message for an overdue customer', parameters:{ type:'object', properties:{ customer_name:{ type:'string' }, tone:{ type:'string', enum:['friendly','firm','urgent'], description:'Tone of the message' } }, required:['customer_name'] } } },
@@ -6256,6 +6256,205 @@ async function groqChat(messages, tools, toolChoice = 'auto') {
   return data.choices[0];
 }
 
+// ---------------------------------------------------------------
+// Gemini chat provider for /api/ai-chat (function-calling loop)
+// ---------------------------------------------------------------
+// Mirrors groqChat()'s contract EXACTLY: takes the same OpenAI-style
+// `messages` array (system/user/assistant[+tool_calls]/tool) and the
+// same OpenAI-style `tools` (AI_TOOLS, function-schema format), and
+// returns the same shape groqChat returns — an OpenAI "choice" object:
+//   { message: { role:'assistant', content, tool_calls? }, finish_reason }
+// This lets the /api/ai-chat tool-calling loop below stay completely
+// provider-agnostic — it never needs to know which provider produced
+// the choice. All OpenAI<->Gemini wire-format translation happens here.
+//
+// Uses raw fetch (no @google/generative-ai / @google/genai SDK) to match
+// the existing codebase convention: runGeminiVisionExtraction() above
+// already talks to the same generativelanguage.googleapis.com endpoint
+// via raw fetch. Adding an SDK just for this one route would introduce
+// a second way of calling the same API for no real benefit.
+
+function openAiToolsToGeminiDeclarations(tools) {
+  const upcaseTypes = (schema) => {
+    if (!schema || typeof schema !== 'object') return schema;
+    if (Array.isArray(schema)) return schema.map(upcaseTypes);
+    const out = {};
+    for (const [k, v] of Object.entries(schema)) {
+      if (k === 'type' && typeof v === 'string') out[k] = v.toUpperCase();
+      else if (v && typeof v === 'object') out[k] = upcaseTypes(v);
+      else out[k] = v;
+    }
+    return out;
+  };
+  return (tools || [])
+    .filter(t => t.type === 'function' && t.function)
+    .map(t => ({
+      name: t.function.name,
+      description: t.function.description || '',
+      parameters: upcaseTypes(t.function.parameters && Object.keys(t.function.parameters.properties || {}).length
+        ? t.function.parameters
+        : { type: 'object', properties: {} }),
+    }));
+}
+
+// Converts the OpenAI-style running transcript into Gemini's
+// { systemInstruction, contents } shape. Stateless — called fresh on
+// every turn of the loop, same as groqChat receives the full transcript
+// each call.
+function openAiMessagesToGeminiContents(messages) {
+  let systemInstruction = null;
+  const contents = [];
+  const toolCallIdToName = {};
+
+  for (const m of messages) {
+    if (m.role === 'system') {
+      systemInstruction = { parts: [{ text: m.content || '' }] };
+      continue;
+    }
+    if (m.role === 'user') {
+      contents.push({ role: 'user', parts: [{ text: String(m.content ?? '') }] });
+      continue;
+    }
+    if (m.role === 'assistant') {
+      if (m.tool_calls?.length) {
+        const parts = m.tool_calls.map(tc => {
+          let args = {};
+          try { args = JSON.parse(tc.function.arguments || '{}'); } catch (_) {}
+          toolCallIdToName[tc.id] = tc.function.name;
+          const part = { functionCall: { name: tc.function.name, args } };
+          // Gemini 3.x requires the model's own functionCall parts to carry
+          // back their thoughtSignature (a sibling field of functionCall
+          // within the SAME part, not nested inside it) on the next turn,
+          // or it 400s with "Function call is missing a thought_signature".
+          // We stash it on the tool_call object when we first receive it
+          // (see below) and must replay it verbatim here.
+          if (tc._geminiThoughtSignature) part.thoughtSignature = tc._geminiThoughtSignature;
+          return part;
+        });
+        contents.push({ role: 'model', parts });
+      } else {
+        contents.push({ role: 'model', parts: [{ text: String(m.content ?? '') }] });
+      }
+      continue;
+    }
+    if (m.role === 'tool') {
+      let response;
+      try { response = JSON.parse(m.content); } catch (_) { response = { result: m.content }; }
+      // Gemini's functionResponse.response field must be a JSON object
+      // (proto Struct) — it rejects arrays/primitives with a 400. Several
+      // real tools here (get_invoices, get_overdue, get_prospects, ...)
+      // return bare arrays, so wrap anything non-object-shaped.
+      if (Array.isArray(response) || response === null || typeof response !== 'object') {
+        response = { result: response };
+      }
+      const name = toolCallIdToName[m.tool_call_id] || 'unknown_tool';
+      contents.push({ role: 'user', parts: [{ functionResponse: { name, response } }] });
+      continue;
+    }
+  }
+  return { systemInstruction, contents };
+}
+
+async function geminiChat(messages, tools, toolChoice = 'auto') {
+  const apiKey = cleanScanString(process.env.GEMINI_API_KEY);
+  // Reject empty/placeholder keys clearly rather than silently failing
+  // or silently falling back to Groq (that would be a hidden behavior
+  // change) — surface the real misconfiguration to the caller.
+  if (!apiKey || apiKey.length < 10) {
+    throw new Error('Gemini provider selected but GEMINI_API_KEY is not configured');
+  }
+  // NOTE: gemini-2.5-flash was retired for new API keys as of this writing —
+  // the API itself returns 404 "no longer available to new users". Its
+  // newest replacements (gemini-3.6-flash, and gemini-flash-latest which
+  // currently resolves to gemini-3.8-flash) both returned 503 "high demand"
+  // repeatedly under real live testing with tools attached (verified
+  // directly against the real GEMINI_API_KEY — reproducible outside this
+  // app too, so it's the newest models under load, not a bug here).
+  // gemini-3.1-flash-lite was reliable across repeated live tests in the
+  // same conditions (function-calling confirmed working, honest no-data
+  // answers confirmed, no 503s). Revisit this once the 3.6/3.8 rollout
+  // stabilizes — GEMINI_MODEL can be overridden without a code change.
+  const model = cleanScanString(process.env.GEMINI_MODEL) || 'gemini-3.1-flash-lite';
+  const modelPath = model.replace(/^models\//i, '');
+  const { systemInstruction, contents } = openAiMessagesToGeminiContents(messages);
+  const geminiTools = openAiToolsToGeminiDeclarations(tools);
+
+  const body = {
+    contents,
+    generationConfig: { temperature: 0.2, maxOutputTokens: 1500 },
+  };
+  if (systemInstruction) body.systemInstruction = systemInstruction;
+  if (geminiTools.length) {
+    body.tools = [{ functionDeclarations: geminiTools }];
+    // toolChoice 'auto' -> AUTO (let model decide, matches Groq's 'auto' default).
+    // Any other explicit value from the caller maps to ANY (must call a tool).
+    body.toolConfig = { functionCallingConfig: { mode: toolChoice === 'auto' ? 'AUTO' : 'ANY' } };
+  }
+
+  let res, data;
+  try {
+    res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelPath}:generateContent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+      body: JSON.stringify(body),
+    });
+    data = await res.json().catch(() => ({}));
+  } catch (netErr) {
+    // Never leak the raw network/SDK error (could echo headers/key in some
+    // fetch implementations' error objects) — surface a clean message only.
+    throw new Error('Gemini request failed (network error)');
+  }
+
+  if (!res.ok) {
+    // data.error?.message from Gemini never contains the API key (it's sent
+    // as a header, not echoed back), but keep this generic and short anyway.
+    const status = res.status;
+    if (status === 401 || status === 403) throw new Error('Gemini authentication failed — check GEMINI_API_KEY');
+    if (status === 429) throw new Error('Gemini rate limit reached, please try again shortly');
+    if (status === 404) throw new Error(`Gemini model "${modelPath}" is unavailable`);
+    throw new Error(data.error?.message || 'Gemini error');
+  }
+
+  const candidate = data.candidates?.[0];
+  if (!candidate) throw new Error('Gemini returned no response');
+  if (candidate.finishReason === 'SAFETY' || candidate.finishReason === 'RECITATION') {
+    throw new Error('Gemini declined to respond to this request');
+  }
+
+  const parts = candidate.content?.parts || [];
+  const functionCallParts = parts.filter(p => p.functionCall);
+
+  if (functionCallParts.length) {
+    const tool_calls = functionCallParts.map((p, i) => ({
+      id: `call_${Date.now()}_${i}`,
+      type: 'function',
+      function: { name: p.functionCall.name, arguments: JSON.stringify(p.functionCall.args || {}) },
+      // Gemini 3.x's own required round-trip field — see note in
+      // openAiMessagesToGeminiContents() where this is replayed back.
+      _geminiThoughtSignature: p.thoughtSignature || null,
+    }));
+    return { message: { role: 'assistant', content: null, tool_calls }, finish_reason: 'tool_calls' };
+  }
+
+  const text = parts.map(p => p.text || '').filter(Boolean).join('\n').trim();
+  return { message: { role: 'assistant', content: text }, finish_reason: 'stop' };
+}
+
+// Provider selector for /api/ai-chat ONLY. Does not affect vision
+// extraction (runGeminiVisionExtraction / runGroqVisionExtraction above),
+// the OCR fallback chain, or any Anthropic-based subsystem — those are
+// untouched and keep using their own existing provider logic.
+//
+// To revert to Groq: unset SCAN_LLM_PROVIDER, or set it to "groq"
+// (or anything unrecognized — default is always Groq, so an unset/typo'd
+// value never silently changes existing behavior for anyone who hasn't
+// opted in).
+function chatCompletion(messages, tools, toolChoice = 'auto') {
+  const provider = (process.env.SCAN_LLM_PROVIDER || 'groq').trim().toLowerCase();
+  if (provider === 'gemini') return geminiChat(messages, tools, toolChoice);
+  return groqChat(messages, tools, toolChoice);
+}
+
 app.post('/api/ai-chat', authMiddleware, async (req, res) => {
   const { messages, business_name } = req.body;
   const user_id = authenticatedUserId(req);
@@ -6264,15 +6463,21 @@ app.post('/api/ai-chat', authMiddleware, async (req, res) => {
   // Pre-fetch top 5 overdue invoices so first response is instant and data-aware
   let overdueContext = '';
   try {
-    const { data: topInvoices } = await supabase
+    const { data: topInvoicesRaw } = await supabase
       .from('invoices')
-      .select('customer_name, invoice_amount, days_overdue, customer_phone')
+      .select('customer_name, invoice_amount, due_date, invoice_date, created_at, customer_phone')
       .eq('user_id', user_id)
       .eq('payment_status', 'Pending')
-      .order('days_overdue', { ascending: false })
-      .limit(5);
+      .limit(200);
 
-    if (topInvoices && topInvoices.length > 0) {
+    // days_overdue is a stored column that can drift stale — always recompute
+    // live from due_date vs. today at read time for anything Scan surfaces.
+    const topInvoices = (topInvoicesRaw || [])
+      .map(i => ({ ...i, days_overdue: calculateDaysOverdue(i.due_date || i.invoice_date || i.created_at) }))
+      .sort((a, b) => b.days_overdue - a.days_overdue)
+      .slice(0, 5);
+
+    if (topInvoices.length > 0) {
       overdueContext = `\n\nTop overdue customers right now:\n${topInvoices.map(i =>
         `- ${i.customer_name}: ₹${Number(i.invoice_amount).toLocaleString('en-IN')} (${i.days_overdue} days overdue${i.customer_phone ? ', phone: ' + i.customer_phone : ''})`
       ).join('\n')}`;
@@ -6312,7 +6517,12 @@ When generating WhatsApp messages, call scripts, or any communication: write EXA
 
 You have tools: fetch data, mark invoices paid, add prospects, get forecasts, navigate pages.
 Be specific, use ₹ formatting, and when asked to do something — DO it with tools, don't just explain.
-Summarise actions clearly after doing them.${voiceContext}${overdueContext}`;
+Summarise actions clearly after doing them.
+
+HARD RULE — never fabricate data you don't have: You only know what your tools return from this business's actual connected data (invoices, prospects, inventory, calls, suppliers, cash flow). You have no access to competitor data, market pricing, external market research, or anything outside this business's own records.
+- Never use navigate_to (or any other tool) as a way to avoid admitting you don't have data for a question. navigate_to is ONLY for genuine navigation requests ("take me to invoices", "open the pricing page") — never call it just because no data tool can answer the question, and never imply that navigating somewhere will reveal an answer this app doesn't actually have.
+- If no tool/data source can verify the answer (e.g. competitor pricing, competitor behavior, external market data, future events outside this business's own records), say so honestly and plainly — something like "I can't verify [X] from the connected data yet." Do not soften this into a fake action like navigating to a page and implying the answer is there.
+- You MAY suggest that the user could connect a relevant data source for that in the future, but you must never imply Starlane/Vantro currently has that data.${voiceContext}${overdueContext}`;
 
   const chatMessages = [
     { role:'system', content: system },
@@ -6338,12 +6548,13 @@ Summarise actions clearly after doing them.${voiceContext}${overdueContext}`;
           return { total_invoices:safe.length, paid:paid.length, pending:pending.length, outstanding:`₹${outstanding.toLocaleString('en-IN')}`, recovered:`₹${recovered.toLocaleString('en-IN')}`, recovery_rate:`${safe.length?Math.round(paid.length/safe.length*100):0}%`, total_customers:uniqueCustomers };
         }
         case 'get_invoices': {
-          let q = supabase.from('invoices').select('id,customer_name,customer_phone,invoice_amount,payment_status,days_overdue,invoice_date').eq('user_id',user_id);
+          let q = supabase.from('invoices').select('id,customer_name,customer_phone,invoice_amount,payment_status,due_date,invoice_date').eq('user_id',user_id);
           if (args.status && args.status!=='all') q = q.eq('payment_status', args.status);
           if (args.customer_name) q = q.ilike('customer_name', `%${args.customer_name}%`);
-          q = q.order('days_overdue',{ascending:false}).limit(args.limit||20);
           const { data } = await q;
-          return data || [];
+          const withLiveOverdue = (data || []).map(i => ({ ...i, days_overdue: calculateDaysOverdue(i.due_date || i.invoice_date, i.payment_status === 'Paid') }));
+          withLiveOverdue.sort((a, b) => b.days_overdue - a.days_overdue);
+          return withLiveOverdue.slice(0, args.limit || 20);
         }
         case 'mark_invoice_paid': {
           let inv;
@@ -6424,9 +6635,12 @@ Summarise actions clearly after doing them.${voiceContext}${overdueContext}`;
           return { forecast_days:days, avg_daily_collections:`₹${avgDaily.toLocaleString('en-IN')}`, total_outstanding:`₹${outstanding.toLocaleString('en-IN')}`, pessimistic_day_n:`₹${Math.round(avgDaily*0.5*days).toLocaleString('en-IN')}`, expected_day_n:`₹${Math.round(avgDaily*0.8*days).toLocaleString('en-IN')}`, optimistic_day_n:`₹${Math.round(avgDaily*0.95*days).toLocaleString('en-IN')}` };
         }
         case 'get_overdue': {
-          let q = supabase.from('invoices').select('customer_name,customer_phone,invoice_amount,days_overdue').eq('user_id',user_id).eq('payment_status','Pending').order('days_overdue',{ascending:false});
-          if (args.min_days) q = q.gte('days_overdue',args.min_days);
-          const { data } = await q.limit(20);
+          let q = supabase.from('invoices').select('customer_name,customer_phone,invoice_amount,due_date,invoice_date').eq('user_id',user_id).eq('payment_status','Pending');
+          const { data: rawData } = await q;
+          let liveData = (rawData || []).map(i => ({ ...i, days_overdue: calculateDaysOverdue(i.due_date || i.invoice_date) }));
+          if (args.min_days) liveData = liveData.filter(i => i.days_overdue >= args.min_days);
+          liveData.sort((a, b) => b.days_overdue - a.days_overdue);
+          const data = liveData.slice(0, 20);
           return data||[];
         }
         case 'navigate_to': {
@@ -6532,7 +6746,7 @@ Summarise actions clearly after doing them.${voiceContext}${overdueContext}`;
 
     while (iteration < maxIter) {
       iteration++;
-      const choice = await groqChat(chatMessages, AI_TOOLS);
+      const choice = await chatCompletion(chatMessages, AI_TOOLS);
       const msg = choice.message;
       chatMessages.push(msg);
 
