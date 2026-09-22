@@ -12325,6 +12325,11 @@ app.patch('/api/promises/:id', authMiddleware, async (req, res) => {
 const { watchesRouter } = require('./lib/routes/watches');
 app.use('/api/watches', watchesRouter({ pool: getPool(), authMiddleware }));
 
+// Priority 2 — Opportunity Engine. See lib/routes/opportunities.js and
+// lib/domain/intelligence/opportunityPropagation.js.
+const { opportunitiesRouter } = require('./lib/routes/opportunities');
+app.use('/api/intelligence/opportunities', opportunitiesRouter({ pool: getPool(), authMiddleware }));
+
 app.get('/api/ai-actions', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
