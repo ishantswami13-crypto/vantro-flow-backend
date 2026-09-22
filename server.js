@@ -5500,31 +5500,34 @@ Rules: numbers only, no currency symbols or commas. Dates must be YYYY-MM-DD.`;
 });
 
 // --- Local connector enrollment and device authentication -------------------
-// DISABLED 2026-09-20: './lib/domain/ingestion/deviceEnrollment' does not
-// exist in this repo (never committed on any branch) and there is no DB
-// schema for connector_devices/connector_enrollments either — this was an
-// incomplete migration, not a rename. Rather than guess at security-sensitive
-// auth/secret-rotation logic, the 4 routes below and the VantroDevice
-// credential path in connectorOrUserAuth are disabled pending a real
-// device-auth design. connectorOrUserAuth itself is KEPT (falls back to
-// plain authMiddleware) because /api/connections/heartbeat and
-// /api/import/tally still use it for normal user-token auth.
-// const { createEnrollment, claimEnrollment, authenticateDevice, listDevices, revokeDevice } = require('./lib/domain/ingestion/deviceEnrollment');
-// const connectorClaimLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false });
+// Re-enabled 2026-09-22: lib/domain/ingestion/deviceEnrollment.js and the
+// connector_devices/connector_enrollments schema (migrations/047_connector_devices.sql)
+// now exist for real (bcrypt-hashed device secrets, TTL'd claim-once
+// enrollment codes). See that migration file for the full design rationale.
+const { createEnrollment, claimEnrollment, authenticateDevice, listDevices, revokeDevice } = require('./lib/domain/ingestion/deviceEnrollment');
+const connectorClaimLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false });
 
 function connectorOrUserAuth(req, res, next) {
   const header = String(req.headers.authorization || '');
   const match = header.match(/^VantroDevice\s+([0-9a-f-]{36})\.([A-Za-z0-9_-]{32,})$/i);
   if (match) {
-    // Device-credential auth is disabled (see comment above) — no module to
-    // authenticate against. Fail closed rather than fall through silently.
-    return res.status(503).json({ error: 'Connector device authentication is disabled pending implementation' });
+    const [, deviceId, secret] = match;
+    authenticateDevice(deviceId, secret)
+      .then((device) => {
+        if (!device) return res.status(401).json({ error: 'Invalid or revoked device credential' });
+        req.user = { userId: device.userId };
+        req.connectorDevice = device;
+        next();
+      })
+      .catch((error) => {
+        console.error('[connector device auth]', error);
+        res.status(503).json({ error: 'Unable to authenticate connector device' });
+      });
+    return;
   }
   return authMiddleware(req, res, next);
 }
 
-/* DISABLED 2026-09-20 — see comment above. Re-enable once deviceEnrollment.js
-   and its DB schema exist for real.
 app.post('/api/connectors/tally/enrollment', authMiddleware, async (req, res) => {
   try {
     const enrollment = await createEnrollment(req.user.userId);
@@ -5572,7 +5575,6 @@ app.post('/api/connectors/tally/devices/:deviceId/revoke', authMiddleware, async
     res.status(503).json({ error: 'Unable to revoke connector device' });
   }
 });
-*/
 // --- Audit (read-only; audit_logs is written by lib/services/orchestrator/
 // audit.service.js on every financial change — this is the first read path
 // exposed for it). No new table, no migration needed. -----------------------
