@@ -12463,6 +12463,12 @@ app.use('/api/intelligence/opportunities', opportunitiesRouter({ pool: getPool()
 const { scenariosRouter } = require('./lib/routes/scenarios');
 app.use('/api/intelligence/scenarios', scenariosRouter({ pool: getPool(), authMiddleware }));
 
+// Priority 6: Prepared V1 — real read-only aggregation of pending
+// ai_actions, triggered watches, real opportunities, and forecast risk.
+// See lib/routes/prepared.js for the honesty rationale.
+const { preparedRouter } = require('./lib/routes/prepared');
+app.use('/api/intelligence/prepared', preparedRouter({ pool: getPool(), authMiddleware }));
+
 app.get('/api/ai-actions', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
