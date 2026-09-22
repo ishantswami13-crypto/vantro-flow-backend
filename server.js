@@ -12318,6 +12318,13 @@ app.patch('/api/promises/:id', authMiddleware, async (req, res) => {
 
 // ── AI ACTIONS ───────────────────────────────────────────────────────────────
 
+// Watch feature (migration 046) — CRUD + on-demand evaluate, strictly scoped
+// to the authenticated user. See lib/routes/watches.js and
+// lib/services/watchEvaluator.js. Uses the same pgPool/getPool() as the rest
+// of server.js's raw-SQL routes.
+const { watchesRouter } = require('./lib/routes/watches');
+app.use('/api/watches', watchesRouter({ pool: getPool(), authMiddleware }));
+
 app.get('/api/ai-actions', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -13503,6 +13510,36 @@ cron.schedule('0 6 * * *', async () => {
     });
   } catch (err) { _log('error', '[WorldFreshnessCron] Fatal', { error: err.message }); }
 }, { timezone: 'UTC' });
+
+// Watch evaluation cron — every 15 minutes. 15 min is a reasonable cadence
+// for demo/pilot scale (a handful of users, a handful of watches each): it
+// keeps "changed"/"triggered" watch state fresh enough to be useful without
+// hammering the DB, and is IN ADDITION to the on-demand
+// POST /api/watches/:id/evaluate route, not a replacement for it. Revisit
+// if/when watch volume grows enough that per-tenant scheduling is needed.
+cron.schedule('*/15 * * * *', async () => {
+  if (!pgPool) return;
+  const { safeLog: _log } = require('./lib/observability/logger');
+  try {
+    const { evaluateAndPersist } = require('./lib/routes/watches');
+    const pool = getPool();
+    const { rows: activeWatches } = await pool.query(`SELECT * FROM watches WHERE status = 'active'`);
+    let ok = 0, failed = 0;
+    for (const watch of activeWatches) {
+      try {
+        await evaluateAndPersist(pool, watch);
+        ok++;
+      } catch (e) {
+        failed++;
+        _log('error', '[WatchCron] evaluate failed', { watch_id: watch.id, error: e.message });
+      }
+    }
+    _log('info', '[WatchCron] Done', { evaluated: ok, failed, total: activeWatches.length });
+  } catch (err) {
+    const { safeLog } = require('./lib/observability/logger');
+    safeLog('error', '[WatchCron] Fatal', { error: err.message });
+  }
+});
 
 // ============================================
 // START SERVER
