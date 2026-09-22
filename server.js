@@ -12330,6 +12330,11 @@ app.use('/api/watches', watchesRouter({ pool: getPool(), authMiddleware }));
 const { opportunitiesRouter } = require('./lib/routes/opportunities');
 app.use('/api/intelligence/opportunities', opportunitiesRouter({ pool: getPool(), authMiddleware }));
 
+// Priority 3 — Simulate V1. See lib/routes/scenarios.js,
+// lib/domain/intelligence/scenarioEngine.js and fxScenarioEngine.js.
+const { scenariosRouter } = require('./lib/routes/scenarios');
+app.use('/api/intelligence/scenarios', scenariosRouter({ pool: getPool(), authMiddleware }));
+
 app.get('/api/ai-actions', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
