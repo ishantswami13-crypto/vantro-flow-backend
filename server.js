@@ -6090,6 +6090,134 @@ app.get('/api/cash-forecast/:userId', requireOwner, async (req, res) => {
   }
 });
 
+// ─── Forecast V2 — honest-contract cash forecast (7/14/30d) ──────────────────
+// Reuses the exact same real calculateCashFlowForecast() math as the legacy
+// /api/cash-forecast endpoint (does not reimplement it), but returns a
+// cleaner contract that separates observed actuals from predicted curve and
+// labels the uncertainty interval for what it actually is: the real
+// pessimistic/optimistic scenario spread already computed above, not a
+// statistically-derived confidence interval. Also persists one row per call
+// into `predictions` (migration 025) so future backtesting has real rows to
+// compare against — no backtest/model-tournament wiring here since the
+// `predictions` table currently has zero cash_position_* rows for any real
+// tenant (confirmed live query before writing this route), so there is
+// nothing yet to backtest against for this target.
+const ALLOWED_FORECAST_V2_HORIZONS = [7, 14, 30];
+
+app.get('/api/intelligence/forecast/v2/:userId', requireOwner, async (req, res) => {
+  const { userId } = req.params;
+  const horizon = ALLOWED_FORECAST_V2_HORIZONS.includes(Number(req.query.horizon))
+    ? Number(req.query.horizon)
+    : 30;
+
+  try {
+    await ensureConnectedBusinessData(userId);
+    await syncExistingSalesReceivables(userId);
+
+    const [forecast, bankTxnsResult] = await Promise.all([
+      calculateCashFlowForecast(userId, 0, horizon),
+      supabase.from('bank_transactions').select('*').eq('user_id', userId).order('txn_date', { ascending: false }),
+    ]);
+
+    const bankTxns = bankTxnsResult.error ? [] : bankTxnsResult.data || [];
+    const mostRecentTxn = bankTxns[0];
+    const dataFreshness = mostRecentTxn ? (mostRecentTxn.txn_date || mostRecentTxn.created_at || null) : null;
+
+    // "Observed" window: the real recent period the burn-rate/inflow math was
+    // itself computed from (last 30 real days of bank_transactions), so the
+    // chart can show actuals immediately preceding the predicted curve.
+    const observedCutoff = new Date();
+    observedCutoff.setDate(observedCutoff.getDate() - 30);
+    const observedCutoffStr = observedCutoff.toISOString().split('T')[0];
+    const observedByDay = {};
+    bankTxns.forEach((t) => {
+      if (!t.txn_date || t.txn_date < observedCutoffStr) return;
+      const amt = Number(t.amount || 0);
+      const signed = t.type === 'debit' ? -Math.abs(amt) : Math.abs(amt);
+      observedByDay[t.txn_date] = (observedByDay[t.txn_date] || 0) + signed;
+    });
+    const observed = Object.keys(observedByDay).sort().map((date) => ({ date, net_change: Math.round(observedByDay[date]) }));
+
+    const insufficientData = bankTxns.length === 0 && forecast.totalOutstanding === 0 && forecast.totalPayable === 0;
+
+    const predicted = forecast.scenarios.expected.curve.map((pt) => ({ day: pt.day, cash: pt.cash }));
+
+    const uncertainty_interval = {
+      note: 'Derived from the real pessimistic/optimistic scenario spread computed from actual bank + receivables/payables data — not a statistical confidence interval.',
+      low_curve: forecast.scenarios.pessimistic.curve.map((pt) => ({ day: pt.day, cash: pt.cash })),
+      high_curve: forecast.scenarios.optimistic.curve.map((pt) => ({ day: pt.day, cash: pt.cash })),
+    };
+
+    const model_metadata = { name: 'deterministic-cashflow-v1', version: '1' };
+
+    // Optional second comparison point: naive baseline off the same observed
+    // daily net-change series, only when there's enough real data to run it.
+    const models = [];
+    if (observed.length >= 1) {
+      const { movingAverageModel } = require('./lib/domain/intelligence/naiveBaselines');
+      const points = observed.map((o) => ({ date: o.date, value: o.net_change }));
+      const baseline = movingAverageModel(points, Math.min(7, points.length));
+      if (!baseline.insufficientData) {
+        models.push({
+          name: baseline.modelName,
+          version: baseline.modelVersion,
+          daily_net_change_prediction: Math.round(baseline.prediction),
+          interval: baseline.interval ? { low: Math.round(baseline.interval.low), high: Math.round(baseline.interval.high) } : null,
+        });
+      }
+    }
+
+    const responseBody = {
+      success: true,
+      horizon_days: horizon,
+      observed,
+      predicted,
+      uncertainty_interval,
+      model_metadata,
+      models,
+      generated_at: new Date().toISOString(),
+      data_freshness: dataFreshness,
+      insufficientData,
+      insufficientDataReason: insufficientData ? 'No bank transactions and no outstanding receivables/payables found for this tenant yet.' : null,
+    };
+
+    // Persist one prediction row (best-effort — never fails the request).
+    try {
+      const pool2 = getPool();
+      const endCash = forecast.scenarios.expected.endCash;
+      const lowCash = forecast.scenarios.pessimistic.endCash;
+      const highCash = forecast.scenarios.optimistic.endCash;
+      await pool2.query(
+        `INSERT INTO predictions
+          (user_id, entity_type, entity_id, target, prediction_type, as_of, horizon_days,
+           point_estimate, lower_bound, upper_bound, model_name, model_version, baseline_model,
+           assumptions, uncertainty_band, data_quality)
+         VALUES ($1, 'tenant_cash', NULL, $2, 'interval', now(), $3,
+           $4, $5, $6, $7, $8, $9,
+           $10::jsonb, $11, $12)`,
+        [
+          userId,
+          `cash_position_${horizon}d`,
+          horizon,
+          endCash, lowCash, highCash,
+          model_metadata.name, model_metadata.version,
+          models.length > 0 ? models[0].name : null,
+          JSON.stringify([{ assumption: 'Real bank-transaction burn/inflow rates from the trailing 30 real days continue over the horizon.', basis: `burnRate=${forecast.burnRate}, avgDailyCollections=${forecast.avgDailyCollections}`, strength: bankTxns.length > 0 ? 'MODERATE' : 'WEAK' }]),
+          insufficientData ? 'INSUFFICIENT' : (bankTxns.length >= 10 ? 'MODERATE' : 'WEAK'),
+          insufficientData ? 'insufficient' : 'partial',
+        ]
+      );
+    } catch (persistErr) {
+      safeLog('warn', '[forecast v2] prediction persistence failed (non-fatal)', { error: persistErr.message });
+    }
+
+    res.json(responseBody);
+  } catch (err) {
+    console.error('[forecast v2 error]', err);
+    res.status(500).json({ success: false, error: 'Failed to compute forecast v2' });
+  }
+});
+
 // ============================================
 // DB MIGRATION (safe to call multiple times)
 // ============================================
