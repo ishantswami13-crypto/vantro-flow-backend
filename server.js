@@ -12469,7 +12469,15 @@ app.get('/api/ai-actions', authMiddleware, async (req, res) => {
     const { status = 'pending', priority, action_type, limit: lim = 50, offset: off = 0 } = req.query;
     let query = supabase
       .from('ai_actions')
-      .select('*, customers(name, phone)')
+      // Priority 5 (Control Approvals): the embedded-relation select
+      // ('*, customers(name, phone)') isn't supported by pgSupabaseShim.js
+      // (the local pg-backed stand-in used when no real Supabase project is
+      // configured — see lib/config/pgSupabaseShim.js's plain '*'-or-column-
+      // list select() implementation), so it always failed with a real 500
+      // ("column \"*\" does not exist") before this fix ever ran. Select the
+      // plain columns and hydrate customer name/phone with a second batched
+      // query below instead, which the shim does support.
+      .select('*')
       .eq('user_id', userId)
       .order('created_at', { ascending: false })
       .range(Number(off), Number(off) + Number(lim) - 1);
@@ -12478,12 +12486,26 @@ app.get('/api/ai-actions', authMiddleware, async (req, res) => {
     if (action_type) query = query.eq('action_type', action_type);
     const { data, error } = await query;
     if (error) throw error;
+
+    const actions = data || [];
+    const customerIds = [...new Set(actions.map(a => a.customer_id).filter(Boolean))];
+    let customersById = {};
+    if (customerIds.length) {
+      const { data: customerRows } = await supabase
+        .from('customers').select('id, name, phone').in('id', customerIds);
+      (customerRows || []).forEach(c => { customersById[c.id] = { name: c.name, phone: c.phone }; });
+    }
+    const actionsWithCustomer = actions.map(a => ({
+      ...a,
+      customers: a.customer_id ? (customersById[a.customer_id] || null) : null,
+    }));
+
     // Priority counts for badge display
     const { data: summary } = await supabase
       .from('ai_actions').select('priority').eq('user_id', userId).eq('status', 'pending');
     const counts = {};
     (summary || []).forEach(r => { counts[r.priority] = (counts[r.priority] || 0) + 1; });
-    res.json({ success: true, actions: data || [], counts, total: (data || []).length });
+    res.json({ success: true, actions: actionsWithCustomer, counts, total: actionsWithCustomer.length });
   } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
@@ -12494,6 +12516,25 @@ app.patch('/api/ai-actions/:id', authMiddleware, async (req, res) => {
     const { status } = req.body;
     const allowed = ['approved', 'rejected', 'done', 'cancelled'];
     if (!allowed.includes(status)) return res.status(400).json({ error: 'Invalid status. Must be: approved, rejected, done, cancelled' });
+
+    // Tenant isolation: look the row up scoped to this user first so a
+    // cross-tenant id reads as a plain 404, never leaking whether the row
+    // exists for someone else.
+    const { data: existing, error: fetchErr } = await supabase
+      .from('ai_actions').select('*').eq('id', id).eq('user_id', userId).single();
+    if (fetchErr || !existing) return res.status(404).json({ error: 'Action not found' });
+
+    // Idempotency (Control Approvals, Priority 5): approve/reject are decisions,
+    // made exactly once. Re-deciding an already-decided action is a 409, never a
+    // silent double-write or a duplicate audit_logs row — the approve-and-execute
+    // route above uses the same "decision is final" principle via its atomic
+    // compare-and-swap; this route isn't racy the same way (no execution side
+    // effect), so a plain status check here is sufficient.
+    const decidedStatuses = ['approved', 'rejected'];
+    if (decidedStatuses.includes(status) && decidedStatuses.includes(existing.status)) {
+      return res.status(409).json({ error: `Action already decided (status=${existing.status})`, status: existing.status });
+    }
+
     const updates = { status, updated_at: new Date().toISOString() };
     if (status === 'approved') { updates.approved_by = userId; updates.approved_at = new Date().toISOString(); }
     if (status === 'done') updates.completed_at = new Date().toISOString();
@@ -12501,6 +12542,19 @@ app.patch('/api/ai-actions/:id', authMiddleware, async (req, res) => {
       .from('ai_actions').update(updates).eq('id', id).eq('user_id', userId).select().single();
     if (error) throw error;
     if (!data) return res.status(404).json({ error: 'Action not found' });
+
+    if (decidedStatuses.includes(status)) {
+      const auditService = require('./lib/services/orchestrator/audit.service');
+      await auditService.log(userId, {
+        action: status === 'approved' ? 'ai_action_approved' : 'ai_action_rejected',
+        entityType: 'ai_action',
+        entityId: data.id,
+        oldValue: { status: existing.status },
+        newValue: { status: data.status },
+        ...auditService.fromRequest(req),
+      });
+    }
+
     res.json({ success: true, action: data });
   } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
