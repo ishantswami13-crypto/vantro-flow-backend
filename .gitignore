@@ -1,4 +1,12 @@
 node_modules/
+
+# Local dev tooling artifacts (not product code)
+.claude/launch.json
+.claude/skills/neon/
+.claude/skills/neon-postgres/
+skills-lock.json
+Tempnpm-cache-fix/
+
 .env
 .env.local
 .env.production
