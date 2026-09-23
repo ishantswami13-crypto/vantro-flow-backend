@@ -10384,6 +10384,108 @@ app.get('/api/user/features', authMiddleware, async (req, res) => {
 });
 
 // ============================================
+// ONBOARDING V2 (Business / Priorities / Connect 3-stage flow)
+//
+// Reuses the existing `onboarding_done` boolean (set by the older
+// /api/onboarding/setup route above) as the single completion gate — no
+// duplicate "completed" concept. `onboarding_completed_at` (migration
+// 048) is set alongside it purely as an audit timestamp.
+//
+// hasBusinessData below answers "does this account already have real
+// business records" so an existing account (e.g. one created before this
+// flow existed, or one with imported data) is never forced through
+// onboarding — it checks the same tables the rest of the product reads
+// from, one row each, real DB reads only.
+// ============================================
+
+async function hasRealBusinessData(userId) {
+  const tables = ['customers', 'sales', 'bills', 'khata_entries', 'purchases'];
+  const results = await Promise.allSettled(
+    tables.map(t => supabase.from(t).select('id').eq('user_id', userId).limit(1))
+  );
+  return results.some(r => r.status === 'fulfilled' && Array.isArray(r.value?.data) && r.value.data.length > 0);
+}
+
+app.get('/api/onboarding/state', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { data, error } = await supabase
+      .from('users')
+      .select('business_name, company_website, country, role, priority_areas, onboarding_done, onboarding_completed_at')
+      .eq('id', userId)
+      .maybeSingle();
+    if (error) throw error;
+    const hasBusinessData = await hasRealBusinessData(userId);
+    res.json({
+      success: true,
+      onboarding_done: !!data?.onboarding_done,
+      hasBusinessData,
+      shouldOnboard: !data?.onboarding_done && !hasBusinessData,
+      profile: {
+        company_name: data?.business_name || '',
+        company_website: data?.company_website || '',
+        country: data?.country || '',
+        role: data?.role || '',
+      },
+      priority_areas: data?.priority_areas || [],
+    });
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/onboarding/business', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    // NOTE: the wire field is `job_role`, not `role` — authMiddleware
+    // unconditionally deletes req.body.role on every request as a
+    // privilege-escalation guard (it means "account permission role"
+    // elsewhere in this codebase), so a field literally named `role` would
+    // silently vanish before this handler ever sees it. The `users.role`
+    // DB column (job title: Founder/CEO, Finance, ...) is unaffected —
+    // only the request body key differs.
+    const { company_name, company_website, country, job_role } = req.body || {};
+    if (!company_name || !String(company_name).trim()) return res.status(400).json({ error: 'Company name is required' });
+    if (!country || !String(country).trim()) return res.status(400).json({ error: 'Country is required' });
+    const update = {
+      business_name: String(company_name).trim(),
+      company_website: company_website ? String(company_website).trim() : null,
+      country: String(country).trim(),
+      role: job_role ? String(job_role).trim() : null,
+    };
+    const { error } = await supabase.from('users').update(update).eq('id', userId);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/onboarding/priorities', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { priority_areas } = req.body || {};
+    if (!Array.isArray(priority_areas)) return res.status(400).json({ error: 'priority_areas must be an array' });
+    // priority_areas is jsonb; the raw-pg shim (lib/config/pgSupabaseShim.js)
+    // does not auto-serialize JS arrays/objects to JSON for jsonb columns —
+    // passing the array directly makes node-pg emit a Postgres array literal,
+    // which fails against a jsonb column ("invalid input syntax for type
+    // json"). Must stringify explicitly.
+    const { error } = await supabase.from('users').update({ priority_areas: JSON.stringify(priority_areas) }).eq('id', userId);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/onboarding/complete', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { error } = await supabase.from('users').update({
+      onboarding_done: true,
+      onboarding_completed_at: new Date(),
+    }).eq('id', userId);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ============================================
 // GST BILLS / INVOICES
 // ============================================
 
