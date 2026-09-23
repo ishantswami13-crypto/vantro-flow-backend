@@ -386,7 +386,12 @@ const corsOptions = {
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Authorization", "Content-Type", "X-CSRF-Token", "X-Request-ID"]
+  allowedHeaders: ["Authorization", "Content-Type", "X-CSRF-Token", "X-Request-ID"],
+  // Lets the frontend read the X-CSRF-Token response header (set below in
+  // authMiddleware) across origins — without this, a custom response header
+  // is invisible to cross-origin fetch() even though the browser received
+  // it, which is what silently broke the self-heal below the first time.
+  exposedHeaders: ["X-CSRF-Token"]
 };
 
 app.use(cors(corsOptions));
@@ -689,6 +694,19 @@ function authMiddleware(req, res, next) {
     if (req.user && req.user.preVerify) return res.status(401).json({ error: 'Verification incomplete' });
     req.authSource = source;
     if (!requireCookieCsrf(req, res)) return;
+
+    // Self-heal an existing cookie-mode session whose vantro_csrf_token was
+    // never mirrored into localStorage (e.g. a session that predates that
+    // mirroring being added to saveAuth()): echo the CSRF cookie the browser
+    // is already sending back as a response header on EVERY authenticated
+    // cookie-mode request, not just login/signup/me. The frontend's
+    // request() picks this up and backfills localStorage the next time it
+    // calls ANY authenticated endpoint — no re-login required. Read-only:
+    // no new cookie is minted, just echoing the one already set.
+    if (req.authSource === 'cookie') {
+      const currentCsrf = parseCookies(req)[CSRF_COOKIE_NAME];
+      if (currentCsrf) res.setHeader('X-CSRF-Token', currentCsrf);
+    }
 
     // --- SECURITY: Force identity fields to safe values ---
     if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
@@ -1401,7 +1419,16 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
     // Warm cache in the background (non-blocking)
     warmBusinessCache(tokenUserId);
 
-    res.json({ success: true, user });
+    // Self-heal an existing cookie-mode session whose vantro_csrf_token was
+    // never written to localStorage (e.g. one that predates that mirroring
+    // being added to saveAuth()): read the CSRF cookie the browser is
+    // already sending back on this request and hand it back in the body, the
+    // same way login/signup do, so the frontend can mirror it without
+    // requiring a fresh login. No new cookie is minted here — just echoing
+    // the existing one — so this stays a read, not a session rotation.
+    const csrf_token = req.authSource === 'cookie' ? (parseCookies(req)[CSRF_COOKIE_NAME] || null) : null;
+
+    res.json({ success: true, user, csrf_token });
   } catch (error) {
     console.error('[auth me]', error);
     res.status(500).json({ error: 'Internal server error' });
