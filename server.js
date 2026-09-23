@@ -1332,20 +1332,6 @@ app.post('/api/auth/verify-otp', async (req, res) => {
   }
 });
 
-// Referral count (public — used on /my-id page)
-app.get('/api/public/referrals/:userId', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { count } = await supabase
-      .from('users')
-      .select('*', { count: 'exact', head: true })
-      .eq('referred_by', userId);
-    res.json({ success: true, referral_count: count || 0 });
-  } catch (error) {
-    res.json({ success: true, referral_count: 0 });
-  }
-});
-
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -7977,79 +7963,6 @@ async function runDunningCycle() {
 cron.schedule('30 3 * * *', runDunningCycle, { timezone: 'UTC' });
 
 // ============================================
-// VANTRO NETWORK — Business Discovery
-// ============================================
-
-app.get('/api/network/search', authMiddleware, async (req, res) => {
-  try {
-    const { q = '', type = 'all', limit = 20 } = req.query;
-
-    let query = supabase
-      .from('users')
-      .select('id, business_name, plan, created_at, gstin')
-      .limit(Number(limit));
-
-    if (q) query = query.ilike('business_name', `%${q}%`);
-
-    const { data: users, error } = await query.order('created_at', { ascending: false });
-    if (error) throw error;
-
-    if (!users || users.length === 0) return res.json({ success: true, businesses: [] });
-
-    // Enrich each user with their profile data
-    const enriched = await Promise.all(users.map(async (user) => {
-      const [{ data: invoices }, { data: callLogs }] = await Promise.all([
-        supabase.from('invoices').select('invoice_amount, payment_status').eq('user_id', user.id),
-        supabase.from('call_logs').select('id').eq('user_id', user.id),
-      ]);
-
-      const inv = invoices || [];
-      const paid = inv.filter(i => i.payment_status === 'Paid');
-      const totalManaged = inv.reduce((s, i) => s + Number(i.invoice_amount), 0);
-      const recoveryRate = inv.length ? Math.round((paid.length / inv.length) * 100) : 0;
-      const memberDays = Math.floor((Date.now() - new Date(user.created_at).getTime()) / 86400000);
-      const uniqueCustomers = new Set(inv.map(i => i.customer_name)).size;
-
-      // Trust score
-      const recScore = recoveryRate * 0.40;
-      const volScore = Math.min(20, inv.length * 0.5) * 0.20;
-      const ageScore = Math.min(20, memberDays * 0.1) * 0.20;
-      const callScore = Math.min(20, (callLogs || []).length * 0.5) * 0.20;
-      const trustScore = Math.min(100, Math.round(recScore + volScore + ageScore + callScore));
-
-      const badges = [];
-      if (inv.length >= 5) badges.push('Active Business');
-      if (recoveryRate >= 70) badges.push('Strong Collector');
-      if (memberDays >= 30) badges.push('Verified Member');
-      if (user.gstin) badges.push('GST Registered');
-
-      const vantroId = 'VAN-' + user.id.replace(/-/g, '').slice(0, 8).toUpperCase();
-
-      return {
-        user_id: user.id,
-        vantro_id: vantroId,
-        business_name: user.business_name,
-        plan: user.plan,
-        trust_score: trustScore,
-        recovery_rate: recoveryRate,
-        total_customers: uniqueCustomers,
-        total_managed: totalManaged,
-        total_invoices: inv.length,
-        member_days: memberDays,
-        badges,
-      };
-    }));
-
-    // Filter out users with no activity if not searching
-    const result = q ? enriched : enriched.filter(b => b.total_invoices > 0 || b.member_days > 1);
-    res.json({ success: true, businesses: result });
-  } catch (error) {
-    console.error('Network search error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// ============================================
 // ML SCORING ENGINE + AI FOUNDER BRIEFING
 // ============================================
 
@@ -8299,70 +8212,6 @@ app.get('/api/admin/stats', adminOnly, async (req, res) => {
           .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
           .slice(0, 10)
           .map(u => ({ email: u.email, business: u.business_name, plan: u.plan, joined: u.created_at })),
-      }
-    });
-  } catch (error) {
-    logRouteError(req, error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// ============================================
-// PUBLIC BUSINESS PROFILE — no auth required
-// ============================================
-
-app.get('/api/public/profile/:userId', async (req, res) => {
-  try {
-    const { userId } = req.params;
-
-    const [{ data: user }, { data: invoices }, { data: callLogs }] = await Promise.all([
-      supabase.from('users').select('id, business_name, plan, created_at, gstin').eq('id', userId).single(),
-      supabase.from('invoices').select('invoice_amount, payment_status, days_overdue, customer_name').eq('user_id', userId),
-      supabase.from('call_logs').select('id').eq('user_id', userId),
-    ]);
-
-    if (!user) return res.status(404).json({ error: 'Business not found' });
-
-    const safe = invoices || [];
-    const totalInvoices   = safe.length;
-    const paidInvoices    = safe.filter(i => i.payment_status === 'Paid').length;
-    const totalManaged    = safe.reduce((s, i) => s + i.invoice_amount, 0);
-    const recoveryRate    = totalInvoices > 0 ? Math.round((paidInvoices / totalInvoices) * 100) : 0;
-    const totalCustomers  = new Set(safe.map(i => i.customer_name)).size;
-    const memberDays      = Math.floor((Date.now() - new Date(user.created_at)) / 86400000);
-
-    // Trust Score: weighted formula (max 100)
-    const recScore   = recoveryRate * 0.40;
-    const volScore   = Math.min(totalInvoices, 100) / 100 * 100 * 0.20;
-    const ageScore   = Math.min(memberDays, 365) / 365 * 100 * 0.20;
-    const callScore  = Math.min((callLogs || []).length, 50) / 50 * 100 * 0.20;
-    const trustScore = Math.round(recScore + volScore + ageScore + callScore);
-
-    // Vantro ID: VAN- + first 8 chars of userId
-    const vantroId = 'VAN-' + userId.replace(/-/g, '').slice(0, 8).toUpperCase();
-
-    // Badges
-    const badges = [];
-    if (totalInvoices >= 10) badges.push('Active Business');
-    if (recoveryRate >= 60)  badges.push('Strong Collector');
-    if (memberDays  >= 30)   badges.push('Verified Member');
-    if (user.gstin)          badges.push('GST Registered');
-    if (trustScore  >= 70)   badges.push('Trusted Partner');
-
-    res.json({
-      success: true,
-      profile: {
-        vantro_id:       vantroId,
-        business_name:   user.business_name,
-        member_since:    user.created_at,
-        plan:            user.plan,
-        trust_score:     trustScore,
-        recovery_rate:   recoveryRate,
-        total_customers: totalCustomers,
-        total_managed:   totalManaged,
-        total_invoices:  totalInvoices,
-        member_days:     memberDays,
-        badges,
       }
     });
   } catch (error) {
@@ -11941,59 +11790,6 @@ cron.schedule('30 12 * * 0', async () => {
 }, { timezone: 'UTC' });
 
 // ============================================
-// PAYMENT PLANS / EMI SPLITS
-// ============================================
-
-app.get('/api/payment-plans', authMiddleware, async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('payment_plans').select('*').eq('user_id', req.user.userId).order('created_at', { ascending: false });
-    if (error) throw error;
-    res.json({ success: true, plans: data || [] });
-  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
-});
-
-app.post('/api/payment-plans', authMiddleware, async (req, res) => {
-  try {
-    const { invoice_id, customer_name, customer_phone, total_amount, installments, notes } = req.body;
-    if (!customer_name || !total_amount || !installments?.length) return res.status(400).json({ error: 'customer_name, total_amount, installments required' });
-    const { data, error } = await supabase.from('payment_plans').insert([{
-      user_id: req.user.userId, invoice_id: invoice_id || null, customer_name,
-      customer_phone: customer_phone || null, total_amount: parseFloat(total_amount),
-      installments, status: 'active', notes: notes || null, created_at: new Date(),
-    }]).select().single();
-    if (error) throw error;
-    if (customer_phone && installments[0]) {
-      const msg = customer_name + ' ji, payment plan set ho gaya. Pehli installment: Rs.' + Number(installments[0].amount).toLocaleString('en-IN') + ' - due: ' + installments[0].due_date;
-      await sendWhatsAppMessage(customer_phone, msg);
-    }
-    res.json({ success: true, plan: data });
-  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
-});
-
-app.patch('/api/payment-plans/:id/installment', authMiddleware, async (req, res) => {
-  try {
-    const { installment_index, paid_at } = req.body;
-    const { data: plan } = await supabase.from('payment_plans').select('*').eq('id', req.params.id).eq('user_id', req.user.userId).single();
-    if (!plan) return res.status(404).json({ error: 'Plan not found' });
-    const installments = plan.installments || [];
-    if (installment_index >= installments.length) return res.status(400).json({ error: 'Invalid installment index' });
-    installments[installment_index].paid = true;
-    installments[installment_index].paid_at = paid_at || new Date().toISOString();
-    const allPaid = installments.every(i => i.paid);
-    const { data, error } = await supabase.from('payment_plans').update({ installments, status: allPaid ? 'completed' : 'active', updated_at: new Date() }).eq('id', req.params.id).eq('user_id', req.user.userId).select().single();
-    if (error) throw error;
-    res.json({ success: true, plan: data });
-  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
-});
-
-app.delete('/api/payment-plans/:id', authMiddleware, async (req, res) => {
-  try {
-    await supabase.from('payment_plans').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
-    res.json({ success: true });
-  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
-});
-
-// ============================================
 // DISPUTE MANAGEMENT
 // ============================================
 
@@ -12040,73 +11836,6 @@ app.delete('/api/disputes/:id', authMiddleware, async (req, res) => {
   try {
     await supabase.from('disputes').delete().eq('id', req.params.id).eq('user_id', req.user.userId);
     res.json({ success: true });
-  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
-});
-
-// ============================================
-// CA PARTNER PORTAL
-// ============================================
-
-app.post('/api/ca-partners/register', authMiddleware, async (req, res) => {
-  try {
-    const { firm_name, license_no, city, specialization } = req.body;
-    if (!firm_name) return res.status(400).json({ error: 'firm_name required' });
-    const referral_code = 'CA' + req.user.userId.replace(/-/g, '').substring(0, 8).toUpperCase();
-    const { data, error } = await supabase.from('ca_partners').upsert([{
-      ca_user_id: req.user.userId, firm_name, license_no: license_no || null,
-      city: city || null, specialization: specialization || null,
-      referral_code, status: 'active', created_at: new Date(),
-    }], { onConflict: 'ca_user_id' }).select().single();
-    if (error) throw error;
-    res.json({ success: true, partner: data, referral_code });
-  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
-});
-
-app.get('/api/ca-partners/dashboard', authMiddleware, async (req, res) => {
-  try {
-    const { data: caData } = await supabase.from('ca_partners').select('*').eq('ca_user_id', req.user.userId).single();
-    if (!caData) return res.status(404).json({ error: 'Not a CA partner. Register first.' });
-    const { count: clientCount } = await supabase.from('users').select('id', { count: 'exact', head: true }).eq('referred_by', req.user.userId);
-    const { count: paidCount } = await supabase.from('users').select('id', { count: 'exact', head: true }).eq('referred_by', req.user.userId).neq('plan', 'free');
-    const monthlyCommission = (paidCount || 0) * 300;
-    res.json({ success: true, ca: caData, stats: { total_clients: clientCount || 0, paid_clients: paidCount || 0, monthly_commission: monthlyCommission, referral_code: caData.referral_code } });
-  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
-});
-
-app.get('/api/ca-partners/clients', authMiddleware, async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('users').select('id, business_name, phone, plan, industry, created_at').eq('referred_by', req.user.userId).order('created_at', { ascending: false });
-    if (error) throw error;
-    res.json({ success: true, clients: data || [] });
-  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
-});
-
-// ============================================
-// REFERRAL REWARD SYSTEM
-// ============================================
-
-app.get('/api/referrals/my-stats', authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const { count: totalReferrals } = await supabase.from('users').select('id', { count: 'exact', head: true }).eq('referred_by', userId);
-    const { count: paidReferrals } = await supabase.from('users').select('id', { count: 'exact', head: true }).eq('referred_by', userId).neq('plan', 'free');
-    const { data: rewards } = await supabase.from('referral_rewards').select('*').eq('referrer_id', userId).order('created_at', { ascending: false });
-    const freeMonthsEarned = (rewards || []).filter(r => r.type === 'free_month').length;
-    const referralCode = 'VF' + userId.replace(/-/g, '').substring(0, 8).toUpperCase();
-    res.json({ success: true, stats: { total_referrals: totalReferrals || 0, paid_referrals: paidReferrals || 0, free_months_earned: freeMonthsEarned, referral_code: referralCode, referral_link: 'https://vantroflow.app/signup?ref=' + referralCode, rewards: rewards || [] } });
-  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
-});
-
-app.post('/api/referrals/claim-reward', authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const { count: paidReferrals } = await supabase.from('users').select('id', { count: 'exact', head: true }).eq('referred_by', userId).neq('plan', 'free');
-    const { count: claimedRewards } = await supabase.from('referral_rewards').select('id', { count: 'exact', head: true }).eq('referrer_id', userId).eq('type', 'free_month');
-    const newRewards = (paidReferrals || 0) - (claimedRewards || 0);
-    if (newRewards <= 0) return res.json({ success: false, message: 'No new rewards. Refer more paying customers!' });
-    const rewardRows = Array.from({ length: newRewards }, () => ({ referrer_id: userId, type: 'free_month', value: 1, status: 'granted', created_at: new Date() }));
-    await supabase.from('referral_rewards').insert(rewardRows);
-    res.json({ success: true, rewards_granted: newRewards, message: newRewards + ' free month(s) added!' });
   } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
