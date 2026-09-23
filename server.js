@@ -12676,22 +12676,51 @@ app.patch('/api/ai-actions/:id', authMiddleware, async (req, res) => {
 
     // Idempotency (Control Approvals, Priority 5): approve/reject are decisions,
     // made exactly once. Re-deciding an already-decided action is a 409, never a
-    // silent double-write or a duplicate audit_logs row — the approve-and-execute
-    // route above uses the same "decision is final" principle via its atomic
-    // compare-and-swap; this route isn't racy the same way (no execution side
-    // effect), so a plain status check here is sufficient.
+    // silent double-write or a duplicate audit_logs row.
+    //
+    // Reconciliation fix: this used to be a plain SELECT-then-UPDATE with no
+    // status guard on the UPDATE itself — two concurrent requests (e.g. a
+    // double-click) could both read status='pending' before either UPDATE
+    // committed, both pass the 409 check, and both go on to write (last
+    // write wins, plus a duplicate audit_logs row). The approve-and-execute
+    // route below already fixed this exact bug class with an atomic
+    // `WHERE status='pending'` compare-and-swap inside the UPDATE; this
+    // route now does the same for approved/rejected decisions.
     const decidedStatuses = ['approved', 'rejected'];
     if (decidedStatuses.includes(status) && decidedStatuses.includes(existing.status)) {
       return res.status(409).json({ error: `Action already decided (status=${existing.status})`, status: existing.status });
     }
 
-    const updates = { status, updated_at: new Date().toISOString() };
-    if (status === 'approved') { updates.approved_by = userId; updates.approved_at = new Date().toISOString(); }
-    if (status === 'done') updates.completed_at = new Date().toISOString();
-    const { data, error } = await supabase
-      .from('ai_actions').update(updates).eq('id', id).eq('user_id', userId).select().single();
-    if (error) throw error;
-    if (!data) return res.status(404).json({ error: 'Action not found' });
+    let data;
+    if (decidedStatuses.includes(status)) {
+      const { getPool } = require('./lib/db/pg');
+      const pool = getPool();
+      const approvedBy = status === 'approved' ? userId : null;
+      const approvedAt = status === 'approved' ? new Date().toISOString() : null;
+      const casRes = await pool.query(
+        `UPDATE ai_actions
+         SET status = $1, approved_by = COALESCE($2, approved_by), approved_at = COALESCE($3, approved_at), updated_at = NOW()
+         WHERE id = $4 AND user_id = $5 AND status = 'pending'
+         RETURNING *`,
+        [status, approvedBy, approvedAt, id, userId]
+      );
+      if (casRes.rows.length === 0) {
+        // Lost the race (or the row moved on) between our SELECT and here —
+        // re-read to report the true current status, same 409 contract as above.
+        const { data: reread } = await supabase
+          .from('ai_actions').select('status').eq('id', id).eq('user_id', userId).single();
+        return res.status(409).json({ error: `Action already decided (status=${reread?.status || 'unknown'})`, status: reread?.status });
+      }
+      data = casRes.rows[0];
+    } else {
+      const updates = { status, updated_at: new Date().toISOString() };
+      if (status === 'done') updates.completed_at = new Date().toISOString();
+      const { data: updated, error } = await supabase
+        .from('ai_actions').update(updates).eq('id', id).eq('user_id', userId).select().single();
+      if (error) throw error;
+      if (!updated) return res.status(404).json({ error: 'Action not found' });
+      data = updated;
+    }
 
     if (decidedStatuses.includes(status)) {
       const auditService = require('./lib/services/orchestrator/audit.service');
