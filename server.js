@@ -1910,21 +1910,14 @@ app.post('/api/import/excel', authMiddleware, upload.single('file'), async (req,
 });
 
 // Quick manual add — add a single customer/invoice
-// Tally connector ingestion — all voucher types, idempotent. Flag-gated OFF by default.
-app.post('/api/import/tally', authMiddleware, async (req, res) => {
-  try {
-    if (!isFeatureEnabled('tally_import_enabled')) {
-      return res.status(403).json({ error: 'Tally import is not enabled. Set FEATURE_TALLY_IMPORT_ENABLED=true.' });
-    }
-    const { importTallyVouchers } = require('./lib/services/tallyImport.service');
-    const result = await importTallyVouchers(supabase, req.user.userId, req.body?.vouchers);
-    if (result.error) return res.status(result.status || 400).json({ error: result.error });
-    res.json(result);
-  } catch (err) {
-    console.error('Tally import error:', err);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
+// NOTE: the real /api/import/tally route (connector-authenticated, via
+// connectorOrUserAuth) lives further down this file next to the device
+// enrollment routes. It used to be shadowed by an older, JWT-only,
+// feature-flag-gated duplicate registered here — since Express dispatches
+// to the FIRST matching route, that duplicate silently ate every request
+// and made the real, connectorOrUserAuth-protected handler dead code (any
+// VantroDevice-authenticated connector request 401'd here instead of ever
+// reaching it). Removed 2026-09-23 so the real handler is reachable.
 
 app.post('/api/import/manual', authMiddleware, async (req, res) => {
   try {
@@ -5726,22 +5719,29 @@ app.post('/api/import/tally', connectorOrUserAuth, async (req, res) => {
     if (!Array.isArray(vouchers)) return res.status(400).json({ error: 'vouchers must be an array' });
     if (vouchers.length > 5000) return res.status(400).json({ error: 'too many vouchers in one request (max 5000)' });
 
-    const { validateTallyBatch } = require('./lib/domain/ingestion/tallyBatchContract');
-    const validation = validateTallyBatch(vouchers, {
-      requireStableIdentity: process.env.TALLY_REQUIRE_STABLE_IDENTITIES === 'true',
-    });
-    if (!validation.ok) return res.status(400).json({ error: validation.error });
-
-    const { commitTallyVouchers } = require('./lib/domain/ingestion/adapters/tallyCommit');
-    const result = await commitTallyVouchers(vouchers, { userId, sourceQuality: 'REAL' });
+    // NOTE: this used to require './lib/domain/ingestion/tallyBatchContract'
+    // and './lib/domain/ingestion/adapters/tallyCommit' — neither module
+    // exists in this repo (MODULE_NOT_FOUND on every real request, so this
+    // route always 500'd once it actually became reachable — see the
+    // removed-duplicate-route note near /api/import/manual above). The real,
+    // already-built, idempotent multi-voucher-type writer is
+    // lib/services/tallyImport.service.js (Sales->invoices,
+    // Purchase->purchases, Receipt/Payment->bank_transactions, items->
+    // products/stock_movements) — it's what the OLD duplicate route used to
+    // call under JWT-only auth. Wired in here instead so connector-device
+    // requests (VantroDevice auth) actually get a working importer.
+    const { importTallyVouchers } = require('./lib/services/tallyImport.service');
+    const result = await importTallyVouchers(supabase, userId, vouchers);
+    if (result.error) return res.status(result.status || 400).json({ error: result.error });
 
     const { upsertConnectionStatus } = require('./lib/domain/ingestion/connections');
-    await upsertConnectionStatus(userId, 'TALLY', result.errored > 0 && result.imported === 0 ? 'ERROR' : 'CONNECTED', {
+    const erroredAll = result.rejected?.length > 0 && Object.values(result.imported || {}).every((n) => n === 0);
+    await upsertConnectionStatus(userId, 'TALLY', erroredAll ? 'ERROR' : 'CONNECTED', {
       lastSyncAt: new Date(),
-      lastSyncError: result.errored > 0 ? `${result.errored} voucher(s) failed to import` : null,
+      lastSyncError: result.rejected?.length ? `${result.rejected.length} voucher(s) rejected` : null,
     }).catch((err) => console.error('[import/tally] connection status update failed', err));
 
-    res.json({ success: true, result });
+    res.json(result);
   } catch (error) {
     console.error('[import/tally]', error);
     res.status(500).json({ error: 'Internal server error' });

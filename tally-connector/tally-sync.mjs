@@ -11,10 +11,27 @@
  * Zero dependencies — plain Node.js (v18+).
  *
  * Usage:
+ *   node tally-sync.mjs --enroll <code>   # one-time: claim an enrollment code from the
+ *                                         # "Connect Tally" button, store a device
+ *                                         # credential in .vantro-device-credentials.json,
+ *                                         # then run one sync
  *   node tally-sync.mjs --test      # offline: parse sample-daybook.xml, print payload (no Tally, no internet)
  *   node tally-sync.mjs --dry-run   # pull from Tally + parse, but DON'T send (print what would be sent)
- *   node tally-sync.mjs             # full sync: Tally -> Starlane, once
+ *   node tally-sync.mjs             # full sync: Tally -> Starlane, once (uses stored device
+ *                                   # credential if present, else falls back to
+ *                                   # starlane.email/password or starlane.token in config.json)
  *   node tally-sync.mjs --watch     # full sync on a loop every config.intervalMinutes
+ *
+ * Auth: the preferred path is `--enroll <code>` once, which claims a device
+ * credential (deviceId + deviceSecret) via POST /api/connectors/tally/claim
+ * and stores it locally in .vantro-device-credentials.json (gitignored,
+ * next to this script). Every subsequent run reuses that credential and
+ * authenticates as `Authorization: VantroDevice <deviceId>.<deviceSecret>`.
+ * The old email+password / static-token config (starlane.email/password/
+ * token in config.json) still works as a fallback for anyone already
+ * relying on it, but is no longer the recommended path — a device
+ * credential doesn't require storing your Starlane account password on
+ * the shop PC.
  */
 
 import http from 'node:http';
@@ -24,8 +41,12 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const args = new Set(process.argv.slice(2));
+const argv = process.argv.slice(2);
+const args = new Set(argv);
 const MODE = args.has('--test') ? 'test' : args.has('--dry-run') ? 'dry-run' : args.has('--watch') ? 'watch' : 'once';
+const enrollIndex = argv.indexOf('--enroll');
+const ENROLLMENT_CODE = enrollIndex >= 0 ? argv[enrollIndex + 1] : null;
+const CREDENTIALS_PATH = join(HERE, '.vantro-device-credentials.json');
 
 // ---------------------------------------------------------------------------
 // Config
@@ -214,11 +235,11 @@ function toApiVouchers(vouchers, wantedTypes) {
 // ---------------------------------------------------------------------------
 // Starlane API
 // ---------------------------------------------------------------------------
-function apiRequest(apiBase, path, { method = 'GET', token, json } = {}) {
+function apiRequest(apiBase, path, { method = 'GET', authHeader, json } = {}) {
   const url = new URL(path, apiBase.replace(/\/+$/, '') + '/');
   const lib = url.protocol === 'https:' ? https : http;
   let body, headers = { accept: 'application/json' };
-  if (token) headers.authorization = `Bearer ${token}`;
+  if (authHeader) headers.authorization = authHeader;
   if (json) { body = Buffer.from(JSON.stringify(json)); headers['content-type'] = 'application/json'; headers['content-length'] = body.length; }
   return new Promise((resolve, reject) => {
     const req = lib.request(url, { method, headers, timeout: 60000 }, (res) => {
@@ -237,16 +258,47 @@ function apiRequest(apiBase, path, { method = 'GET', token, json } = {}) {
   });
 }
 
-async function getToken(cfg) {
-  if (cfg.starlane.token) return cfg.starlane.token;
-  if (!cfg.starlane.email || !cfg.starlane.password) throw new Error('Set starlane.email + starlane.password (or starlane.token) in config.json.');
-  const r = await apiRequest(cfg.starlane.apiBase, '/api/auth/login', { method: 'POST', json: { email: cfg.starlane.email, password: cfg.starlane.password } });
-  if (r.status !== 200 || !r.body?.token) throw new Error(`Login failed (${r.status}): ${r.body?.error || JSON.stringify(r.body)}`);
-  return r.body.token;
+// ---------------------------------------------------------------------------
+// Device-credential enrollment (preferred auth path)
+// ---------------------------------------------------------------------------
+function loadDeviceCredentials() {
+  if (!existsSync(CREDENTIALS_PATH)) return null;
+  try {
+    const { deviceId, deviceSecret } = JSON.parse(readFileSync(CREDENTIALS_PATH, 'utf-8'));
+    if (!deviceId || !deviceSecret) return null;
+    return { deviceId, deviceSecret };
+  } catch {
+    return null;
+  }
 }
 
-async function pushToStarlane(cfg, rows, token) {
-  const r = await apiRequest(cfg.starlane.apiBase, '/api/import/tally', { method: 'POST', token, json: { vouchers: rows } });
+async function claimEnrollment(apiBase, enrollmentCode) {
+  const r = await apiRequest(apiBase, '/api/connectors/tally/claim', {
+    method: 'POST',
+    json: { enrollmentCode, deviceName: process.env.COMPUTERNAME || process.env.HOSTNAME || 'Tally connector script' },
+  });
+  if (r.status !== 201 || !r.body?.deviceId) throw new Error(`Enrollment claim failed (${r.status}): ${r.body?.error || JSON.stringify(r.body)}`);
+  return { deviceId: r.body.deviceId, deviceSecret: r.body.deviceSecret };
+}
+
+/** Resolve an Authorization header, preferring a stored device credential over
+ * email/password or a static token — a device credential never puts the
+ * Starlane account password on the shop PC and can be revoked per-device
+ * from Settings without touching the account login. */
+async function getAuthHeader(cfg) {
+  const device = loadDeviceCredentials();
+  if (device) return `VantroDevice ${device.deviceId}.${device.deviceSecret}`;
+  if (cfg.starlane.token) return `Bearer ${cfg.starlane.token}`;
+  if (!cfg.starlane.email || !cfg.starlane.password) {
+    throw new Error('Not paired. Run `node tally-sync.mjs --enroll <code>` with the code from the "Connect Tally" button (or set starlane.email + starlane.password / starlane.token in config.json as a fallback).');
+  }
+  const r = await apiRequest(cfg.starlane.apiBase, '/api/auth/login', { method: 'POST', json: { email: cfg.starlane.email, password: cfg.starlane.password } });
+  if (r.status !== 200 || !r.body?.token) throw new Error(`Login failed (${r.status}): ${r.body?.error || JSON.stringify(r.body)}`);
+  return `Bearer ${r.body.token}`;
+}
+
+async function pushToStarlane(cfg, rows, authHeader) {
+  const r = await apiRequest(cfg.starlane.apiBase, '/api/import/tally', { method: 'POST', authHeader, json: { vouchers: rows } });
   if (r.status !== 200) throw new Error(`Import failed (${r.status}): ${r.body?.error || JSON.stringify(r.body)}`);
   return r.body;
 }
@@ -289,20 +341,33 @@ async function runOnce(cfg) {
     return;
   }
 
-  process.stdout.write('🔑 Logging in to Starlane ... ');
-  const token = await getToken(cfg);
+  process.stdout.write('🔑 Authenticating with Starlane ... ');
+  const authHeader = await getAuthHeader(cfg);
   console.log('ok.');
   process.stdout.write(`⬆️  Sending ${rows.length} vouchers to Starlane ... `);
-  const res = await pushToStarlane(cfg, rows, token);
+  const res = await pushToStarlane(cfg, rows, authHeader);
   console.log('done.');
   console.log(`\n✅ ${res.message || JSON.stringify(res.imported)}`);
   try { writeFileSync(join(HERE, 'state.json'), JSON.stringify({ lastSync: new Date().toISOString(), result: res.imported }, null, 2)); } catch {}
 }
 
+async function enroll(cfg) {
+  if (!ENROLLMENT_CODE) throw new Error('Usage: node tally-sync.mjs --enroll <code>');
+  process.stdout.write(`🔗 Claiming enrollment code against ${cfg.starlane.apiBase} ... `);
+  const { deviceId, deviceSecret } = await claimEnrollment(cfg.starlane.apiBase, ENROLLMENT_CODE);
+  writeFileSync(CREDENTIALS_PATH, JSON.stringify({ deviceId, deviceSecret, pairedAt: new Date().toISOString() }, null, 2));
+  console.log('done.');
+  console.log(`✅ Paired. Device credential stored in ${CREDENTIALS_PATH} — this machine can now sync without your Starlane password.`);
+}
+
 async function main() {
   const cfg = loadConfig();
-  console.log(`\n★ Starlane Tally Connector v2 — mode: ${MODE}\n`);
+  console.log(`\n★ Starlane Tally Connector v2 — mode: ${MODE}${ENROLLMENT_CODE ? ' (enrolling)' : ''}\n`);
   try {
+    if (ENROLLMENT_CODE) {
+      await enroll(cfg);
+      if (MODE === 'test' || MODE === 'dry-run') return;
+    }
     if (MODE === 'watch') {
       const everyMs = Math.max(1, cfg.intervalMinutes) * 60000;
       const loop = async () => {
