@@ -1282,10 +1282,23 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     if (!decoded.preVerify) return res.status(400).json({ error: 'Invalid pre-verification token' });
 
     const { otp } = req.body;
-    if (!otp) return res.status(400).json({ error: 'OTP required' });
 
-    const result = verifyOTP(decoded.userId, String(otp).trim());
-    if (!result.valid) return res.status(400).json({ error: result.reason });
+    // ── TEMPORARY TESTING BYPASS ─────────────────────────────────────────────
+    // OTP_VERIFICATION_DISABLED=true skips the actual OTP check below so the
+    // team can test signup without working WhatsApp/email delivery. This does
+    // NOT touch OTP generation/sending, account creation, password hashing, or
+    // JWT issuance — those all still run normally. Default/unset = normal
+    // OTP-required behavior. Flip back off by unsetting the var or setting it
+    // to 'false'. This is reversible and NOT a permanent security change.
+    const otpBypassed = process.env.OTP_VERIFICATION_DISABLED === 'true';
+    if (otpBypassed) {
+      console.warn(`[OTP BYPASS] OTP_VERIFICATION_DISABLED=true — skipping OTP check for userId=${decoded.userId}. This is a TEMPORARY testing bypass, not a permanent change.`);
+      otpStore.delete(decoded.userId);
+    } else {
+      if (!otp) return res.status(400).json({ error: 'OTP required' });
+      const result = verifyOTP(decoded.userId, String(otp).trim());
+      if (!result.valid) return res.status(400).json({ error: result.reason });
+    }
 
     // Mark verified in DB (columns added gracefully — silently ignored if columns don't exist yet)
     await supabase.from('users').update({ phone_verified: true, email_verified: true }).eq('id', decoded.userId).catch(() => {});
@@ -14688,6 +14701,9 @@ app.listen(PORT, () => {
   const { isEnabled: _isFE } = require('./lib/featureFlags');
   const _worldEnabled = _isFE('world_intelligence_enabled');
   console.log(`🌍 World intelligence: ${_worldEnabled ? 'ENABLED' : 'DISABLED'} (USGS ${_worldEnabled ? 'enabled' : 'disabled'}, FX ${_worldEnabled ? 'enabled' : 'disabled'}, scheduler ${_worldEnabled ? 'enabled' : 'disabled'})`);
+  if (process.env.OTP_VERIFICATION_DISABLED === 'true') {
+    console.warn('⚠️  OTP_VERIFICATION_DISABLED=true — OTP verification is BYPASSED for signup. TEMPORARY testing mode only. Unset this var or set it to false to restore normal OTP-required behavior.');
+  }
   runAutoMigrations();
 });
 
