@@ -11,6 +11,7 @@
     "db:migrate": "node scripts/migrate.js",
     "db:migrate:status": "node scripts/migrate.js --status",
     "db:preflight": "node scripts/db-preflight.js",
+    "env:check": "node scripts/check-production-env.js",
     "db:baseline": "node scripts/db-baseline.js",
     "verify:connection": "node scripts/verify-connection.js",
     "setup:database": "node scripts/setup-fresh-database.js",

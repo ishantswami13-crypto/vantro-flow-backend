@@ -1332,7 +1332,10 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     // JWT issuance — those all still run normally. Default/unset = normal
     // OTP-required behavior. Flip back off by unsetting the var or setting it
     // to 'false'. This is reversible and NOT a permanent security change.
-    const otpBypassed = process.env.OTP_VERIFICATION_DISABLED === 'true';
+    // Never honoured on the production deployment (lib/config/deployEnv.js):
+    // a forgotten flag there would let anyone sign up without verification.
+    const otpBypassed = process.env.OTP_VERIFICATION_DISABLED === 'true'
+      && !require('./lib/config/deployEnv').isProductionDeployment();
     if (otpBypassed) {
       console.warn(`[OTP BYPASS] OTP_VERIFICATION_DISABLED=true — skipping OTP check for userId=${decoded.userId}. This is a TEMPORARY testing bypass, not a permanent change.`);
       otpStore.delete(decoded.userId);
@@ -14596,7 +14599,9 @@ app.listen(PORT, () => {
   const { isEnabled: _isFE } = require('./lib/featureFlags');
   const _worldEnabled = _isFE('world_intelligence_enabled');
   console.log(`🌍 World intelligence: ${_worldEnabled ? 'ENABLED' : 'DISABLED'} (USGS ${_worldEnabled ? 'enabled' : 'disabled'}, FX ${_worldEnabled ? 'enabled' : 'disabled'}, scheduler ${_worldEnabled ? 'enabled' : 'disabled'})`);
-  if (process.env.OTP_VERIFICATION_DISABLED === 'true') {
+  if (process.env.OTP_VERIFICATION_DISABLED === 'true' && require('./lib/config/deployEnv').isProductionDeployment()) {
+    console.error('[SECURITY] OTP_VERIFICATION_DISABLED=true is IGNORED on the production deployment — OTP verification stays on. Unset the variable.');
+  } else if (process.env.OTP_VERIFICATION_DISABLED === 'true') {
     console.warn('⚠️  OTP_VERIFICATION_DISABLED=true — OTP verification is BYPASSED for signup. TEMPORARY testing mode only. Unset this var or set it to false to restore normal OTP-required behavior.');
   }
   runAutoMigrations();
