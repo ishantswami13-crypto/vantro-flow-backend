@@ -386,12 +386,13 @@ const corsOptions = {
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Authorization", "Content-Type", "X-CSRF-Token", "X-Request-ID"],
+  // X-Access-Token: access-flow status/entitlement tokens (lib/routes/access.js).
+  allowedHeaders: ["Authorization", "Content-Type", "X-CSRF-Token", "X-Request-ID", "X-Access-Token"],
   // Lets the frontend read the X-CSRF-Token response header (set below in
   // authMiddleware) across origins — without this, a custom response header
   // is invisible to cross-origin fetch() even though the browser received
   // it, which is what silently broke the self-heal below the first time.
-  exposedHeaders: ["X-CSRF-Token"]
+  exposedHeaders: ["X-CSRF-Token", "X-Content-SHA256", "Content-Disposition"]
 };
 
 // Same-origin requests (the backend's own server-rendered pages, e.g. the

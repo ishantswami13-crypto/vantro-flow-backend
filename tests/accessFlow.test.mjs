@@ -65,6 +65,11 @@ async function main() {
     check('duplicate email (case-insensitive) -> 202, no token, nothing new stored',
       dup.status === 202 && !dupBody.statusToken && (await pool.query('SELECT COUNT(*)::int c FROM access_applications WHERE lower(email) = $1', [applicantEmail])).rows[0].c === 1);
 
+    console.log('— CORS (browser preflight from the frontend origin)');
+    const pre = await fetch(`${base}/api/access/status`, { method: 'OPTIONS', headers: {
+      Origin: 'http://localhost:3000', 'Access-Control-Request-Method': 'GET', 'Access-Control-Request-Headers': 'x-access-token' } });
+    check('preflight allows the X-Access-Token header', /x-access-token/i.test(pre.headers.get('access-control-allow-headers') || ''), pre.headers.get('access-control-allow-headers'));
+
     console.log('— status');
     const st = await fetch(`${base}/api/access/status`, { headers: { 'X-Access-Token': body.statusToken } });
     const stBody = await st.json();
