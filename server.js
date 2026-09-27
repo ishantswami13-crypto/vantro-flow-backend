@@ -1963,14 +1963,9 @@ app.post('/api/import/excel', authMiddleware, upload.single('file'), async (req,
 });
 
 // Quick manual add — add a single customer/invoice
-// NOTE: the real /api/import/tally route (connector-authenticated, via
-// connectorOrUserAuth) lives further down this file next to the device
-// enrollment routes. It used to be shadowed by an older, JWT-only,
-// feature-flag-gated duplicate registered here — since Express dispatches
-// to the FIRST matching route, that duplicate silently ate every request
-// and made the real, connectorOrUserAuth-protected handler dead code (any
-// VantroDevice-authenticated connector request 401'd here instead of ever
-// reaching it). Removed 2026-09-23 so the real handler is reachable.
+// NOTE: /api/import/tally lives in lib/routes/tallyConnector.js. An older
+// JWT-only duplicate registered here used to shadow it (Express dispatches to
+// the first matching route); removed 2026-09-23.
 
 app.post('/api/import/manual', authMiddleware, async (req, res) => {
   try {
@@ -5545,82 +5540,12 @@ Rules: numbers only, no currency symbols or commas. Dates must be YYYY-MM-DD.`;
   }
 });
 
-// --- Local connector enrollment and device authentication -------------------
-// Re-enabled 2026-09-22: lib/domain/ingestion/deviceEnrollment.js and the
-// connector_devices/connector_enrollments schema (migrations/047_connector_devices.sql)
-// now exist for real (bcrypt-hashed device secrets, TTL'd claim-once
-// enrollment codes). See that migration file for the full design rationale.
-const { createEnrollment, claimEnrollment, authenticateDevice, listDevices, revokeDevice } = require('./lib/domain/ingestion/deviceEnrollment');
-const connectorClaimLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false });
+// --- Local connector (Tally bridge / desktop connector host) routes ---------
+// Pairing, device tokens, sync runs, heartbeat and /api/import/tally live in
+// lib/routes/tallyConnector.js.
+const { tallyConnectorRouter } = require('./lib/routes/tallyConnector');
+app.use('/api', tallyConnectorRouter({ pool: getPool(), supabase, authMiddleware }));
 
-function connectorOrUserAuth(req, res, next) {
-  const header = String(req.headers.authorization || '');
-  const match = header.match(/^VantroDevice\s+([0-9a-f-]{36})\.([A-Za-z0-9_-]{32,})$/i);
-  if (match) {
-    const [, deviceId, secret] = match;
-    authenticateDevice(deviceId, secret)
-      .then((device) => {
-        if (!device) return res.status(401).json({ error: 'Invalid or revoked device credential' });
-        req.user = { userId: device.userId };
-        req.connectorDevice = device;
-        next();
-      })
-      .catch((error) => {
-        console.error('[connector device auth]', error);
-        res.status(503).json({ error: 'Unable to authenticate connector device' });
-      });
-    return;
-  }
-  return authMiddleware(req, res, next);
-}
-
-app.post('/api/connectors/tally/enrollment', authMiddleware, async (req, res) => {
-  try {
-    const enrollment = await createEnrollment(req.user.userId);
-    res.status(201).json({ success: true, enrollmentCode: enrollment.enrollmentCode, expiresAt: enrollment.expiresAt });
-  } catch (error) {
-    console.error('[connector enrollment]', error);
-    res.status(503).json({ error: 'Unable to create connector enrollment' });
-  }
-});
-
-app.post('/api/connectors/tally/claim', connectorClaimLimiter, async (req, res) => {
-  try {
-    const { enrollmentCode, deviceName } = req.body || {};
-    const device = await claimEnrollment(enrollmentCode, deviceName);
-    res.status(201).json({ success: true, deviceId: device.deviceId, deviceSecret: device.deviceSecret, apiBase: `${req.protocol}://${req.get('host')}` });
-  } catch (error) {
-    const message = String(error.message || '');
-    const safe = /Enrollment|device name/i.test(message) ? message : 'Unable to claim connector enrollment';
-    res.status(400).json({ error: safe });
-  }
-});
-
-// Self-service visibility + kill switch for connector devices — a device
-// secret has no expiry (see deviceEnrollment.js), so this list+revoke pair
-// is the only way a tenant can see what's connected or shut one off without
-// a direct DB edit. Always authMiddleware (a device credential must never
-// be able to list or revoke devices, including itself).
-app.get('/api/connectors/tally/devices', authMiddleware, async (req, res) => {
-  try {
-    const devices = await listDevices(req.user.userId);
-    res.json({ success: true, devices });
-  } catch (error) {
-    console.error('[connector devices list]', error);
-    res.status(503).json({ error: 'Unable to list connector devices' });
-  }
-});
-
-app.post('/api/connectors/tally/devices/:deviceId/revoke', authMiddleware, async (req, res) => {
-  try {
-    const revoked = await revokeDevice(req.user.userId, req.params.deviceId);
-    if (!revoked) return res.status(404).json({ error: 'Device not found or already revoked' });
-    res.json({ success: true });
-  } catch (error) {
-    console.error('[connector device revoke]', error);
-    res.status(503).json({ error: 'Unable to revoke connector device' });
-  }
-});
 // --- Audit (read-only; audit_logs is written by lib/services/orchestrator/
 // audit.service.js on every financial change — this is the first read path
 // exposed for it). No new table, no migration needed. -----------------------
@@ -5708,102 +5633,6 @@ app.get('/api/agent-runs', authMiddleware, async (req, res) => {
     res.json({ success: true, runs: data || [] });
   } catch (error) {
     console.error('[agent-runs list]', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// --- Data Connections (Tally / file import / future integrations) ---------
-const {
-  getConnections,
-  upsertConnectionStatus,
-  VALID_SOURCE_TYPES,
-  VALID_STATUSES,
-} = require('./lib/domain/ingestion/connections');
-
-app.get('/api/connections', authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const connections = await getConnections(userId);
-    res.json({ success: true, connections });
-  } catch (error) {
-    console.error('[connections list]', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.post('/api/connections/heartbeat', connectorOrUserAuth, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const { sourceType, status, lastSyncAt, lastSyncError } = req.body || {};
-
-    if (!sourceType || !VALID_SOURCE_TYPES.includes(sourceType)) {
-      return res.status(400).json({ error: `sourceType must be one of ${VALID_SOURCE_TYPES.join(', ')}` });
-    }
-    if (!status || !VALID_STATUSES.includes(status)) {
-      return res.status(400).json({ error: `status must be one of ${VALID_STATUSES.join(', ')}` });
-    }
-
-    const { authorizeHeartbeat } = require('./lib/domain/ingestion/connections');
-    const authz = authorizeHeartbeat({ device: req.connectorDevice || null, sourceType, status });
-    if (!authz.ok) return res.status(authz.status).json({ error: authz.error });
-
-    const connection = await upsertConnectionStatus(userId, sourceType, status, {
-      lastSyncAt: lastSyncAt || new Date(),
-      lastSyncError: lastSyncError ?? null,
-    });
-    res.json({ success: true, connection });
-  } catch (error) {
-    console.error('[connections heartbeat]', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// POST /api/import/tally — accepts already-extracted, already-parsed Tally
-// vouchers (contract: { vouchers: [{ type, date, party, voucherNo, amount,
-// items }] }, date as ISO or Tally's yyyymmdd) from the local Tally
-// connector script (tally-sync.mjs, runs on the shop PC since Tally itself
-// has no public API a hosted backend could reach). Commits via
-// commitTallyVouchers — the same raw_observations/entity-resolution
-// contract csvImport.js uses, not a parallel scheme. sourceQuality is
-// 'REAL' unconditionally: this route only ever receives genuine exports
-// from a live Tally instance, never seeded/demo data.
-app.post('/api/import/tally', connectorOrUserAuth, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const { vouchers } = req.body || {};
-    if (req.connectorDevice && req.connectorDevice.sourceType !== 'TALLY') {
-      return res.status(403).json({ error: `This device is paired for ${req.connectorDevice.sourceType}, not TALLY` });
-    }
-    // Keep an explicit route-level cap as a fast, documented guard before
-    // serializing or opening any database work for a large connector request.
-    if (!Array.isArray(vouchers)) return res.status(400).json({ error: 'vouchers must be an array' });
-    if (vouchers.length > 5000) return res.status(400).json({ error: 'too many vouchers in one request (max 5000)' });
-
-    // NOTE: this used to require './lib/domain/ingestion/tallyBatchContract'
-    // and './lib/domain/ingestion/adapters/tallyCommit' — neither module
-    // exists in this repo (MODULE_NOT_FOUND on every real request, so this
-    // route always 500'd once it actually became reachable — see the
-    // removed-duplicate-route note near /api/import/manual above). The real,
-    // already-built, idempotent multi-voucher-type writer is
-    // lib/services/tallyImport.service.js (Sales->invoices,
-    // Purchase->purchases, Receipt/Payment->bank_transactions, items->
-    // products/stock_movements) — it's what the OLD duplicate route used to
-    // call under JWT-only auth. Wired in here instead so connector-device
-    // requests (VantroDevice auth) actually get a working importer.
-    const { importTallyVouchers } = require('./lib/services/tallyImport.service');
-    const result = await importTallyVouchers(supabase, userId, vouchers);
-    if (result.error) return res.status(result.status || 400).json({ error: result.error });
-
-    const { upsertConnectionStatus } = require('./lib/domain/ingestion/connections');
-    const erroredAll = result.rejected?.length > 0 && Object.values(result.imported || {}).every((n) => n === 0);
-    await upsertConnectionStatus(userId, 'TALLY', erroredAll ? 'ERROR' : 'CONNECTED', {
-      lastSyncAt: new Date(),
-      lastSyncError: result.rejected?.length ? `${result.rejected.length} voucher(s) rejected` : null,
-    }).catch((err) => console.error('[import/tally] connection status update failed', err));
-
-    res.json(result);
-  } catch (error) {
-    console.error('[import/tally]', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
