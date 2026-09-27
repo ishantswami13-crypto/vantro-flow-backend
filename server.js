@@ -394,8 +394,22 @@ const corsOptions = {
   exposedHeaders: ["X-CSRF-Token"]
 };
 
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
+// Same-origin requests (the backend's own server-rendered pages, e.g. the
+// approval-link confirmation form) are not cross-origin and must not be
+// judged by the cross-origin allow-list. Compared by host, which is what the
+// browser put in Origin for a same-origin POST.
+function isSameOriginRequest(req) {
+  const origin = req.headers.origin;
+  if (!origin) return false;
+  try { return new URL(origin).host === req.get('host'); } catch { return false; }
+}
+const corsDelegate = (req, callback) => {
+  if (isSameOriginRequest(req)) return callback(null, { ...corsOptions, origin: true });
+  return callback(null, corsOptions);
+};
+
+app.use(cors(corsDelegate));
+app.options("*", cors(corsDelegate));
 
 // Raw body preservation for Razorpay webhook (must come BEFORE express.json)
 app.use((req, res, next) => {
@@ -5716,6 +5730,10 @@ app.post('/api/connections/heartbeat', connectorOrUserAuth, async (req, res) => 
       return res.status(400).json({ error: `status must be one of ${VALID_STATUSES.join(', ')}` });
     }
 
+    const { authorizeHeartbeat } = require('./lib/domain/ingestion/connections');
+    const authz = authorizeHeartbeat({ device: req.connectorDevice || null, sourceType, status });
+    if (!authz.ok) return res.status(authz.status).json({ error: authz.error });
+
     const connection = await upsertConnectionStatus(userId, sourceType, status, {
       lastSyncAt: lastSyncAt || new Date(),
       lastSyncError: lastSyncError ?? null,
@@ -5740,6 +5758,9 @@ app.post('/api/import/tally', connectorOrUserAuth, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { vouchers } = req.body || {};
+    if (req.connectorDevice && req.connectorDevice.sourceType !== 'TALLY') {
+      return res.status(403).json({ error: `This device is paired for ${req.connectorDevice.sourceType}, not TALLY` });
+    }
     // Keep an explicit route-level cap as a fast, documented guard before
     // serializing or opening any database work for a large connector request.
     if (!Array.isArray(vouchers)) return res.status(400).json({ error: 'vouchers must be an array' });
@@ -11690,36 +11711,99 @@ async function executeCollectionsMessage(userId, action) {
 
 function safeLogFallback(msg, meta) { try { console.log(msg, JSON.stringify(meta)); } catch { console.log(msg); } }
 
-app.get('/api/actions/:id/approve', async (req, res) => {
+// ── One-tap approval links (sent to the owner on WhatsApp) ──────────────────
+// GET never changes state. Link-preview bots (WhatsApp, Slack, mail scanners)
+// fetch every URL they see; when GET used to approve-and-execute, merely
+// sharing or previewing a link could send a supplier PO or a customer
+// reminder. GET now renders a confirmation page describing exactly what will
+// happen; the owner's tap on its button POSTs the same signed token back.
+//
+// The POST claims the action atomically (UPDATE ... WHERE status='pending'),
+// so a double tap or two devices racing execute it at most once, and the
+// terminal state reflects what actually happened (done vs failed) instead of
+// always 'done'.
+function approvalConfirmPage(action, intent, token) {
+  const verb = intent === 'approve' ? 'Approve' : 'Decline';
+  const title = escapeHtml(action.title || 'Pending action');
+  const desc = escapeHtml(action.description || '');
+  const effect = intent === 'approve'
+    ? 'Approving will carry out this action now. Nothing happens until you press the button.'
+    : 'Declining dismisses this suggestion. No action will be taken.';
+  return `<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>${verb}: ${title}</title>
+  <style>body{font-family:-apple-system,system-ui,sans-serif;background:#FAFAF9;color:#0F0E0D;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px;}
+  .card{background:#fff;border:1px solid #E3E2DE;border-radius:12px;padding:28px;max-width:440px;width:100%;}
+  h1{font-size:19px;margin:0 0 10px;line-height:1.35}p{color:#46443F;line-height:1.55;margin:0 0 14px}
+  .k{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:#7A7873;margin-bottom:8px}
+  button{font:inherit;font-weight:600;border:0;border-radius:8px;padding:12px 18px;width:100%;cursor:pointer;background:#0F0E0D;color:#fff}
+  button.secondary{background:#fff;color:#0F0E0D;border:1px solid #D2D0CA}</style></head>
+  <body><main class="card"><div class="k">Starlane · ${verb}</div><h1>${title}</h1>${desc ? `<p>${desc}</p>` : ''}<p>${effect}</p>
+  <form method="post" action="/api/actions/${encodeURIComponent(action.id)}/${intent}">
+  <input type="hidden" name="token" value="${escapeHtml(token)}">
+  <button type="submit" class="${intent === 'approve' ? '' : 'secondary'}">${verb}</button></form></main></body></html>`;
+}
+
+async function renderApprovalConfirm(req, res, intent) {
+  const { verifyActionToken, loadPendingAction } = require('./lib/services/actionApproval.service');
+  res.setHeader('X-Robots-Tag', 'noindex');
+  const token = String(req.query.token || '');
+  if (!verifyActionToken(token, req.params.id, intent)) {
+    return res.status(403).send(approvalResultPage('Link expired or invalid', 'This link is no longer valid. Please check your Action Center for the latest status.', false));
+  }
+  const { ok, action, reason } = await loadPendingAction(req.params.id);
+  if (!ok) {
+    return res.send(approvalResultPage('Nothing to do', reason === 'already_actioned'
+      ? `This was already ${action?.status || 'actioned'} — no changes made.`
+      : 'This action could not be found.'));
+  }
+  res.send(approvalConfirmPage(action, intent, token));
+}
+
+app.get('/api/actions/:id/approve', (req, res) => {
+  renderApprovalConfirm(req, res, 'approve').catch((err) => {
+    console.error('[actions/approve:confirm] Error:', err.message);
+    res.status(500).send(approvalResultPage('Something went wrong', 'Please try again from your Action Center.', false));
+  });
+});
+
+app.get('/api/actions/:id/reject', (req, res) => {
+  renderApprovalConfirm(req, res, 'reject').catch((err) => {
+    console.error('[actions/reject:confirm] Error:', err.message);
+    res.status(500).send(approvalResultPage('Something went wrong', 'Please try again from your Action Center.', false));
+  });
+});
+
+const approvalLinkLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
+
+app.post('/api/actions/:id/approve', approvalLinkLimiter, async (req, res) => {
   try {
-    const { verifyActionToken, loadPendingAction } = require('./lib/services/actionApproval.service');
+    const { verifyActionToken, claimPendingAction } = require('./lib/services/actionApproval.service');
     const actionService = require('./lib/services/orchestrator/action.service');
     const actionId = req.params.id;
-    const token = req.query.token;
-
-    if (!verifyActionToken(token, actionId, 'approve')) {
+    if (!verifyActionToken(req.body?.token, actionId, 'approve')) {
       return res.status(403).send(approvalResultPage('Link expired or invalid', 'This approval link is no longer valid. Please check your Action Center for the latest status.', false));
     }
 
-    const { ok, action, reason } = await loadPendingAction(actionId);
-    if (!ok) {
-      const msg = reason === 'already_actioned'
-        ? `This was already ${action?.status || 'actioned'} — no changes made.`
-        : 'This action could not be found.';
-      return res.send(approvalResultPage('Nothing to do', msg));
+    const claim = await claimPendingAction(actionId, 'approved');
+    if (!claim.ok) {
+      return res.send(approvalResultPage('Nothing to do', claim.reason === 'already_actioned'
+        ? `This was already ${claim.action?.status || 'actioned'} — no changes made.`
+        : 'This action could not be found.'));
     }
-
-    await actionService.updateStatus(action.user_id, actionId, 'approved');
+    const action = claim.action;
 
     let result;
-    if (action.action_type === 'INVENTORY_PO_READY') result = await executeInventoryPO(action.user_id, action);
-    else if (action.action_type === 'PAYABLES_PAYMENT_READY') result = await executePayablesPayment(action.user_id, action);
-    else if (action.action_type === 'ESCALATE_COLLECTION_CALL') result = await executeCollectionCall(action.user_id, action);
-    else if (['SEND_POLITE_REMINDER', 'SEND_FIRM_REMINDER', 'ESCALATE_COLLECTION'].includes(action.action_type)) result = await executeCollectionsMessage(action.user_id, action);
-    else result = { ok: true, message: 'Approved.' };
+    try {
+      if (action.action_type === 'INVENTORY_PO_READY') result = await executeInventoryPO(action.user_id, action);
+      else if (action.action_type === 'PAYABLES_PAYMENT_READY') result = await executePayablesPayment(action.user_id, action);
+      else if (action.action_type === 'ESCALATE_COLLECTION_CALL') result = await executeCollectionCall(action.user_id, action);
+      else if (['SEND_POLITE_REMINDER', 'SEND_FIRM_REMINDER', 'ESCALATE_COLLECTION'].includes(action.action_type)) result = await executeCollectionsMessage(action.user_id, action);
+      else result = { ok: true, message: 'Approved.' };
+    } catch (execErr) {
+      result = { ok: false, message: 'Approved, but carrying it out failed. Nothing further was sent — please retry from your Action Center.', error: execErr.message };
+    }
 
-    await actionService.updateStatus(action.user_id, actionId, 'done');
-    await createActivityLog(action.user_id, 'ai_action_approved_and_executed', {
+    await actionService.updateStatus(action.user_id, actionId, result.ok ? 'done' : 'failed');
+    await createActivityLog(action.user_id, result.ok ? 'ai_action_approved_and_executed' : 'ai_action_execution_failed', {
       entityType: 'ai_action', entityId: actionId, source: 'approval_link', actionType: action.action_type,
     });
 
@@ -11730,21 +11814,20 @@ app.get('/api/actions/:id/approve', async (req, res) => {
   }
 });
 
-app.get('/api/actions/:id/reject', async (req, res) => {
+app.post('/api/actions/:id/reject', approvalLinkLimiter, async (req, res) => {
   try {
-    const { verifyActionToken, loadPendingAction } = require('./lib/services/actionApproval.service');
-    const actionService = require('./lib/services/orchestrator/action.service');
+    const { verifyActionToken, claimPendingAction } = require('./lib/services/actionApproval.service');
     const actionId = req.params.id;
-    const token = req.query.token;
-
-    if (!verifyActionToken(token, actionId, 'reject')) {
+    if (!verifyActionToken(req.body?.token, actionId, 'reject')) {
       return res.status(403).send(approvalResultPage('Link expired or invalid', 'This link is no longer valid.', false));
     }
-    const { ok, action, reason } = await loadPendingAction(actionId);
-    if (!ok) {
-      return res.send(approvalResultPage('Nothing to do', reason === 'already_actioned' ? `This was already ${action?.status}.` : 'Action not found.'));
+    const claim = await claimPendingAction(actionId, 'rejected');
+    if (!claim.ok) {
+      return res.send(approvalResultPage('Nothing to do', claim.reason === 'already_actioned' ? `This was already ${claim.action?.status}.` : 'Action not found.'));
     }
-    await actionService.updateStatus(action.user_id, actionId, 'rejected');
+    await createActivityLog(claim.action.user_id, 'ai_action_rejected', {
+      entityType: 'ai_action', entityId: actionId, source: 'approval_link', actionType: claim.action.action_type,
+    });
     res.send(approvalResultPage('Declined', 'This suggestion has been dismissed. No action was taken.'));
   } catch (err) {
     console.error('[actions/reject] Error:', err.message);
@@ -12642,14 +12725,17 @@ app.post('/api/intelligence/signals/:id/verify-outcome', authMiddleware, async (
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
-// Demo control: resets the 2xA tenant and re-runs the seed + trigger scripts
-// via the SAME code paths as the CLI scripts (no bypass/shortcut version).
-// Deliberately authMiddleware only, not adminOnly: this always operates on
-// one hardcoded, isolated demo tenant (owner@2xa-demo-meridian.invalid) —
-// it can never read or modify any other tenant's data, so requiring a
-// separately-configured ADMIN_EMAILS entry would only get in the way of
-// running the demo itself, with no real security benefit.
-app.post('/api/demo/2xa/reset', authMiddleware, async (req, res) => {
+// Demo control: resets the 2xA demo tenant and re-runs the seed + trigger
+// scripts via the same code paths as the CLI scripts.
+// Previously open to ANY authenticated user: every signed-in customer could
+// spawn child processes on the API host (a trivially repeatable CPU/DB-load
+// lever) and the response leaked the scripts' stderr. It is now an operator
+// tool: admin only, explicitly enabled per environment, never in production,
+// and it returns no script output beyond success/failure.
+app.post('/api/demo/2xa/reset', requireAdmin, async (req, res) => {
+  if (IS_PRODUCTION || process.env.DEMO_RESET_ENABLED !== 'true') {
+    return res.status(404).json({ error: 'Not found' });
+  }
   try {
     delete require.cache[require.resolve('./scripts/seed-2xa-demo.js')];
     delete require.cache[require.resolve('./scripts/trigger-2xa-event.js')];
@@ -12667,8 +12753,12 @@ app.post('/api/demo/2xa/reset', authMiddleware, async (req, res) => {
         resolve(stdout);
       });
     });
-    res.json({ success: true, triggerOutput });
-  } catch (err) { res.status(500).json({ error: 'Internal server error', detail: String(err.message || err) }); }
+    void triggerOutput;
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[demo/2xa/reset] failed:', String(err.message || err).split('\n')[0]);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // ── CUSTOMER INTELLIGENCE (behavioral profile for customers page) ────────────
