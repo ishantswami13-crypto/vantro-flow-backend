@@ -13,6 +13,7 @@
 // Each stage prints its name so a failure says exactly where the chain broke.
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, copyFileSync, readFileSync, statSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -53,6 +54,11 @@ async function main() {
     const refused = await fetch(`${base}/api/connectors/quickbooks/pairing`, { method: 'POST', headers: auth(owner) });
     check('pairing refused for a connector that is not a local bridge (400)', refused.status === 400);
 
+    const bridgeRes = await fetch(`${base}/api/connectors/tally/bridge`, { headers: auth(owner) });
+    const bridgeSrc = await bridgeRes.text();
+    check('signed-in owner can download the bridge (checksum header matches)',
+      bridgeRes.status === 200 && createHash('sha256').update(bridgeSrc).digest('hex') === bridgeRes.headers.get('x-content-sha256'));
+    check('bridge download requires sign-in (401)', (await fetch(`${base}/api/connectors/tally/bridge`)).status === 401);
     check('pairing command is the exact bridge invocation', pair.command === `node tally-sync.mjs --api ${base} --enroll ${pair.code}`, pair.command);
 
     // Run the command exactly as shown to the owner, from a fresh folder
