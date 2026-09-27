@@ -114,6 +114,9 @@ async function main() {
       file.status === 200 && /attachment/.test(file.headers.get('content-disposition') || '') && createHash('sha256').update(fileText).digest('hex') === bridge.sha256);
     const { rows: evs } = await pool.query(`SELECT artifact FROM access_download_events d JOIN access_entitlements e ON e.id = d.entitlement_id WHERE e.application_id = $1`, [appId]);
     check('download recorded', evs.length === 1 && evs[0].artifact === 'tally-bridge');
+    const plat = await (await fetch(`${base}/api/access/platforms`)).json();
+    check('public platform list: booleans only, nothing claimed without a build', Object.values(plat.platforms).every((v) => v === false) && !JSON.stringify(plat).includes('http'), plat);
+    check('unpublished mobile build cannot be downloaded (404)', (await fetch(`${base}/api/access/download/mobile-android`, { method: 'POST', headers: { 'X-Access-Token': dlToken } })).status === 404);
     check('unpublished desktop build cannot be downloaded (404)', (await fetch(`${base}/api/access/download/desktop-windows`, { method: 'POST', headers: { 'X-Access-Token': dlToken } })).status === 404);
 
     const reissue = await (await fetch(`${base}/api/admin/access/applications/${appId}/entitlement`, { method: 'POST', headers: { Authorization: `Bearer ${adminToken}` } })).json();
