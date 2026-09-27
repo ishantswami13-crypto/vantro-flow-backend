@@ -26,7 +26,7 @@ async function main() {
   try {
     const a = await seedAccount(pool, 'seven-a'); users.push(a.id);
     const b = await seedAccount(pool, 'seven-b'); users.push(b.id);
-    server = await startServer(PORT, { FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED: 'false' });
+    server = await startServer(PORT, { FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED: 'false', WATCH_FORCED_REFRESH_MIN_MS: '0' });
     const { base } = server;
     const call = (method, p, token, body) => fetch(`${base}${p}`, { method, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) }, body: body ? JSON.stringify(body) : undefined });
     const get = async (p, t) => { const r = await call('GET', p, t); return { status: r.status, body: await r.json().catch(() => ({})) }; };
