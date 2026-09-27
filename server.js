@@ -1213,6 +1213,15 @@ app.post('/api/auth/signup', async (req, res) => {
     const { data: existing } = await supabase.from('users').select('id').eq('email', email).maybeSingle();
     if (existing) return res.status(409).json({ error: 'Email already registered' });
 
+    // Selective rollout: when the access gate is on, only emails with an
+    // approved access application may create an account.
+    if (isFeatureEnabled('access_gate_enabled')) {
+      const { hasApprovedApplication } = require('./lib/access/service');
+      if (!(await hasApprovedApplication(getPool(), email))) {
+        return res.status(403).json({ error: 'Starlane is in a private rollout. Request access first — you can sign up once your application is approved.', code: 'ACCESS_NOT_APPROVED' });
+      }
+    }
+
     const password_hash = await bcrypt.hash(password, 12);
     const insertPayload = { email, phone, business_name, password_hash, plan: 'free', created_at: new Date() };
 
@@ -12424,6 +12433,11 @@ app.use('/api/intelligence/scenarios', scenariosRouter({ pool: getPool(), authMi
 // See lib/routes/prepared.js for the honesty rationale.
 const { preparedRouter } = require('./lib/routes/prepared');
 app.use('/api/intelligence/prepared', preparedRouter({ pool: getPool(), authMiddleware }));
+
+// Selective-rollout access flow: applications, deterministic eligibility,
+// admin review, download entitlements. See lib/routes/access.js.
+const { accessRouter } = require('./lib/routes/access');
+app.use('/api', accessRouter({ pool: getPool(), requireAdmin }));
 
 // Connector platform — manifests (lib/connectors/registry.js) + live state
 // derived only from real rows (lib/connectors/state.js). See lib/routes/connectors.js.

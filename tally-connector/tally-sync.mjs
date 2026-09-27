@@ -11,7 +11,8 @@
  * Zero dependencies — plain Node.js (v18+).
  *
  * Usage:
- *   node tally-sync.mjs --enroll <code>   # one-time: claim an enrollment code from the
+ *   node tally-sync.mjs --api <url> --enroll <code>
+ *                                         # one-time: claim an enrollment code from the
  *                                         # "Connect Tally" button, store a device
  *                                         # credential in .vantro-device-credentials.json,
  *                                         # then run one sync
@@ -47,6 +48,14 @@ const MODE = args.has('--test') ? 'test' : args.has('--dry-run') ? 'dry-run' : a
 const enrollIndex = argv.indexOf('--enroll');
 const ENROLLMENT_CODE = enrollIndex >= 0 ? argv[enrollIndex + 1] : null;
 const CREDENTIALS_PATH = join(HERE, '.vantro-device-credentials.json');
+// --api <url>: the Starlane API to pair with. Remembered next to the device
+// credential, so after pairing no config.json is needed at all.
+const apiIndex = argv.indexOf('--api');
+const API_OVERRIDE = apiIndex >= 0 ? argv[apiIndex + 1] : null;
+if (API_OVERRIDE && !/^https?:\/\//.test(API_OVERRIDE)) {
+  console.error('❌ --api must be a full URL, e.g. --api https://api.example.com');
+  process.exit(1);
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -61,10 +70,20 @@ const TEST_CONFIG = {
   intervalMinutes: 30,
 };
 
+// API base precedence: --api flag > the one stored at pairing > config.json.
+function withApiBase(cfg) {
+  let stored = null;
+  try { stored = JSON.parse(readFileSync(CREDENTIALS_PATH, 'utf-8')).apiBase || null; } catch { /* not paired */ }
+  cfg.starlane.apiBase = API_OVERRIDE || stored || cfg.starlane.apiBase;
+  return cfg;
+}
+
 function loadConfig() {
   const p = join(HERE, 'config.json');
   if (!existsSync(p)) {
-    if (MODE === 'test') return TEST_CONFIG;
+    // No config.json is fine once paired (or while pairing): Tally defaults to
+    // localhost:9000 and the API base comes from --api or the stored credential.
+    if (MODE === 'test' || ENROLLMENT_CODE || existsSync(CREDENTIALS_PATH)) return withApiBase({ ...TEST_CONFIG, starlane: { ...TEST_CONFIG.starlane } });
     console.error('❌ config.json not found. Copy config.example.json to config.json and fill it in.');
     process.exit(1);
   }
@@ -76,7 +95,7 @@ function loadConfig() {
     if (!Array.isArray(cfg.voucherTypes) || cfg.voucherTypes.length === 0) cfg.voucherTypes = TEST_CONFIG.voucherTypes;
     cfg.starlane = { ...TEST_CONFIG.starlane, ...(cfg.starlane || {}) };
     cfg.tally = { ...TEST_CONFIG.tally, ...(cfg.tally || {}) };
-    return cfg;
+    return withApiBase(cfg);
   } catch (e) {
     console.error('❌ config.json is not valid JSON:', e.message);
     process.exit(1);
@@ -352,10 +371,11 @@ async function runOnce(cfg) {
 }
 
 async function enroll(cfg) {
-  if (!ENROLLMENT_CODE) throw new Error('Usage: node tally-sync.mjs --enroll <code>');
+  if (!ENROLLMENT_CODE) throw new Error('Usage: node tally-sync.mjs --api <url> --enroll <code>');
   process.stdout.write(`🔗 Claiming enrollment code against ${cfg.starlane.apiBase} ... `);
   const { deviceId, deviceSecret } = await claimEnrollment(cfg.starlane.apiBase, ENROLLMENT_CODE);
-  writeFileSync(CREDENTIALS_PATH, JSON.stringify({ deviceId, deviceSecret, pairedAt: new Date().toISOString() }, null, 2));
+  // Owner-only file permissions: the secret is a long-lived, revocable credential.
+  writeFileSync(CREDENTIALS_PATH, JSON.stringify({ deviceId, deviceSecret, apiBase: cfg.starlane.apiBase, pairedAt: new Date().toISOString() }, null, 2), { mode: 0o600 });
   console.log('done.');
   console.log(`✅ Paired. Device credential stored in ${CREDENTIALS_PATH} — this machine can now sync without your Starlane password.`);
 }

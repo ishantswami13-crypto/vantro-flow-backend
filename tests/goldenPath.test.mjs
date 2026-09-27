@@ -13,6 +13,9 @@
 // Each stage prints its name so a failure says exactly where the chain broke.
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
+import { mkdtempSync, copyFileSync, readFileSync, statSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { makeChecker, openPool, seedUser, deleteUsers, startServer } from './helpers/httpHarness.mjs';
 
 const require = createRequire(import.meta.url);
@@ -50,17 +53,27 @@ async function main() {
     const refused = await fetch(`${base}/api/connectors/quickbooks/pairing`, { method: 'POST', headers: auth(owner) });
     check('pairing refused for a connector that is not a local bridge (400)', refused.status === 400);
 
-    const claimRes = await fetch(`${base}/api/connectors/tally/claim`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enrollmentCode: pair.code, deviceName: 'Golden path test PC' }),
-    });
-    const claim = await claimRes.json();
-    check('bridge claims the code for a device credential (201)', claimRes.status === 201 && !!claim.deviceSecret);
+    check('pairing command is the exact bridge invocation', pair.command === `node tally-sync.mjs --api ${base} --enroll ${pair.code}`, pair.command);
+
+    // Run the command exactly as shown to the owner, from a fresh folder
+    // holding only the downloaded bridge file (no config.json).
+    const bridgeDir = mkdtempSync(join(tmpdir(), 'starlane-bridge-'));
+    copyFileSync('tally-connector/tally-sync.mjs', join(bridgeDir, 'tally-sync.mjs'));
+    const args = pair.command.split(' ').slice(2);
+    let enrollOut = '';
+    try { enrollOut = execFileSync(process.execPath, ['tally-sync.mjs', ...args, '--dry-run'], { cwd: bridgeDir, encoding: 'utf8', env: { ...process.env, COMPUTERNAME: 'Golden path test PC' } }); }
+    catch (e) { enrollOut = String(e.stdout || '') + String(e.stderr || ''); }
+    let cred = null;
+    try { cred = JSON.parse(readFileSync(join(bridgeDir, '.vantro-device-credentials.json'), 'utf8')); } catch { /* not written */ }
+    check('bridge paired with the shown command (credential stored)', !!cred?.deviceSecret, enrollOut.slice(-400));
+    check('credential file is owner-only (0600)', cred && (statSync(join(bridgeDir, '.vantro-device-credentials.json')).mode & 0o777) === 0o600);
+    check('bridge remembered the API base (no config.json needed later)', cred?.apiBase === base);
+    rmSync(bridgeDir, { recursive: true, force: true });
     const reclaim = await fetch(`${base}/api/connectors/tally/claim`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enrollmentCode: pair.code }),
     });
     check('a pairing code works only once (400 on reuse)', reclaim.status === 400);
-    const device = `VantroDevice ${claim.deviceId}.${claim.deviceSecret}`;
+    const device = `VantroDevice ${cred.deviceId}.${cred.deviceSecret}`;
 
     console.log('— INGEST');
     const vouchers = bridgeVouchers();
