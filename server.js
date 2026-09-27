@@ -11567,7 +11567,7 @@ async function executeCollectionsMessage(userId, action) {
   if (!action.recommended_message) return { ok: false, message: 'No message drafted for this action.' };
 
   if (!isFeatureEnabled('external_message_sending_enabled')) {
-    return { ok: true, message: `Marked sent, but external sending is currently off — no WhatsApp message actually went to ${invoice.customer_name}.` };
+    return { ok: true, message: `Recorded. Sending messages is switched off, so nothing went to ${invoice.customer_name} — send the drafted message yourself.` };
   }
   const sendResult = await sendWhatsAppMessage(invoice.customer_phone, action.recommended_message);
   if (sendResult.success) {
@@ -11735,6 +11735,17 @@ app.post('/api/actions/:id/reject', approvalLinkLimiter, async (req, res) => {
 cron.schedule('*/30 * * * *', () => {
   require('./lib/notifications/connectorMonitor').checkQuietBridges(getPool())
     .catch((e) => console.error('[connector monitor]', e.message));
+}, { timezone: 'UTC' });
+
+// Watch, mission and memory sweep for companies with a signed-in app, so a
+// phone gets its push without anyone opening Starlane.
+cron.schedule('*/15 * * * *', async () => {
+  try {
+    const { rows } = await getPool().query(
+      `SELECT DISTINCT user_id FROM auth_sessions WHERE revoked_at IS NULL AND expires_at > now()
+        UNION SELECT DISTINCT user_id FROM push_devices WHERE disabled_at IS NULL`);
+    for (const r of rows) await featuresApi.refreshFor(r.user_id).catch((e) => console.error('[watch sweep]', e.message));
+  } catch (e) { console.error('[watch sweep]', e.message); }
 }, { timezone: 'UTC' });
 
 // ============================================
@@ -12331,6 +12342,12 @@ app.use('/api/intelligence/prepared', preparedRouter({ pool: getPool(), authMidd
 // admin review, download entitlements. See lib/routes/access.js.
 const { accessRouter } = require('./lib/routes/access');
 app.use('/api', accessRouter({ pool: getPool(), requireAdmin }));
+
+// Starlane's seven features (Bridge, Scan, Watch, Missions, Simulate, Memory,
+// Prepared) for the desktop and mobile apps. See lib/routes/features.js.
+const { featuresRouter } = require('./lib/routes/features');
+const featuresApi = featuresRouter({ pool: getPool(), authMiddleware, notifyFn: require('./lib/notifications/notify').notify, isEnabled: isFeatureEnabled });
+app.use('/api', featuresApi);
 
 // Desktop + mobile client API: native sessions, bootstrap, Now, action
 // evidence/decisions, canonical notifications, push devices, telemetry.
