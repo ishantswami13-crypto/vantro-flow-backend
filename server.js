@@ -12425,6 +12425,11 @@ app.use('/api/intelligence/scenarios', scenariosRouter({ pool: getPool(), authMi
 const { preparedRouter } = require('./lib/routes/prepared');
 app.use('/api/intelligence/prepared', preparedRouter({ pool: getPool(), authMiddleware }));
 
+// Connector platform — manifests (lib/connectors/registry.js) + live state
+// derived only from real rows (lib/connectors/state.js). See lib/routes/connectors.js.
+const { connectorsRouter } = require('./lib/routes/connectors');
+app.use('/api/connectors', connectorsRouter({ pool: getPool(), authMiddleware }));
+
 app.get('/api/ai-actions', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
