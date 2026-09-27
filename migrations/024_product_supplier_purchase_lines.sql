@@ -20,14 +20,30 @@ CREATE TABLE IF NOT EXISTS product_suppliers (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL,
   product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-  supplier_id UUID NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
+  -- supplier_id: added below with suppliers.id's real type (see repair note).
   evidence TEXT, -- how this relationship was established (e.g. 'manually linked', 'inferred from purchase line item <id>')
   source TEXT,   -- e.g. 'manual', 'purchase_line_item'
   first_seen_at TIMESTAMPTZ,
   last_seen_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (user_id, product_id, supplier_id)
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Schema-type repair (2026-09-27): suppliers.id is BIGINT in the canonical
+-- base schema (supabase-schema.sql, BIGSERIAL) but UUID on some hand-built dev
+-- databases. Hard-coding UUID here made this file fail on every database
+-- bootstrapped from the base schema — and the old bootstrap script swallowed
+-- the error, so the table silently never existed. The supplier FK column is
+-- now added with whatever type suppliers.id actually has. Where this file
+-- already succeeded, every statement below is a no-op.
+DO $$
+DECLARE supplier_id_type TEXT;
+BEGIN
+  SELECT format_type(a.atttypid, a.atttypmod) INTO supplier_id_type
+    FROM pg_attribute a WHERE a.attrelid = 'suppliers'::regclass AND a.attname = 'id';
+  EXECUTE format('ALTER TABLE product_suppliers ADD COLUMN IF NOT EXISTS supplier_id %s NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE', supplier_id_type);
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS product_suppliers_user_id_product_id_supplier_id_key
+  ON product_suppliers(user_id, product_id, supplier_id);
 
 CREATE INDEX IF NOT EXISTS idx_product_suppliers_user ON product_suppliers(user_id);
 CREATE INDEX IF NOT EXISTS idx_product_suppliers_product ON product_suppliers(product_id);
