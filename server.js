@@ -736,10 +736,21 @@ function authMiddleware(req, res, next) {
     // ------------------------------------------------------
     
     setNoStoreHeaders(res);
-    next();
+    return continueIfSessionActive(req, res, next);
   } catch {
     res.status(401).json({ error: 'Invalid or expired token' });
   }
+}
+
+// Native-client access tokens carry a session id (sid); signing a device out
+// must take effect on its next request, not when the 15-minute token expires.
+// Web tokens have no sid and are unaffected.
+function continueIfSessionActive(req, res, next) {
+  const sid = req.user && req.user.sid;
+  if (!sid) return next();
+  require('./lib/auth/sessions').isActive(getPool(), sid)
+    .then((active) => (active ? next() : res.status(401).json({ error: 'Session ended', code: 'SESSION_INVALID' })))
+    .catch(() => res.status(503).json({ error: 'Could not verify session' }));
 }
 
 // requireOwner — authenticates AND verifies the caller owns the :userId resource
@@ -773,7 +784,7 @@ function requireOwner(req, res, next) {
   // ------------------------------------------------------
 
   setNoStoreHeaders(res);
-  next();
+  return continueIfSessionActive(req, res, next);
 }
 
 function authenticatedUserId(req) {
@@ -11600,6 +11611,40 @@ async function renderApprovalConfirm(req, res, intent) {
   res.send(approvalConfirmPage(action, intent, token));
 }
 
+// Carry out an action that has ALREADY been atomically claimed as 'approved'
+// (by the approval-link POST or POST /api/client/actions/:id/decision), then
+// record the honest terminal state, activity log, product events and the
+// owner's notification. The single place approved actions execute.
+async function executeApprovedAction(action, { source }) {
+  const actionService = require('./lib/services/orchestrator/action.service');
+  const { track, EVENTS } = require('./lib/observability/productEvents');
+  const { notify, TYPES } = require('./lib/notifications/notify');
+  let result;
+  try {
+    if (action.action_type === 'INVENTORY_PO_READY') result = await executeInventoryPO(action.user_id, action);
+    else if (action.action_type === 'PAYABLES_PAYMENT_READY') result = await executePayablesPayment(action.user_id, action);
+    else if (action.action_type === 'ESCALATE_COLLECTION_CALL') result = await executeCollectionCall(action.user_id, action);
+    else if (['SEND_POLITE_REMINDER', 'SEND_FIRM_REMINDER', 'ESCALATE_COLLECTION'].includes(action.action_type)) result = await executeCollectionsMessage(action.user_id, action);
+    else result = { ok: true, message: 'Approved.' };
+  } catch (execErr) {
+    result = { ok: false, message: 'Approved, but carrying it out failed. Nothing further was sent — please retry from your Action Center.', error: execErr.message };
+  }
+  await actionService.updateStatus(action.user_id, action.id, result.ok ? 'done' : 'failed');
+  await createActivityLog(action.user_id, result.ok ? 'ai_action_approved_and_executed' : 'ai_action_execution_failed', {
+    entityType: 'ai_action', entityId: action.id, source, actionType: action.action_type,
+  });
+  track(result.ok ? EVENTS.ACTION_EXECUTED : EVENTS.ACTION_FAILED, { userId: action.user_id, actionId: action.id, props: { action_type: action.action_type, via: source } });
+  await notify(getPool(), action.user_id, {
+    type: result.ok ? TYPES.ACTION_COMPLETED : TYPES.ACTION_FAILED,
+    severity: result.ok ? 'normal' : 'high',
+    title: result.ok ? `Done: ${String(action.title || 'Action').slice(0, 100)}` : `Failed: ${String(action.title || 'Action').slice(0, 100)}`,
+    body: result.ok ? null : 'Nothing further was sent. Open it to see what happened.',
+    entity: { type: 'ai_action', id: action.id }, actionId: action.id, route: `/actions/${action.id}`,
+    dedupeKey: `action-result:${action.id}`,
+  });
+  return result;
+}
+
 app.get('/api/actions/:id/approve', (req, res) => {
   renderApprovalConfirm(req, res, 'approve').catch((err) => {
     console.error('[actions/approve:confirm] Error:', err.message);
@@ -11619,13 +11664,13 @@ const approvalLinkLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, stand
 app.post('/api/actions/:id/approve', approvalLinkLimiter, async (req, res) => {
   try {
     const { verifyActionToken, claimPendingAction } = require('./lib/services/actionApproval.service');
-    const actionService = require('./lib/services/orchestrator/action.service');
     const actionId = req.params.id;
     if (!verifyActionToken(req.body?.token, actionId, 'approve')) {
       return res.status(403).send(approvalResultPage('Link expired or invalid', 'This approval link is no longer valid. Please check your Action Center for the latest status.', false));
     }
 
     const claim = await claimPendingAction(actionId, 'approved');
+    if (claim.ok) require('./lib/observability/productEvents').track('approval.completed', { userId: claim.action.user_id, actionId, props: { decision: 'approved', via: 'approval_link' } });
     if (!claim.ok) {
       return res.send(approvalResultPage('Nothing to do', claim.reason === 'already_actioned'
         ? `This was already ${claim.action?.status || 'actioned'} — no changes made.`
@@ -11633,21 +11678,7 @@ app.post('/api/actions/:id/approve', approvalLinkLimiter, async (req, res) => {
     }
     const action = claim.action;
 
-    let result;
-    try {
-      if (action.action_type === 'INVENTORY_PO_READY') result = await executeInventoryPO(action.user_id, action);
-      else if (action.action_type === 'PAYABLES_PAYMENT_READY') result = await executePayablesPayment(action.user_id, action);
-      else if (action.action_type === 'ESCALATE_COLLECTION_CALL') result = await executeCollectionCall(action.user_id, action);
-      else if (['SEND_POLITE_REMINDER', 'SEND_FIRM_REMINDER', 'ESCALATE_COLLECTION'].includes(action.action_type)) result = await executeCollectionsMessage(action.user_id, action);
-      else result = { ok: true, message: 'Approved.' };
-    } catch (execErr) {
-      result = { ok: false, message: 'Approved, but carrying it out failed. Nothing further was sent — please retry from your Action Center.', error: execErr.message };
-    }
-
-    await actionService.updateStatus(action.user_id, actionId, result.ok ? 'done' : 'failed');
-    await createActivityLog(action.user_id, result.ok ? 'ai_action_approved_and_executed' : 'ai_action_execution_failed', {
-      entityType: 'ai_action', entityId: actionId, source: 'approval_link', actionType: action.action_type,
-    });
+    const result = await executeApprovedAction(action, { source: 'approval_link' });
 
     res.send(approvalResultPage(action.title || 'Approved', result.message, result.ok));
   } catch (err) {
@@ -11676,6 +11707,12 @@ app.post('/api/actions/:id/reject', approvalLinkLimiter, async (req, res) => {
     res.status(500).send(approvalResultPage('Something went wrong', 'Please try again from your Action Center.', false));
   }
 });
+
+// Connector monitor: "Tally has stopped syncing" (once per device per day).
+cron.schedule('*/30 * * * *', () => {
+  require('./lib/notifications/connectorMonitor').checkQuietBridges(getPool())
+    .catch((e) => console.error('[connector monitor]', e.message));
+}, { timezone: 'UTC' });
 
 // ============================================
 // WEEKLY SCORECARD CRON -- Sunday 6pm IST (12:30 UTC)
@@ -12271,6 +12308,11 @@ app.use('/api/intelligence/prepared', preparedRouter({ pool: getPool(), authMidd
 // admin review, download entitlements. See lib/routes/access.js.
 const { accessRouter } = require('./lib/routes/access');
 app.use('/api', accessRouter({ pool: getPool(), requireAdmin }));
+
+// Desktop + mobile client API: native sessions, bootstrap, Now, action
+// evidence/decisions, canonical notifications, push devices, telemetry.
+const { clientApiRouter } = require('./lib/routes/clientApi');
+app.use('/api', clientApiRouter({ pool: getPool(), authMiddleware, executeApprovedAction }));
 
 // Connector platform — manifests (lib/connectors/registry.js) + live state
 // derived only from real rows (lib/connectors/state.js). See lib/routes/connectors.js.

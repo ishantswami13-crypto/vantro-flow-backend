@@ -26,13 +26,13 @@ async function withScratch(name, fn) {
   finally { await client.end(); await admin.query(`DROP DATABASE ${db} WITH (FORCE)`); await admin.end(); }
 }
 
-// A database migrated by hand through 048 (the production situation): no ledger, no 049/050.
+// A database migrated by hand through 048 (the production situation): no ledger.
+const LAST_PROD = 'migrations/048_onboarding_profile.sql';
 async function prodLike(client) {
-  await migrate.run({ mode: 'apply', client, log: quiet });
-  await client.query(`DROP TABLE schema_migrations;
-    DROP TABLE access_download_events, access_entitlements, access_application_events, access_applications;
-    DROP INDEX idx_invoices_user_customer; ALTER TABLE invoices DROP COLUMN customer_id;`);
+  await migrate.run({ mode: 'apply', client, log: quiet, throughFile: LAST_PROD });
+  await client.query('DROP TABLE schema_migrations');
 }
+const AFTER_PROD = migrate.orderedMigrationFiles().slice(migrate.orderedMigrationFiles().indexOf(LAST_PROD) + 1);
 const ledgerCount = async (c) => (await c.query(`SELECT COUNT(*)::int n FROM information_schema.tables WHERE table_name='schema_migrations'`)).rows[0].n
   ? (await c.query('SELECT COUNT(*)::int n FROM schema_migrations')).rows[0].n : 0;
 
@@ -42,7 +42,7 @@ async function main() {
     const r = await preflight(c);
     check('prod-like: PASS', r.plan.pass, r.plan.failures);
     check('prod-like: cut-off is 048', r.plan.baselineThrough === 'migrations/048_onboarding_profile.sql', r.plan.baselineThrough);
-    check('prod-like: only 049 and 050 to apply', r.plan.apply.map((a) => a.file).join() === 'migrations/049_invoices_customer_link.sql,migrations/050_access_applications.sql');
+    check('prod-like: applies exactly the files after 048', r.plan.apply.map((a) => a.file).join() === AFTER_PROD.join() && AFTER_PROD[0] === 'migrations/049_invoices_customer_link.sql', r.plan.apply);
     check('preflight wrote nothing (no ledger table)', await ledgerCount(c) === 0);
     let err = null;
     try { await baseline(c, { through: 'migrations/047_connector_devices.sql', log: quiet }); } catch (e) { err = e; }
@@ -50,12 +50,14 @@ async function main() {
     await baseline(c, { through: 'migrations/048_onboarding_profile.sql', log: quiet });
     check('baseline records exactly the planned files', await ledgerCount(c) === r.plan.record.length);
     const applied = await migrate.run({ mode: 'apply', client: c, log: quiet });
-    check('migrate then applies only 049 and 050', applied.applied.length === 2);
+    check('migrate then applies exactly those files', applied.applied.join() === AFTER_PROD.join());
     const cols = await c.query(`SELECT data_type FROM information_schema.columns WHERE table_name='invoices' AND column_name='customer_id'`);
     check('invoices.customer_id now exists as uuid', cols.rows[0]?.data_type === 'uuid');
     let again = null;
     try { await baseline(c, { through: 'migrations/050_access_applications.sql', log: quiet }); } catch (e) { again = e; }
     check('baseline refuses a database already on the ledger', !!again);
+    const pre = await c.query(`SELECT COUNT(*)::int n FROM information_schema.tables WHERE table_name IN ('auth_sessions','notification_events','product_events')`);
+    check('client-platform tables exist after the upgrade', pre.rows[0].n === 3);
   });
 
   await withScratch('missing020', async (c) => {

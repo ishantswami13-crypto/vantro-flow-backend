@@ -121,7 +121,7 @@ async function plan(client) {
   });
 }
 
-async function run({ mode = 'apply', baselineThrough = null, log = console.log, client: injected } = {}) {
+async function run({ mode = 'apply', baselineThrough = null, throughFile = null, log = console.log, client: injected } = {}) {
   const client = injected || await connect();
   try {
     const steps = await plan(client);
@@ -133,7 +133,11 @@ async function run({ mode = 'apply', baselineThrough = null, log = console.log, 
       return { steps: steps.map(({ file, state }) => ({ file, state })) };
     }
 
-    const pending = steps.filter((s) => s.state === 'pending');
+    // throughFile: apply only up to and including that file (tests build
+    // "a database migrated through N" exactly the way production was).
+    const stopAt = throughFile ? steps.findIndex((x) => x.file === throughFile) : steps.length - 1;
+    if (throughFile && stopAt === -1) throw new Error(`Unknown migration file ${throughFile}`);
+    const pending = steps.slice(0, stopAt + 1).filter((s) => s.state === 'pending');
     if (mode === 'baseline') {
       const cutoff = steps.findIndex((s) => s.file === baselineThrough);
       if (cutoff === -1) throw new Error(`--baseline needs a known migration file as its cut-off (got ${baselineThrough || 'nothing'})`);
