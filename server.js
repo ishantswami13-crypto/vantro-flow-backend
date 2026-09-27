@@ -569,7 +569,7 @@ app.use('/api', apiLimiter);
 // client rotating IPs sidesteps it entirely; and the default MemoryStore is
 // per-process, so the effective limit multiplies by the replica count and
 // resets on every deploy.
-app.use(['/api/upload-csv', '/api/import/excel', '/api/bank/transactions/import', '/api/scan-document', '/api/purchases/scan', '/api/sales/scan', '/api/transactions/scan', '/api/ai/extract-voice'], uploadLimiter);
+app.use(['/api/upload-csv', '/api/import/excel', '/api/import/preview', '/api/bank/transactions/import', '/api/scan-document', '/api/purchases/scan', '/api/sales/scan', '/api/transactions/scan', '/api/ai/extract-voice'], uploadLimiter);
 // /api/voice/call places a real outbound PSTN call. It takes customer_phone
 // straight from the request body and dials through getTwilio() with no
 // arguments, which falls back to the platform's own TWILIO_ACCOUNT_SID rather
@@ -1860,117 +1860,119 @@ app.get('/api/invoice/:invoiceId', authMiddleware, async (req, res) => {
 // EXCEL / XLSX SMART IMPORT
 // ============================================
 
-app.post('/api/import/excel', authMiddleware, upload.single('file'), async (req, res) => {
+// Spreadsheet import of invoices/receivables from any bookkeeping software.
+// lib/import/receivablesMapper.js recognises the export (Tally, Busy, Marg,
+// Vyapar, Zoho Books, QuickBooks, Xero, Khatabook, or generic), maps the
+// columns itself, and says why any row was skipped. The same file (by
+// content hash) is never imported twice for a company. /preview writes
+// nothing; /excel imports.
+const receivablesMapper = require('./lib/import/receivablesMapper');
+
+function readSpreadsheet(file) {
+  const name = (file.originalname || '').toLowerCase();
+  if (name.endsWith('.xlsx') || name.endsWith('.xls') || (file.mimetype || '').includes('spreadsheet') || (file.mimetype || '').includes('excel')) {
+    const XLSX = require('xlsx');
+    const wb = XLSX.read(file.buffer, { type: 'buffer', cellDates: true, sheetRows: 5021 });
+    return { fileType: 'XLSX', matrix: XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: '', raw: true }) };
+  }
+  return { fileType: 'CSV', matrix: receivablesMapper.parseDelimited(file.buffer.toString('utf-8')) };
+}
+
+function mapUpload(file) {
+  const { fileType, matrix } = readSpreadsheet(file);
+  if (matrix.length > 5020) return { error: 'File has too many rows. Please import 5000 rows or fewer.' };
+  const result = receivablesMapper.mapTable(matrix);
+  return { fileType, ...result };
+}
+
+function importSummary(m) {
+  return {
+    source: m.source.name,                     // e.g. "Zoho Books", or null for a generic sheet
+    headerRow: m.headerRow,
+    columns: m.mapping.byField,                // which column became which field
+    confidence: m.mapping.confidence,
+    rows: m.invoices.length,
+    skipped: m.skipped.length,
+    skippedReasons: m.skipped.slice(0, 20),
+  };
+}
+
+app.post('/api/import/preview', authMiddleware, upload.single('file'), async (req, res) => {
   try {
-    const userId = req.user.userId;
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    let m;
+    try { m = mapUpload(req.file); } catch { return res.status(400).json({ error: 'Could not read this file. Save it as .xlsx or .csv and try again.' }); }
+    if (m.error) return res.status(400).json({ error: m.error });
+    const hash = require('crypto').createHash('sha256').update(req.file.buffer).digest('hex');
+    const { rows } = await getPool().query(`SELECT status FROM file_import_batches WHERE user_id = $1 AND file_content_hash = $2`, [req.user.userId, hash]);
+    res.json({ success: true, ...importSummary(m), alreadyImported: rows[0]?.status === 'COMPLETED', sample: m.invoices.slice(0, 10) });
+  } catch (err) {
+    console.error('Import preview error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
-    const ext = (req.file.originalname || '').toLowerCase();
-    let rows = [];
+app.post('/api/import/excel', authMiddleware, upload.single('file'), async (req, res) => {
+  const userId = req.user.userId;
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  let m;
+  try { m = mapUpload(req.file); } catch { return res.status(400).json({ error: 'Could not read this file. Save it as .xlsx or .csv and try again.' }); }
+  if (m.error) return res.status(400).json({ error: m.error });
+  if (m.mapping.confidence === 'insufficient' || m.invoices.length === 0) {
+    return res.status(400).json({
+      error: m.mapping.confidence === 'insufficient'
+        ? 'Could not find a customer name and an amount column in this file.'
+        : 'No rows could be imported from this file.',
+      ...importSummary(m),
+      headers: m.headers,
+      hint: 'Export invoices or bills receivable with the customer (party) name and the amount or balance owed.',
+    });
+  }
 
-    if (ext.endsWith('.xlsx') || ext.endsWith('.xls') || req.file.mimetype.includes('spreadsheet') || req.file.mimetype.includes('excel')) {
-      // Parse Excel
-      try {
-        const XLSX = require('xlsx');
-        const wb = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true, sheetRows: 5001 });
-        const ws = wb.Sheets[wb.SheetNames[0]];
-        rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
-      } catch (e) {
-        return res.status(400).json({ error: 'Could not parse Excel file. Please use .xlsx format.' });
-      }
-    } else {
-      // Parse CSV
-      const text = req.file.buffer.toString('utf-8');
-      const lines = text.split('\n').filter(l => l.trim());
-      if (lines.length < 2) return res.status(400).json({ error: 'CSV must have a header row and at least one data row' });
-      const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, '').toLowerCase());
-      rows = lines.slice(1).map(line => {
-        const vals = line.split(',').map(v => v.trim().replace(/"/g, ''));
-        const obj = {};
-        headers.forEach((h, i) => { obj[h] = vals[i] || ''; });
-        return obj;
-      });
+  const pool = getPool();
+  const hash = require('crypto').createHash('sha256').update(req.file.buffer).digest('hex');
+  let batchId = null;
+  try {
+    const { rows: existing } = await pool.query(`SELECT id, status, rows_accepted FROM file_import_batches WHERE user_id = $1 AND file_content_hash = $2`, [userId, hash]);
+    if (existing[0]?.status === 'COMPLETED') {
+      return res.json({ success: true, duplicate: true, imported: 0, ...importSummary(m), message: 'This exact file was already imported — nothing was added twice.' });
     }
-    if (rows.length > 5000) return res.status(400).json({ error: 'File has too many rows. Please import 5000 rows or fewer.' });
+    const { rows: b } = await pool.query(
+      `INSERT INTO file_import_batches (user_id, source_system, filename, file_type, file_content_hash, mapping_profile, status, rows_total)
+       VALUES ($1, 'file_import', $2, $3, $4, $5, 'STARTED', $6)
+       ON CONFLICT (user_id, file_content_hash) DO UPDATE SET status = 'STARTED', started_at = now() RETURNING id`,
+      [userId, String(req.file.originalname || '').slice(0, 200), m.fileType, hash, m.source.id, m.invoices.length + m.skipped.length]);
+    batchId = b[0].id;
 
-    // Smart column detection — try many possible header names
-    const findCol = (obj, candidates) => {
-      const keys = Object.keys(obj).map(k => k.toLowerCase().trim());
-      for (const c of candidates) {
-        const match = keys.find(k => k.includes(c));
-        if (match) return obj[Object.keys(obj).find(k => k.toLowerCase().trim() === match)];
-      }
-      return null;
-    };
-
-    const invoices = [];
-    const skipped = [];
-
-    for (const row of rows) {
-      const name = findCol(row, ['customer', 'party', 'client', 'debtor', 'buyer', 'name', 'company']);
-      const amountRaw = findCol(row, ['amount', 'outstanding', 'due', 'balance', 'pending', 'invoice_amount', 'receivable']);
-      const dateRaw = findCol(row, ['date', 'invoice_date', 'bill_date', 'due_date', 'created']);
-      const phone = findCol(row, ['phone', 'mobile', 'contact', 'number', 'whatsapp']);
-      const statusRaw = findCol(row, ['status', 'payment_status', 'paid', 'cleared']);
-
-      if (!name || !amountRaw) { skipped.push(row); continue; }
-
-      const amount = parseFloat(String(amountRaw).replace(/[₹,\s]/g, ''));
-      if (isNaN(amount) || amount <= 0) { skipped.push(row); continue; }
-
-      // Date parsing — handle DD/MM/YYYY, MM/DD/YYYY, YYYY-MM-DD, serial numbers
-      let invoiceDate = new Date();
-      if (dateRaw) {
-        if (dateRaw instanceof Date) {
-          invoiceDate = dateRaw;
-        } else if (typeof dateRaw === 'number') {
-          // Excel serial date
-          invoiceDate = new Date(Math.round((dateRaw - 25569) * 86400 * 1000));
-        } else {
-          const str = String(dateRaw).trim();
-          // Try DD/MM/YYYY
-          const ddmm = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
-          if (ddmm) invoiceDate = new Date(`${ddmm[3]}-${ddmm[2].padStart(2,'0')}-${ddmm[1].padStart(2,'0')}`);
-          else invoiceDate = new Date(str);
-          if (isNaN(invoiceDate.getTime())) invoiceDate = new Date();
-        }
-      }
-
-      const daysOverdue = Math.max(0, Math.floor((Date.now() - invoiceDate.getTime()) / 86400000));
-      const statusLower = String(statusRaw || '').toLowerCase();
-      const paymentStatus = statusLower.includes('paid') || statusLower.includes('clear') ? 'Paid' : 'Pending';
-
-      invoices.push({
-        user_id: userId,
-        customer_name: String(name).trim(),
-        customer_phone: phone ? String(phone).replace(/\D/g, '').slice(-10) : null,
-        invoice_amount: amount,
-        invoice_date: invoiceDate.toISOString().split('T')[0],
-        payment_status: paymentStatus,
-        days_overdue: paymentStatus === 'Paid' ? 0 : daysOverdue,
-        created_at: new Date(),
-      });
-    }
-
-    if (invoices.length === 0) {
-      return res.status(400).json({
-        error: 'No valid rows found. Make sure your file has columns: Customer Name, Amount, Date.',
-        skipped: skipped.length,
-        hint: 'Column names can be: customer_name, party, amount, outstanding, invoice_date, date, phone, mobile',
-      });
-    }
-
-    const { data, error } = await supabase.from('invoices').insert(invoices).select('id');
+    const records = m.invoices.map((inv) => ({
+      user_id: userId,
+      customer_name: inv.customer_name,
+      customer_phone: inv.customer_phone,
+      customer_email: inv.customer_email,
+      invoice_number: inv.invoice_number,
+      invoice_amount: inv.invoice_amount,
+      invoice_date: inv.invoice_date || new Date().toISOString().slice(0, 10),
+      due_date: inv.due_date,
+      payment_status: inv.payment_status,
+      days_overdue: inv.days_overdue,
+      source_type: 'file_import',
+      created_at: new Date(),
+    }));
+    const { error } = await supabase.from('invoices').insert(records);
     if (error) throw error;
 
+    await pool.query(
+      `UPDATE file_import_batches SET status = 'COMPLETED', completed_at = now(), rows_accepted = $2, rows_rejected = $3 WHERE id = $1`,
+      [batchId, records.length, m.skipped.length]);
     res.json({
       success: true,
-      imported: invoices.length,
-      skipped: skipped.length,
-      message: `✅ ${invoices.length} invoices imported${skipped.length ? `, ${skipped.length} rows skipped (missing name/amount)` : ''}`,
+      imported: records.length,
+      ...importSummary(m),
+      message: `${records.length} invoices imported${m.source.name ? ` from a ${m.source.name} export` : ''}${m.skipped.length ? `; ${m.skipped.length} rows skipped` : ''}.`,
     });
   } catch (err) {
-    console.error('Import error:', err);
+    if (batchId) await pool.query(`UPDATE file_import_batches SET status = 'FAILED', error_message = $2 WHERE id = $1`, [batchId, String(err.message).slice(0, 500)]).catch(() => {});
+    console.error('Import error:', err.message);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
