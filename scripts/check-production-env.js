@@ -92,8 +92,8 @@ if (env.FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED === 'true') {
   add(twilio.length ? 'FAIL' : 'OK', 'FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED', twilio.length ? `on, but ${twilio.join(', ')} not set` : 'on, Twilio configured');
 } else add('OK', 'FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED', 'off (no WhatsApp sends)');
 
-// ── Desktop builds (must be real signed https builds if set) ─────────────
-for (const k of ['DESKTOP_DOWNLOAD_URL_WINDOWS', 'DESKTOP_DOWNLOAD_URL_MACOS', 'DESKTOP_DOWNLOAD_URL_LINUX']) {
+// ── App builds (must be real https builds if set) ─────────────────────────
+for (const k of ['DESKTOP_DOWNLOAD_URL_WINDOWS', 'DESKTOP_DOWNLOAD_URL_MACOS', 'DESKTOP_DOWNLOAD_URL_LINUX', 'MOBILE_DOWNLOAD_URL_ANDROID', 'MOBILE_DOWNLOAD_URL_IOS']) {
   if (has(k) && !isHttps(env[k])) add('FAIL', k, 'must be an https URL');
 }
 
