@@ -351,7 +351,7 @@ function isMissingSchemaError(error) {
 }
 
 // Middleware
-const { isAllowedOrigin } = require('./lib/security/originPolicy');
+const { isAllowedOrigin, isNativeAppOrigin } = require('./lib/security/originPolicy');
 
 // Vercel preview deployments get a generated subdomain per commit, so they can't
 // be enumerated in ALLOWED_ORIGINS. VERCEL_PROJECT_SLUGS lists the project names
@@ -387,7 +387,8 @@ const corsOptions = {
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   // X-Access-Token: access-flow status/entitlement tokens (lib/routes/access.js).
-  allowedHeaders: ["Authorization", "Content-Type", "X-CSRF-Token", "X-Request-ID", "X-Access-Token"],
+  // X-Sync-Run-Id: connector hosts tie an import to the sync run they started.
+  allowedHeaders: ["Authorization", "Content-Type", "X-CSRF-Token", "X-Request-ID", "X-Access-Token", "X-Sync-Run-Id"],
   // Lets the frontend read the X-CSRF-Token response header (set below in
   // authMiddleware) across origins — without this, a custom response header
   // is invisible to cross-origin fetch() even though the browser received
@@ -406,6 +407,7 @@ function isSameOriginRequest(req) {
 }
 const corsDelegate = (req, callback) => {
   if (isSameOriginRequest(req)) return callback(null, { ...corsOptions, origin: true });
+  if (isNativeAppOrigin(req.headers.origin)) return callback(null, { ...corsOptions, origin: true, credentials: false });
   return callback(null, corsOptions);
 };
 
@@ -6485,10 +6487,28 @@ function chatCompletion(messages, tools, toolChoice = 'auto') {
   return groqChat(messages, tools, toolChoice);
 }
 
+// Ask Starlane from the desktop and mobile apps (native sessions carry a
+// `sid`) runs with read-only tools: it can look things up and navigate, never
+// mark an invoice paid, change the CRM, place an order or compose messages
+// (Hard Rule 9). Enforced here on the server, not by the client's choice of
+// tools, and re-checked inside executeTool.
+const AI_READ_ONLY_TOOLS = new Set(['get_summary', 'get_invoices', 'get_prospects', 'get_inventory', 'get_calls', 'get_cash_forecast', 'get_overdue', 'get_suppliers', 'navigate_to']);
+
 app.post('/api/ai-chat', authMiddleware, async (req, res) => {
-  const { messages, business_name } = req.body;
+  const { business_name } = req.body;
+  let { messages } = req.body;
   const user_id = authenticatedUserId(req);
   if (!user_id || !messages) return res.status(400).json({ error: 'Missing messages' });
+  const readOnly = !!req.user?.sid || req.body?.mode === 'read_only';
+  if (readOnly) {
+    // Only the conversation itself — a client cannot inject system or tool turns.
+    if (!Array.isArray(messages)) return res.status(400).json({ error: 'messages must be an array' });
+    messages = messages
+      .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
+      .slice(-20)
+      .map((m) => ({ role: m.role, content: m.content.slice(0, 4000) }));
+    if (!messages.length || messages[messages.length - 1].role !== 'user') return res.status(400).json({ error: 'The last message must be from the user' });
+  }
 
   // Pre-fetch top 5 overdue invoices so first response is instant and data-aware
   let overdueContext = '';
@@ -6545,8 +6565,11 @@ When generating WhatsApp messages, call scripts, or any communication: write EXA
 
   const system = `You are ${ownerName ? ownerName + "'s" : 'Vantro'} AI co-founder, built into Vantro Flow for ${business_name || 'this business'}. You help Indian MSME owners manage collections, invoices, CRM, inventory, and cash flow.
 
-You have tools: fetch data, mark invoices paid, add prospects, get forecasts, navigate pages.
-Be specific, use ₹ formatting, and when asked to do something — DO it with tools, don't just explain.
+${readOnly
+  ? `You have read-only tools: look up invoices, overdue customers, summary, inventory, calls, suppliers, prospects and the cash forecast. You cannot change anything from here: if the owner asks you to mark something paid, send a message, place an order or change a record, say that this is done from the Decisions screen or the Starlane website, and never claim you did it.
+Be specific and use ₹ formatting.`
+  : `You have tools: fetch data, mark invoices paid, add prospects, get forecasts, navigate pages.
+Be specific, use ₹ formatting, and when asked to do something — DO it with tools, don't just explain.`}
 Summarise actions clearly after doing them.
 
 HARD RULE — never fabricate data you don't have: You only know what your tools return from this business's actual connected data (invoices, prospects, inventory, calls, suppliers, cash flow). You have no access to competitor data, market pricing, external market research, or anything outside this business's own records.
@@ -6564,6 +6587,7 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
   let navigateTo = null;
 
   const executeTool = async (name, args) => {
+    if (readOnly && !AI_READ_ONLY_TOOLS.has(name)) return { error: `${name} is not available here — Ask Starlane is read-only in the apps.` };
     try {
       switch(name) {
         case 'get_summary': {
@@ -6776,7 +6800,7 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
 
     while (iteration < maxIter) {
       iteration++;
-      const choice = await chatCompletion(chatMessages, AI_TOOLS);
+      const choice = await chatCompletion(chatMessages, readOnly ? AI_TOOLS.filter((t) => AI_READ_ONLY_TOOLS.has(t.function.name)) : AI_TOOLS);
       const msg = choice.message;
       chatMessages.push(msg);
 
