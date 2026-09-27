@@ -1,0 +1,219 @@
+'use strict';
+// scripts/db-preflight.js — READ-ONLY production baseline preflight.
+//
+// Answers one question: is it safe to start using scripts/migrate.js's ledger
+// on this database, and exactly which files should be recorded as already
+// applied?
+//
+// It never writes: the whole inspection runs inside
+// `BEGIN TRANSACTION READ ONLY` and ends with ROLLBACK. It prints no
+// connection string or credential.
+//
+// For every migration file (in runner order) it derives a *signature* from
+// the SQL — the tables it creates, the columns it adds, the indexes it
+// creates — and checks each object against the live catalog:
+//   present  every object the file creates exists
+//   absent   none of them exist
+//   partial  some exist, some don't  -> FAIL (a human must look)
+//   n/a      the file creates nothing checkable (seed data, constraints only)
+//
+// The plan:
+//   RECORD    the leading run of present/n-a files -> recorded without running
+//   APPLY     everything after -> run by migrate.js
+// and it FAILS when applying would re-run a file that is not known to be
+// re-runnable (see REAPPLY_SAFE_FROM), or when a present file sits after a gap
+// before that point.
+//
+// Usage:
+//   node scripts/db-preflight.js            human report, exit 0 PASS / 1 FAIL
+//   node scripts/db-preflight.js --json     machine-readable report
+//
+// Also exported for scripts/db-baseline.js, which re-runs it before writing.
+
+require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
+const { Client } = require('pg');
+const { buildSanitizedPgConfig } = require('../lib/db/pgConfig');
+const { orderedMigrationFiles } = require('./migrate');
+
+const ROOT = path.join(__dirname, '..');
+
+// Files at or after this one were verified (2026-09-27, see
+// docs/STARLANE_OPERATIONS.md) to re-apply cleanly on a schema that already
+// has them. Earlier files are NOT all re-runnable (015 adds constraints
+// without IF NOT EXISTS), so the plan may never re-apply one of them.
+const REAPPLY_SAFE_FROM = 'migrations/020_payment_allocations.sql';
+
+// Objects that later migrations intentionally drop/rename, so their absence
+// is not evidence that the creating migration never ran.
+const IGNORED_OBJECTS = new Set([]);
+
+function stripSql(sql) {
+  return sql
+    .replace(/--[^\n]*/g, ' ')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ');
+}
+
+const ident = String.raw`(?:"?([a-zA-Z_][\w]*)"?\.)?"?([a-zA-Z_][\w]*)"?`;
+
+function signatureOf(sql) {
+  const s = stripSql(sql);
+  const tables = new Set();
+  const columns = new Set();
+  const indexes = new Set();
+  for (const m of s.matchAll(new RegExp(String.raw`CREATE\s+(?:UNLOGGED\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?${ident}`, 'gi'))) {
+    if (!m[1] || m[1].toLowerCase() === 'public') tables.add(m[2].toLowerCase());
+  }
+  for (const m of s.matchAll(new RegExp(String.raw`ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?${ident}\s+ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?"?([a-zA-Z_]\w*)"?`, 'gi'))) {
+    if (!m[1] || m[1].toLowerCase() === 'public') columns.add(`${m[2].toLowerCase()}.${m[3].toLowerCase()}`);
+  }
+  for (const m of s.matchAll(/CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?"?([a-zA-Z_]\w*)"?\s+ON/gi)) {
+    indexes.add(m[1].toLowerCase());
+  }
+  return { tables: [...tables], columns: [...columns], indexes: [...indexes] };
+}
+
+async function catalog(client) {
+  // Sequential: one pg Client runs one query at a time.
+  const t = await client.query(`SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'`);
+  const c = await client.query(`SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'public'`);
+  const i = await client.query(`SELECT indexname FROM pg_indexes WHERE schemaname = 'public'`);
+  return {
+    tables: new Set(t.rows.map((r) => r.table_name.toLowerCase())),
+    columns: new Map(c.rows.map((r) => [`${r.table_name}.${r.column_name}`.toLowerCase(), r.data_type])),
+    indexes: new Set(i.rows.map((r) => r.indexname.toLowerCase())),
+  };
+}
+
+// Targeted checks for the known hazards, reported separately so the operator
+// sees them even when signatures look fine.
+function hazardChecks(cat) {
+  const col = (k) => cat.columns.get(k) || null;
+  return [
+    { id: 'suppliers.id type', value: col('suppliers.id'), note: '020/024 adapt to this type (bigint in the base schema, uuid on some dev DBs)' },
+    { id: 'payment_allocations', value: cat.tables.has('payment_allocations') ? 'present' : 'absent', note: 'created by 020; absent on DBs bootstrapped by the old script' },
+    { id: 'product_suppliers', value: cat.tables.has('product_suppliers') ? 'present' : 'absent', note: 'created by 024' },
+    { id: 'purchase_line_items', value: cat.tables.has('purchase_line_items') ? 'present' : 'absent', note: 'created by 024' },
+    { id: 'invoices.customer_id', value: col('invoices.customer_id') || 'absent', note: '049 adds it as uuid; a non-uuid existing column is left alone (no FK)' },
+    { id: 'access_applications', value: cat.tables.has('access_applications') ? 'present' : 'absent', note: 'created by 050' },
+    { id: 'connector_devices', value: cat.tables.has('connector_devices') ? 'present' : 'absent', note: 'created by 047; Tally pairing depends on it' },
+  ];
+}
+
+async function inspect(client) {
+  await client.query('BEGIN TRANSACTION READ ONLY');
+  try {
+    const cat = await catalog(client);
+    const ledgerExists = cat.tables.has('schema_migrations');
+    const ledger = ledgerExists
+      ? new Map((await client.query('SELECT filename, checksum FROM schema_migrations')).rows.map((r) => [r.filename, r.checksum]))
+      : new Map();
+
+    const files = orderedMigrationFiles().map((file) => {
+      const sig = signatureOf(fs.readFileSync(path.join(ROOT, file), 'utf8'));
+      const objects = [
+        ...sig.tables.map((x) => ({ kind: 'table', name: x, ok: cat.tables.has(x) })),
+        ...sig.columns.map((x) => ({ kind: 'column', name: x, ok: cat.columns.has(x) })),
+        ...sig.indexes.map((x) => ({ kind: 'index', name: x, ok: cat.indexes.has(x) })),
+      ].filter((o) => !IGNORED_OBJECTS.has(o.name));
+      const present = objects.filter((o) => o.ok).length;
+      const state = !objects.length ? 'n/a' : present === objects.length ? 'present' : present === 0 ? 'absent' : 'partial';
+      return { file, state, objects: objects.length, missing: objects.filter((o) => !o.ok).map((o) => `${o.kind} ${o.name}`), inLedger: ledger.has(file) };
+    });
+
+    return { cat, ledgerExists, ledgerRows: ledger.size, files, hazards: hazardChecks(cat) };
+  } finally {
+    await client.query('ROLLBACK');
+  }
+}
+
+function buildPlan(report) {
+  const { files, ledgerExists, ledgerRows } = report;
+  const failures = [];
+  const warnings = [];
+  const safeIdx = files.findIndex((f) => f.file === REAPPLY_SAFE_FROM);
+
+  if (ledgerExists && ledgerRows > 0) {
+    warnings.push(`schema_migrations already has ${ledgerRows} row(s): this database is already on the ledger — use \`node scripts/migrate.js --status\`, not a baseline.`);
+  }
+  for (const f of files) {
+    if (f.state === 'partial') failures.push(`${f.file} is PARTIALLY present (missing: ${f.missing.slice(0, 6).join(', ')}${f.missing.length > 6 ? ', …' : ''}). A human must reconcile it before any baseline.`);
+  }
+
+  // Leading run of files that are present (or have nothing checkable).
+  let cut = -1;
+  for (let i = 0; i < files.length; i++) {
+    if (files[i].state === 'present' || files[i].state === 'n/a') cut = i; else break;
+  }
+  const firstApply = cut + 1;
+  if (files.length && cut < 0) failures.push('The base schema (supabase-schema.sql) is not present. This is not an existing Starlane database — use `node scripts/migrate.js` on an empty one instead.');
+
+  // Everything after the cut is re-run by migrate.js. That is only safe from REAPPLY_SAFE_FROM on.
+  if (firstApply < files.length && firstApply < safeIdx) {
+    const offenders = files.slice(firstApply, safeIdx).filter((f) => f.state !== 'absent');
+    const gap = files[firstApply];
+    if (offenders.length) {
+      failures.push(`${gap.file} is ${gap.state}, but later pre-020 files are present (${offenders.map((f) => f.file).join(', ')}). Re-running them is not known to be safe. A human must reconcile.`);
+    } else {
+      warnings.push(`${files.length - firstApply} file(s) from ${gap.file} onward would run for the first time. Confirm this database really never had them.`);
+    }
+  }
+
+  const record = files.slice(0, firstApply).map((f) => f.file);
+  const apply = files.slice(firstApply).map((f) => ({ file: f.file, state: f.state }));
+  return {
+    pass: failures.length === 0 && !(ledgerExists && ledgerRows > 0),
+    failures,
+    warnings,
+    baselineThrough: record.length ? record[record.length - 1] : null,
+    record,
+    apply,
+  };
+}
+
+async function preflight(client) {
+  const report = await inspect(client);
+  return { ...report, plan: buildPlan(report) };
+}
+
+function printReport(r, log = console.log) {
+  log('Starlane database baseline preflight (read-only)\n');
+  log('Known hazards:');
+  for (const h of r.hazards) log(`  ${h.id.padEnd(22)} ${String(h.value).padEnd(10)} ${h.note}`);
+  log(`\nLedger: ${r.ledgerExists ? `schema_migrations exists (${r.ledgerRows} rows)` : 'none yet'}\n`);
+  log('Per-file state (objects the file creates vs the live catalog):');
+  for (const f of r.files) {
+    const action = r.plan.record.includes(f.file) ? 'RECORD' : 'APPLY ';
+    log(`  ${action} ${f.state.padEnd(8)} ${f.file}${f.missing.length && f.state !== 'absent' ? `  (missing ${f.missing.length})` : ''}`);
+  }
+  for (const w of r.plan.warnings) log(`\n  ! ${w}`);
+  for (const e of r.plan.failures) log(`\n  ✖ ${e}`);
+  log(`\nRESULT: ${r.plan.pass ? 'PASS' : 'FAIL'}`);
+  if (r.plan.pass) {
+    log(`\nPlan (not executed):`);
+    log(`  1. node scripts/db-baseline.js --execute --through=${r.plan.baselineThrough}`);
+    log(`     records ${r.plan.record.length} file(s) as applied without running them`);
+    log(`  2. node scripts/migrate.js`);
+    log(`     applies ${r.plan.apply.length} file(s): ${r.plan.apply.map((a) => path.basename(a.file)).join(', ') || 'none'}`);
+  }
+}
+
+if (require.main === module) {
+  (async () => {
+    const cfg = buildSanitizedPgConfig(process.env.DATABASE_URL);
+    if (!cfg) { console.error('DATABASE_URL is not set'); process.exit(2); }
+    const client = new Client(cfg);
+    await client.connect();
+    try {
+      const r = await preflight(client);
+      if (process.argv.includes('--json')) {
+        const { cat, ...rest } = r;
+        console.log(JSON.stringify(rest, null, 2));
+      } else printReport(r);
+      process.exitCode = r.plan.pass ? 0 : 1;
+    } finally { await client.end(); }
+  })().catch((e) => { console.error(`preflight error: ${String(e.message).split('\n')[0]}`); process.exit(2); });
+}
+
+module.exports = { preflight, signatureOf, printReport, REAPPLY_SAFE_FROM };

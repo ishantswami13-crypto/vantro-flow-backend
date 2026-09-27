@@ -10,6 +10,8 @@
     "test": "node scripts/run-tests.js",
     "db:migrate": "node scripts/migrate.js",
     "db:migrate:status": "node scripts/migrate.js --status",
+    "db:preflight": "node scripts/db-preflight.js",
+    "db:baseline": "node scripts/db-baseline.js",
     "verify:connection": "node scripts/verify-connection.js",
     "setup:database": "node scripts/setup-fresh-database.js",
     "security:secrets": "node scripts/security-secret-scan.js",
