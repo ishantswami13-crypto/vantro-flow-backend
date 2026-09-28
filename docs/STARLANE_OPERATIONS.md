@@ -10,6 +10,11 @@
 
 ## Schema migrations (read before the first deploy of this change)
 
+The step-by-step go-live order (preflight → baseline → migrate → deploy
+backend → deploy website → connect books → signed apps) is in
+[`GO_LIVE.md`](GO_LIVE.md); prefer `npm run db:preflight` / `db:baseline`
+over the manual commands below.
+
 `scripts/migrate.js` is now the only way schema is applied. It keeps a
 `schema_migrations` ledger (file + SHA-256) and stops on the first failure.
 
@@ -27,7 +32,7 @@ node scripts/migrate.js --status
 # 3. Record 001..048 as applied WITHOUT running them
 node scripts/migrate.js --baseline=migrations/048_onboarding_profile.sql
 
-# 4. Apply what is genuinely new (049 invoices.customer_id, 050 access_*)
+# 4. Apply what is genuinely new (049 … 053)
 node scripts/migrate.js
 ```
 
