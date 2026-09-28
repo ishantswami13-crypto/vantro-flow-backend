@@ -34,6 +34,11 @@ async function main() {
     const login = async (u, client) => (await post('/api/auth/native/login', null, { email: u.email, password: 'correct-horse-9', client, platform: 'test' })).body.accessToken;
     const ta = await login(a, 'desktop');
     const tb = await login(b, 'mobile');
+    // The website signs in with the ordinary web login and uses the same /api/client/* routes.
+    const webLogin = async (u) => (await post('/api/auth/login', null, { email: u.email, password: 'correct-horse-9' })).body.token;
+    const taWeb = await webLogin(a);
+    const tbWeb = await webLogin(b);
+    check('web sessions sign in', !!taWeb && !!tbWeb);
 
     console.log('— empty company');
     let br = await get('/api/client/bridge', ta);
@@ -113,9 +118,12 @@ async function main() {
     check('simulate the mission: owner rate used, target = what is left', sim.body.scope === 'mission' && sim.body.simulation.assumptions.find((x) => x.band === '31_90').source === 'you' && sim.body.simulation.target.amount === 100000, sim.body);
     check('simulate on another tenant\'s mission -> 404', (await post('/api/client/simulate', tb, { missionId: mid })).status === 404);
 
-    console.log('— approve -> execute -> progress');
-    const dec = await post(`/api/client/actions/${ma.id}/decision`, ta, { decision: 'approve', confirmHighRisk: true });
-    check('approve: executed honestly (sending off, nothing sent)', dec.body.status === 'done' && /nothing went to Mehta Hardware/.test(dec.body.message), dec.body);
+    console.log('— approve (from the website) -> execute -> progress');
+    check('web session reads the Bridge with the waiting step', (await get('/api/client/bridge', taWeb)).body.attention.topDecisions.some((x) => x.id === ma.id));
+    const foreign = await post(`/api/client/actions/${ma.id}/decision`, tbWeb, { decision: 'approve', confirmHighRisk: true });
+    check('another company\'s web session cannot decide this action (404)', foreign.status === 404, foreign);
+    const dec = await post(`/api/client/actions/${ma.id}/decision`, taWeb, { decision: 'approve', confirmHighRisk: true, via: 'web' });
+    check('approve from the web: executed honestly (sending off, nothing sent)', dec.body.status === 'done' && /nothing went to Mehta Hardware/.test(dec.body.message), dec.body);
     const detail = await get(`/api/client/actions/${ma.id}`, ta);
     check('action lifecycle is EXECUTED', detail.body.action.lifecycle === 'EXECUTED');
     await pool.query(`UPDATE invoices SET payment_status = 'Paid', payment_date = CURRENT_DATE::text WHERE user_id = $1 AND invoice_number = 'S/101'`, [a.id]);
