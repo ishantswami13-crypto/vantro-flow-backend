@@ -107,12 +107,18 @@ async function catalog(client) {
   // Constraint- and policy-level facts that table shapes cannot show.
   const k = await client.query(`SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conname IN ('ai_actions_suggested_by_check')`);
   const r = await client.query(`SELECT relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relrowsecurity`);
+  // 050-053 enable row-level security on their new tables; the backend reads them
+  // through this same connection, which must own them or bypass RLS.
+  const who = (await client.query(`SELECT r.rolsuper OR r.rolbypassrls AS bypass,
+      EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = 'invoices' AND pg_get_userbyid(c.relowner) = current_user) AS owns
+    FROM pg_roles r WHERE r.rolname = current_user`)).rows[0] || {};
   return {
     tables: new Set(t.rows.map((r) => r.table_name.toLowerCase())),
     columns: new Map(c.rows.map((r) => [`${r.table_name}.${r.column_name}`.toLowerCase(), r.data_type])),
     indexes: new Set(i.rows.map((r) => r.indexname.toLowerCase())),
     constraints: new Map(k.rows.map((x) => [x.conname, x.def])),
     rlsTables: r.rows.map((x) => x.relname),
+    role: { bypass: !!who.bypass, ownsTables: !!who.owns },
   };
 }
 
@@ -130,6 +136,7 @@ function hazardChecks(cat) {
     { id: 'connector_devices', value: cat.tables.has('connector_devices') ? 'present' : 'absent', note: 'created by 047; Tally pairing depends on it' },
     { id: 'suggested_by check', value: suggestedByState(cat), note: '019 widens it; mission proposals insert suggested_by = collections_agent' },
     { id: 'row-level security', value: cat.rlsTables.length ? `${cat.rlsTables.length} tables` : 'off', note: '006 enables it (needs Supabase auth); the app enforces tenancy in queries either way' },
+    { id: 'connection role', value: cat.role.bypass ? 'bypasses' : cat.role.ownsTables ? 'owner' : 'LIMITED', note: 'new tables (050-053) have RLS on; this role must own them or bypass RLS, or the new features read nothing' },
   ];
 }
 
@@ -211,6 +218,8 @@ function buildPlan(report) {
   for (const f of outOfOrder) warnings.push(`${f.file} was never applied although later files were; it only creates missing objects IF NOT EXISTS, so it runs out of order.`);
   const unverified = files.slice(0, cut + 1).filter((f) => f.state === 'n/a').map((f) => path.basename(f.file));
   if (unverified.length) warnings.push(`Recorded without verification (they change constraints, policies or seed data, which the catalog check cannot see): ${unverified.join(', ')}. See the hazard lines above.`);
+  const role = report.hazards.find((h) => h.id === 'connection role');
+  if (role && role.value === 'LIMITED') failures.push('The connecting role neither owns the tables nor bypasses row-level security. Run the migrations and the backend with the database owner role (Supabase: the postgres user in the connection string), or the new tables will read as empty.');
   const sb = report.hazards.find((h) => h.id === 'suggested_by check');
   if (sb && sb.value === 'BLOCKS') failures.push('ai_actions_suggested_by_check does not allow collections_agent, so 019 was not applied; mission proposals would fail. Apply 019 by hand (it drops and re-adds the constraint) and re-run this preflight.');
   const firstApply = cut + 1;
