@@ -136,6 +136,15 @@ async function main() {
     check('the paid invoice\'s watch event resolved itself (paid)', w3.body.events.some((e) => e.id === ev.id && e.state === 'resolved' && e.resolution === 'paid_or_removed'));
     check('other tenant sees no missions', (await get('/api/client/missions', tb)).body.missions.length === 0 && (await get(`/api/client/missions/${mid}`, tb)).status === 404);
 
+    console.log('— days overdue are live (the stored column goes stale)');
+    await pool.query(`INSERT INTO invoices (user_id, customer_name, customer_phone, invoice_number, invoice_amount, payment_status, days_overdue, due_date, source_type)
+      VALUES ($1,'Stale Traders','9810000009','T/1',50000,'Pending',3,(CURRENT_DATE - 40)::text,'tally')`, [b.id]);
+    const brB = await get('/api/client/bridge', tb);
+    const band = (id) => brB.body.state.ageing.find((x) => x.id === id);
+    check('Bridge ages a stale invoice by its due date (40 days -> 31–90), not the stored 3', band('31_90').count === 1 && band('1_7').count === 0, brB.body.state.ageing);
+    const wB = await get('/api/client/watch?refresh=1', tb);
+    check('Watch raises it in the 31+ band', wB.body.events.some((e) => /Stale Traders/.test(e.title) && /30 days/.test(e.title)), wB.body.events.map((e) => e.title));
+
     console.log('— memory');
     const mem = await get('/api/client/memory', ta);
     const timing = mem.body.records.find((r) => r.topic === 'payment_timing');
