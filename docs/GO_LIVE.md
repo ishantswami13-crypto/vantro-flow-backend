@@ -193,6 +193,8 @@ What the import does with a company's books:
 | Company with bill-wise details off (no allocations) | Receipts stay unmatched bank credits; bills stay open until paid in Starlane |
 | Bills Receivable as of the day before the synced range (earlier years' unpaid bills) | Invoices for the amount still owed then, sent before the day book so this year's receipts settle them. Credit balances are left out. The same bill arriving later as a sale (or the reverse) stays one invoice |
 | Any new Tally bill | Takes the phone number already on file for that customer (their other invoices). Tally vouchers carry none |
+| Customer ledgers under Sundry Debtors (name + mobile/phone fields only) | A valid Indian mobile fills bills that have no number. A number already on file is never replaced. Landlines and anything else are counted, not used |
+| An empty day book | A successful sync with nothing imported (previously a failed sync and a "sync failed" notification) |
 
 Known limits to check on the first real company:
 - A bill renamed in Tally so that its name differs from the voucher number
@@ -202,9 +204,13 @@ Known limits to check on the first real company:
   sample. It has not been checked against a real export. If Tally refuses
   the report, the sync continues with the day book only (the CLI says so;
   the desktop app records `client.opening_bills_failed`).
-- Customers with no number anywhere in Starlane still have none. Their
-  reminders fail on approval with "No phone number on file". Reading
-  numbers from Tally's ledger masters is not built.
+- The customer-ledger contacts request (TDL collection of Ledger under
+  $$GroupSundryDebtors, FETCH NAME, LEDGERMOBILE, LEDGERPHONE) has not been
+  checked against a real TallyPrime. A customer with no valid mobile in
+  Tally or Starlane still can't be reminded ("No phone number on file").
+- The CLI bridge now sends at most 1000 vouchers per request. Before, one
+  request carried the whole range and anything over the 5000 limit was
+  rejected outright.
 - Bills show Tally's bill number without punctuation ("S201" for "S/201").
   Scan finds either spelling. The stored reference is unchanged, so
   re-syncs stay idempotent.

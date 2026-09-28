@@ -181,6 +181,23 @@ async function main() {
       byBill.invoices?.length === 1 && byBill.invoices[0].invoiceNumber === 'S201', byBill.invoices);
     const cust = await (await fetch(`${base}/api/client/scan/customer/${encodeURIComponent('mehta hardware')}`, { headers: auth(owner) })).json();
     check('customer Scan lists bills by number', cust.scan?.invoices?.some((i) => i.invoiceNumber === 'S1450') && !cust.scan.invoices.some((i) => /^TLY-/.test(i.invoiceNumber)), cust.scan?.invoices);
+    console.log('— PHONE NUMBERS from Tally customer ledgers');
+    const contactsOut = execFileSync(process.execPath, ['tally-connector/tally-sync.mjs', '--test', '--contacts=sample-ledger-contacts.xml'], { encoding: 'utf8' });
+    const contactsLine = contactsOut.split('\n').find((l) => l.includes('customer phone numbers that WOULD be sent')) || '';
+    const contacts = JSON.parse(contactsLine.slice(contactsLine.indexOf('[')) || '[]');
+    const phonesBefore = (await pool.query(`SELECT customer_name, customer_phone FROM invoices WHERE user_id = $1 AND customer_name IN ('Sharma Traders','Mehta Hardware')`, [owner.id])).rows;
+    const withContacts = await (await fetch(`${base}/api/import/tally`, {
+      method: 'POST', headers: { Authorization: device, 'Content-Type': 'application/json' }, body: JSON.stringify({ vouchers: [], contacts }),
+    })).json();
+    const phones = (await pool.query(`SELECT customer_name, customer_phone FROM invoices WHERE user_id = $1`, [owner.id])).rows;
+    const phonesOf = (name) => [...new Set(phones.filter((r) => r.customer_name === name).map((r) => r.customer_phone))];
+    check('an empty day book with contacts is a successful sync', withContacts.success === true && withContacts.contacts?.received === 4, withContacts);
+    check('Mehta\'s bills get the mobile from the Tally ledger (normalised)', phonesOf('Mehta Hardware').join() === '9810000001', phonesBefore.concat(phonesOf('Mehta Hardware')));
+    check('a number already on file is kept (Sharma)', phonesOf('Sharma Traders').join() === '9800000000', phonesOf('Sharma Traders'));
+    check('a customer with no Tally number stays without one (Rao & Sons)', phonesOf('Rao & Sons').join() === '', phonesOf('Rao & Sons'));
+    check('a landline is not used as a mobile', withContacts.contacts?.not_a_mobile === 1, withContacts.contacts);
+    const badContacts = await fetch(`${base}/api/import/tally`, { method: 'POST', headers: { Authorization: device, 'Content-Type': 'application/json' }, body: JSON.stringify({ vouchers: [], contacts: 'x' }) });
+    check('contacts must be a list (400)', badContacts.status === 400);
     check('no receivable for the on-account credit balance', (await pool.query(`SELECT COUNT(*)::int c FROM invoices WHERE user_id = $1 AND customer_name = 'Kapoor & Co'`, [owner.id])).rows[0].c === 0);
   } finally {
     if (server) server.stop();

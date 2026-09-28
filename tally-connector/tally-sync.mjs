@@ -18,7 +18,8 @@
  *                                         # then run one sync
  *   node tally-sync.mjs --test      # offline: parse sample-daybook.xml, print payload (no Tally, no internet)
  *                                   # (--sample=<file> picks another day book, --opening=<file> adds
- *                                   #  a Bills Receivable export of bills unpaid before the range)
+ *                                   #  a Bills Receivable export of bills unpaid before the range,
+ *                                   #  --contacts=<file> a customer-ledger contacts export)
  *   node tally-sync.mjs --dry-run   # pull from Tally + parse, but DON'T send (print what would be sent)
  *   node tally-sync.mjs             # full sync: Tally -> Starlane, once (uses stored device
  *                                   # credential if present, else falls back to
@@ -180,6 +181,23 @@ function billsReceivableRequestXML(asOf, company) {
    </STATICVARIABLES>
   </DESC>
  </BODY>
+</ENVELOPE>`;
+}
+
+/**
+ * Asks Tally for its customers' ledgers (everything under Sundry Debtors), with
+ * only the name and phone fields — no addresses, tax numbers or balances.
+ */
+function debtorContactsRequestXML(company) {
+  const companyTag = company ? `<SVCURRENTCOMPANY>${escapeXml(company)}</SVCURRENTCOMPANY>` : '';
+  return `<ENVELOPE>
+ <HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>StarlaneDebtorContacts</ID></HEADER>
+ <BODY><DESC>
+  <STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>${companyTag}</STATICVARIABLES>
+  <TDL><TDLMESSAGE>
+   <COLLECTION NAME="StarlaneDebtorContacts" ISMODIFY="No"><TYPE>Ledger</TYPE><CHILDOF>$$GroupSundryDebtors</CHILDOF><BELONGSTO>Yes</BELONGSTO><FETCH>NAME, LEDGERMOBILE, LEDGERPHONE</FETCH></COLLECTION>
+  </TDLMESSAGE></TDL>
+ </DESC></BODY>
 </ENVELOPE>`;
 }
 
@@ -356,6 +374,17 @@ function openingBillVouchers(bills) {
   return bills.map((b) => ({ type: 'Opening Bill', date: b.billDate, party: b.party, voucherNo: b.billName, amount: b.pending, items: [], dueDate: b.dueDate, bills: [] }));
 }
 
+/** Customers' phone numbers from the debtor ledgers (mobile first). Starlane keeps only valid mobiles. */
+function parseLedgerContacts(xml) {
+  const out = [];
+  for (const block of xml.match(/<LEDGER\b[^>]*>[\s\S]*?<\/LEDGER>/gi) || []) {
+    const party = decode(block.match(/^<LEDGER\b[^>]*\bNAME="([^"]*)"/i)?.[1] || '') || tag(block, 'NAME');
+    const phone = tag(block, 'LEDGERMOBILE') || tag(block, 'LEDGERPHONE');
+    if (party && phone) out.push({ party, phone });
+  }
+  return out;
+}
+
 function toApiVouchers(vouchers, wantedTypes) {
   const wanted = wantedTypes.map((t) => t.toLowerCase());
   const rows = [];
@@ -435,8 +464,9 @@ async function getAuthHeader(cfg) {
   return `Bearer ${r.body.token}`;
 }
 
-async function pushToStarlane(cfg, rows, authHeader) {
-  const r = await apiRequest(cfg.starlane.apiBase, '/api/import/tally', { method: 'POST', authHeader, json: { vouchers: rows } });
+async function pushToStarlane(cfg, rows, authHeader, contacts = []) {
+  const json = contacts.length ? { vouchers: rows, contacts } : { vouchers: rows };
+  const r = await apiRequest(cfg.starlane.apiBase, '/api/import/tally', { method: 'POST', authHeader, json });
   if (r.status !== 200) throw new Error(`Import failed (${r.status}): ${r.body?.error || JSON.stringify(r.body)}`);
   return r.body;
 }
@@ -446,6 +476,7 @@ async function pushToStarlane(cfg, rows, authHeader) {
 // ---------------------------------------------------------------------------
 async function collectRows(cfg) {
   const all = [];
+  const contacts = [];
   let totalSkipped = 0;
   for (const company of cfg.companies.length ? cfg.companies : ['']) {
     const label = company || '(current company)';
@@ -482,6 +513,24 @@ async function collectRows(cfg) {
       console.log(`   ${label}: ${bills.length} bills unpaid on ${tallyDateToISO(asOf)}${credits ? `, ${credits} credit balance${credits === 1 ? '' : 's'} left out` : ''}${unreadable ? `, ${unreadable} lines not understood` : ''}.`);
     }
 
+    // Customers' mobile numbers from their Tally ledgers (name and phone fields only),
+    // so reminders can reach them. Starlane uses them only where it has no number.
+    let contactsXml = null;
+    if (MODE === 'test') {
+      const file = [...args].find((a) => a.startsWith('--contacts='))?.slice('--contacts='.length);
+      if (file) contactsXml = readFileSync(join(HERE, file.replace(/[^\w.-]/g, '')), 'utf-8');
+    } else {
+      try {
+        contactsXml = await tallyPost(cfg, debtorContactsRequestXML(company));
+        if (tag(contactsXml, 'LINEERROR')) contactsXml = null;
+      } catch { /* optional: the sync goes on without them */ }
+    }
+    if (contactsXml) {
+      const found = parseLedgerContacts(contactsXml);
+      contacts.push(...found);
+      console.log(`   ${label}: phone numbers on ${found.length} customer ledger${found.length === 1 ? '' : 's'}.`);
+    }
+
     const vouchers = parseVouchers(xml);
     const { rows, skipped } = toApiVouchers(vouchers, cfg.voucherTypes);
     totalSkipped += skipped.length;
@@ -489,16 +538,21 @@ async function collectRows(cfg) {
     const byType = rows.reduce((m, r) => ((m[r.type] = (m[r.type] || 0) + 1), m), {});
     console.log(`   ${label}: ${vouchers.length} vouchers → keeping ${rows.length} (${Object.entries(byType).map(([t, c]) => `${c} ${t}`).join(', ') || 'none'}), ${skipped.length} skipped.`);
   }
-  return { rows: all, totalSkipped };
+  return { rows: all, contacts, totalSkipped };
 }
 
+// Starlane takes at most 5000 vouchers per request; a year of a busy company's
+// books is more than that, so it goes in chunks (the import is idempotent).
+const CHUNK = 1000;
+
 async function runOnce(cfg) {
-  const { rows } = await collectRows(cfg);
+  const { rows, contacts } = await collectRows(cfg);
   if (rows.length === 0) { console.log('ℹ️  No vouchers found in this date range. Nothing to send.'); return; }
 
   if (MODE === 'test' || MODE === 'dry-run') {
     console.log(`\n📋 ${rows.length} vouchers that WOULD be sent to Starlane:\n`);
     console.log(JSON.stringify(rows, null, 2));
+    if (contacts.length) console.log(`\n📇 ${contacts.length} customer phone numbers that WOULD be sent: ${JSON.stringify(contacts)}`);
     console.log(`\n(${MODE} mode — nothing was sent.)`);
     return;
   }
@@ -506,11 +560,17 @@ async function runOnce(cfg) {
   process.stdout.write('🔑 Authenticating with Starlane ... ');
   const authHeader = await getAuthHeader(cfg);
   console.log('ok.');
-  process.stdout.write(`⬆️  Sending ${rows.length} vouchers to Starlane ... `);
-  const res = await pushToStarlane(cfg, rows, authHeader);
-  console.log('done.');
-  console.log(`\n✅ ${res.message || JSON.stringify(res.imported)}`);
-  try { writeFileSync(join(HERE, 'state.json'), JSON.stringify({ lastSync: new Date().toISOString(), result: res.imported }, null, 2)); } catch {}
+  const results = [];
+  for (let i = 0; i < rows.length; i += CHUNK) {
+    const part = rows.slice(i, i + CHUNK);
+    process.stdout.write(`⬆️  Sending vouchers ${i + 1}–${i + part.length} of ${rows.length} to Starlane ... `);
+    results.push(await pushToStarlane(cfg, part, authHeader, i === 0 ? contacts : []));
+    console.log('done.');
+  }
+  for (const res of results) console.log(`✅ ${res.message || JSON.stringify(res.imported)}`);
+  const imported = {};
+  for (const res of results) for (const [k, v] of Object.entries(res.imported || {})) imported[k] = (imported[k] || 0) + (Number(v) || 0);
+  try { writeFileSync(join(HERE, 'state.json'), JSON.stringify({ lastSync: new Date().toISOString(), result: imported }, null, 2)); } catch {}
 }
 
 async function enroll(cfg) {
