@@ -12,6 +12,7 @@ const cron = require('node-cron');
 const rateLimit = require('express-rate-limit');
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
+const { RELEASE } = require('./lib/release');
 const path = require('path');
 const webpush = require('web-push');
 const { createClient } = require('@supabase/supabase-js');
@@ -143,7 +144,10 @@ app.use((req, res, next) => {
       statusCode: status,
       userId: req.user?.userId || req.user?.id || null,
       businessId: req.user?.businessId || null,
-      durationMs: parseFloat(durationMs)
+      durationMs: parseFloat(durationMs),
+      release: RELEASE,
+      // Set by the desktop/phone apps so a failure can be tied to the build that sent it.
+      clientVersion: typeof req.headers['x-starlane-client'] === 'string' ? req.headers['x-starlane-client'].slice(0, 40) : null
     };
 
     if (status >= 400) {
@@ -388,7 +392,7 @@ const corsOptions = {
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   // X-Access-Token: access-flow status/entitlement tokens (lib/routes/access.js).
   // X-Sync-Run-Id: connector hosts tie an import to the sync run they started.
-  allowedHeaders: ["Authorization", "Content-Type", "X-CSRF-Token", "X-Request-ID", "X-Access-Token", "X-Sync-Run-Id"],
+  allowedHeaders: ["Authorization", "Content-Type", "X-CSRF-Token", "X-Request-ID", "X-Access-Token", "X-Sync-Run-Id", "X-Starlane-Client"],
   // Lets the frontend read the X-CSRF-Token response header (set below in
   // authMiddleware) across origins — without this, a custom response header
   // is invisible to cross-origin fetch() even though the browser received
@@ -5660,6 +5664,13 @@ app.get('/api/health', (req, res) => {
     timestamp: new Date().toISOString(),
     requestId: req.requestId
   });
+});
+
+// Which build is live and whether its database matches: release, git SHA, API
+// level the apps must speak, and the migration level expected vs applied.
+// Public on purpose (no secrets, no tenant data): it is the first post-deploy check.
+app.get('/api/version', async (req, res) => {
+  res.json({ success: true, ...(await require('./lib/release').versionReport(pgPool)) });
 });
 
 app.get('/api/live', (req, res) => {
