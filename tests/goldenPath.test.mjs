@@ -225,6 +225,25 @@ async function main() {
     });
     check('a mission never counts a cancelled bill as collected', prog.collected === 0 && prog.byInvoice[0].status === 'cancelled_in_books'
       && prog.blockers.some((b) => b.code === 'cancelled_in_books'), prog);
+
+    console.log('— DELETIONS in Tally (a voucher removed, not cancelled)');
+    const idOut = execFileSync(process.execPath, ['tally-connector/tally-sync.mjs', '--test', '--sample=sample-daybook-corrections.xml'], { encoding: 'utf8' });
+    const idLine = idOut.split('\n').find((l) => l.includes('WOULD be checked for deletions')) || '';
+    const identities = JSON.parse(idLine.slice(idLine.indexOf('[')) || '[]');
+    const reconcile = (present) => fetch(`${base}/api/import/tally/reconcile`, {
+      method: 'POST', headers: { Authorization: device, 'Content-Type': 'application/json' }, body: JSON.stringify({ from: '2026-08-01', to: '2026-09-30', present }),
+    }).then(async (r) => ({ status: r.status, body: await r.json() }));
+    const same = await reconcile(identities);
+    check('the corrected books, all present: nothing deleted', same.status === 200 && !same.body.held && Object.values(same.body.deleted).every((x) => x === 0), same.body);
+    const r33 = await reconcile(identities.filter((v) => v.voucherNo !== 'R/33'));
+    const r33line = (await pool.query(`SELECT status FROM bank_transactions WHERE user_id = $1 AND description LIKE '[TLY-RECEIPT-R33-%'`, [owner.id])).rows[0];
+    check('a receipt deleted in Tally: its bank line is cancelled', r33.body.deleted?.bank_lines === 1 && r33line?.status === 'cancelled', [r33.body, r33line]);
+    const partial = await reconcile(identities.slice(0, 1));
+    check('a partial export is held and changes nothing', partial.body.held === true && /nothing was treated as deleted/.test(partial.body.message), partial.body);
+    check('an empty export deletes nothing', (await reconcile([])).body.checked === 0);
+    const otherRecon = await fetch(`${base}/api/import/tally/reconcile`, { method: 'POST', headers: { ...auth(other), 'Content-Type': 'application/json' }, body: JSON.stringify({ from: '2026-08-01', to: '2026-09-30', present: [{ type: 'Sales', voucherNo: 'X', date: '2026-08-02' }] }) }).then((r) => r.json());
+    check('another company\'s reconcile never touches this company\'s bills', !otherRecon.held && Object.values(otherRecon.deleted || {}).every((x) => x === 0)
+      && (await pool.query(`SELECT COUNT(*)::int c FROM invoices WHERE user_id = $1 AND payment_status = 'Cancelled'`, [owner.id])).rows[0].c === 1, otherRecon);
   } finally {
     if (server) server.stop();
     await pool.query('DELETE FROM connector_devices WHERE user_id = ANY($1)', [users]).catch(() => {});

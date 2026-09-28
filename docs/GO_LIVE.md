@@ -199,6 +199,8 @@ What the import does with a company's books:
 | A sale cancelled in Tally (ISCANCELLED) | Invoice becomes `Cancelled`: not owed on any screen, never chased (every sending path only chases `Pending`), not counted as collected in a Mission (shown as a blocker instead) |
 | A receipt / payment / purchase cancelled | Its unmatched bank line or purchase is marked cancelled; a bank line already matched by reconciliation is left alone |
 | An optional voucher (ISOPTIONAL, a memorandum) | Never imported |
+| A sale or purchase cancelled after its stock moved | Each stock movement it made is reversed once (`<ref>:cancelled`) |
+| A voucher deleted in Tally (not cancelled) | After a full sync, the client lists every voucher in the range; what Starlane imported there and is missing is treated like a cancellation (bill Cancelled, settlement taken back, unmatched bank line cancelled). Held when the export looks partial (see below) |
 | An empty day book | A successful sync with nothing imported (previously a failed sync and a "sync failed" notification) |
 
 Known limits to check on the first real company:
@@ -213,11 +215,15 @@ Known limits to check on the first real company:
   $$GroupSundryDebtors, FETCH NAME, LEDGERMOBILE, LEDGERPHONE) has not been
   checked against a real TallyPrime. A customer with no valid mobile in
   Tally or Starlane still can't be reminded ("No phone number on file").
-- A cancelled sale's stock movement stays recorded. Stock is not given
-  back when a sale is cancelled.
-- A voucher deleted in Tally, rather than cancelled, simply stops appearing,
-  and Starlane keeps what it imported. Detecting deletions needs a full-range
-  reconciliation, which is not built.
+- Deletions are detected only for the synced range (1 April to today),
+  by comparing against the list the client sends after a full sync. That
+  list covers every voucher Tally exported, whatever the voucher-type
+  filter; the CLI sends all its companies together. The comparison is
+  held (nothing applied, a message shown) when more than max(3, 10%) of
+  what is live in the range would go, or more than half of it. A held
+  result stays held until the export looks complete again.
+- Switching the desktop app to another Tally company therefore holds
+  deletion checks for the old company's bills rather than removing them.
 - The CLI bridge now sends at most 1000 vouchers per request. Before, one
   request carried the whole range and anything over the 5000 limit was
   rejected outright.

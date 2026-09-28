@@ -389,6 +389,21 @@ function parseLedgerContacts(xml) {
   return out;
 }
 
+/**
+ * Every voucher Tally exported for a synced range, by identity only (type,
+ * number, date), whatever the voucher-type filter: Starlane treats what it
+ * imported in the range and is absent here as deleted in Tally. Optional
+ * vouchers are not in the books, so they are not listed.
+ */
+function voucherIdentities(vouchers) {
+  const out = [];
+  for (const v of vouchers) {
+    const date = tallyDateToISO(v.date);
+    if (date && !v.optional) out.push({ type: v.type, voucherNo: v.voucherNo, date });
+  }
+  return out;
+}
+
 function toApiVouchers(vouchers, wantedTypes) {
   const wanted = wantedTypes.map((t) => t.toLowerCase());
   const rows = [];
@@ -488,6 +503,9 @@ async function pushToStarlane(cfg, rows, authHeader, contacts = []) {
 async function collectRows(cfg) {
   const all = [];
   const contacts = [];
+  // One list for every company synced to this Starlane account, so one company's
+  // bills are never treated as deleted because another company's export lacks them.
+  const identities = [];
   let totalSkipped = 0;
   for (const company of cfg.companies.length ? cfg.companies : ['']) {
     const label = company || '(current company)';
@@ -543,13 +561,14 @@ async function collectRows(cfg) {
     }
 
     const vouchers = parseVouchers(xml);
+    identities.push(...voucherIdentities(vouchers));
     const { rows, skipped } = toApiVouchers(vouchers, cfg.voucherTypes);
     totalSkipped += skipped.length;
     all.push(...rows);
     const byType = rows.reduce((m, r) => ((m[r.type] = (m[r.type] || 0) + 1), m), {});
     console.log(`   ${label}: ${vouchers.length} vouchers → keeping ${rows.length} (${Object.entries(byType).map(([t, c]) => `${c} ${t}`).join(', ') || 'none'}), ${skipped.length} skipped.`);
   }
-  return { rows: all, contacts, totalSkipped };
+  return { rows: all, contacts, identities, totalSkipped };
 }
 
 // Starlane takes at most 5000 vouchers per request; a year of a busy company's
@@ -557,13 +576,14 @@ async function collectRows(cfg) {
 const CHUNK = 1000;
 
 async function runOnce(cfg) {
-  const { rows, contacts } = await collectRows(cfg);
+  const { rows, contacts, identities } = await collectRows(cfg);
   if (rows.length === 0) { console.log('ℹ️  No vouchers found in this date range. Nothing to send.'); return; }
 
   if (MODE === 'test' || MODE === 'dry-run') {
     console.log(`\n📋 ${rows.length} vouchers that WOULD be sent to Starlane:\n`);
     console.log(JSON.stringify(rows, null, 2));
     if (contacts.length) console.log(`\n📇 ${contacts.length} customer phone numbers that WOULD be sent: ${JSON.stringify(contacts)}`);
+    console.log(`\n🧾 ${identities.length} vouchers in ${tallyDateToISO(cfg.fromDate)}–${tallyDateToISO(cfg.toDate)} WOULD be checked for deletions: ${JSON.stringify(identities)}`);
     console.log(`\n(${MODE} mode — nothing was sent.)`);
     return;
   }
@@ -579,6 +599,13 @@ async function runOnce(cfg) {
     console.log('done.');
   }
   for (const res of results) console.log(`✅ ${res.message || JSON.stringify(res.imported)}`);
+  // Everything imported, so what Tally no longer has in the range was deleted there.
+  // Starlane holds back (and says so) when the export looks partial.
+  const recon = await apiRequest(cfg.starlane.apiBase, '/api/import/tally/reconcile', {
+    method: 'POST', authHeader, json: { from: tallyDateToISO(cfg.fromDate), to: tallyDateToISO(cfg.toDate), present: identities },
+  }).catch((e) => ({ status: 0, body: { error: e.message } }));
+  if (recon.status === 200) console.log(`${recon.body.held ? '⚠️ ' : '🧾'} ${recon.body.message}`);
+  else console.log(`⚠️  Could not check for vouchers deleted in Tally (${recon.status}): ${recon.body?.error || 'unknown error'}`);
   const imported = {};
   for (const res of results) for (const [k, v] of Object.entries(res.imported || {})) imported[k] = (imported[k] || 0) + (Number(v) || 0);
   try { writeFileSync(join(HERE, 'state.json'), JSON.stringify({ lastSync: new Date().toISOString(), result: imported }, null, 2)); } catch {}
