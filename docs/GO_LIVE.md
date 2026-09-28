@@ -195,6 +195,9 @@ What the import does with a company's books:
 Known limits to check on the first real company:
 - A bill renamed in Tally so that its name differs from the voucher number
   will not match.
-- Receipts dated before the first synced date range can't settle bills
-  from that range.
+- The day book sync starts at the financial year (1 April). Bills still
+  outstanding from earlier years (opening balances) are not imported, and
+  receipts against them are reported as `bill_not_found`. Importing
+  opening outstanding bills (Tally's Bills Receivable) is the next import
+  gap to close.
 Compare the Outstanding report after the first sync.
