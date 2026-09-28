@@ -91,6 +91,13 @@ if (env.FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED === 'true') {
   const twilio = ['TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_WHATSAPP_NUMBER'].filter((k) => !has(k));
   add(twilio.length ? 'FAIL' : 'OK', 'FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED', twilio.length ? `on, but ${twilio.join(', ')} not set` : 'on, Twilio configured');
 } else add('OK', 'FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED', 'off (no WhatsApp sends)');
+// Pilot emergency stop: approvals are recorded but nothing is carried out.
+add('OK', 'ACTION_EXECUTION_PAUSED', env.ACTION_EXECUTION_PAUSED === 'true'
+  ? 'on: approvals are recorded, nothing is executed (no message, call, PO or payout)'
+  : 'off (approved actions are carried out; set true to stop them without a deploy)');
+// Real payouts happen only when the payout gateway is configured.
+add(has('RAZORPAYX_KEY_ID') && has('RAZORPAYX_KEY_SECRET') ? 'WARN' : 'OK', 'RAZORPAYX_*',
+  has('RAZORPAYX_KEY_ID') && has('RAZORPAYX_KEY_SECRET') ? 'set: approving a supplier payment can move money' : 'not set (supplier payments stay manual)');
 
 // ── App builds (must be real https builds if set) ─────────────────────────
 for (const k of ['DESKTOP_DOWNLOAD_URL_WINDOWS', 'DESKTOP_DOWNLOAD_URL_MACOS', 'DESKTOP_DOWNLOAD_URL_LINUX', 'MOBILE_DOWNLOAD_URL_ANDROID', 'MOBILE_DOWNLOAD_URL_IOS']) {

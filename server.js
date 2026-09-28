@@ -11653,6 +11653,15 @@ async function executeApprovedAction(action, { source }) {
   const actionService = require('./lib/services/orchestrator/action.service');
   const { track, EVENTS } = require('./lib/observability/productEvents');
   const { notify, TYPES } = require('./lib/notifications/notify');
+  // Operator emergency stop for pilots: approvals are still recorded (the action
+  // stays APPROVED and can be carried out once this is lifted), but nothing is
+  // executed — no message, call, purchase order or payout.
+  if (process.env.ACTION_EXECUTION_PAUSED === 'true') {
+    await createActivityLog(action.user_id, 'ai_action_approved_execution_paused', {
+      entityType: 'ai_action', entityId: action.id, source, actionType: action.action_type,
+    });
+    return { ok: true, paused: true, message: 'Approved and recorded. Carrying out actions is paused by Starlane for now, so nothing was sent, called or paid.' };
+  }
   let result;
   try {
     if (action.action_type === 'INVENTORY_PO_READY') result = await executeInventoryPO(action.user_id, action);
