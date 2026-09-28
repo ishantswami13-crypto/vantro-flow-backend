@@ -1,125 +1,181 @@
-# Starlane — going live
+# Starlane 0.1.0 — go-live plan
 
-Everything that can be built and tested without your accounts is done and
-green (backend PR ishantswami13-crypto/vantro-flow-backend#41, frontend PR
-ishantswami13-crypto/vantro-flow-frontend#22). What is left needs your
-accounts, your keys or your approval. Do it in this order; each step says who
-does it and how you know it worked.
+Backend PR ishantswami13-crypto/vantro-flow-backend#41 and frontend PR
+ishantswami13-crypto/vantro-flow-frontend#22 are the release candidate. Nothing
+below has been run against production. Every step that writes to production
+waits for the owner's explicit go-ahead.
 
 Railway does **not** run migrations on deploy (`startCommand` is
-`node server.js`), so the database is upgraded **before** the new backend
-goes out. Migrations 049–053 only add tables, columns, indexes and one
-trigger, so the backend that is live today keeps working on the upgraded
-database.
+`node server.js`), so the database is upgraded **first**, while today's backend
+is still live. That is safe because 049–053 only add (tables, nullable
+columns, indexes, one trigger) — proven on a rehearsal copy, below.
 
-## 1. Look at the production database — read-only (you run it, ~2 min)
+## Rehearsal evidence (production-like copy, 2026-09-28)
 
-From your computer, in `vantro-flow-backend`, with the Railway CLI logged in
-and linked to the production service:
+A database built the way production was: `main`'s base schema, migrations
+001–048 applied by hand (006 failed — no Supabase `auth`; 020 and 024 failed
+silently on `suppliers.id`), `main`'s server booted once, 400 invoices, 60
+actions, customers and promises for two businesses, no migration ledger.
 
-```bash
-railway run npm run db:preflight
-```
+| Check | Result |
+| --- | --- |
+| Preflight (read-only) | PASS after one fix (below): record 19 files, apply 27 |
+| Baseline + migrate | clean; `migrate --status` shows nothing pending |
+| Existing data | all 90 pre-existing tables byte-identical over their original columns |
+| Old backend (`main`) on the upgraded schema | boots, deep health OK, serves |
+| New backend on it | each business's Bridge equals its invoices in SQL (₹60,39,884 / 213 open; ₹30,48,116 / 107 open); Watch, Memory, Prepared work; cross-tenant read → 404 |
+| `npm test` against it | 40/40 |
 
-It runs inside a read-only transaction, prints no credentials and changes
-nothing. It ends in **PASS** with a plan (which files to record as already
-applied, which to apply), or **FAIL** with the file that needs a human look.
-Send me the output (it contains no secrets) and I will check the plan with
-you. If it fails, stop here.
+The rehearsal found that the original preflight would have **failed on
+production**: a hand-migrated history has gaps (the error-events table file
+was never applied while later files were). The preflight now runs such a file
+out of order only if every statement is a no-op when its object exists, still
+fails on any other gap, lists the files it cannot verify (006, 016, 019), and
+checks the facts the new code depends on (019's `suggested_by` constraint, and
+that the connecting role can read the new RLS-protected tables).
 
-## 2. Adopt the migration ledger (you run it, after we agree on step 1)
+**Estimated downtime: none.** The only locks are brief: indexes on `invoices`
+and `ai_actions` (seconds for thousands of rows) and a trigger on
+`ai_actions`. Run it at a quiet hour anyway.
 
-```bash
-railway run npm run db:baseline -- --execute --through=<the file step 1 printed>
-```
+## Execution order
 
-Writes only the `schema_migrations` table, in one transaction, and refuses
-if the database no longer matches the plan. Nothing else runs.
+Steps marked **(approval)** change production and need the owner's go-ahead.
 
-## 3. Apply the new migrations (you run it)
+1. **Preflight — read-only.** With `PROD_DATABASE_URL` in the environment:
+   `DATABASE_URL="$PROD_DATABASE_URL" npm run db:preflight`
+   (or `railway run npm run db:preflight`). Review the plan: which files are
+   recorded without running, which run, the unverified list and the hazard
+   lines. Stop if it says FAIL.
+2. **Backup.** Supabase: Database → Backups (or a `pg_dump` of the project).
+   Note the backup time; it is the rollback point.
+3. **(approval) Baseline.**
+   `npm run db:baseline -- --execute --through=<file the preflight printed>`
+   — writes only `schema_migrations`, in one transaction; refuses if the
+   database changed since the preflight.
+4. **(approval) Migrate.** `npm run db:migrate`, then `npm run db:migrate:status`
+   (expect nothing pending). Stops at the first failure.
+5. **Check the live (old) site still works** — sign in, open the dashboard.
+6. **(approval) Merge #41 → Railway deploys the backend.** Check
+   `GET /api/version`: `release 0.1.0`, `migrations.upToDate: true`, and the
+   git SHA of the merge. Set `ACTION_EXECUTION_PAUSED=true` first if you want
+   the pilot to start with nothing carried out (see Pilot controls).
+7. **(approval) Merge #22 → Vercel deploys the website.** Its
+   `NEXT_PUBLIC_API_URL` must be the production backend (https).
+8. **Smoke test with your own login:** Bridge shows your real receivables (or
+   "Connect your books"), the sidebar is the seven features + Sources +
+   Settings, Scan finds a customer, Watch lists overdue items, a mission can be
+   started and cancelled.
+9. **Connect Tally** on the owner's PC (bridge from the setup page, or the
+   Windows app) and watch the first sync land in Sources.
+10. **Give the Windows installer / Android APK to the first business**
+    (direct distribution; see Distribution).
 
-```bash
-railway run npm run db:migrate
-railway run npm run db:migrate:status   # expect 049 … 053 applied, nothing pending
-```
+## Rollback
 
-Stops at the first failure. Take a Railway/Supabase backup first if you have
-not recently.
-
-## 4. Backend environment (Railway → vantro-flow-backend → Variables)
-
-Required (the server checks `JWT_SECRET` at start and stops without it;
-without `DATABASE_URL` every data route fails):
-`JWT_SECRET` (≥32 chars), `DATABASE_URL`, `SUPABASE_URL`, `PUBLIC_APP_URL`,
-`PUBLIC_API_URL` (both https), `ADMIN_EMAILS`.
-
-Recommended: `RESEND_API_KEY` + `ACCESS_EMAIL_FROM` (applicant emails; without
-them an admin sends links by hand).
-
-Leave as they are: `FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED` **off** (nothing
-is sent to customers; approving records the decision and shows the draft),
-`DEMO_RESET_ENABLED` unset. Leave `DESKTOP_DOWNLOAD_URL_*` unset until a
-signed build is published (step 8) — the website then says honestly that no
-app is available.
-
-Check them without printing values: `railway run npm run env:check`.
-
-## 5. Merge and deploy the backend (you)
-
-Merge #41. Railway deploys it. Check: `GET /health` is 200, and signing in on
-the website still works.
-
-## 6. Merge and deploy the website (you)
-
-Merge #22. Vercel deploys it. In Vercel, `NEXT_PUBLIC_API_URL` must be the
-production backend URL (https); leave `NEXT_PUBLIC_DEMO_CONTROLS` unset.
-
-Check with your own login: The Bridge shows your real receivables (or "Connect
-your books to start" if nothing is imported yet), and the sidebar shows the
-seven features plus Sources and Settings.
-
-## 7. Connect your books (you, on the PC that runs TallyPrime)
-
-- **Tally:** Sources → Connect Tally. Until the signed Windows app is
-  published, use the bridge the setup page offers; the Windows app does the
-  same from the tray once installed.
-- **Busy, Marg, Zoho Books, QuickBooks, Xero, anything else:** export a sheet
-  and upload it in Sources. These are imports, not live connections.
-
-Then: Watch lists what is overdue, Scan explains a customer, and a mission
-from Scan proposes reminders for you to approve.
-
-## 8. Signed apps (you provide the keys; the pipelines are already wired)
-
-Add these as GitHub Actions secrets on `vantro-flow-frontend`; the next push
-builds signed artifacts automatically:
-
-| What | Secrets | Without it |
+| Situation | Action | Data risk |
 | --- | --- | --- |
-| Windows code signing | `WINDOWS_CERTIFICATE` (base64 .pfx), `WINDOWS_CERTIFICATE_PASSWORD` | SmartScreen shows "unknown publisher" |
-| In-app updates | secret `TAURI_SIGNING_PRIVATE_KEY` (+ `_PASSWORD`), and the public half as the Actions *variable* `TAURI_UPDATER_PUBKEY` | No automatic updates |
-| Android release | `ANDROID_KEYSTORE` (base64), `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD` | Debug-signed APK, not for the Play Store |
-| Push notifications | Expo/EAS project id, Firebase project (Android), Apple APNs (iOS) | The app says push is off |
-| iOS | Apple Developer account, then EAS build → TestFlight | No iOS build |
+| Website misbehaves | Vercel → Deployments → promote the previous deployment | none |
+| Backend misbehaves | Railway → redeploy the previous deployment. The old code runs fine on the upgraded schema (rehearsal step "old backend") | none |
+| Something is being carried out that should not be | set `ACTION_EXECUTION_PAUSED=true` in Railway (no deploy) | none |
+| A migration fails midway | it rolls back its own transaction and stops; fix and re-run `db:migrate`. The old backend keeps working | none |
+| The schema itself must go back | restore the step-2 backup (loses writes since then). Additive migrations make this unnecessary in practice | writes since backup |
 
-Keep the keystore and certificate backed up; losing the Android keystore means
-you can never update the Play Store app.
+The new tables can also be dropped by hand if ever needed; nothing in the old
+code reads them.
 
-After the first signed Windows build is on a GitHub Release, set
-`DESKTOP_DOWNLOAD_URL_WINDOWS` in Railway so the website offers the download.
+## Pilot controls (already in the code)
 
-## 9. Later, when you decide
+- **Who gets in:** `FEATURE_ACCESS_GATE_ENABLED=true` + `ACCESS_AUTO_APPROVE=false`
+  — signups need an application an admin approves (`/admin/access`,
+  admins from `ADMIN_EMAILS`).
+- **Emergency stop:** `ACTION_EXECUTION_PAUSED=true` — owners can still
+  approve; nothing is executed (no message, call, purchase order or payout);
+  lift it and approved actions can proceed.
+- **Messaging:** `FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED` stays **off** —
+  approving records the decision and shows the drafted message.
+- **Payouts:** only possible if `RAZORPAYX_KEY_ID/SECRET` are set; keep them
+  unset for the pilot (`env:check` warns if they are).
+- **Which build is live:** `GET /api/version` (release, git SHA, API level,
+  migration level expected vs applied).
+- **Support references:** every failed request returns a `requestId`; the log
+  line has request id, user id, route, status, release. Financial figures are
+  never logged.
+- **Connector health:** Sources shows each connector's state, last good sync
+  and the device; failed syncs are recorded with their error.
+- **Assistant stays read-only for apps:** every assistant tool must be
+  classified (`lib/ai/assistantTools.test.mjs`); apps get look-ups only.
 
-- **WhatsApp sending:** set `TWILIO_WHATSAPP_NUMBER`, then turn on
-  `FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED`. Until then nothing reaches a
-  customer.
-- **AI answers in Ask Starlane:** needs an AI provider key; without it, answers
-  come from look-ups only.
+## Environment (Railway → backend)
 
-## What I cannot do from my side
+Run `npm run env:check` against the production variables (values are never
+printed). Required: `JWT_SECRET` (≥32 chars), `DATABASE_URL` (the owner/
+`postgres` role — the preflight checks it can read RLS tables),
+`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `PUBLIC_APP_URL`,
+`PUBLIC_API_URL` (https), `ADMIN_EMAILS`; set `STARLANE_ENV=production`
+explicitly (otherwise it is inferred, with a warning).
+Recommended: `RESEND_API_KEY` + `ACCESS_EMAIL_FROM`. Keep unset:
+`DEMO_RESET_ENABLED`, `TEST_MODE`, `RAZORPAYX_*`, `DESKTOP_DOWNLOAD_URL_*`
+(until a signed build is published). CORS allows the website origin, the
+desktop app's Tauri origins (without credentials) and mobile.
 
-My cloud session cannot reach your computer, your Railway project, the
-production database, or your Vercel team (the connected Vercel account has no
-access to the `vantro` team). I will not merge or run anything against
-production without your go-ahead. Everything above that says "you" needs one
-of those.
+## Distribution for the first businesses
+
+No store is needed for a pilot.
+
+- **Windows:** the NSIS `.exe` (per-user, no admin rights) or `.msi` from the
+  latest Desktop workflow run. **Unsigned:** Windows SmartScreen shows
+  "Windows protected your PC — unknown publisher"; the user clicks *More
+  info → Run anyway*. Tell them this in advance; do not ask them to turn off
+  SmartScreen. The app's own updater stays off until the updater key exists.
+- **Android:** the APK from the latest Mobile workflow run, debug-signed.
+  Android asks to allow installs from the source (e.g. Files/Chrome). Play
+  Protect may warn about an unknown developer. A later release-signed APK
+  cannot update over a debug one: pilot users uninstall first.
+- **iPhone:** not available until TestFlight (below).
+
+## Signing
+
+**Windows code signing.** Needs an OV or EV code-signing certificate issued to
+the company (DigiCert, Sectigo, SSL.com…; EV builds SmartScreen reputation
+immediately, OV over time). Export it as `.pfx`, then add GitHub Actions
+secrets on `vantro-flow-frontend`: `WINDOWS_CERTIFICATE` (base64 of the
+.pfx) and `WINDOWS_CERTIFICATE_PASSWORD`. The Desktop workflow already imports
+it and signs both installers. Updater: generate a key pair with
+`npx tauri signer generate`, add secret `TAURI_SIGNING_PRIVATE_KEY`
+(+ `_PASSWORD`) and the public half as the Actions *variable*
+`TAURI_UPDATER_PUBKEY`; releases are published from `desktop-v*` tags.
+
+**Android release signing.** Create one upload keystore and keep it backed up
+forever (losing it means the Play listing can never be updated):
+`keytool -genkeypair -v -keystore starlane-release.jks -alias starlane -keyalg RSA -keysize 2048 -validity 10000`.
+Add secrets `ANDROID_KEYSTORE` (base64 of the .jks), `ANDROID_KEYSTORE_PASSWORD`,
+`ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`. The Mobile workflow uses them when
+present and the debug key otherwise; the keystore never goes into Git. For
+the Play Store, enrol in Play App Signing with this as the upload key.
+
+## iPhone (TestFlight)
+
+Needs from the owner: Apple Developer Program membership (USD 99/year; an
+organisation account needs a D-U-N-S number), an Expo account, and a
+confirmed bundle identifier — `mobile/app.json` sets `app.starlane.mobile` for
+both iOS and Android; confirm you own that name before the first build, as it
+cannot change after publishing.
+Shortest path, from `vantro-flow-frontend/mobile`:
+
+1. `npx eas-cli login`, then `npx eas-cli init` (links the Expo project; writes
+   the project id).
+2. `npx eas-cli build --platform ios --profile preview` — EAS creates the
+   certificate and provisioning profile on the first run (Apple login needed).
+3. `npx eas-cli submit --platform ios` → App Store Connect → TestFlight →
+   add testers by email.
+4. Push notifications: create an APNs key in the Apple portal; EAS stores it
+   on the first build that asks.
+
+## Real TallyPrime
+
+Tested so far against the TallyPrime HTTP/XML protocol with the bridge's
+sample vouchers and a simulated Tally (desktop golden flow). Not yet tested
+against a real TallyPrime installation. Before the first business: run the
+first sync on a real company and compare invoice count, amounts, due dates and
+paid invoices with Tally's own Outstanding report.
