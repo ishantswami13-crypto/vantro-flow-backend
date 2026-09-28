@@ -179,3 +179,22 @@ sample vouchers and a simulated Tally (desktop golden flow). Not yet tested
 against a real TallyPrime installation. Before the first business: run the
 first sync on a real company and compare invoice count, amounts, due dates and
 paid invoices with Tally's own Outstanding report.
+
+What the import does with a company's books:
+
+| Tally | Starlane |
+|---|---|
+| Sales with a bill credit period ("30 Days", a date) | Invoice due on that date |
+| Sales with no credit period | Invoice due on its own date |
+| Receipt / Credit Note "Agst Ref <bill>" | Reduces that bill (same party, same bill name, bill dated on or before). Paid in full → Paid on the receipt date |
+| Receipt "On Account" / "Advance" | Bank credit only; counted under `unapplied.on_account` |
+| Agst Ref bill not found, or more than one open match | Nothing applied; counted under `unapplied.bill_not_found` |
+| Debit Note | Nothing created; counted under `unapplied.debit_notes` |
+| Company with bill-wise details off (no allocations) | Receipts stay unmatched bank credits; bills stay open until paid in Starlane |
+
+Known limits to check on the first real company:
+- A bill renamed in Tally so that its name differs from the voucher number
+  will not match.
+- Receipts dated before the first synced date range can't settle bills
+  from that range.
+Compare the Outstanding report after the first sync.
