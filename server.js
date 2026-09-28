@@ -12342,6 +12342,13 @@ app.use('/api/intelligence/scenarios', scenariosRouter({ pool: getPool(), authMi
 const { preparedRouter } = require('./lib/routes/prepared');
 app.use('/api/intelligence/prepared', preparedRouter({ pool: getPool(), authMiddleware }));
 
+// Starlane decision loop: discovery, decision contracts, shadow/live
+// execution through the Action Fabric, verification, backtest and the
+// control plane (pilot mode, kill switches). See lib/routes/decisions.js
+// and lib/domain/decisions/.
+const { decisionsRouter } = require('./lib/routes/decisions');
+app.use('/api/decisions', decisionsRouter({ pool: getPool(), authMiddleware }));
+
 app.get('/api/ai-actions', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -13542,6 +13549,42 @@ cron.schedule('10 * * * *', async () => {
     if (!outcome.ran) { _log('info', '[WorldUSGSCron] Skipped — previous run still holds the lock'); return; }
     _log('info', '[WorldUSGSCron] Done', outcome.result.stats);
   } catch (err) { _log('error', '[WorldUSGSCron] Fatal', { error: err.message }); }
+}, { timezone: 'UTC' });
+
+// Starlane decisions — hourly discovery and daily contract verification per
+// tenant, gated by FEATURE_DECISION_SCHEDULER_ENABLED (default OFF). Each
+// tenant runs separately and fully scoped; a kill switch at tenant or agent
+// scope stops that tenant's run (runDiscovery checks it first).
+cron.schedule('20 * * * *', async () => {
+  const { isEnabled: _isFE } = require('./lib/featureFlags');
+  if (!_isFE('decision_scheduler_enabled')) return;
+  const { safeLog: _log } = require('./lib/observability/logger');
+  const { runDiscovery } = require('./lib/domain/decisions/discovery');
+  const { getSignalImpact } = require('./lib/domain/intelligence/supplyChainOrchestrator');
+  const pool = getPool();
+  try {
+    const tenants = await pool.query('SELECT DISTINCT user_id FROM invoices WHERE user_id IS NOT NULL');
+    for (const t of tenants.rows) {
+      try {
+        await runDiscovery(pool, t.user_id, { correlationId: `cron:${Date.now()}`, externalSendEnabled: _isFE('external_message_sending_enabled'), getSignalImpact });
+      } catch (err) { _log('error', '[DecisionDiscoveryCron] tenant failed', { userId: t.user_id, error: err.message }); }
+    }
+  } catch (err) { _log('error', '[DecisionDiscoveryCron] Fatal', { error: err.message }); }
+}, { timezone: 'UTC' });
+
+cron.schedule('40 3 * * *', async () => {
+  const { isEnabled: _isFE } = require('./lib/featureFlags');
+  if (!_isFE('decision_scheduler_enabled')) return;
+  const { safeLog: _log } = require('./lib/observability/logger');
+  const { verifyDueContracts } = require('./lib/domain/decisions/verification');
+  const pool = getPool();
+  try {
+    const tenants = await pool.query(`SELECT DISTINCT user_id FROM decision_contracts WHERE status IN ('ACTIVE','ON_TRACK','OFF_TRACK')`);
+    for (const t of tenants.rows) {
+      try { await verifyDueContracts(pool, t.user_id, { correlationId: `cron:${Date.now()}` }); }
+      catch (err) { _log('error', '[DecisionVerifyCron] tenant failed', { userId: t.user_id, error: err.message }); }
+    }
+  } catch (err) { _log('error', '[DecisionVerifyCron] Fatal', { error: err.message }); }
 }, { timezone: 'UTC' });
 
 // Outcome verification — daily at 03:10 UTC. Iterates every ACTIVE/UPDATED
