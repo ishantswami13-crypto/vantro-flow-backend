@@ -199,6 +199,32 @@ async function main() {
     const badContacts = await fetch(`${base}/api/import/tally`, { method: 'POST', headers: { Authorization: device, 'Content-Type': 'application/json' }, body: JSON.stringify({ vouchers: [], contacts: 'x' }) });
     check('contacts must be a list (400)', badContacts.status === 400);
     check('no receivable for the on-account credit balance', (await pool.query(`SELECT COUNT(*)::int c FROM invoices WHERE user_id = $1 AND customer_name = 'Kapoor & Co'`, [owner.id])).rows[0].c === 0);
+
+    console.log('— CORRECTIONS made in Tally (edited, cancelled and optional vouchers)');
+    const corrected = bridgeVouchers('sample-daybook-corrections.xml');
+    check('bridge sends cancelled vouchers, never the optional one', corrected.filter((v) => v.cancelled).length === 3 && !corrected.some((v) => v.voucherNo === 'S/204'), corrected.map((v) => v.voucherNo));
+    const cr = await (await fetch(`${base}/api/import/tally`, {
+      method: 'POST', headers: { Authorization: device, 'Content-Type': 'application/json' }, body: JSON.stringify({ vouchers: corrected }),
+    })).json();
+    const [c201] = await bill('S201'); const [c202] = await bill('S202'); const [c203] = await bill('S203');
+    check('edited sale and receipt follow Tally (₹1,30,000 bill, ₹60,000 paid)', Number(c201?.invoice_amount) === 130000 && Number(c201?.payment_amount) === 60000 && c201?.payment_status === 'Pending', c201);
+    check('cancelled sale is Cancelled and its cancelled credit note taken back', c202?.payment_status === 'Cancelled' && Number(c202?.payment_amount) === 0, c202);
+    check('cancelled receipt re-opens the bill it had settled', c203?.payment_status === 'Pending' && Number(c203?.payment_amount) === 0, c203);
+    check('corrections reported', cr.corrections?.cancelled === 2 && cr.corrections?.settlements_changed === 3, cr.corrections);
+    const mehta3 = (await (await fetch(`${base}/api/client/scan/search?q=Mehta`, { headers: auth(owner) })).json()).customers?.find((c) => c.name === 'Mehta Hardware');
+    check('Scan: Mehta owes ₹70,000 + last year\'s ₹32,000', mehta3?.openTotal === 102000, mehta3);
+    const rao = (await (await fetch(`${base}/api/client/scan/search?q=Rao`, { headers: auth(owner) })).json()).customers?.find((c) => c.name === 'Rao & Sons');
+    check('Scan: the cancelled bill is not owed (Rao owes only last year\'s ₹18,500)', rao?.openTotal === 18500 && rao?.openCount === 1, rao);
+    const c202id = (await pool.query(`SELECT id FROM invoices WHERE user_id = $1 AND invoice_number LIKE 'TLY-SALES-S202-%'`, [owner.id])).rows[0].id;
+    const c202scan = await (await fetch(`${base}/api/client/scan/invoice/${c202id}`, { headers: auth(owner) })).json();
+    check('Scan of the cancelled bill says so', /^Cancelled in your books/.test(c202scan.scan?.headline || ''), c202scan.scan?.headline);
+    const missions = require('../lib/features/missions.js');
+    const prog = missions.progressOf({
+      mission: { status: 'active', target: { amount: 40000 }, baseline: { at: '2026-09-01', outstanding: 40000, invoices: [{ id: c202id, customer: 'Rao & Sons', invoiceNumber: 'TLY-SALES-S202-20260805', amount: 40000 }] } },
+      current: [], withdrawn: [String(c202id)], dataAsOf: new Date().toISOString(),
+    });
+    check('a mission never counts a cancelled bill as collected', prog.collected === 0 && prog.byInvoice[0].status === 'cancelled_in_books'
+      && prog.blockers.some((b) => b.code === 'cancelled_in_books'), prog);
   } finally {
     if (server) server.stop();
     await pool.query('DELETE FROM connector_devices WHERE user_id = ANY($1)', [users]).catch(() => {});

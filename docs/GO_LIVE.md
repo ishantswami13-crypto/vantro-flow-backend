@@ -194,6 +194,11 @@ What the import does with a company's books:
 | Bills Receivable as of the day before the synced range (earlier years' unpaid bills) | Invoices for the amount still owed then, sent before the day book so this year's receipts settle them. Credit balances are left out. The same bill arriving later as a sale (or the reverse) stays one invoice |
 | Any new Tally bill | Takes the phone number already on file for that customer (their other invoices). Tally vouchers carry none |
 | Customer ledgers under Sundry Debtors (name + mobile/phone fields only) | A valid Indian mobile fills bills that have no number. A number already on file is never replaced. Landlines and anything else are counted, not used |
+| A sale edited in Tally (amount or credit period) | The invoice follows on the next sync. What was paid is kept, and the bill is Paid exactly when that covers the new amount |
+| A receipt / credit note edited, re-allocated or cancelled | The bill it settled moves by the difference (each application is recorded on the invoice with the amount it moved); a cancelled one gives its amount back and re-opens the bill |
+| A sale cancelled in Tally (ISCANCELLED) | Invoice becomes `Cancelled`: not owed on any screen, never chased (every sending path only chases `Pending`), not counted as collected in a Mission (shown as a blocker instead) |
+| A receipt / payment / purchase cancelled | Its unmatched bank line or purchase is marked cancelled; a bank line already matched by reconciliation is left alone |
+| An optional voucher (ISOPTIONAL, a memorandum) | Never imported |
 | An empty day book | A successful sync with nothing imported (previously a failed sync and a "sync failed" notification) |
 
 Known limits to check on the first real company:
@@ -208,6 +213,11 @@ Known limits to check on the first real company:
   $$GroupSundryDebtors, FETCH NAME, LEDGERMOBILE, LEDGERPHONE) has not been
   checked against a real TallyPrime. A customer with no valid mobile in
   Tally or Starlane still can't be reminded ("No phone number on file").
+- A cancelled sale's stock movement stays recorded. Stock is not given
+  back when a sale is cancelled.
+- A voucher deleted in Tally, rather than cancelled, simply stops appearing,
+  and Starlane keeps what it imported. Detecting deletions needs a full-range
+  reconciliation, which is not built.
 - The CLI bridge now sends at most 1000 vouchers per request. Before, one
   request carried the whole range and anything over the 5000 limit was
   rejected outright.

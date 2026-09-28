@@ -333,9 +333,13 @@ function parseVouchers(xml) {
       if (name && !isNaN(qty) && qty > 0) items.push({ name, qty, rate: isNaN(rate) ? 0 : Math.abs(rate) });
     }
 
+    // Cancelled vouchers are kept (so Starlane can withdraw what it imported);
+    // optional ones are memoranda, not in the books, and are never imported.
+    const flag = (name) => /^yes$/i.test(tag(b, name) || '');
     out.push({
       type: decode(vchType), date, party, voucherNo: vchNo,
       amount: isNaN(amount) ? null : Math.abs(amount), items, dueDate, bills,
+      cancelled: flag('ISCANCELLED'), optional: flag('ISOPTIONAL'),
     });
   }
   return out;
@@ -392,7 +396,14 @@ function toApiVouchers(vouchers, wantedTypes) {
   for (const v of vouchers) {
     const typeMatch = wanted.some((w) => (v.type || '').toLowerCase().includes(w));
     const iso = tallyDateToISO(v.date);
-    if (!typeMatch || !v.party || !v.amount || !iso || v.amount <= 0) { skipped.push(v); continue; }
+    if (v.optional || !typeMatch || !v.party || !iso) { skipped.push(v); continue; }
+    // A cancelled voucher keeps its type, number, date and party but usually loses
+    // its amounts; it is sent so Starlane can withdraw what it imported before.
+    if (v.cancelled) {
+      rows.push({ type: v.type, date: iso, party: v.party, voucherNo: v.voucherNo, amount: v.amount || 0, items: [], dueDate: null, bills: [], cancelled: true });
+      continue;
+    }
+    if (!v.amount || v.amount <= 0) { skipped.push(v); continue; }
     rows.push({ type: v.type, date: iso, party: v.party, voucherNo: v.voucherNo, amount: v.amount, items: v.items,
       dueDate: v.dueDate, bills: v.bills.map((x) => ({ name: x.name, type: x.type, amount: x.amount })) });
   }
