@@ -10,7 +10,10 @@ import { makeChecker } from './helpers/httpHarness.mjs';
 const require = createRequire(import.meta.url);
 const { Client } = require('pg');
 const { buildSanitizedPgConfig } = require('../lib/db/pgConfig');
-const { preflight } = require('../scripts/db-preflight');
+const fs = require('fs');
+const path = require('path');
+const ROOT = path.join(path.dirname(new URL(import.meta.url).pathname), '..');
+const { preflight, isIdempotent, buildPlan } = require('../scripts/db-preflight');
 const { baseline } = require('../scripts/db-baseline');
 const migrate = require('../scripts/migrate');
 const { check, done } = makeChecker();
@@ -85,8 +88,28 @@ async function main() {
     await prodLike(c);
     await c.query('DROP TABLE customer_score_history CASCADE'); // created by 011; 013+ present
     const r = await preflight(c);
-    check('a pre-020 gap with later files present FAILS (would re-run non-idempotent files)', !r.plan.pass && r.plan.failures.some((f) => /not known to be safe/.test(f)), r.plan.failures);
+    const ooo = r.plan.apply.filter((a) => a.outOfOrder).map((a) => a.file);
+    check('a pre-020 gap in an idempotent file: it runs out of order, later present files are recorded, not re-run',
+      r.plan.pass && ooo.length === 1 && ooo[0] === 'migrations/011_customer_score_history.sql'
+      && r.plan.record.includes('migrations/013_orders_and_workers.sql') && !r.plan.apply.some((a) => a.file === 'migrations/013_orders_and_workers.sql'), { ooo, failures: r.plan.failures });
+    await baseline(c, { through: r.plan.baselineThrough, log: quiet });
+    await migrate.run({ mode: 'apply', client: c, log: quiet });
+    check('…and the migration run recreates it', (await c.query(`SELECT to_regclass('public.customer_score_history') AS t`)).rows[0].t !== null);
   });
+
+  console.log('— which files may run out of order');
+  const fileSql = (f) => fs.readFileSync(path.join(ROOT, f), 'utf8');
+  check('idempotent: 011 (CREATE TABLE/INDEX IF NOT EXISTS), error-events rollout (plus RLS policies)', isIdempotent(fileSql('migrations/011_customer_score_history.sql')) && isIdempotent(fileSql('supabase-error-events-rollout.sql')));
+  check('not idempotent: 015 (constraints without IF NOT EXISTS), 016 (seed data), 019 (constraint swap), 006 (RLS on existing tables)',
+    !isIdempotent(fileSql('migrations/015_world_intelligence_core.sql')) && !isIdempotent(fileSql('migrations/016_world_transmission_channels_seed.sql'))
+    && !isIdempotent(fileSql('migrations/019_ai_actions_suggested_by_widen.sql')) && !isIdempotent(fileSql('migrations/006_cortex_rls.sql')));
+  const synth = (states) => buildPlan({ ledgerExists: false, ledgerRows: 0, hazards: [],
+    files: states.map(([file, state, idempotent]) => ({ file, state, idempotent, missing: [] })) });
+  const unsafeGap = synth([['supabase-schema.sql', 'present', false], ['migrations/015_x.sql', 'absent', false], ['migrations/017_y.sql', 'present', false], ['migrations/020_payment_allocations.sql', 'absent', true]]);
+  check('a gap in a non-idempotent file with later files present FAILS', !unsafeGap.pass && unsafeGap.failures.some((f) => /not safe to run out of order/.test(f)), unsafeGap.failures);
+  const blocked = buildPlan({ ledgerExists: false, ledgerRows: 0, hazards: [{ id: 'suggested_by check', value: 'BLOCKS' }],
+    files: [{ file: 'supabase-schema.sql', state: 'present', idempotent: false, missing: [] }] });
+  check('a suggested_by constraint that blocks collections_agent FAILS (019 not applied)', !blocked.pass && blocked.failures.some((f) => /019/.test(f)), blocked.failures);
 
   await withScratch('empty', async (c) => {
     const r = await preflight(c);

@@ -49,6 +49,31 @@ const REAPPLY_SAFE_FROM = 'migrations/020_payment_allocations.sql';
 // is not evidence that the creating migration never ran.
 const IGNORED_OBJECTS = new Set([]);
 
+// A file is safe to run out of order (after later files were already applied by
+// hand) only if every statement in it is a no-op when its object exists:
+// CREATE ... IF NOT EXISTS, ADD COLUMN IF NOT EXISTS, CREATE OR REPLACE, COMMENT.
+// Anything else — constraints, data, DROP, function bodies — is not assumed safe.
+function isIdempotent(sql) {
+  const s = stripSql(sql);
+  if (s.includes('$$')) return false;
+  const safe = [
+    /^CREATE\s+EXTENSION\s+IF\s+NOT\s+EXISTS\b/i,
+    /^CREATE\s+(?:UNLOGGED\s+)?TABLE\s+IF\s+NOT\s+EXISTS\b/i,
+    /^CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?IF\s+NOT\s+EXISTS\b/i,
+    /^CREATE\s+OR\s+REPLACE\s+(?:VIEW|FUNCTION)\b/i,
+    /^COMMENT\s+ON\b/i,
+    // Access policies on the file's own new table: enabling RLS is idempotent and
+    // each policy is dropped IF EXISTS before it is created.
+    /^ALTER\s+TABLE\s+\S+\s+ENABLE\s+ROW\s+LEVEL\s+SECURITY$/i,
+    /^DROP\s+POLICY\s+IF\s+EXISTS\b/i,
+    /^CREATE\s+POLICY\b/i,
+  ];
+  const addsOnly = (st) => /^ALTER\s+TABLE\b/i.test(st)
+    && st.replace(/^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?\S+\s+/i, '').split(/,(?![^()]*\))/)
+      .every((part) => /^\s*ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\b/i.test(part));
+  return s.split(';').map((x) => x.trim()).filter(Boolean).every((st) => safe.some((re) => re.test(st)) || addsOnly(st));
+}
+
 function stripSql(sql) {
   return sql
     .replace(/--[^\n]*/g, ' ')
@@ -79,10 +104,15 @@ async function catalog(client) {
   const t = await client.query(`SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'`);
   const c = await client.query(`SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'public'`);
   const i = await client.query(`SELECT indexname FROM pg_indexes WHERE schemaname = 'public'`);
+  // Constraint- and policy-level facts that table shapes cannot show.
+  const k = await client.query(`SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conname IN ('ai_actions_suggested_by_check')`);
+  const r = await client.query(`SELECT relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relrowsecurity`);
   return {
     tables: new Set(t.rows.map((r) => r.table_name.toLowerCase())),
     columns: new Map(c.rows.map((r) => [`${r.table_name}.${r.column_name}`.toLowerCase(), r.data_type])),
     indexes: new Set(i.rows.map((r) => r.indexname.toLowerCase())),
+    constraints: new Map(k.rows.map((x) => [x.conname, x.def])),
+    rlsTables: r.rows.map((x) => x.relname),
   };
 }
 
@@ -98,7 +128,15 @@ function hazardChecks(cat) {
     { id: 'invoices.customer_id', value: col('invoices.customer_id') || 'absent', note: '049 adds it as uuid; a non-uuid existing column is left alone (no FK)' },
     { id: 'access_applications', value: cat.tables.has('access_applications') ? 'present' : 'absent', note: 'created by 050' },
     { id: 'connector_devices', value: cat.tables.has('connector_devices') ? 'present' : 'absent', note: 'created by 047; Tally pairing depends on it' },
+    { id: 'suggested_by check', value: suggestedByState(cat), note: '019 widens it; mission proposals insert suggested_by = collections_agent' },
+    { id: 'row-level security', value: cat.rlsTables.length ? `${cat.rlsTables.length} tables` : 'off', note: '006 enables it (needs Supabase auth); the app enforces tenancy in queries either way' },
   ];
+}
+
+function suggestedByState(cat) {
+  const def = cat.constraints.get('ai_actions_suggested_by_check');
+  if (!def) return 'none';
+  return /'collections_agent'/.test(def) ? 'allows' : 'BLOCKS';
 }
 
 async function inspect(client) {
@@ -119,7 +157,8 @@ async function inspect(client) {
       ].filter((o) => !IGNORED_OBJECTS.has(o.name));
       const present = objects.filter((o) => o.ok).length;
       const state = !objects.length ? 'n/a' : present === objects.length ? 'present' : present === 0 ? 'absent' : 'partial';
-      return { file, state, objects: objects.length, missing: objects.filter((o) => !o.ok).map((o) => `${o.kind} ${o.name}`), inLedger: ledger.has(file) };
+      const idempotent = isIdempotent(fs.readFileSync(path.join(ROOT, file), 'utf8'));
+      return { file, state, idempotent, objects: objects.length, missing: objects.filter((o) => !o.ok).map((o) => `${o.kind} ${o.name}`), inLedger: ledger.has(file) };
     });
 
     return { cat, ledgerExists, ledgerRows: ledger.size, files, hazards: hazardChecks(cat) };
@@ -141,27 +180,48 @@ function buildPlan(report) {
     if (f.state === 'partial') failures.push(`${f.file} is PARTIALLY present (missing: ${f.missing.slice(0, 6).join(', ')}${f.missing.length > 6 ? ', …' : ''}). A human must reconcile it before any baseline.`);
   }
 
-  // Leading run of files that are present (or have nothing checkable).
-  let cut = -1;
-  for (let i = 0; i < files.length; i++) {
-    if (files[i].state === 'present' || files[i].state === 'n/a') cut = i; else break;
+  if (files.length && !(files[0].state === 'present' || files[0].state === 'n/a')) {
+    failures.push('The base schema (supabase-schema.sql) is not present. This is not an existing Starlane database — use `node scripts/migrate.js` on an empty one instead.');
   }
-  const firstApply = cut + 1;
-  if (files.length && cut < 0) failures.push('The base schema (supabase-schema.sql) is not present. This is not an existing Starlane database — use `node scripts/migrate.js` on an empty one instead.');
 
-  // Everything after the cut is re-run by migrate.js. That is only safe from REAPPLY_SAFE_FROM on.
-  if (firstApply < files.length && firstApply < safeIdx) {
-    const offenders = files.slice(firstApply, safeIdx).filter((f) => f.state !== 'absent');
-    const gap = files[firstApply];
-    if (offenders.length) {
-      failures.push(`${gap.file} is ${gap.state}, but later pre-020 files are present (${offenders.map((f) => f.file).join(', ')}). Re-running them is not known to be safe. A human must reconcile.`);
-    } else {
-      warnings.push(`${files.length - firstApply} file(s) from ${gap.file} onward would run for the first time. Confirm this database really never had them.`);
+  // The cut: the last file before REAPPLY_SAFE_FROM that is present. Files up to it
+  // were applied by hand and are recorded without running; files after it run.
+  // Earlier files are not all safe to re-run, so nothing before the cut may run —
+  // except a file that is absent AND idempotent, which can run out of order.
+  const limit = safeIdx >= 0 ? safeIdx : files.length;
+  let cut = -1;
+  for (let i = 0; i < limit; i++) if (files[i].state === 'present') cut = i;
+  // Files right after the cut that create nothing checkable (constraints, seeds)
+  // are taken as applied with their neighbours; the hazard checks cover the one
+  // the new code depends on (019's suggested_by constraint).
+  while (cut >= 0 && cut + 1 < limit && files[cut + 1].state === 'n/a') cut++;
+  // If the leading run reaches the safe point, keep going through it as before.
+  if (cut === limit - 1 || cut < 0) {
+    for (let i = Math.max(cut, 0); i < files.length; i++) {
+      if (files[i].state === 'present' || files[i].state === 'n/a') cut = i; else break;
     }
   }
+  const outOfOrder = [];
+  for (let i = 0; i <= cut; i++) {
+    const f = files[i];
+    if (f.state !== 'absent') continue;
+    if (f.idempotent) outOfOrder.push(f);
+    else failures.push(`${f.file} is absent, but later files are present, and it is not safe to run out of order (it does more than CREATE/ADD … IF NOT EXISTS). A human must reconcile.`);
+  }
+  for (const f of outOfOrder) warnings.push(`${f.file} was never applied although later files were; it only creates missing objects IF NOT EXISTS, so it runs out of order.`);
+  const unverified = files.slice(0, cut + 1).filter((f) => f.state === 'n/a').map((f) => path.basename(f.file));
+  if (unverified.length) warnings.push(`Recorded without verification (they change constraints, policies or seed data, which the catalog check cannot see): ${unverified.join(', ')}. See the hazard lines above.`);
+  const sb = report.hazards.find((h) => h.id === 'suggested_by check');
+  if (sb && sb.value === 'BLOCKS') failures.push('ai_actions_suggested_by_check does not allow collections_agent, so 019 was not applied; mission proposals would fail. Apply 019 by hand (it drops and re-adds the constraint) and re-run this preflight.');
+  const firstApply = cut + 1;
+  const later = files.slice(firstApply).filter((f) => f.state !== 'absent' && files.indexOf(f) < limit);
+  if (later.length) failures.push(`Files before ${REAPPLY_SAFE_FROM} would be re-run although present (${later.map((f) => f.file).join(', ')}). A human must reconcile.`);
+  if (firstApply < limit && !later.length && firstApply < files.length) {
+    warnings.push(`${limit - firstApply} pre-020 file(s) from ${files[firstApply].file} onward would run for the first time. Confirm this database really never had them.`);
+  }
 
-  const record = files.slice(0, firstApply).map((f) => f.file);
-  const apply = files.slice(firstApply).map((f) => ({ file: f.file, state: f.state }));
+  const record = files.slice(0, firstApply).filter((f) => !outOfOrder.includes(f)).map((f) => f.file);
+  const apply = [...outOfOrder, ...files.slice(firstApply)].map((f) => ({ file: f.file, state: f.state, outOfOrder: outOfOrder.includes(f) }));
   return {
     pass: failures.length === 0 && !(ledgerExists && ledgerRows > 0),
     failures,
@@ -216,4 +276,4 @@ if (require.main === module) {
   })().catch((e) => { console.error(`preflight error: ${String(e.message).split('\n')[0]}`); process.exit(2); });
 }
 
-module.exports = { preflight, signatureOf, printReport, REAPPLY_SAFE_FROM };
+module.exports = { preflight, signatureOf, printReport, REAPPLY_SAFE_FROM, isIdempotent, buildPlan };
