@@ -23,9 +23,9 @@ const require = createRequire(import.meta.url);
 const { check, done } = makeChecker();
 const PORT = 3922;
 
-function bridgeVouchers() {
-  // The real connector's parser, offline, on its bundled sample day book.
-  const out = execFileSync(process.execPath, ['tally-connector/tally-sync.mjs', '--test'], { encoding: 'utf8' });
+function bridgeVouchers(sample = 'sample-daybook.xml') {
+  // The real connector's parser, offline, on a bundled sample day book.
+  const out = execFileSync(process.execPath, ['tally-connector/tally-sync.mjs', '--test', `--sample=${sample}`], { encoding: 'utf8' });
   const start = out.indexOf('\n[');
   const end = out.lastIndexOf('\n]');
   return JSON.parse(out.slice(start + 1, end + 2));
@@ -141,6 +141,28 @@ async function main() {
     } else {
       check('a pending action exists to decide', false, actions.map((a) => a.status));
     }
+
+    console.log('— BILL-WISE BOOKS (due dates, receipts and a credit note against named bills)');
+    const billwise = bridgeVouchers('sample-daybook-billwise.xml');
+    check('bridge parsed the bill-wise day book', billwise.length === 7, billwise.length);
+    const bw = await (await fetch(`${base}/api/import/tally`, {
+      method: 'POST', headers: { Authorization: device, 'Content-Type': 'application/json' }, body: JSON.stringify({ vouchers: billwise }),
+    })).json();
+    const bill = async (no) => (await pool.query(
+      `SELECT invoice_amount, payment_amount, payment_status, payment_date, due_date::text AS due FROM invoices WHERE user_id = $1 AND invoice_number LIKE $2`,
+      [owner.id, `TLY-SALES-${no}-%`])).rows;
+    const [s201] = await bill('S201'); const [s202] = await bill('S202'); const [s203] = await bill('S203');
+    check('due dates from Tally credit periods', s201?.due?.startsWith('2026-08-31') && s202?.due?.startsWith('2026-09-20') && s203?.due?.startsWith('2026-08-10'), [s201, s202, s203]);
+    check('Agst Ref receipt settled S/203 (Paid on the receipt date)', s203?.payment_status === 'Paid' && Number(s203.payment_amount) === 15000 && String(s203.payment_date).startsWith('2026-09-12'), s203);
+    check('part receipt and credit note leave the rest owed', s201?.payment_status === 'Pending' && Number(s201.payment_amount) === 50000
+      && s202?.payment_status === 'Pending' && Number(s202.payment_amount) === 5000, [s201, s202]);
+    check('credit note is not a receivable', (await pool.query(`SELECT COUNT(*)::int c FROM invoices WHERE user_id = $1 AND invoice_number LIKE 'TLY-CREDITNO%'`, [owner.id])).rows[0].c === 0);
+    check('on-account receipt reported, not guessed', bw.unapplied?.on_account === 1 && bw.imported?.bills_settled === 1 && bw.imported?.bills_part_paid === 2, bw);
+    await fetch(`${base}/api/import/tally`, { method: 'POST', headers: { Authorization: device, 'Content-Type': 'application/json' }, body: JSON.stringify({ vouchers: billwise }) });
+    check('re-sync applies no receipt twice', Number((await bill('S201'))[0]?.payment_amount) === 50000);
+    const scanned = await (await fetch(`${base}/api/client/scan/search?q=Mehta`, { headers: auth(owner) })).json();
+    const mehta = scanned.customers?.find((c) => c.name === 'Mehta Hardware');
+    check('Scan shows Mehta owing what is left (₹78,500)', mehta?.openTotal === 78500, scanned.customers);
   } finally {
     if (server) server.stop();
     await pool.query('DELETE FROM connector_devices WHERE user_id = ANY($1)', [users]).catch(() => {});

@@ -193,6 +193,37 @@ function qtyNum(v) {
 }
 
 /** Parse a Tally Day Book XML export into normalised voucher objects. */
+// Bill-wise details: "New Ref" raises a bill (with its credit period), "Agst Ref" settles one.
+const MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+const pad2 = (n) => String(n).padStart(2, '0');
+/** Tally writes a credit period as "30 Days" or as the due date itself ("20-Sep-2026", "20260920"). */
+function dueDateFrom(voucherDate, period) {
+  if (!period) return null;
+  const p = String(period).trim();
+  const days = p.match(/^(\d+)\s*days?$/i);
+  const start = tallyDateToISO(voucherDate);
+  if (days) {
+    if (!start) return null;
+    const d = new Date(`${start}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + Number(days[1]));
+    return d.toISOString().slice(0, 10);
+  }
+  if (/^\d{8}$/.test(p)) return tallyDateToISO(p);
+  const m = p.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2}|\d{4})$/);
+  const mon = m ? MONTHS[m[2].toLowerCase()] : undefined;
+  if (m && mon) return `${m[3].length === 2 ? 2000 + Number(m[3]) : Number(m[3])}-${pad2(mon)}-${pad2(Number(m[1]))}`;
+  return null;
+}
+function billType(s) {
+  const t = String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (t === 'new ref') return 'new';
+  if (t === 'agst ref') return 'against';
+  if (t === 'advance') return 'advance';
+  if (t === 'on account') return 'on_account';
+  return 'other';
+}
+const BILLS_RE = /<BILLALLOCATIONS\.LIST>[\s\S]*?<\/BILLALLOCATIONS\.LIST>/gi;
+
 function parseVouchers(xml) {
   const out = [];
   const blocks = xml.match(/<VOUCHER\b[\s\S]*?<\/VOUCHER>/gi) || [];
@@ -207,9 +238,14 @@ function parseVouchers(xml) {
     const entries = b.match(/<ALLLEDGERENTRIES\.LIST>[\s\S]*?<\/ALLLEDGERENTRIES\.LIST>/gi)
       || b.match(/<LEDGERENTRIES\.LIST>[\s\S]*?<\/LEDGERENTRIES\.LIST>/gi) || [];
     let maxAbs = NaN;
+    let partyEntry = null;
     for (const e of entries) {
-      const ln = tag(e, 'LEDGERNAME');
-      const amt = num(tag(e, 'AMOUNT'));
+      // Read the entry's own tags with its bill allocations removed: Tally does not
+      // guarantee the ledger AMOUNT comes before BILLALLOCATIONS.LIST.
+      const own = e.replace(BILLS_RE, '');
+      const ln = tag(own, 'LEDGERNAME');
+      const amt = num(tag(own, 'AMOUNT'));
+      if (party && ln && ln.toLowerCase() === party.toLowerCase()) partyEntry = e;
       if (!isNaN(amt)) {
         if (isNaN(maxAbs) || Math.abs(amt) > Math.abs(maxAbs)) maxAbs = amt;
         if (party && ln && ln.toLowerCase() === party.toLowerCase()) amount = amt;
@@ -217,6 +253,15 @@ function parseVouchers(xml) {
     }
     if (isNaN(amount)) amount = maxAbs;
     if (isNaN(amount)) amount = num(tag(b, 'AMOUNT'));
+
+    const bills = [];
+    for (const bl of (partyEntry || '').match(BILLS_RE) || []) {
+      const name = tag(bl, 'NAME') || '';
+      const amt = Math.abs(num(tag(bl, 'AMOUNT')));
+      if (name && amt > 0) bills.push({ name, type: billType(tag(bl, 'BILLTYPE')), amount: amt, creditPeriod: tag(bl, 'BILLCREDITPERIOD') });
+    }
+    const raised = bills.find((x) => x.type === 'new' && x.creditPeriod);
+    const dueDate = dueDateFrom(date, raised?.creditPeriod ?? null) ?? dueDateFrom(date, tag(b, 'BASICDUEDATEOFPYMT'));
 
     // Stock items (Sales/Purchase vouchers carry ALLINVENTORYENTRIES.LIST)
     const items = [];
@@ -231,7 +276,7 @@ function parseVouchers(xml) {
 
     out.push({
       type: decode(vchType), date, party, voucherNo: vchNo,
-      amount: isNaN(amount) ? null : Math.abs(amount), items,
+      amount: isNaN(amount) ? null : Math.abs(amount), items, dueDate, bills,
     });
   }
   return out;
@@ -246,7 +291,8 @@ function toApiVouchers(vouchers, wantedTypes) {
     const typeMatch = wanted.some((w) => (v.type || '').toLowerCase().includes(w));
     const iso = tallyDateToISO(v.date);
     if (!typeMatch || !v.party || !v.amount || !iso || v.amount <= 0) { skipped.push(v); continue; }
-    rows.push({ type: v.type, date: iso, party: v.party, voucherNo: v.voucherNo, amount: v.amount, items: v.items });
+    rows.push({ type: v.type, date: iso, party: v.party, voucherNo: v.voucherNo, amount: v.amount, items: v.items,
+      dueDate: v.dueDate, bills: v.bills.map((x) => ({ name: x.name, type: x.type, amount: x.amount })) });
   }
   return { rows, skipped };
 }
@@ -332,8 +378,9 @@ async function collectRows(cfg) {
     const label = company || '(current company)';
     let xml;
     if (MODE === 'test') {
-      xml = readFileSync(join(HERE, 'sample-daybook.xml'), 'utf-8');
-      console.log('🧪 TEST MODE — reading sample-daybook.xml (Tally not contacted)');
+      const sample = [...args].find((a) => a.startsWith('--sample='))?.slice('--sample='.length) || 'sample-daybook.xml';
+      xml = readFileSync(join(HERE, sample.replace(/[^\w.-]/g, '')), 'utf-8');
+      console.log(`🧪 TEST MODE — reading ${sample} (Tally not contacted)`);
     } else {
       process.stdout.write(`📥 Reading Day Book from Tally for ${label} ... `);
       xml = await fetchTallyDayBook(cfg, company);

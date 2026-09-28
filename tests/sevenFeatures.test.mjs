@@ -144,6 +144,20 @@ async function main() {
     check('Bridge ages a stale invoice by its due date (40 days -> 31–90), not the stored 3', band('31_90').count === 1 && band('1_7').count === 0, brB.body.state.ageing);
     const wB = await get('/api/client/watch?refresh=1', tb);
     check('Watch raises it in the 31+ band', wB.body.events.some((e) => /Stale Traders/.test(e.title) && /30 days/.test(e.title)), wB.body.events.map((e) => e.title));
+    const nowB = await get('/api/client/now', tb);
+    check('Now counts it over 30 days by its due date too', nowB.body.state.over30Count === 1, nowB.body.state);
+
+    console.log('— a part-paid bill is owed for what is left (Tally Agst Ref receipt / credit note)');
+    await pool.query(`INSERT INTO invoices (user_id, customer_name, invoice_number, invoice_amount, payment_amount, payment_status, days_overdue, due_date, payment_notes)
+      VALUES ($1,'Part Paid Co','TLY-SALES-S77-20260801',100000,60000,'Pending',0,(CURRENT_DATE - 10)::text,'[TLY-RECEIPT-R9-20260901] Tally Receipt R/9 ₹60000')`, [b.id]);
+    const brB2 = await get('/api/client/bridge', tb);
+    check('Bridge adds ₹40,000 open, not the ₹1,00,000 face value', brB2.body.state.openReceivables - brB.body.state.openReceivables === 40000, [brB.body.state.openReceivables, brB2.body.state.openReceivables]);
+    const nowB2 = await get('/api/client/now', tb);
+    check('Now agrees with the Bridge', nowB2.body.state.openReceivables === brB2.body.state.openReceivables && nowB2.body.state.overdueReceivables === brB2.body.state.overdueReceivables, [nowB2.body.state, brB2.body.state.overdueReceivables]);
+    const ppId = (await pool.query(`SELECT id FROM invoices WHERE user_id = $1 AND invoice_number = 'TLY-SALES-S77-20260801'`, [b.id])).rows[0].id;
+    const scanPP = await get(`/api/client/scan/invoice/${ppId}`, tb);
+    check('Scan shows what is left and what was paid', /₹40,000 from Part Paid Co/.test(scanPP.body.scan.headline)
+      && scanPP.body.scan.evidence.facts.some((f) => f.label === 'Paid so far' && f.value === 60000), scanPP.body.scan);
 
     console.log('— memory');
     const mem = await get('/api/client/memory', ta);
