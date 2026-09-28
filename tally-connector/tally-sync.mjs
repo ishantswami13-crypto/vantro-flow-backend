@@ -17,6 +17,8 @@
  *                                         # credential in .vantro-device-credentials.json,
  *                                         # then run one sync
  *   node tally-sync.mjs --test      # offline: parse sample-daybook.xml, print payload (no Tally, no internet)
+ *                                   # (--sample=<file> picks another day book, --opening=<file> adds
+ *                                   #  a Bills Receivable export of bills unpaid before the range)
  *   node tally-sync.mjs --dry-run   # pull from Tally + parse, but DON'T send (print what would be sent)
  *   node tally-sync.mjs             # full sync: Tally -> Starlane, once (uses stored device
  *                                   # credential if present, else falls back to
@@ -150,8 +152,42 @@ function dayBookRequestXML(fromDate, toDate, company) {
 </ENVELOPE>`;
 }
 
+/** The day before a Tally date (YYYYMMDD): the "as of" date for bills still open when a sync range starts. */
+function dayBefore(yyyymmdd) {
+  const iso = tallyDateToISO(yyyymmdd);
+  if (!iso) return yyyymmdd;
+  const d = new Date(`${iso}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() - 1);
+  return d.toISOString().slice(0, 10).replace(/-/g, '');
+}
+
+/** Tally's Bills Receivable report as of a date: every sales bill still unpaid then. */
+function billsReceivableRequestXML(asOf, company) {
+  const companyTag = company ? `<SVCURRENTCOMPANY>${escapeXml(company)}</SVCURRENTCOMPANY>` : '';
+  return `<ENVELOPE>
+ <HEADER>
+  <VERSION>1</VERSION>
+  <TALLYREQUEST>Export</TALLYREQUEST>
+  <TYPE>Data</TYPE>
+  <ID>Bills Receivable</ID>
+ </HEADER>
+ <BODY>
+  <DESC>
+   <STATICVARIABLES>
+    <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+    <SVTODATE TYPE="Date">${asOf}</SVTODATE>
+    ${companyTag}
+   </STATICVARIABLES>
+  </DESC>
+ </BODY>
+</ENVELOPE>`;
+}
+
 function fetchTallyDayBook(cfg, company) {
-  const body = dayBookRequestXML(cfg.fromDate, cfg.toDate, company);
+  return tallyPost(cfg, dayBookRequestXML(cfg.fromDate, cfg.toDate, company));
+}
+
+function tallyPost(cfg, body) {
   return new Promise((resolve, reject) => {
     const req = http.request(
       { host: cfg.tally.host, port: cfg.tally.port, method: 'POST', headers: { 'Content-Type': 'text/xml', 'Content-Length': Buffer.byteLength(body) }, timeout: 60000 },
@@ -208,6 +244,11 @@ function dueDateFrom(voucherDate, period) {
     d.setUTCDate(d.getUTCDate() + Number(days[1]));
     return d.toISOString().slice(0, 10);
   }
+  return tallyAnyDateToISO(p);
+}
+/** A date as Tally writes it in reports: "20260920", "20-Sep-2026" or "20-Sep-26". */
+function tallyAnyDateToISO(s) {
+  const p = String(s || '').trim();
   if (/^\d{8}$/.test(p)) return tallyDateToISO(p);
   const m = p.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2}|\d{4})$/);
   const mon = m ? MONTHS[m[2].toLowerCase()] : undefined;
@@ -283,6 +324,38 @@ function parseVouchers(xml) {
 }
 
 /** Keep only wanted voucher types with usable party + amount + date, as API payload rows. */
+/**
+ * Parses the Bills Receivable report. Tally writes each bill as a BILLFIXED
+ * block (date, reference, party) followed by its pending amount (BILLCL) and
+ * due date (BILLDUE). Debit amounts are negative in Tally XML, so a bill owed
+ * to the business is negative; anything else (an advance or credit balance)
+ * is counted in `credits`, never turned into a receivable.
+ */
+function parseOpeningBills(xml, asOf) {
+  const bills = [];
+  let credits = 0, unreadable = 0;
+  const limit = tallyDateToISO(asOf);
+  const parts = xml.split(/<BILLFIXED>/i).slice(1);
+  for (const part of parts) {
+    const end = part.search(/<\/BILLFIXED>/i);
+    if (end < 0) { unreadable++; continue; }
+    const fixed = part.slice(0, end);
+    const rest = part.slice(end);
+    const party = tag(fixed, 'BILLPARTY');
+    const billName = tag(fixed, 'BILLREF');
+    const billDate = tallyAnyDateToISO(tag(fixed, 'BILLDATE'));
+    const amount = num(tag(rest, 'BILLCL'));
+    if (!party || !billName || !billDate || isNaN(amount) || (limit && billDate > limit)) { unreadable++; continue; }
+    if (amount >= 0) { credits++; continue; }
+    bills.push({ party, billName, billDate, dueDate: tallyAnyDateToISO(tag(rest, 'BILLDUE')), pending: Math.round(-amount * 100) / 100 });
+  }
+  return { bills, credits, unreadable };
+}
+/** Opening bills as import rows: sent before the day book so later receipts find them. */
+function openingBillVouchers(bills) {
+  return bills.map((b) => ({ type: 'Opening Bill', date: b.billDate, party: b.party, voucherNo: b.billName, amount: b.pending, items: [], dueDate: b.dueDate, bills: [] }));
+}
+
 function toApiVouchers(vouchers, wantedTypes) {
   const wanted = wantedTypes.map((t) => t.toLowerCase());
   const rows = [];
@@ -386,6 +459,29 @@ async function collectRows(cfg) {
       xml = await fetchTallyDayBook(cfg, company);
       console.log('done.');
     }
+    // Bills still unpaid when the day book range starts (earlier years' sales).
+    // Sent first so receipts in the range can settle them.
+    const asOf = dayBefore(cfg.fromDate);
+    let openingXml = null;
+    if (MODE === 'test') {
+      const opening = [...args].find((a) => a.startsWith('--opening='))?.slice('--opening='.length);
+      if (opening) openingXml = readFileSync(join(HERE, opening.replace(/[^\w.-]/g, '')), 'utf-8');
+    } else {
+      process.stdout.write(`📥 Reading bills still unpaid on ${tallyDateToISO(asOf)} for ${label} ... `);
+      try {
+        openingXml = await tallyPost(cfg, billsReceivableRequestXML(asOf, company));
+        const err = tag(openingXml, 'LINEERROR');
+        if (err) { console.log(`Tally refused (${err}); continuing with the day book only.`); openingXml = null; } else console.log('done.');
+      } catch (e) {
+        console.log(`failed (${e.message}); continuing with the day book only.`);
+      }
+    }
+    if (openingXml) {
+      const { bills, credits, unreadable } = parseOpeningBills(openingXml, asOf);
+      all.push(...openingBillVouchers(bills));
+      console.log(`   ${label}: ${bills.length} bills unpaid on ${tallyDateToISO(asOf)}${credits ? `, ${credits} credit balance${credits === 1 ? '' : 's'} left out` : ''}${unreadable ? `, ${unreadable} lines not understood` : ''}.`);
+    }
+
     const vouchers = parseVouchers(xml);
     const { rows, skipped } = toApiVouchers(vouchers, cfg.voucherTypes);
     totalSkipped += skipped.length;

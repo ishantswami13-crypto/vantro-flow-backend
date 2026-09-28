@@ -23,9 +23,9 @@ const require = createRequire(import.meta.url);
 const { check, done } = makeChecker();
 const PORT = 3922;
 
-function bridgeVouchers(sample = 'sample-daybook.xml') {
-  // The real connector's parser, offline, on a bundled sample day book.
-  const out = execFileSync(process.execPath, ['tally-connector/tally-sync.mjs', '--test', `--sample=${sample}`], { encoding: 'utf8' });
+function bridgeVouchers(sample = 'sample-daybook.xml', opening = null) {
+  // The real connector's parser, offline, on a bundled sample day book (and Bills Receivable export).
+  const out = execFileSync(process.execPath, ['tally-connector/tally-sync.mjs', '--test', `--sample=${sample}`, ...(opening ? [`--opening=${opening}`] : [])], { encoding: 'utf8' });
   const start = out.indexOf('\n[');
   const end = out.lastIndexOf('\n]');
   return JSON.parse(out.slice(start + 1, end + 2));
@@ -163,6 +163,20 @@ async function main() {
     const scanned = await (await fetch(`${base}/api/client/scan/search?q=Mehta`, { headers: auth(owner) })).json();
     const mehta = scanned.customers?.find((c) => c.name === 'Mehta Hardware');
     check('Scan shows Mehta owing what is left (₹78,500)', mehta?.openTotal === 78500, scanned.customers);
+
+    console.log('— OPENING BILLS (earlier years, still unpaid when the day book starts)');
+    const withOpening = bridgeVouchers('sample-daybook-billwise.xml', 'sample-bills-receivable.xml');
+    check('bridge sends 3 opening bills ahead of the day book (credit balance left out)',
+      withOpening.slice(0, 3).every((v) => v.type === 'Opening Bill') && withOpening.filter((v) => v.type === 'Opening Bill').length === 3, withOpening.slice(0, 4));
+    const ob = await (await fetch(`${base}/api/import/tally`, {
+      method: 'POST', headers: { Authorization: device, 'Content-Type': 'application/json' }, body: JSON.stringify({ vouchers: withOpening }),
+    })).json();
+    check('opening bills imported once, the day book already there', ob.imported?.opening === 3 && ob.imported?.sales === 0, ob);
+    const [o1450] = (await pool.query(`SELECT invoice_amount, due_date::text AS due FROM invoices WHERE user_id = $1 AND invoice_number LIKE 'TLY-OPENINGB-S1450-%'`, [owner.id])).rows;
+    check('opening bill at the amount still owed, with its due date', Number(o1450?.invoice_amount) === 32000 && o1450?.due?.startsWith('2026-02-09'), o1450);
+    const scanned2 = await (await fetch(`${base}/api/client/scan/search?q=Mehta`, { headers: auth(owner) })).json();
+    check('Scan now shows Mehta owing last year\'s bill too (₹1,10,500)', scanned2.customers?.find((c) => c.name === 'Mehta Hardware')?.openTotal === 110500, scanned2.customers);
+    check('no receivable for the on-account credit balance', (await pool.query(`SELECT COUNT(*)::int c FROM invoices WHERE user_id = $1 AND customer_name = 'Kapoor & Co'`, [owner.id])).rows[0].c === 0);
   } finally {
     if (server) server.stop();
     await pool.query('DELETE FROM connector_devices WHERE user_id = ANY($1)', [users]).catch(() => {});

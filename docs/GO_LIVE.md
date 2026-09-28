@@ -191,13 +191,20 @@ What the import does with a company's books:
 | Agst Ref bill not found, or more than one open match | Nothing applied; counted under `unapplied.bill_not_found` |
 | Debit Note | Nothing created; counted under `unapplied.debit_notes` |
 | Company with bill-wise details off (no allocations) | Receipts stay unmatched bank credits; bills stay open until paid in Starlane |
+| Bills Receivable as of the day before the synced range (earlier years' unpaid bills) | Invoices for the amount still owed then, sent before the day book so this year's receipts settle them. Credit balances are left out. The same bill arriving later as a sale (or the reverse) stays one invoice |
+| Any new Tally bill | Takes the phone number already on file for that customer (their other invoices). Tally vouchers carry none |
 
 Known limits to check on the first real company:
 - A bill renamed in Tally so that its name differs from the voucher number
   will not match.
-- The day book sync starts at the financial year (1 April). Bills still
-  outstanding from earlier years (opening balances) are not imported, and
-  receipts against them are reported as `bill_not_found`. Importing
-  opening outstanding bills (Tally's Bills Receivable) is the next import
-  gap to close.
+- The Bills Receivable export format (BILLFIXED / BILLCL / BILLDUE, debit
+  negative) is built from TallyPrime's documented XML shape and a fictional
+  sample. It has not been checked against a real export. If Tally refuses
+  the report, the sync continues with the day book only (the CLI says so;
+  the desktop app records `client.opening_bills_failed`).
+- Customers with no number anywhere in Starlane still have none. Their
+  reminders fail on approval with "No phone number on file". Reading
+  numbers from Tally's ledger masters is not built.
+- Bills show Starlane's reference (e.g. `TLY-SALES-S201-20260801`), not
+  Tally's own "S/201".
 Compare the Outstanding report after the first sync.
