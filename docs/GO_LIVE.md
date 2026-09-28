@@ -205,6 +205,7 @@ Known limits to check on the first real company:
 - Customers with no number anywhere in Starlane still have none. Their
   reminders fail on approval with "No phone number on file". Reading
   numbers from Tally's ledger masters is not built.
-- Bills show Starlane's reference (e.g. `TLY-SALES-S201-20260801`), not
-  Tally's own "S/201".
+- Bills show Tally's bill number without punctuation ("S201" for "S/201").
+  Scan finds either spelling. The stored reference is unchanged, so
+  re-syncs stay idempotent.
 Compare the Outstanding report after the first sync.

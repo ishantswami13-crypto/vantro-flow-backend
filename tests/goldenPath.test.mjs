@@ -176,6 +176,11 @@ async function main() {
     check('opening bill at the amount still owed, with its due date', Number(o1450?.invoice_amount) === 32000 && o1450?.due?.startsWith('2026-02-09'), o1450);
     const scanned2 = await (await fetch(`${base}/api/client/scan/search?q=Mehta`, { headers: auth(owner) })).json();
     check('Scan now shows Mehta owing last year\'s bill too (₹1,10,500)', scanned2.customers?.find((c) => c.name === 'Mehta Hardware')?.openTotal === 110500, scanned2.customers);
+    const byBill = await (await fetch(`${base}/api/client/scan/search?q=${encodeURIComponent('S/201')}`, { headers: auth(owner) })).json();
+    check('Scan finds "S/201" typed as Tally shows it, and shows the bill number (not the import reference)',
+      byBill.invoices?.length === 1 && byBill.invoices[0].invoiceNumber === 'S201', byBill.invoices);
+    const cust = await (await fetch(`${base}/api/client/scan/customer/${encodeURIComponent('mehta hardware')}`, { headers: auth(owner) })).json();
+    check('customer Scan lists bills by number', cust.scan?.invoices?.some((i) => i.invoiceNumber === 'S1450') && !cust.scan.invoices.some((i) => /^TLY-/.test(i.invoiceNumber)), cust.scan?.invoices);
     check('no receivable for the on-account credit balance', (await pool.query(`SELECT COUNT(*)::int c FROM invoices WHERE user_id = $1 AND customer_name = 'Kapoor & Co'`, [owner.id])).rows[0].c === 0);
   } finally {
     if (server) server.stop();
