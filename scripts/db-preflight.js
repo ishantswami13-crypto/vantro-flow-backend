@@ -36,6 +36,7 @@ const path = require('path');
 const { Client } = require('pg');
 const { buildSanitizedPgConfig } = require('../lib/db/pgConfig');
 const { orderedMigrationFiles } = require('./migrate');
+const { LEDGER_TABLE, locateLedger } = require('../lib/db/migrationLedger');
 
 const ROOT = path.join(__dirname, '..');
 
@@ -136,6 +137,7 @@ function hazardChecks(cat) {
     { id: 'connector_devices', value: cat.tables.has('connector_devices') ? 'present' : 'absent', note: 'created by 047; Tally pairing depends on it' },
     { id: 'suggested_by check', value: suggestedByState(cat), note: '019 widens it; mission proposals insert suggested_by = collections_agent' },
     { id: 'row-level security', value: cat.rlsTables.length ? `${cat.rlsTables.length} tables` : 'off', note: '006 enables it (needs Supabase auth); the app enforces tenancy in queries either way' },
+    { id: 'schema_migrations', value: !cat.tables.has('schema_migrations') ? 'absent' : cat.columns.has('schema_migrations.filename') ? 'earlier ledger' : 'other tool', note: 'the ledger is starlane_migrations; a schema_migrations table from another tool is never read or written' },
     { id: 'connection role', value: cat.role.bypass ? 'bypasses' : cat.role.ownsTables ? 'owner' : 'LIMITED', note: 'new tables (050-053) have RLS on; this role must own them or bypass RLS, or the new features read nothing' },
   ];
 }
@@ -150,9 +152,13 @@ async function inspect(client) {
   await client.query('BEGIN TRANSACTION READ ONLY');
   try {
     const cat = await catalog(client);
-    const ledgerExists = cat.tables.has('schema_migrations');
+    // The ledger is starlane_migrations (or, on a copy migrated by this
+    // branch's first revision, schema_migrations with a filename column). An
+    // unrelated schema_migrations table from another tool is not a ledger.
+    const ledgerTable = await locateLedger(client);
+    const ledgerExists = !!ledgerTable;
     const ledger = ledgerExists
-      ? new Map((await client.query('SELECT filename, checksum FROM schema_migrations')).rows.map((r) => [r.filename, r.checksum]))
+      ? new Map((await client.query(`SELECT filename, checksum FROM ${ledgerTable}`)).rows.map((r) => [r.filename, r.checksum]))
       : new Map();
 
     const files = orderedMigrationFiles().map((file) => {
@@ -181,7 +187,7 @@ function buildPlan(report) {
   const safeIdx = files.findIndex((f) => f.file === REAPPLY_SAFE_FROM);
 
   if (ledgerExists && ledgerRows > 0) {
-    warnings.push(`schema_migrations already has ${ledgerRows} row(s): this database is already on the ledger — use \`node scripts/migrate.js --status\`, not a baseline.`);
+    warnings.push(`${LEDGER_TABLE} already has ${ledgerRows} row(s): this database is already on the ledger — use \`node scripts/migrate.js --status\`, not a baseline.`);
   }
   for (const f of files) {
     if (f.state === 'partial') failures.push(`${f.file} is PARTIALLY present (missing: ${f.missing.slice(0, 6).join(', ')}${f.missing.length > 6 ? ', …' : ''}). A human must reconcile it before any baseline.`);
@@ -250,7 +256,7 @@ function printReport(r, log = console.log) {
   log('Starlane database baseline preflight (read-only)\n');
   log('Known hazards:');
   for (const h of r.hazards) log(`  ${h.id.padEnd(22)} ${String(h.value).padEnd(10)} ${h.note}`);
-  log(`\nLedger: ${r.ledgerExists ? `schema_migrations exists (${r.ledgerRows} rows)` : 'none yet'}\n`);
+  log(`\nLedger: ${r.ledgerExists ? `${LEDGER_TABLE} exists (${r.ledgerRows} rows)` : 'none yet'}\n`);
   log('Per-file state (objects the file creates vs the live catalog):');
   for (const f of r.files) {
     const action = r.plan.record.includes(f.file) ? 'RECORD' : 'APPLY ';

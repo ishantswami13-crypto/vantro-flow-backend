@@ -33,11 +33,14 @@ async function withScratch(name, fn) {
 const LAST_PROD = 'migrations/048_onboarding_profile.sql';
 async function prodLike(client) {
   await migrate.run({ mode: 'apply', client, log: quiet, throughFile: LAST_PROD });
-  await client.query('DROP TABLE schema_migrations');
+  await client.query('DROP TABLE starlane_migrations');
 }
 const AFTER_PROD = migrate.orderedMigrationFiles().slice(migrate.orderedMigrationFiles().indexOf(LAST_PROD) + 1);
-const ledgerCount = async (c) => (await c.query(`SELECT COUNT(*)::int n FROM information_schema.tables WHERE table_name='schema_migrations'`)).rows[0].n
-  ? (await c.query('SELECT COUNT(*)::int n FROM schema_migrations')).rows[0].n : 0;
+const ledgerCount = async (c) => (await c.query(`SELECT COUNT(*)::int n FROM information_schema.tables WHERE table_name='starlane_migrations'`)).rows[0].n
+  ? (await c.query('SELECT COUNT(*)::int n FROM starlane_migrations')).rows[0].n : 0;
+const tableColumns = async (c, t) => (await c.query(`SELECT column_name FROM information_schema.columns WHERE table_name=$1 ORDER BY ordinal_position`, [t])).rows.map((r) => r.column_name).join();
+// Production has this table, created outside the repo and empty. It is not ours.
+const FOREIGN_LEDGER_DDL = 'CREATE TABLE schema_migrations (version text, checksum text, applied_at timestamptz, applied_by text)';
 
 async function main() {
   await withScratch('happy', async (c) => {
@@ -61,6 +64,32 @@ async function main() {
     check('baseline refuses a database already on the ledger', !!again);
     const pre = await c.query(`SELECT COUNT(*)::int n FROM information_schema.tables WHERE table_name IN ('auth_sessions','notification_events','product_events')`);
     check('client-platform tables exist after the upgrade', pre.rows[0].n === 3);
+  });
+
+  await withScratch('foreign', async (c) => {
+    await prodLike(c);
+    await c.query(FOREIGN_LEDGER_DDL);
+    const r = await preflight(c);
+    check('production shape (unrelated empty schema_migrations): preflight PASSES with cut-off 048', r.plan.pass && r.plan.baselineThrough === LAST_PROD, r.plan.failures);
+    check('preflight reports that table as another tool\'s', r.hazards.some((h) => h.id === 'schema_migrations' && h.value === 'other tool'));
+    await baseline(c, { through: LAST_PROD, log: quiet });
+    const applied = await migrate.run({ mode: 'apply', client: c, log: quiet });
+    check('baseline then migrate apply exactly the files after 048', applied.applied.join() === AFTER_PROD.join());
+    check('the unrelated table is untouched: same columns, still empty',
+      await tableColumns(c, 'schema_migrations') === 'version,checksum,applied_at,applied_by'
+      && (await c.query('SELECT COUNT(*)::int n FROM schema_migrations')).rows[0].n === 0);
+  });
+
+  await withScratch('earlier', async (c) => {
+    await migrate.run({ mode: 'apply', client: c, log: quiet });
+    const recorded = await ledgerCount(c);
+    await c.query('ALTER TABLE starlane_migrations RENAME TO schema_migrations'); // how the first revision left it
+    const r = await preflight(c);
+    check('a ledger under the earlier name is recognised read-only (no baseline offered)', r.ledgerExists && r.ledgerRows === recorded);
+    const st = await migrate.run({ mode: 'status', client: c, log: quiet });
+    check('migrate adopts it: renamed, every row kept, nothing pending',
+      await ledgerCount(c) === recorded && (await c.query(`SELECT to_regclass('public.schema_migrations') AS t`)).rows[0].t === null
+      && st.steps.every((x) => x.state === 'applied'));
   });
 
   await withScratch('missing020', async (c) => {

@@ -47,12 +47,15 @@ Steps marked **(approval)** change production and need the owner's go-ahead.
    (or `railway run npm run db:preflight`). Review the plan: which files are
    recorded without running, which run, the unverified list and the hazard
    lines. Stop if it says FAIL.
-2. **Backup.** Supabase: Database → Backups (or a `pg_dump` of the project).
-   Note the backup time; it is the rollback point.
+2. **Backup.** Production is on Neon: create a branch from the production
+   branch (e.g. `backup-pre-golive-<date>`) and note its time; it is the
+   rollback point. (Elsewhere: Supabase Database → Backups, or `pg_dump`.)
 3. **(approval) Baseline.**
    `npm run db:baseline -- --execute --through=<file the preflight printed>`
-   — writes only `schema_migrations`, in one transaction; refuses if the
-   database changed since the preflight.
+   — writes only `starlane_migrations`, in one transaction; refuses if the
+   database changed since the preflight. Production also has an unrelated,
+   empty `schema_migrations` table (version, checksum, applied_at,
+   applied_by) made outside this repo; the scripts never read or write it.
 4. **(approval) Migrate.** `npm run db:migrate`, then `npm run db:migrate:status`
    (expect nothing pending). Stops at the first failure.
 5. **Check the live (old) site still works** — sign in, open the dashboard.

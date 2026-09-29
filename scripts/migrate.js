@@ -11,7 +11,8 @@
 // This runner:
 //   - derives the order from one list (PRELUDE_FILES, then every migrations/*.sql
 //     sorted by filename), so a new migration file is picked up automatically;
-//   - records each applied file in schema_migrations with a SHA-256 checksum;
+//   - records each applied file in starlane_migrations (lib/db/migrationLedger.js)
+//     with a SHA-256 checksum;
 //   - applies each pending file inside its own transaction and STOPS on the first
 //     failure (no "warning (continuing)" — a half-applied schema is not a state we
 //     want to discover later from a 500);
@@ -38,6 +39,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { Client } = require('pg');
 const { buildSanitizedPgConfig } = require('../lib/db/pgConfig');
+const { LEDGER_TABLE, LEDGER_DDL, adoptEarlierLedger } = require('../lib/db/migrationLedger');
 
 const ROOT = path.join(__dirname, '..');
 
@@ -67,13 +69,6 @@ function orderedMigrationFiles() {
 function checksum(sql) {
   return crypto.createHash('sha256').update(sql).digest('hex');
 }
-
-const LEDGER_DDL = `
-  CREATE TABLE IF NOT EXISTS schema_migrations (
-    filename   TEXT PRIMARY KEY,
-    checksum   TEXT NOT NULL,
-    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
-  )`;
 
 // Supabase provisions these roles and the auth.uid() helper; a plain Postgres
 // (local dev, CI) does not, and RLS policies/GRANTs in the migrations reference
@@ -108,9 +103,10 @@ async function connect() {
 }
 
 async function plan(client) {
+  await adoptEarlierLedger(client);
   await client.query(LEDGER_DDL);
   await client.query(PLATFORM_COMPAT_SQL);
-  const { rows } = await client.query('SELECT filename, checksum FROM schema_migrations');
+  const { rows } = await client.query(`SELECT filename, checksum FROM ${LEDGER_TABLE}`);
   const applied = new Map(rows.map((r) => [r.filename, r.checksum]));
   return orderedMigrationFiles().map((file) => {
     const sql = fs.readFileSync(path.join(ROOT, file), 'utf8');
@@ -142,7 +138,7 @@ async function run({ mode = 'apply', baselineThrough = null, throughFile = null,
       const cutoff = steps.findIndex((s) => s.file === baselineThrough);
       if (cutoff === -1) throw new Error(`--baseline needs a known migration file as its cut-off (got ${baselineThrough || 'nothing'})`);
       for (const s of steps.slice(0, cutoff + 1).filter((x) => x.state === 'pending')) {
-        await client.query('INSERT INTO schema_migrations (filename, checksum) VALUES ($1, $2) ON CONFLICT DO NOTHING', [s.file, s.sum]);
+        await client.query(`INSERT INTO ${LEDGER_TABLE} (filename, checksum) VALUES ($1, $2) ON CONFLICT DO NOTHING`, [s.file, s.sum]);
         log(`baselined ${s.file}`);
       }
       return { applied: [], baselined: steps.slice(0, cutoff + 1).filter((x) => x.state === 'pending').map((x) => x.file) };
@@ -153,7 +149,7 @@ async function run({ mode = 'apply', baselineThrough = null, throughFile = null,
       try {
         await client.query('BEGIN');
         await client.query(s.sql);
-        await client.query('INSERT INTO schema_migrations (filename, checksum) VALUES ($1, $2)', [s.file, s.sum]);
+        await client.query(`INSERT INTO ${LEDGER_TABLE} (filename, checksum) VALUES ($1, $2)`, [s.file, s.sum]);
         await client.query('COMMIT');
         appliedNow.push(s.file);
         log(`applied  ${s.file}`);

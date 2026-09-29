@@ -10,12 +10,13 @@
 //   2. refuses unless --through equals the preflight's computed cut-off
 //      exactly (the operator confirms the plan they reviewed; a changed
 //      database or a typo stops here);
-//   3. in ONE transaction, creates schema_migrations and records each file up
+//   3. in ONE transaction, creates starlane_migrations and records each file up
 //      to the cut-off with the SHA-256 of its current contents;
 //   4. runs nothing else. Pending files are applied afterwards by
 //      `node scripts/migrate.js`, which stops on the first failure.
 //
-// Writes only the schema_migrations table. Never prints credentials.
+// Writes only the starlane_migrations table (an unrelated schema_migrations
+// table, if present, is left untouched). Never prints credentials.
 
 require('dotenv').config();
 const fs = require('fs');
@@ -24,6 +25,7 @@ const crypto = require('crypto');
 const { Client } = require('pg');
 const { buildSanitizedPgConfig } = require('../lib/db/pgConfig');
 const { preflight, printReport } = require('./db-preflight');
+const { LEDGER_TABLE, LEDGER_DDL, adoptEarlierLedger } = require('../lib/db/migrationLedger');
 
 const ROOT = path.join(__dirname, '..');
 const sha = (file) => crypto.createHash('sha256').update(fs.readFileSync(path.join(ROOT, file), 'utf8')).digest('hex');
@@ -39,14 +41,14 @@ async function baseline(client, { through, log = console.log }) {
   }
   await client.query('BEGIN');
   try {
-    await client.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
-      filename TEXT PRIMARY KEY, checksum TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
-    const existing = await client.query('SELECT COUNT(*)::int AS n FROM schema_migrations');
-    if (existing.rows[0].n > 0) throw new Error('schema_migrations is not empty — this database is already on the ledger.');
+    await adoptEarlierLedger(client);
+    await client.query(LEDGER_DDL);
+    const existing = await client.query(`SELECT COUNT(*)::int AS n FROM ${LEDGER_TABLE}`);
+    if (existing.rows[0].n > 0) throw new Error(`${LEDGER_TABLE} is not empty — this database is already on the ledger.`);
     for (const file of r.plan.record) {
-      await client.query('INSERT INTO schema_migrations (filename, checksum) VALUES ($1, $2)', [file, sha(file)]);
+      await client.query(`INSERT INTO ${LEDGER_TABLE} (filename, checksum) VALUES ($1, $2)`, [file, sha(file)]);
     }
-    const written = await client.query('SELECT COUNT(*)::int AS n FROM schema_migrations');
+    const written = await client.query(`SELECT COUNT(*)::int AS n FROM ${LEDGER_TABLE}`);
     if (written.rows[0].n !== r.plan.record.length) throw new Error('Ledger row count mismatch after insert.');
     await client.query('COMMIT');
   } catch (e) {

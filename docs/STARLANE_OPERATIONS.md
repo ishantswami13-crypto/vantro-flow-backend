@@ -16,7 +16,9 @@ backend → deploy website → connect books → signed apps) is in
 over the manual commands below.
 
 `scripts/migrate.js` is now the only way schema is applied. It keeps a
-`schema_migrations` ledger (file + SHA-256) and stops on the first failure.
+`starlane_migrations` ledger (file + SHA-256) and stops on the first failure.
+(Not `schema_migrations`: production already has an unrelated table by that
+name. A copy migrated under the old name is renamed automatically.)
 
 **Existing databases (staging, production) were migrated by hand and have
 no ledger.** Not every legacy file is safe to re-run, so baseline first:
