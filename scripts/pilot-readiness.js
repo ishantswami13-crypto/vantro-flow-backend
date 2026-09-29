@@ -5,7 +5,7 @@
 //
 //   AUTH  TENANCY  DATABASE  BRIDGE  IMPORT  SCAN  WATCH  DECISIONS
 //   SIMULATE  PREPARED  MISSIONS  AGENTS  POLICY  ACTIONS  VERIFY  MEMORY
-//   FRONTEND
+//   OUTREACH  FRONTEND
 //
 // Each check is PASS only when it was actually exercised and verified.
 // Anything not exercised is SKIPPED or BLOCKED with the reason; nothing is
@@ -38,7 +38,7 @@ const args = process.argv.slice(2);
 const flag = (n) => args.includes(`--${n}`);
 const opt = (n) => { const i = args.indexOf(`--${n}`); return i !== -1 ? args[i + 1] : null; };
 
-const CHECKS = ['AUTH', 'TENANCY', 'DATABASE', 'BRIDGE', 'IMPORT', 'SCAN', 'WATCH', 'DECISIONS', 'SIMULATE', 'PREPARED', 'MISSIONS', 'AGENTS', 'POLICY', 'ACTIONS', 'VERIFY', 'MEMORY', 'FRONTEND'];
+const CHECKS = ['AUTH', 'TENANCY', 'DATABASE', 'BRIDGE', 'IMPORT', 'SCAN', 'WATCH', 'DECISIONS', 'SIMULATE', 'PREPARED', 'MISSIONS', 'AGENTS', 'POLICY', 'ACTIONS', 'VERIFY', 'MEMORY', 'OUTREACH', 'FRONTEND'];
 const results = Object.fromEntries(CHECKS.map((c) => [c, { status: 'NOT_RUN', detail: 'not reached' }]));
 const transcript = [];
 const DAY = 86400000;
@@ -113,7 +113,7 @@ async function run() {
   const tenants = [];
   let server;
   try {
-    server = await startServer({ FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED: 'false', STARLANE_GLOBAL_STOP: '' });
+    server = await startServer({ FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED: 'false', STARLANE_GLOBAL_STOP: '', OUTBOUND_ENGINE_ENABLED: 'false', OUTBOUND_FIXTURE_MODE: 'true' });
     const mk = async (label) => { const t = await createTenant(env.pool, `pilot-${label}`); tenants.push(t); return t; };
     const a = await mk('slipping');
     const b = await mk('intruder');
@@ -523,6 +523,60 @@ async function run() {
       verdict('TENANCY', problems, `another tenant gets 404 on A's decision (read, select, feedback, evidence, Handle it) and on O's workflow, objective and approval; it sees 0 invoices, decisions, missions, items, knowledge, outcomes and agent runs`);
     }
 
+    // ── OUTREACH: the outbound pipeline over the API, then one send to the sink.
+    // START must refuse here (this backend runs no outbound runner); the
+    // queue and worker are driven in-process at a fixed weekday morning so
+    // the local-time window is deterministic. Prospects are *.invalid.
+    {
+      const outboundOk = (await env.pool.query(`SELECT to_regclass('public.outbound_send_jobs') AS t`)).rows[0].t;
+      if (!outboundOk) set('OUTREACH', 'BLOCKED', 'migration 062_outbound_engine.sql not applied');
+      else {
+        const problems = [];
+        const H = require('../tests/helpers/outboundHarness');
+        const scheduler = require('../lib/domain/outbound/scheduler');
+        const worker = require('../lib/domain/outbound/worker');
+        const ou = await mk('outreach');
+        const cu = client(server.base, ou);
+        const acct = await cu.post('/api/outreach/providers', { provider: 'sink' });
+        const camp = await cu.post('/api/outreach/campaigns', { name: 'Pilot readiness outreach', goal: 'Book pilot conversations', cta: 'Would a 15-minute working session be useful?', allowedCountries: ['IN'], providerAccountId: acct.body.id });
+        const imp = await cu.post('/api/outreach/targets/import', { rows: [H.targetRow({ domain: 'pilot-outreach.invalid', first: 'Nisha' }), H.targetRow({ domain: 'pilot-generic.invalid', first: 'x', email: 'info@pilot-generic.invalid' })], source: 'pilot-readiness' });
+        const ids = (imp.body.results || []).filter((r) => r.contactId).map((r) => r.contactId);
+        await cu.post(`/api/outreach/campaigns/${camp.body.id}/enroll`, { contactIds: ids });
+        const drafts = await cu.post(`/api/outreach/campaigns/${camp.body.id}/drafts`);
+        const pending = (await cu.get('/api/outreach/messages')).body.messages || [];
+        for (const m of pending) await cu.post(`/api/outreach/messages/${m.id}/review`, { decision: 'APPROVE' });
+        await cu.post(`/api/outreach/campaigns/${camp.body.id}/start`);
+        const start = await cu.post('/api/outreach/start', { mode: 'SHADOW' });
+        const live = await cu.post('/api/outreach/start', { mode: 'LIVE' });
+        if (acct.status !== 201 || camp.status !== 201) problems.push(`setup ${acct.status}/${camp.status}`);
+        if (pending.length !== 1) problems.push(`${pending.length} drafts for review (expected 1: the generic inbox must be excluded; drafts said ${JSON.stringify(drafts.body.excluded || [])})`);
+        if (start.status !== 409 || !(start.body.preflight?.checks || []).some((c) => c.name === 'SCHEDULER' && c.status !== 'PASS')) problems.push(`START without a runner returned ${start.status}`);
+        if (live.status !== 400) problems.push(`LIVE without confirmation returned ${live.status}`);
+        // Drive one scheduler tick and the worker in-process (SHADOW, sink).
+        const at = new Date('2026-09-30T05:30:00Z');
+        await env.pool.query(`INSERT INTO outbound_tenant_state (user_id, engine_status, mode) VALUES ($1,'RUNNING','SHADOW') ON CONFLICT (user_id) DO UPDATE SET engine_status='RUNNING', mode='SHADOW'`, [ou.id]);
+        await env.pool.query(`DELETE FROM outbound_locks WHERE name='scheduler'`);
+        await scheduler.tick(env.pool, { owner: 'pilot-readiness', now: at, rng: () => 0 });
+        await env.pool.query(`DELETE FROM outbound_locks WHERE name='scheduler'`);
+        await scheduler.tick(env.pool, { owner: 'pilot-readiness-2', now: at, rng: () => 0 });
+        await env.pool.query(`DELETE FROM outbound_locks WHERE name='scheduler'`);
+        const cp = H.countingProvider();
+        const later = new Date(at.getTime() + 10 * 60000);
+        for (let i = 0; i < 5; i += 1) {
+          const got = await worker.reserve(env.pool, { owner: 'pilot-readiness', limit: 1, now: later });
+          if (!got.length) break;
+          await worker.processJob(env.pool, got[0], { owner: 'pilot-readiness', now: later, providerFor: cp.providerFor, rng: () => 0 });
+        }
+        const jobs = (await cu.get('/api/outreach/jobs')).body.jobs || [];
+        await env.pool.query(`UPDATE outbound_tenant_state SET engine_status='STOPPED' WHERE user_id=$1`, [ou.id]);
+        if (jobs.length !== 1 || jobs[0].status !== 'SENT' || jobs[0].mode !== 'SHADOW') problems.push(`jobs after two scheduler ticks: ${JSON.stringify(jobs.map((j) => [j.status, j.mode]))}`);
+        if (cp.calls.length !== 1) problems.push(`${cp.calls.length} provider calls (expected exactly 1)`);
+        const intruder = [(await cb.get('/api/outreach/jobs')).body.jobs?.length, (await cb.get('/api/outreach/contacts')).body.contacts?.length, (await cb.get(`/api/outreach/campaigns/${camp.body.id}`)).status];
+        if (intruder[0] !== 0 || intruder[1] !== 0 || intruder[2] !== 404) problems.push(`another tenant sees ${JSON.stringify(intruder)}`);
+        verdict('OUTREACH', problems, 'sink account, campaign, target import, draft and review over the API; the generic inbox was excluded; START refused without a runner and LIVE refused without the typed confirmation; two scheduler ticks queued one job and the worker sent it once to the sink in SHADOW; another tenant sees none of it. Real Gmail sending is not exercised here');
+      }
+    }
+
     // ── FRONTEND: only checked when a URL is given; reachability is all this proves.
     const fe = opt('frontend-url') || process.env.PILOT_FRONTEND_URL;
     if (!fe) set('FRONTEND', 'SKIPPED', 'no --frontend-url given; run with the deployed or local frontend URL to check the pages respond');
@@ -544,6 +598,8 @@ async function run() {
     if (!flag('keep')) {
       for (const t of tenants) {
         await env.pool.query('DELETE FROM file_import_batches WHERE user_id = $1', [t.id]).catch(() => {});
+        for (const tbl of ['outbound_rate_buckets', 'outbound_rate_windows']) await env.pool.query(`DELETE FROM ${tbl} WHERE bucket_key LIKE $1`, [`%${t.id}%`]).catch(() => {});
+        await env.pool.query('DELETE FROM outbound_audit WHERE user_id = $1', [t.id]).catch(() => {});
         await deleteTenant(env.pool, t.id).catch(() => {});
       }
     }
