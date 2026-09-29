@@ -1,0 +1,4 @@
+Customer,Invoice No,Invoice Date,Due Date,Invoice Amount,Amount Paid,Payment Date,Status,Currency,Credit Days,Phone
+Sharma Traders (example),INV-1041,13/04/2026,13/05/2026,"1,20,000",0,,Unpaid,INR,30,9876500001
+Mehta Stores (example),INV-1042,15/04/2026,15/05/2026,"45,000","45,000",14/05/2026,Paid,INR,30,9876500002
+Kapoor & Sons (example),INV-1043,20/04/2026,20/05/2026,"80,000","30,000",25/05/2026,Partially paid,INR,30,

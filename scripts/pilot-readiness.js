@@ -190,11 +190,12 @@ async function run() {
     {
       const hh = await upload(server, h, 'commit', healthyCsv(today), confirmedOptions());
       const nn = await upload(server, n, 'commit', noDueDatesCsv(today), confirmedOptions({ dueDate: false }));
-      const healthyQuiet = hh.status === 200 && hh.body.firstLook.needYou === 0;
+      const quietLine = (hh.body.firstLook?.lines || []).find((l) => /No material decision currently requires attention/.test(l));
+      const healthyQuiet = hh.status === 200 && hh.body.firstLook.needYou === 0 && !!quietLine;
       const noDueHonest = nn.status === 200 && nn.body.firstLook.needYou === 0 && nn.body.firstLook.insufficientInformation === true && nn.body.profile.limitations.some((l) => l.key === 'noDueDates' && l.severity === 'blocking');
       transcript.push({ step: 'Healthy business (fixture)', lines: hh.body.firstLook?.lines || [] });
       transcript.push({ step: 'Ledger without due dates (fixture)', lines: nn.body.firstLook?.lines || [] });
-      set('SIGNALS', healthyQuiet && noDueHonest ? 'PASS' : 'FAIL', `healthy ledger -> ${hh.body.firstLook?.needYou} decisions ("${(hh.body.firstLook?.lines || []).slice(-1)[0]}"); no-due-date ledger -> ${nn.body.firstLook?.needYou} decisions, blocking limitation shown: ${noDueHonest}`);
+      set('SIGNALS', healthyQuiet && noDueHonest ? 'PASS' : 'FAIL', `healthy ledger -> ${hh.body.firstLook?.needYou} decisions ("${quietLine || 'no all-clear line'}"); no-due-date ledger -> ${nn.body.firstLook?.needYou} decisions, blocking limitation shown: ${noDueHonest}`);
     }
 
     // SIMULATE: what-if runs, is read-only, and do-nothing is always there.
