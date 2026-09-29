@@ -107,10 +107,53 @@ async function main() {
     await prodLike(c);
     await c.query('DROP INDEX IF EXISTS idx_data_connections_user');
     const r = await preflight(c);
-    check('a partially-applied migration FAILS preflight', !r.plan.pass && r.plan.failures.some((f) => f.includes('031_data_connections')), r.plan.failures);
+    check('an idempotent file after 020 missing an index: PASS, cut moves before it and it runs again',
+      r.plan.pass && r.plan.baselineThrough === 'migrations/030_import_batches.sql' && r.plan.apply[0]?.file === 'migrations/031_data_connections.sql', r.plan);
+    await baseline(c, { through: r.plan.baselineThrough, log: quiet });
+    await migrate.run({ mode: 'apply', client: c, log: quiet });
+    check('…and migrate recreates the index', (await c.query(`SELECT to_regclass('public.idx_data_connections_user') AS t`)).rows[0].t !== null);
+  });
+
+  await withScratch('guarded', async (c) => {
+    await prodLike(c);
+    await c.query('DROP INDEX IF EXISTS idx_bills_user_number'); // only built inside a guarded DO block, on a table that exists
+    const r = await preflight(c);
+    check('a missing object only a guarded block creates on an existing table FAILS preflight', !r.plan.pass && r.plan.failures.some((f) => f.includes('supabase-schema.sql') && f.includes('idx_bills_user_number')), r.plan.failures);
     let err = null;
     try { await baseline(c, { through: 'migrations/048_onboarding_profile.sql', log: quiet }); } catch (e) { err = e; }
     check('baseline refuses when preflight fails; nothing written', !!err && await ledgerCount(c) === 0);
+  });
+
+  await withScratch('production', async (c) => {
+    // The shape production's read-only preflight reported on 2026-09-29: base
+    // tables never created, a table and indexes missing from recorded files,
+    // 049/051 half-applied, the error-events rollout never run, and the
+    // unrelated schema_migrations table.
+    await prodLike(c);
+    await c.query(`DROP TABLE billing_history, attendance, expenses, business_vocabulary, brain_rules, prospect_notes CASCADE;
+      DROP INDEX idx_customer_score_history_user_customer; DROP TABLE IF EXISTS error_events CASCADE;`);
+    await c.query(FOREIGN_LEDGER_DDL);
+    const rlsOf = async () => (await c.query(`SELECT relname, relrowsecurity FROM pg_class WHERE relkind='r' AND relnamespace='public'::regnamespace`)).rows;
+    const before = await rlsOf();
+    const r = await preflight(c);
+    const repaired = r.plan.repair.map((x) => x.file).join();
+    check('production shape: PASS, repairing the base schema, 006_boot and 011 additively',
+      r.plan.pass && repaired === 'supabase-schema.sql,migrations/006_boot_migration_promoted.sql,migrations/011_customer_score_history.sql', { failures: r.plan.failures, repaired });
+    check('no repair statement toggles RLS, drops, or changes constraints or rows',
+      r.plan.repair.flatMap((x) => x.statements).every((st) =>
+        /^(CREATE (UNIQUE )?INDEX IF NOT EXISTS|CREATE TABLE IF NOT EXISTS|CREATE EXTENSION IF NOT EXISTS|ALTER TABLE \S+ ADD COLUMN IF NOT EXISTS)\b/i.test(st)
+        && !/ROW\s+LEVEL\s+SECURITY|\bPOLICY\b/i.test(st)));
+    await baseline(c, { through: r.plan.baselineThrough, log: quiet });
+    await migrate.run({ mode: 'apply', client: c, log: quiet });
+    const st = await migrate.run({ mode: 'status', client: c, log: quiet });
+    check('after baseline and migrate nothing is pending', st.steps.every((x) => x.state === 'applied'));
+    const again = await preflight(c);
+    check('every file is now fully present', again.files.every((f) => f.state === 'present' || f.state === 'n/a'), again.files.filter((f) => f.state !== 'present' && f.state !== 'n/a'));
+    const after = new Map((await rlsOf()).map((x) => [x.relname, x.relrowsecurity]));
+    check('RLS is unchanged on every table that existed before', before.every((x) => after.get(x.relname) === x.relrowsecurity));
+    check('the unrelated schema_migrations table is untouched',
+      await tableColumns(c, 'schema_migrations') === 'version,checksum,applied_at,applied_by'
+      && (await c.query('SELECT COUNT(*)::int n FROM schema_migrations')).rows[0].n === 0);
   });
 
   await withScratch('gap', async (c) => {

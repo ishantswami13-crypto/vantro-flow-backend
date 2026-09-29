@@ -34,6 +34,23 @@ fails on any other gap, lists the files it cannot verify (006, 016, 019), and
 checks the facts the new code depends on (019's `suggested_by` constraint, and
 that the connecting role can read the new RLS-protected tables).
 
+The first read-only preflight **on production** (2026-09-29) found more than
+the rehearsal: six base-schema tables were never created (`billing_history`,
+`bills`, `attendance`, `expenses`, `business_vocabulary`, `brain_rules` and
+their indexes), `prospect_notes` (006) and two indexes (011, 049) are missing,
+and 051 is half-applied. Re-running `supabase-schema.sql` whole is not an
+option: it ends by turning RLS **off** on 16 tables. So for a partial file the
+baseline records, it runs only that file's additive statements (`CREATE
+TABLE/INDEX/EXTENSION IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`; never a
+`DO` block, RLS toggle, constraint change or data change), then checks every
+missing object exists, all in the baseline's one transaction. A missing object
+that only a guarded block creates on an existing table still fails the
+preflight. Partial files after the cut (049, 051) simply run again. On a copy
+built to that exact shape: preflight PASS, baseline + migrate clean, nothing
+pending, RLS unchanged on every pre-existing table, the unrelated
+`schema_migrations` untouched (`tests/dbBaseline.test.mjs`, scenario
+`production`).
+
 **Estimated downtime: none.** The only locks are brief: indexes on `invoices`
 and `ai_actions` (seconds for thousands of rows) and a trigger on
 `ai_actions`. Run it at a quiet hour anyway.
@@ -52,8 +69,9 @@ Steps marked **(approval)** change production and need the owner's go-ahead.
    rollback point. (Elsewhere: Supabase Database → Backups, or `pg_dump`.)
 3. **(approval) Baseline.**
    `npm run db:baseline -- --execute --through=<file the preflight printed>`
-   — writes only `starlane_migrations`, in one transaction; refuses if the
-   database changed since the preflight. Production also has an unrelated,
+   — in one transaction: creates the missing objects of partial files
+   (additive statements only, listed by the preflight) and writes
+   `starlane_migrations`; refuses if the database changed since the preflight. Production also has an unrelated,
    empty `schema_migrations` table (version, checksum, applied_at,
    applied_by) made outside this repo; the scripts never read or write it.
 4. **(approval) Migrate.** `npm run db:migrate`, then `npm run db:migrate:status`
