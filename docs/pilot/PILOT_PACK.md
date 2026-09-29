@@ -7,9 +7,10 @@ No real business dataset has been run yet; that is the first pilot's job.
 ## 1. How to run it
 
 **Production (after go-live).** The pilot path needs, merged and deployed in this
-order: backend #41 (migration tooling), #42 (decision loop), this PR; frontend #27
-(decision screens), then this frontend PR; and migration `060_decision_core.sql`
-applied to production. Until then, production does not have Decisions or the
+order: backend #41 (migration tooling), #42 (decision loop), #43 (pilot path),
+#44 (seven surfaces), then the final-integration PR; frontend #27, #28, #29, then
+the final-integration PR; and migrations `060_decision_core.sql` and
+`061_operating_system.sql` applied to production. Until then, production does not have Decisions or the
 upload page. Keep `FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED=false`. New tenants
 start in **Shadow** mode: Starlane analyses and prepares but changes nothing
 outside itself.
@@ -27,7 +28,7 @@ DATABASE_URL=<prod> node scripts/decision-dry-run.js --email <owner email>
 ```bash
 # backend
 PORT=4000 DATABASE_URL=postgresql://postgres@127.0.0.1:5432/starlane JWT_SECRET=<32+ chars> npm start
-npm run pilot:readiness -- --frontend-url http://localhost:3000   # must print VERDICT: READY
+npm run pilot:readiness -- --frontend-url http://localhost:3000   # 17 checks, AUTH ... FRONTEND; must print VERDICT: READY
 # frontend
 NEXT_PUBLIC_API_URL=http://localhost:4000 npm run build && npm start
 ```
@@ -92,8 +93,10 @@ decision worked.
 6. **Evidence**: click the invoices behind the rupee figure.
 7. **What Starlane doesn't know** and **Under pressure / Try a what-if**: move
    payment speed, watch the recommendation hold or change.
-8. Choose an option → **Approve** → **Run**. It runs in Shadow: show "would
-   have" and that nothing changed outside Starlane.
+8. Press **Handle it** under the recommendation. It records your approval and
+   runs in Shadow: show "would have" and that nothing changed outside Starlane.
+   Open **Missions**: the decision is there as "Checking the outcome", and
+   stays there until the ledger shows whether it worked.
 9. Tap feedback at the top: **Already knew this / This matters / Wrong / …**
 10. **Track record** (`/decisions/proof`) shows the historical replay on their own data.
 
@@ -127,6 +130,10 @@ Measured from the database, not from impressions:
   collection-cycle process check run on uploaded files. Supply-chain decisions
   need product/supplier data that the upload does not take.
 - Live execution beyond internal records is off; customer messages are drafts.
+- Busy, QuickBooks, Zoho Books, Xero, Odoo and SAP have no connector; export to
+  CSV/Excel and upload. Tally is read-only.
+- Agents are deterministic code; there is no model router or token cost
+  tracking, and the chat assistant cannot mark invoices paid or place orders.
 - Password login and OTP were not exercised in this pass (they read users via
   Supabase, not configured locally).
 - Customer names that look alike ("Kapoor & Sons" / "Kapoor and Sons Pvt Ltd")

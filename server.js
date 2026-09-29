@@ -1107,8 +1107,9 @@ async function sendWhatsAppMessage(phone, message, creds = {}, opts = {}) {
       }
     }
     // Dev mode fallback — never log the phone or message body (PII/OTP/payment links).
-    console.log(`[WA MOCK] queued (no provider configured) — len=${String(message || '').length}`);
-    return { success: true, provider: 'mock' };
+    // Nothing was sent, so say so: callers must not count this as delivered.
+    console.log(`[WA] not sent: no WhatsApp provider configured — len=${String(message || '').length}`);
+    return { success: false, provider: 'none', reason: 'no_provider' };
   } catch (err) {
     console.error('[WA] Send error:', err.message);
     return { success: false, error: err.message };
@@ -6387,7 +6388,7 @@ CREATE INDEX IF NOT EXISTS idx_bank_transactions_status ON bank_transactions(use
 const AI_TOOLS = [
   { type:'function', function:{ name:'get_summary', description:'Get business overview: total invoices, outstanding amount, recovery rate, total customers', parameters:{ type:'object', properties:{} } } },
   { type:'function', function:{ name:'get_invoices', description:'Get invoices list, optionally filtered by status or customer name', parameters:{ type:'object', properties:{ status:{ type:'string', description:'Pending, Paid, or all' }, customer_name:{ type:'string', description:'Filter by customer (partial match)' }, limit:{ type:'number', description:'Max records to return' } } } } },
-  { type:'function', function:{ name:'mark_invoice_paid', description:'Mark a specific invoice as paid using invoice_id or customer_name (marks the most overdue one)', parameters:{ type:'object', properties:{ invoice_id:{ type:'string' }, customer_name:{ type:'string' } } } } },
+  { type:'function', function:{ name:'mark_invoice_paid', description:'Find the invoice the owner says was paid (by invoice_id or customer_name) so the owner can mark it paid themselves. This tool never changes the invoice.', parameters:{ type:'object', properties:{ invoice_id:{ type:'string' }, customer_name:{ type:'string' } } } } },
   { type:'function', function:{ name:'get_prospects', description:'Get CRM prospects, optionally filtered by stage', parameters:{ type:'object', properties:{ status:{ type:'string', description:'cold, contacted, trial, engaged, paid, churned, or all' } } } } },
   { type:'function', function:{ name:'add_prospect', description:'Add a new prospect to the CRM pipeline', parameters:{ type:'object', properties:{ name:{ type:'string' }, phone:{ type:'string' }, business_type:{ type:'string' }, location:{ type:'string' }, amount_stuck:{ type:'number' } }, required:['name'] } } },
   { type:'function', function:{ name:'update_prospect_status', description:'Move a prospect to a different CRM stage', parameters:{ type:'object', properties:{ prospect_name:{ type:'string', description:'Name of the prospect to update' }, status:{ type:'string', enum:['cold','contacted','trial','engaged','paid','churned'] } }, required:['prospect_name','status'] } } },
@@ -6400,7 +6401,7 @@ const AI_TOOLS = [
   { type:'function', function:{ name:'send_whatsapp', description:'Compose and prepare a WhatsApp message to any contact (customer or supplier). The message will be opened ready-to-send in WhatsApp.', parameters:{ type:'object', properties:{ to:{ type:'string', description:'Recipient name' }, phone:{ type:'string', description:'Phone number (digits only or with spaces)' }, message:{ type:'string', description:'The full message text — write it naturally in Hindi/English mix if appropriate' } }, required:['to','phone','message'] } } },
   { type:'function', function:{ name:'send_collection_reminder', description:'Compose a tailored payment reminder WhatsApp message for an overdue customer', parameters:{ type:'object', properties:{ customer_name:{ type:'string' }, tone:{ type:'string', enum:['friendly','firm','urgent'], description:'Tone of the message' } }, required:['customer_name'] } } },
   { type:'function', function:{ name:'send_bulk_reminders', description:'Prepare WhatsApp payment reminders for ALL overdue customers at once (or filtered by min days overdue)', parameters:{ type:'object', properties:{ min_days:{ type:'number', description:'Only customers overdue by at least this many days (default 1)' }, tone:{ type:'string', enum:['friendly','firm','urgent'] } } } } },
-  { type:'function', function:{ name:'place_order_with_supplier', description:'Create a purchase order for a supplier and compose a WhatsApp order message to them', parameters:{ type:'object', properties:{ supplier_name:{ type:'string', description:'Name of the supplier' }, items:{ type:'array', items:{ type:'object', properties:{ name:{type:'string'}, quantity:{type:'number'}, unit:{type:'string',description:'e.g. boxes, kg, units'} } }, description:'Items to order' }, notes:{ type:'string', description:'Any special instructions' } }, required:['supplier_name','items'] } } },
+  { type:'function', function:{ name:'place_order_with_supplier', description:'Compose a draft WhatsApp order message to a supplier for the owner to send. Records nothing.', parameters:{ type:'object', properties:{ supplier_name:{ type:'string', description:'Name of the supplier' }, items:{ type:'array', items:{ type:'object', properties:{ name:{type:'string'}, quantity:{type:'number'}, unit:{type:'string',description:'e.g. boxes, kg, units'} } }, description:'Items to order' }, notes:{ type:'string', description:'Any special instructions' } }, required:['supplier_name','items'] } } },
 ];
 
 async function groqChat(messages, tools, toolChoice = 'auto') {
@@ -6675,7 +6676,7 @@ When generating WhatsApp messages, call scripts, or any communication: write EXA
 
   const system = `You are ${ownerName ? ownerName + "'s" : 'Vantro'} AI co-founder, built into Vantro Flow for ${business_name || 'this business'}. You help Indian MSME owners manage collections, invoices, CRM, inventory, and cash flow.
 
-You have tools: fetch data, mark invoices paid, add prospects, get forecasts, navigate pages.
+You have tools: fetch data, find invoices, add prospects, get forecasts, draft messages, navigate pages. You never mark payments received or record orders; the owner does that.
 Be specific, use ₹ formatting, and when asked to do something — DO it with tools, don't just explain.
 Summarise actions clearly after doing them.
 
@@ -6717,36 +6718,20 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
           return withLiveOverdue.slice(0, args.limit || 20);
         }
         case 'mark_invoice_paid': {
+          // Hard rule: no AI action marks a payment received. The assistant
+          // finds the invoice and points the owner at it; the owner marks it
+          // paid themselves on the invoice page (a human, audited write).
           let inv;
           if (args.invoice_id) {
-            const { data } = await supabase.from('invoices').select('id,customer_name,invoice_amount,payment_status,payment_date,due_date').eq('id',args.invoice_id).eq('user_id',user_id).single();
+            const { data } = await supabase.from('invoices').select('id,customer_name,invoice_amount,payment_status').eq('id',args.invoice_id).eq('user_id',user_id).single();
             inv = data;
           } else if (args.customer_name) {
-            const { data } = await supabase.from('invoices').select('id,customer_name,invoice_amount,payment_status,payment_date,due_date').eq('user_id',user_id).ilike('customer_name',`%${args.customer_name}%`).eq('payment_status','Pending').order('days_overdue',{ascending:false}).limit(1);
+            const { data } = await supabase.from('invoices').select('id,customer_name,invoice_amount,payment_status').eq('user_id',user_id).ilike('customer_name',`%${args.customer_name}%`).eq('payment_status','Pending').order('days_overdue',{ascending:false}).limit(1);
             inv = data?.[0];
           }
           if (!inv) return { error: 'Invoice not found' };
-          const newPaymentDate = new Date().toISOString().split('T')[0];
-          await supabase.from('invoices').update({ payment_status:'Paid', payment_date:newPaymentDate, payment_amount:inv.invoice_amount }).eq('id',inv.id).eq('user_id',user_id);
-          // Global Context + Temporal Foundation, Part E — additive history
-          // write alongside the existing UPDATE above. Never blocks the
-          // actual business operation on failure.
-          try {
-            const { recordEntityStateChange } = require('./lib/domain/temporal/entityStateHistory');
-            await recordEntityStateChange({
-              userId: user_id,
-              entityType: 'invoice',
-              entityId: inv.id,
-              eventType: 'payment_received',
-              previousRow: inv,
-              newRow: { ...inv, payment_status: 'Paid', payment_date: newPaymentDate, payment_amount: inv.invoice_amount },
-              fields: ['payment_status', 'payment_date', 'payment_amount'],
-              source: 'server.js:mark_invoice_paid',
-              actor: 'ai_assistant',
-            });
-          } catch (histErr) { console.error('[entity_state_history] mark_invoice_paid write failed:', histErr.message); }
-          actions.push(`✅ Marked ${inv.customer_name} invoice (₹${Number(inv.invoice_amount).toLocaleString('en-IN')}) as paid`);
-          return { success:true, message:`Marked ${inv.customer_name} as paid`, amount:inv.invoice_amount };
+          actions.push(`🧾 Found ${inv.customer_name}'s invoice (₹${Number(inv.invoice_amount).toLocaleString('en-IN')}). Open it to mark it paid yourself.`);
+          return { success:false, requires_human:true, invoice_id: inv.id, message:`Starlane does not mark payments received. Tell the owner to open invoice ${inv.id} and mark it paid themselves if the money has arrived.` };
         }
         case 'get_prospects': {
           let q = supabase.from('prospects').select('id,name,phone,status,business_type,location,amount_stuck,created_at').eq('user_id',user_id);
@@ -6881,19 +6866,12 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
           const itemLines = (args.items||[]).map(it=>`  • ${it.name} — ${it.quantity} ${it.unit||'units'}`).join('\n');
           const totalItems = (args.items||[]).length;
           const msg = `Namaste ${args.supplier_name} ji 🙏\n\nHumein aapki taraf se yeh order chahiye:\n\n${itemLines}\n\n${args.notes ? `Note: ${args.notes}\n\n` : ''}Kripya availability aur delivery time confirm karein.\n\nDhanyawaad!\n— ${business_name||'Vantro Flow'}`;
-          // Log as stock movement "ordered"
-          if (supplier) {
-            for (const item of (args.items||[])) {
-              const { data: prod } = await supabase.from('products').select('id,name').eq('user_id',user_id).ilike('name',`%${item.name}%`).limit(1);
-              if (prod?.[0]) {
-                await supabase.from('stock_movements').insert([{ user_id, product_id:prod[0].id, movement_type:'order', quantity:item.quantity, notes:`Order placed with ${args.supplier_name}${args.notes?'. '+args.notes:''}`, created_at:new Date() }]).catch(()=>{});
-              }
-            }
-          }
+          // Draft only: the assistant never records an order or a stock
+          // movement. The owner sends the message and records the order.
           const url = phone ? `https://wa.me/91${phone}?text=${encodeURIComponent(msg)}` : null;
           if (url) { waLinks.push({ to: args.supplier_name, phone, message: msg, url }); actions.push(`📦 Order WhatsApp ready for ${args.supplier_name}`); }
           else { actions.push(`📦 Order composed for ${args.supplier_name} (no phone on file)`); }
-          return { success:true, supplier: args.supplier_name, items_ordered: totalItems, message_preview: msg.substring(0,120), whatsapp_url: url || 'No phone number on file for this supplier', order_logged: !!supplier };
+          return { success:true, supplier: args.supplier_name, items_ordered: totalItems, message_preview: msg.substring(0,120), whatsapp_url: url || 'No phone number on file for this supplier', order_logged: false, note: 'Draft only. Nothing was recorded; send the message and record the order yourself.' };
         }
         default: return { error:`Unknown tool: ${name}` };
       }
@@ -9403,7 +9381,9 @@ app.post('/api/orders', authMiddleware, async (req, res) => {
       user_id: userId, customer_name, customer_phone,
       delivery_address, items: JSON.stringify(items || []), total_amount: total_amount || null,
       delivery_time, special_instructions, worker_id: worker_id || null,
-      source: 'manual', status: 'new',
+      // A sale recorded after the fact (Today > Add sale) is already
+      // delivered; anything else starts as new. No other status is accepted.
+      source: 'manual', status: req.body.status === 'delivered' ? 'delivered' : 'new',
       order_date: new Date().toISOString().split('T')[0], created_at: new Date(),
     }]).select().single();
     if (error) throw error;
@@ -9845,7 +9825,7 @@ app.get('/api/today/summary', authMiddleware, async (req, res) => {
     // Top selling items from orders
     const itemMap = {};
     (orders || []).forEach(o => {
-      (o.items || []).forEach((item) => {
+      parseJsonArray(o.items).forEach((item) => {
         const key = item.name || item.local_name || 'Unknown';
         itemMap[key] = (itemMap[key] || 0) + (item.quantity || 0);
       });
@@ -11611,12 +11591,16 @@ async function executeInventoryPO(userId, action) {
     sendResult = await sendWhatsAppMessage(po.supplier_phone, message);
   }
 
-  await supabase.from('purchase_orders').update({ status: 'sent', sent_at: new Date().toISOString() }).eq('id', po.id);
+  // Only a delivered message makes the PO "sent". Otherwise it is approved
+  // and waiting for a person to place it; never shown as sent when it wasn't.
+  await supabase.from('purchase_orders')
+    .update(sendResult.success ? { status: 'sent', sent_at: new Date().toISOString() } : { status: 'approved' })
+    .eq('id', po.id).eq('user_id', userId);
   return {
     ok: true,
     message: sendResult.success
       ? `Purchase order sent to ${po.supplier_name} on WhatsApp.`
-      : `Purchase order marked sent, but the WhatsApp message was not delivered (${sendResult.provider === 'skipped_flag_off' ? 'external sending is currently off' : 'send failed'}). You may want to contact ${po.supplier_name} directly.`,
+      : `Purchase order approved but not sent: the WhatsApp message was not delivered (${sendResult.provider === 'skipped_flag_off' ? 'external sending is currently off' : 'no provider or the send failed'}). Place it with ${po.supplier_name} yourself.`,
   };
 }
 
@@ -11674,7 +11658,7 @@ async function executeCollectionsMessage(userId, action) {
   if (!action.recommended_message) return { ok: false, message: 'No message drafted for this action.' };
 
   if (!isFeatureEnabled('external_message_sending_enabled')) {
-    return { ok: true, message: `Marked sent, but external sending is currently off — no WhatsApp message actually went to ${invoice.customer_name}.` };
+    return { ok: true, message: `Approved, not sent: external sending is off, so no WhatsApp message went to ${invoice.customer_name}. Send it yourself if you want it to go today.` };
   }
   const sendResult = await sendWhatsAppMessage(invoice.customer_phone, action.recommended_message);
   if (sendResult.success) {
@@ -12668,6 +12652,12 @@ app.post('/api/intelligence/signals/:id/verify-outcome', authMiddleware, async (
 // separately-configured ADMIN_EMAILS entry would only get in the way of
 // running the demo itself, with no real security benefit.
 app.post('/api/demo/2xa/reset', authMiddleware, async (req, res) => {
+  // Internal demo control: it re-seeds a demo tenant and runs scripts, so a
+  // real user must never be able to trigger it. Off unless an operator
+  // switches it on for a demo environment.
+  if (String(process.env.FEATURE_DEMO_RESET_ENABLED || '').toLowerCase() !== 'true') {
+    return res.status(404).json({ error: 'Not available' });
+  }
   try {
     delete require.cache[require.resolve('./scripts/seed-2xa-demo.js')];
     delete require.cache[require.resolve('./scripts/trigger-2xa-event.js')];
@@ -12686,7 +12676,7 @@ app.post('/api/demo/2xa/reset', authMiddleware, async (req, res) => {
       });
     });
     res.json({ success: true, triggerOutput });
-  } catch (err) { res.status(500).json({ error: 'Internal server error', detail: String(err.message || err) }); }
+  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── CUSTOMER INTELLIGENCE (behavioral profile for customers page) ────────────
@@ -13073,7 +13063,6 @@ app.post('/api/ai-actions/:id/send-whatsapp', authMiddleware, async (req, res) =
     }
 
     const sendResult = result?.sendResult;
-    res.json({ success: true, sid: sendResult?.sid || null, provider: sendResult?.provider || null });
     await supabase.from('ai_actions').update({ status: 'done', completed_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', id).eq('user_id', userId);
     res.json({ success: true, sid: sendResult?.sid || null, provider: sendResult?.provider || null });
   } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
