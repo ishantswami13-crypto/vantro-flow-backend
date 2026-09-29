@@ -1898,7 +1898,11 @@ app.post('/api/import/excel', authMiddleware, upload.single('file'), async (req,
 
       const daysOverdue = Math.max(0, Math.floor((Date.now() - invoiceDate.getTime()) / 86400000));
       const statusLower = String(statusRaw || '').toLowerCase();
-      const paymentStatus = statusLower.includes('paid') || statusLower.includes('clear') ? 'Paid' : 'Pending';
+      // "unpaid", "not paid" and "partially paid" all contain "paid"; only a
+      // plain paid/cleared/settled status means the invoice is settled.
+      const paymentStatus = /\b(un|not|partial(ly)?|part)\s*paid\b|\bnot\s+cleared\b|\buncleared\b/.test(statusLower)
+        ? 'Pending'
+        : /\b(paid|cleared|settled|received)\b/.test(statusLower) ? 'Paid' : 'Pending';
 
       invoices.push({
         user_id: userId,
