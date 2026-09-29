@@ -12344,6 +12344,19 @@ app.use('/api/decisions', decisionsRouter({ pool: getPool(), authMiddleware }));
 const { osRouter } = require('./lib/routes/os');
 app.use('/api/os', osRouter({ pool: getPool(), authMiddleware }));
 
+// Outbound engine: targets, campaigns, review, queue, rate limits, sending,
+// bounces, replies, follow-ups, START / STOP ALL OUTBOUND. Needs migration
+// 062. The runner (scheduler + workers + mailbox poller) lives in this
+// process only when OUTBOUND_ENGINE_ENABLED=true; every instance may run it
+// (leader lease + job leases prevent duplicates). See lib/domain/outbound/.
+const { outreachRouter } = require('./lib/routes/outreach');
+let outboundRunner = null;
+if (String(process.env.OUTBOUND_ENGINE_ENABLED || '').toLowerCase() === 'true' && process.env.DATABASE_URL) {
+  const { Runner } = require('./lib/domain/outbound/engine');
+  outboundRunner = new Runner(getPool());
+}
+app.use('/api/outreach', outreachRouter({ pool: getPool(), authMiddleware, requireAdmin, runner: outboundRunner }));
+
 app.get('/api/ai-actions', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -14533,6 +14546,21 @@ app.listen(PORT, () => {
     console.warn('⚠️  OTP_VERIFICATION_DISABLED=true — OTP verification is BYPASSED for signup. TEMPORARY testing mode only. Unset this var or set it to false to restore normal OTP-required behavior.');
   }
   runAutoMigrations();
+  if (outboundRunner) {
+    outboundRunner.start();
+    console.log(`📮 Outbound engine runner: STARTED (${outboundRunner.concurrency} worker slot(s); sends only for tenants that pressed START)`);
+  } else {
+    console.log('📮 Outbound engine runner: OFF (OUTBOUND_ENGINE_ENABLED is not true)');
+  }
 });
+
+// Graceful shutdown for the outbound runner: stop reserving, let in-flight
+// sends finish, release reserved jobs so another instance takes them.
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.once(sig, async () => {
+    if (outboundRunner) await outboundRunner.stop().catch(() => {});
+    process.exit(0);
+  });
+}
 
 
