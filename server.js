@@ -12353,6 +12353,13 @@ app.use('/api/intelligence/prepared', preparedRouter({ pool: getPool(), authMidd
 const { decisionsRouter } = require('./lib/routes/decisions');
 app.use('/api/decisions', decisionsRouter({ pool: getPool(), authMiddleware }));
 
+// Seven-surface operating system: Bridge health and knowledge, Scan
+// (process + automation discovery), Watch objectives and autopilot,
+// workflow proposals, approvals and shadow runs, outcome memory. Needs
+// migration 061. See lib/routes/os.js and lib/domain/os/.
+const { osRouter } = require('./lib/routes/os');
+app.use('/api/os', osRouter({ pool: getPool(), authMiddleware }));
+
 app.get('/api/ai-actions', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
