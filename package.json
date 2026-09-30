@@ -46,6 +46,7 @@
     "test:decisions":      "node --test --test-concurrency=1 tests/decisions.engine.test.js tests/decisions.goldenLoop.test.js tests/decisions.ledgerImport.test.js",
     "test:os":             "node --test --test-concurrency=1 tests/os.unit.test.js tests/os.goldenAutomation.test.js tests/os.missions.test.js",
     "pilot:readiness":     "node scripts/pilot-readiness.js",
+    "release:readiness":   "node scripts/release-readiness.js",
     "test:outbound":       "node --test --test-concurrency=1 tests/outbound.unit.test.js tests/outbound.engine.test.js tests/outbound.http.test.js",
     "outreach:preflight":  "node scripts/outreach-preflight.js",
     "staging:migrate":     "node scripts/staging-migrate.js",
