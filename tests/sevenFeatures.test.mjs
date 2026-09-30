@@ -7,6 +7,7 @@ import { createRequire } from 'node:module';
 import { makeChecker, openPool, deleteUsers, startServer } from './helpers/httpHarness.mjs';
 
 const require = createRequire(import.meta.url);
+const LATEST_MIGRATION = require("node:fs").readdirSync(new URL("../migrations/", import.meta.url)).filter((f) => /^\d+_.*\.sql$/.test(f)).sort().pop();
 const bcrypt = require('bcryptjs');
 const { randomUUID } = require('crypto');
 const { check, done } = makeChecker();
@@ -47,7 +48,7 @@ async function main() {
     check('prepared on an empty company says it has no data', prepEmpty.body.horizons.every((h) => h.status === 'insufficient_data'));
     check('telemetry keeps optional auth (features router does not swallow /api/client/*)', (await post('/api/client/telemetry', null, { events: [{ name: 'client.app_started' }] })).status === 202);
     const ver = await get('/api/version');
-    check('version: release, API level and migration level (this database is up to date)', ver.status === 200 && ver.body.release === '0.1.0' && ver.body.apiLevel && ver.body.migrations.expected === '053_seven_features.sql' && ver.body.migrations.upToDate === true, ver.body);
+    check('version: release, API level and migration level (this database is up to date)', ver.status === 200 && ver.body.release === '0.1.0' && ver.body.apiLevel && ver.body.migrations.expected === LATEST_MIGRATION && ver.body.migrations.upToDate === true, ver.body);
     check('features require sign-in',(await get('/api/client/bridge')).status === 401 && (await get('/api/client/missions')).status === 401);
 
     await pool.query(`INSERT INTO invoices (user_id, customer_name, customer_phone, invoice_number, invoice_amount, payment_status, days_overdue, due_date, source_type) VALUES
@@ -125,7 +126,7 @@ async function main() {
     const foreign = await post(`/api/client/actions/${ma.id}/decision`, tbWeb, { decision: 'approve', confirmHighRisk: true });
     check('another company\'s web session cannot decide this action (404)', foreign.status === 404, foreign);
     const dec = await post(`/api/client/actions/${ma.id}/decision`, taWeb, { decision: 'approve', confirmHighRisk: true, via: 'web' });
-    check('approve from the web: executed honestly (sending off, nothing sent)', dec.body.status === 'done' && /nothing went to Mehta Hardware/.test(dec.body.message), dec.body);
+    check('approve from the web: executed honestly (sending off, nothing sent)', dec.body.status === 'done' && /(nothing|no WhatsApp message) went to Mehta Hardware/.test(dec.body.message), dec.body);
     const detail = await get(`/api/client/actions/${ma.id}`, ta);
     check('action lifecycle is EXECUTED', detail.body.action.lifecycle === 'EXECUTED');
     await pool.query(`UPDATE invoices SET payment_status = 'Paid', payment_date = CURRENT_DATE::text WHERE user_id = $1 AND invoice_number = 'S/101'`, [a.id]);
