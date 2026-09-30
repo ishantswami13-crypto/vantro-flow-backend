@@ -1608,6 +1608,29 @@ app.post('/api/auth/reset-password', async (req, res) => {
   }
 });
 
+// Change password while signed in: the current password is required, so a
+// stolen session alone cannot lock the owner out.
+app.post('/api/auth/change-password', authLimiter, authMiddleware, async (req, res) => {
+  try {
+    const { current_password, new_password } = req.body || {};
+    if (typeof current_password !== 'string' || !current_password) return res.status(400).json({ error: 'Enter your current password.' });
+    if (typeof new_password !== 'string' || new_password.length < 8) return res.status(400).json({ error: 'The new password must be at least 8 characters.' });
+    if (new_password === current_password) return res.status(400).json({ error: 'The new password is the same as the current one.' });
+    const { data: user, error } = await supabase.from('users').select('id, password_hash').eq('id', req.user.userId).maybeSingle();
+    if (error) throw error;
+    if (!user || !user.password_hash || !(await bcrypt.compare(current_password, user.password_hash))) {
+      return res.status(400).json({ error: 'The current password is not correct.' });
+    }
+    const password_hash = await bcrypt.hash(new_password, 12);
+    const { error: upErr } = await supabase.from('users').update({ password_hash, updated_at: new Date() }).eq('id', req.user.userId);
+    if (upErr) throw upErr;
+    res.json({ success: true, message: 'Password changed.' });
+  } catch (error) {
+    logRouteError(req, error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ============================================
 // CSV UPLOAD & INVOICE PROCESSING
 // ============================================
@@ -7472,6 +7495,31 @@ app.patch('/api/settings', authMiddleware, async (req, res) => {
   }
 });
 
+// What actually delivers for this tenant right now. Settings shows these
+// instead of hard-coded "Active" badges.
+app.get('/api/settings/delivery-status', authMiddleware, async (req, res) => {
+  try {
+    const guards = require('./lib/safety/externalSend');
+    const { data: u } = await supabase.from('users').select('automation_enabled, upi_id').eq('id', req.user.userId).maybeSingle();
+    const stopped = guards.isGloballyStopped();
+    const sendingFlag = guards.externalSendEnabled();
+    const whatsappNumber = !!process.env.TWILIO_WHATSAPP_NUMBER;
+    const why = (ok, reasons) => (ok ? null : reasons.filter(Boolean)[0] || 'Not available');
+    const whatsappOn = sendingFlag && whatsappNumber && !stopped;
+    const razorpayOn = !!(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET);
+    const pushOn = guards.pushSendEnabled() && !stopped;
+    res.json({
+      whatsapp: { active: whatsappOn, reason: why(whatsappOn, [stopped && 'All outbound sending is stopped', !sendingFlag && 'Customer messaging is switched off on this server', !whatsappNumber && 'No WhatsApp sender number is configured']) },
+      paymentLinks: { active: razorpayOn, upiFallback: !!u?.upi_id, reason: why(razorpayOn, [u?.upi_id ? 'Razorpay is not configured; links fall back to your UPI ID' : 'Razorpay is not configured and no UPI ID is saved']) },
+      dunning: { active: !!u?.automation_enabled && whatsappOn, scheduledAt: '09:00 IST', reason: why(!!u?.automation_enabled && whatsappOn, [!u?.automation_enabled && 'Auto-reminders are paused in your settings', !whatsappOn && 'Reminders are prepared but not sent because WhatsApp sending is off']) },
+      push: { active: pushOn, reason: why(pushOn, [stopped && 'All outbound sending is stopped', 'Push notifications are switched off on this server']) },
+    });
+  } catch (error) {
+    logRouteError(req, error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Save Twilio credentials (stored per-user in DB, used instead of env vars)
 app.post('/api/settings/twilio', authMiddleware, async (req, res) => {
   try {
@@ -9341,6 +9389,14 @@ Return JSON only:
 // ORDERS — AI voice order management
 // ============================================
 
+// The owner's calendar day, not UTC's: before 05:30 IST a UTC date is still
+// yesterday. BUSINESS_TIMEZONE overrides the default for non-Indian tenants.
+function businessToday() {
+  const tz = process.env.BUSINESS_TIMEZONE || 'Asia/Kolkata';
+  try { return new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(new Date()); }
+  catch (_) { return new Date().toISOString().split('T')[0]; }
+}
+
 app.get('/api/orders', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -9356,12 +9412,17 @@ app.get('/api/orders', authMiddleware, async (req, res) => {
     if (from && to) {
       query = query.gte('order_date', from).lte('order_date', to);
     } else {
-      const today = new Date().toISOString().split('T')[0];
-      query = query.eq('order_date', date || today);
+      query = query.eq('order_date', date || businessToday());
     }
     const { data, error } = await query;
     if (error) throw error;
     const orders = data || [];
+    // POST stores items with JSON.stringify, so older rows come back as a
+    // string; clients always get an array.
+    orders.forEach((o) => {
+      if (typeof o.items === 'string') { try { o.items = JSON.parse(o.items); } catch (_) { o.items = []; } }
+      if (!Array.isArray(o.items)) o.items = [];
+    });
 
     // Merge worker name/phone into each order, scoped by the same user_id (defensive
     // against a cross-tenant worker_id collision, even though UUIDs make that
@@ -9802,7 +9863,7 @@ app.delete('/api/expenses/:id', authMiddleware, async (req, res) => {
 app.get('/api/today/summary', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const date = req.query.date || new Date().toISOString().split('T')[0];
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.date || '')) ? req.query.date : businessToday();
 
     const [
       { data: orders },
@@ -9820,6 +9881,10 @@ app.get('/api/today/summary', authMiddleware, async (req, res) => {
       supabase.from('call_logs').select('*').eq('user_id', userId).gte('created_at', date + 'T00:00:00').lte('created_at', date + 'T23:59:59'),
     ]);
 
+    (orders || []).forEach((o) => {
+      if (typeof o.items === 'string') { try { o.items = JSON.parse(o.items); } catch (_) { o.items = []; } }
+      if (!Array.isArray(o.items)) o.items = [];
+    });
     const orderIncome = (orders || [])
       .filter(o => !['cancelled'].includes(o.status))
       .reduce((s, o) => s + (Number(o.total_amount) || 0), 0);
