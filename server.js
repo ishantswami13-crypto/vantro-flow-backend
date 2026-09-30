@@ -6358,7 +6358,10 @@ const AI_TOOLS = [
 async function groqChat(messages, tools, toolChoice = 'auto') {
   const body = { model:'llama-3.3-70b-versatile', max_tokens:1500, temperature:0.2, messages };
   if (tools?.length) { body.tools = tools; body.tool_choice = toolChoice; }
-  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+  // GROQ_BASE_URL lets a local OpenAI-compatible stub stand in for Groq in
+  // tests and pilot:readiness; it is ignored on the production deployment.
+  const base = (!require('./lib/config/deployEnv').isProductionDeployment() && process.env.GROQ_BASE_URL) || 'https://api.groq.com/openai/v1';
+  const res = await fetch(`${base}/chat/completions`, {
     method:'POST',
     headers:{ 'Content-Type':'application/json', 'Authorization':`Bearer ${process.env.GROQ_API_KEY}` },
     body: JSON.stringify(body)
