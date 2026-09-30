@@ -397,7 +397,7 @@ const corsOptions = {
   // authMiddleware) across origins — without this, a custom response header
   // is invisible to cross-origin fetch() even though the browser received
   // it, which is what silently broke the self-heal below the first time.
-  exposedHeaders: ["X-CSRF-Token", "X-Content-SHA256", "Content-Disposition"]
+  exposedHeaders: ["X-CSRF-Token", "X-Content-SHA256", "Content-Disposition", "X-Request-Id"]
 };
 
 // Same-origin requests (the backend's own server-rendered pages, e.g. the
@@ -571,6 +571,10 @@ const heavyReadLimiter = makeLimiter({ windowMs: 5 * 60 * 1000, max: 90 });
 // is a whole statement rather than a row.
 const bulkImportLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, max: 10 });
 app.use('/api/auth', authLimiter);
+// Signup and resend-otp answer 200, so authLimiter (failures only) never
+// counted them: anyone could make Starlane send endless OTPs to a victim.
+const otpSendLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, max: Number(process.env.OTP_SEND_LIMIT_PER_15M || 6) });
+app.use(['/api/auth/signup', '/api/auth/resend-otp', '/api/auth/forgot-password'], otpSendLimiter);
 app.use('/api', apiLimiter);
 // /api/bank/transactions/import belongs here with the other upload routes: it
 // takes a multipart file and parses .xls/.xlsx through the same library. It was
@@ -819,9 +823,34 @@ function isAdminEmail(email) {
   return admins.includes(String(email || '').toLowerCase());
 }
 
+// Admin = an ADMIN_EMAILS entry that matches the account's stored email
+// exactly (case included), on an account whose email is verified, and — when
+// ADMIN_USER_IDS is set — whose id is listed. Matching case-insensitively let
+// anyone sign up as FOUNDER@X.COM next to founder@x.com, log in without OTP
+// and pass as admin.
+function adminListExact() {
+  return (process.env.ADMIN_EMAILS || '').split(',').map((e) => e.trim()).filter(Boolean);
+}
+async function isVerifiedAdmin(userId) {
+  if (!userId) return false;
+  const ids = (process.env.ADMIN_USER_IDS || '').split(',').map((e) => e.trim()).filter(Boolean);
+  if (ids.length && !ids.includes(String(userId))) return false;
+  const { rows } = await getPool().query('SELECT email, email_verified FROM users WHERE id = $1', [userId]);
+  const row = rows[0];
+  if (!row || row.email_verified !== true) return false;
+  return adminListExact().includes(String(row.email || '').trim());
+}
+
 function requireAdmin(req, res, next) {
-  authMiddleware(req, res, () => {
-    if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: 'Forbidden' });
+  authMiddleware(req, res, async () => {
+    try {
+      if (!isAdminEmail(req.user?.email) || !(await isVerifiedAdmin(req.user?.userId || req.user?.id))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+    } catch (err) {
+      console.error('[requireAdmin]', err.message);
+      return res.status(403).json({ error: 'Forbidden' });
+    }
     next();
   });
 }
@@ -1235,16 +1264,23 @@ async function sendOTPEmail(email, name, otp) {
 // AUTHENTICATION ENDPOINTS
 // ============================================
 
+function normalizeEmail(value) {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+const resetAttempts = new Map(); // email -> { first, count }; per process
+
 app.post('/api/auth/signup', async (req, res) => {
   try {
-    const { email, phone, business_name, password, referred_by } = req.body;
+    const { phone, business_name, password, referred_by } = req.body;
+    const email = normalizeEmail(req.body.email);
     if (!email || !phone || !business_name || !password) {
       return res.status(400).json({ error: 'All fields are required' });
     }
-    if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    if (typeof password !== 'string' || password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
 
-    const { data: existing } = await supabase.from('users').select('id').eq('email', email).maybeSingle();
-    if (existing) return res.status(409).json({ error: 'Email already registered' });
+    // Case-insensitive: FOUNDER@x.com and founder@x.com are one mailbox.
+    const { rows: existingRows } = await getPool().query('SELECT id FROM users WHERE lower(email) = $1 LIMIT 1', [email]);
+    if (existingRows.length) return res.status(409).json({ error: 'Email already registered' });
 
     // Selective rollout: when the access gate is on, only emails with an
     // approved access application may create an account.
@@ -1393,14 +1429,15 @@ app.post('/api/auth/verify-otp', async (req, res) => {
 
 app.post('/api/auth/login', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { password } = req.body;
+    const email = typeof req.body.email === 'string' ? req.body.email.trim() : '';
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
-    const { data, error } = await supabase
-      .from('users')
-      .select('id, email, phone, business_name, plan, password_hash, created_at')
-      .eq('email', email)
-      .maybeSingle();
+    const cols = 'id, email, phone, business_name, plan, password_hash, created_at';
+    let { data, error } = await supabase.from('users').select(cols).eq('email', email).maybeSingle();
+    if (!error && !data && normalizeEmail(email) !== email) {
+      ({ data, error } = await supabase.from('users').select(cols).eq('email', normalizeEmail(email)).maybeSingle());
+    }
 
     if (error || !data) return res.status(401).json({ error: 'Invalid email or password' });
 
@@ -1486,15 +1523,16 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
 
 app.post('/api/auth/forgot-password', async (req, res) => {
   try {
-    const { email } = req.body;
+    const email = typeof req.body.email === 'string' ? req.body.email.trim() : '';
     if (!email) return res.status(400).json({ error: 'Email required' });
 
     const { data: user } = await supabase.from('users').select('id, email, business_name').eq('email', email).maybeSingle();
     // Always respond success to prevent email enumeration
     if (!user) return res.json({ success: true, message: 'If that email exists, an OTP has been sent.' });
 
-    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    const otp = String(crypto.randomInt(100000, 1000000));
     const expires_at = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+    resetAttempts.delete(email);
 
     // Invalidate previous tokens for this email
     await supabase.from('password_reset_tokens').update({ used: true }).eq('email', email).eq('used', false);
@@ -1526,9 +1564,16 @@ app.post('/api/auth/forgot-password', async (req, res) => {
 
 app.post('/api/auth/reset-password', async (req, res) => {
   try {
-    const { email, otp, new_password } = req.body;
+    const { otp, new_password } = req.body;
+    const email = typeof req.body.email === 'string' ? req.body.email.trim() : '';
     if (!email || !otp || !new_password) return res.status(400).json({ error: 'Email, OTP, and new password required' });
-    if (new_password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    if (typeof new_password !== 'string' || new_password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    // Five wrong codes burn every open code for this email (a 6-digit code
+    // must not be guessable by spreading attempts over many IPs).
+    const tries = resetAttempts.get(email);
+    if (tries && tries.count >= 5 && Date.now() - tries.first < 15 * 60 * 1000) {
+      return res.status(429).json({ error: 'Too many wrong codes. Request a new code.' });
+    }
 
     const { data: token } = await supabase
       .from('password_reset_tokens')
@@ -1541,7 +1586,14 @@ app.post('/api/auth/reset-password', async (req, res) => {
       .limit(1)
       .maybeSingle();
 
-    if (!token) return res.status(400).json({ error: 'Invalid or expired OTP' });
+    if (!token) {
+      const t = resetAttempts.get(email);
+      const next = t && Date.now() - t.first < 15 * 60 * 1000 ? { first: t.first, count: t.count + 1 } : { first: Date.now(), count: 1 };
+      resetAttempts.set(email, next);
+      if (next.count >= 5) await supabase.from('password_reset_tokens').update({ used: true }).eq('email', email).eq('used', false);
+      return res.status(400).json({ error: 'Invalid or expired OTP' });
+    }
+    resetAttempts.delete(email);
 
     const password_hash = await bcrypt.hash(new_password, 12);
     await Promise.all([
@@ -6524,8 +6576,9 @@ app.post('/api/ai-chat', authMiddleware, async (req, res) => {
   if (!user_id || !messages) return res.status(400).json({ error: 'Missing messages' });
   const readOnly = !!req.user?.sid || req.body?.mode === 'read_only';
   const allowedTools = allowedToolsFor({ native: readOnly });
-  if (readOnly) {
-    // Only the conversation itself — a client cannot inject system or tool turns.
+  {
+    // Only the conversation itself, on every surface: a client cannot inject
+    // system or tool turns (the web path used to pass them through).
     if (!Array.isArray(messages)) return res.status(400).json({ error: 'messages must be an array' });
     messages = messages
       .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
@@ -6633,7 +6686,7 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
           const { data } = await q;
           const withLiveOverdue = (data || []).map(i => ({ ...i, days_overdue: calculateDaysOverdue(i.due_date || i.invoice_date, i.payment_status === 'Paid') }));
           withLiveOverdue.sort((a, b) => b.days_overdue - a.days_overdue);
-          return withLiveOverdue.slice(0, args.limit || 20);
+          return withLiveOverdue.slice(0, Math.min(Math.max(Number(args.limit) || 20, 1), 50));
         }
         case 'mark_invoice_paid': {
           // Hard rule: no AI action marks a payment received. The assistant
@@ -6682,7 +6735,7 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
           return { total_products:prd.length, stock_value:`₹${stockValue.toLocaleString('en-IN')}`, low_stock:lowStock.map(p=>({name:p.name,stock:p.current_stock,alert:p.low_stock_alert})), out_of_stock:outOfStock.map(p=>p.name), products:prd.map(p=>({name:p.name,stock:p.current_stock,unit_price:`₹${p.unit_price}`})) };
         }
         case 'get_calls': {
-          const { data } = await supabase.from('call_logs').select('customer_name,did_pick_up,notes,promised_payment_date,created_at').eq('user_id',user_id).order('created_at',{ascending:false}).limit(args.limit||15);
+          const { data } = await supabase.from('call_logs').select('customer_name,did_pick_up,notes,promised_payment_date,created_at').eq('user_id',user_id).order('created_at',{ascending:false}).limit(Math.min(Math.max(Number(args.limit) || 15, 1), 50));
           const cls = data||[];
           const pickupRate = cls.length ? Math.round(cls.filter(c=>c.did_pick_up).length/cls.length*100) : 0;
           return { total:cls.length, pickup_rate:`${pickupRate}%`, promises:cls.filter(c=>c.promised_payment_date).length, recent:cls.slice(0,10) };
@@ -6833,12 +6886,27 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
 
 app.post('/api/payments/create-link', authMiddleware, async (req, res) => {
   try {
-    const { invoice_id, customer_name, amount, description } = req.body;
-    if (!amount || !customer_name) return res.status(400).json({ error: 'amount and customer_name required' });
+    const { invoice_id, description } = req.body;
+    let { customer_name, amount } = req.body;
+    // A link tied to an invoice must be for this company's invoice, and for
+    // what that invoice says is owed: the webhook later marks the invoice
+    // paid by this link's id.
+    if (invoice_id) {
+      const { data: inv } = await supabase.from('invoices')
+        .select('id, customer_name, invoice_amount, payment_amount, payment_status')
+        .eq('id', invoice_id).eq('user_id', req.user.userId).maybeSingle();
+      if (!inv) return res.status(404).json({ error: 'Invoice not found' });
+      if (inv.payment_status === 'Paid') return res.status(409).json({ error: 'This invoice is already paid' });
+      customer_name = inv.customer_name;
+      amount = Math.max(0, Number(inv.invoice_amount || 0) - Number(inv.payment_amount || 0)) || Number(inv.invoice_amount || 0);
+    }
+    if (!(Number(amount) > 0) || !customer_name) return res.status(400).json({ error: 'amount and customer_name required' });
 
-    // If Razorpay not configured, return a UPI deep link fallback
+    // If Razorpay not configured, return a UPI deep link to the owner's own UPI id.
     if (!razorpay) {
-      const upiId = process.env.BUSINESS_UPI_ID || 'vantro@upi';
+      const { data: owner } = await supabase.from('users').select('upi_id').eq('id', req.user.userId).maybeSingle();
+      const upiId = owner?.upi_id || '';
+      if (!upiId) return res.status(400).json({ error: 'Add your UPI ID in Settings first, so customers pay you and not someone else.', code: 'UPI_ID_MISSING' });
       const upiLink = `upi://pay?pa=${upiId}&pn=${encodeURIComponent(customer_name)}&am=${amount}&tn=${encodeURIComponent(description || 'Invoice Payment')}&cu=INR`;
       return res.json({
         success: true,
@@ -6867,7 +6935,7 @@ app.post('/api/payments/create-link', authMiddleware, async (req, res) => {
         payment_link: paymentLink.short_url,
         payment_link_id: paymentLink.id,
         payment_link_sent_at: new Date()
-      }).eq('id', invoice_id);
+      }).eq('id', invoice_id).eq('user_id', req.user.userId);
     }
 
     res.json({
@@ -6945,7 +7013,7 @@ app.post('/api/collections/send-reminder', authMiddleware, async (req, res) => {
       }
       // UPI deeplink fallback
       if (!payLink) {
-        const upiId = owner?.upi_id || process.env.BUSINESS_UPI_ID || '';
+        const upiId = owner?.upi_id || '';
         if (upiId) {
           payLink = `upi://pay?pa=${upiId}&pn=${encodeURIComponent(bizName)}&am=${inv.invoice_amount}&tn=${encodeURIComponent('Invoice Payment')}&cu=INR`;
         }
@@ -7252,7 +7320,10 @@ const PLANS = {
 app.post('/api/billing/create-order', authMiddleware, async (req, res) => {
   try {
     if (!razorpay) return res.status(503).json({ error: 'Payment gateway not configured' });
-    const { plan, period } = req.body;
+    // authMiddleware strips body.plan (mass-assignment guard), so the plan
+    // being bought travels as plan_id.
+    const plan = req.body.plan_id;
+    const { period } = req.body;
     if (!PLANS[plan]) return res.status(400).json({ error: 'Invalid plan' });
 
     const amount = period === 'annual' ? PLANS[plan].amount_annual : PLANS[plan].amount_monthly;
@@ -7271,11 +7342,23 @@ app.post('/api/billing/create-order', authMiddleware, async (req, res) => {
 
 app.post('/api/billing/verify', authMiddleware, async (req, res) => {
   try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, plan } = req.body;
-    const body = razorpay_order_id + '|' + razorpay_payment_id;
-    const expectedSig = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET || '').update(body).digest('hex');
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+    // Without the secret every signature "verifies" against an empty key.
+    if (!razorpay || !process.env.RAZORPAY_KEY_SECRET) return res.status(503).json({ error: 'Payment gateway not configured' });
+    if (typeof razorpay_order_id !== 'string' || typeof razorpay_payment_id !== 'string' || typeof razorpay_signature !== 'string') {
+      return res.status(400).json({ error: 'Payment verification failed' });
+    }
+    const expectedSig = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET).update(`${razorpay_order_id}|${razorpay_payment_id}`).digest('hex');
+    const a = Buffer.from(expectedSig);
+    const b = Buffer.from(razorpay_signature);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(400).json({ error: 'Payment verification failed' });
 
-    if (expectedSig !== razorpay_signature) return res.status(400).json({ error: 'Payment verification failed' });
+    // The plan comes from the order this user created, never from the body.
+    const order = await razorpay.orders.fetch(razorpay_order_id);
+    if (!order || order.notes?.userId !== req.user.userId || !PLANS[order.notes?.plan]) {
+      return res.status(400).json({ error: 'Payment verification failed' });
+    }
+    const plan = order.notes.plan;
 
     // Upgrade plan + auto-enable Vantro AutoPilot for all paid subscribers
     await supabase.from('users').update({
@@ -8578,6 +8661,13 @@ app.post('/api/payments/webhook', async (req, res) => {
 
         if (invoices && invoices.length > 0) {
           const inv = invoices[0];
+          // A link paid for less than the invoice (e.g. one created for a
+          // wrong amount) records the money but does not settle the invoice.
+          if (amountPaid + 0.5 < Number(inv.invoice_amount || 0)) {
+            await supabase.from('invoices').update({ payment_amount: amountPaid, payment_id: paymentId }).eq('id', inv.id).eq('user_id', inv.user_id);
+            console.warn('[razorpay webhook] partial payment on link; invoice left open', { invoiceId: inv.id });
+            return res.sendStatus(200);
+          }
 
     // Mark as paid
     await supabase.from('invoices')
@@ -9511,6 +9601,11 @@ app.post('/api/voice/recording', async (req, res) => {
   const userId = req.query.uid;
   const { RecordingUrl, RecordingSid, From: callerPhone } = req.body;
   if (!RecordingUrl || !userId) return;
+  // Only ever send Twilio credentials to Twilio: a forged callback could name
+  // any host as RecordingUrl and receive the Basic auth header.
+  let recHost = '';
+  try { const u = new URL(String(RecordingUrl)); recHost = u.protocol === 'https:' ? u.hostname : ''; } catch { recHost = ''; }
+  if (recHost !== 'api.twilio.com') { console.warn('[voice/recording] refused a non-Twilio RecordingUrl'); return; }
 
   try {
     // 1. Download MP3 from Twilio — use per-user credentials if env vars not set
@@ -9970,22 +10065,6 @@ RULES:
       {
         type: 'function',
         function: {
-          name: 'add_expense',
-          description: 'Add a new expense entry for today',
-          parameters: {
-            type: 'object',
-            properties: {
-              description: { type: 'string' },
-              amount: { type: 'number' },
-              category: { type: 'string', enum: EXPENSE_CATEGORIES },
-            },
-            required: ['description', 'amount']
-          }
-        }
-      },
-      {
-        type: 'function',
-        function: {
           name: 'get_top_customers',
           description: 'Get customers ranked by outstanding amount or order history',
           parameters: {
@@ -10005,7 +10084,7 @@ RULES:
         case 'get_invoices': {
           const order = args.sort_by === 'days_overdue' ? 'due_date' : 'invoice_amount';
           let q = supabase.from('invoices').select('customer_name,invoice_amount,due_date,payment_status')
-            .eq('user_id', userId).eq('payment_status', 'Pending').order(order, { ascending: false }).limit(args.limit || 10);
+            .eq('user_id', userId).eq('payment_status', 'Pending').order(order, { ascending: false }).limit(Math.min(Math.max(Number(args.limit) || 10, 1), 50));
           if (args.min_amount) q = q.gte('invoice_amount', args.min_amount);
           const { data } = await q;
           return (data || []).map(i => ({
@@ -10041,21 +10120,18 @@ RULES:
           ]);
           return { invoices: invRes.data || [], orders: ordRes.data || [] };
         }
-        case 'add_expense': {
-          const { data } = await supabase.from('expenses').insert([{
-            user_id: userId, description: args.description, amount: args.amount,
-            category: args.category || 'misc', expense_date: today, created_at: new Date()
-          }]).select().single();
-          return { added: true, expense: data };
-        }
+        // The assistant reads; it never writes records (a model-chosen amount
+        // must not land in the books). The owner adds expenses on Today.
+        case 'add_expense':
+          return { error: 'The assistant cannot add expenses. Add it from the Today page.' };
         case 'get_top_customers': {
           if (args.ranked_by === 'orders') {
             const { data } = await supabase.from('orders').select('customer_name,total_amount').eq('user_id', userId).not('status', 'eq', 'cancelled');
             const map = {};
             (data || []).forEach(o => { map[o.customer_name] = (map[o.customer_name] || 0) + Number(o.total_amount || 0); });
-            return Object.entries(map).sort(([,a],[,b]) => b-a).slice(0, args.limit || 5).map(([name, total]) => ({ name, total: `₹${total.toLocaleString('en-IN')}` }));
+            return Object.entries(map).sort(([,a],[,b]) => b-a).slice(0, Math.min(Math.max(Number(args.limit) || 5, 1), 50)).map(([name, total]) => ({ name, total: `₹${total.toLocaleString('en-IN')}` }));
           } else {
-            const { data } = await supabase.from('invoices').select('customer_name,invoice_amount').eq('user_id', userId).eq('payment_status','Pending').order('invoice_amount', { ascending: false }).limit(args.limit || 5);
+            const { data } = await supabase.from('invoices').select('customer_name,invoice_amount').eq('user_id', userId).eq('payment_status','Pending').order('invoice_amount', { ascending: false }).limit(Math.min(Math.max(Number(args.limit) || 5, 1), 50));
             return data || [];
           }
         }
@@ -14596,6 +14672,7 @@ app.listen(PORT, () => {
     console.warn('⚠️  OTP_VERIFICATION_DISABLED=true — OTP verification is BYPASSED for signup. TEMPORARY testing mode only. Unset this var or set it to false to restore normal OTP-required behavior.');
   }
   runAutoMigrations();
+  if (process.env.DATABASE_URL) require('./lib/safety/externalSend').startGlobalStopWatcher(getPool());
   if (outboundRunner) {
     outboundRunner.start();
     console.log(`📮 Outbound engine runner: STARTED (${outboundRunner.concurrency} worker slot(s); sends only for tenants that pressed START)`);

@@ -23,7 +23,7 @@ async function main() {
   try {
     const nonAdmin = await seedUser(pool, 'access-nonadmin'); users.push(nonAdmin.id);
     const adminId = randomUUID();
-    await pool.query(`INSERT INTO users (id, email, password_hash, business_name) VALUES ($1, $2, 'x', 'Admin')`, [adminId, adminEmail]);
+    await pool.query(`INSERT INTO users (id, email, password_hash, business_name, email_verified) VALUES ($1, $2, 'x', 'Admin', true)`, [adminId, adminEmail]);
     users.push(adminId);
     const adminToken = jwt.sign({ userId: adminId, email: adminEmail }, process.env.JWT_SECRET, { expiresIn: '10m' });
 
