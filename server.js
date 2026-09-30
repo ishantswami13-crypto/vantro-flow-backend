@@ -12,6 +12,7 @@ const cron = require('node-cron');
 const rateLimit = require('express-rate-limit');
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
+const { RELEASE } = require('./lib/release');
 const path = require('path');
 const webpush = require('web-push');
 const { createClient } = require('@supabase/supabase-js');
@@ -143,7 +144,10 @@ app.use((req, res, next) => {
       statusCode: status,
       userId: req.user?.userId || req.user?.id || null,
       businessId: req.user?.businessId || null,
-      durationMs: parseFloat(durationMs)
+      durationMs: parseFloat(durationMs),
+      release: RELEASE,
+      // Set by the desktop/phone apps so a failure can be tied to the build that sent it.
+      clientVersion: typeof req.headers['x-starlane-client'] === 'string' ? req.headers['x-starlane-client'].slice(0, 40) : null
     };
 
     if (status >= 400) {
@@ -351,7 +355,7 @@ function isMissingSchemaError(error) {
 }
 
 // Middleware
-const { isAllowedOrigin } = require('./lib/security/originPolicy');
+const { isAllowedOrigin, isNativeAppOrigin } = require('./lib/security/originPolicy');
 
 // Vercel preview deployments get a generated subdomain per commit, so they can't
 // be enumerated in ALLOWED_ORIGINS. VERCEL_PROJECT_SLUGS lists the project names
@@ -386,16 +390,33 @@ const corsOptions = {
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Authorization", "Content-Type", "X-CSRF-Token", "X-Request-ID"],
+  // X-Access-Token: access-flow status/entitlement tokens (lib/routes/access.js).
+  // X-Sync-Run-Id: connector hosts tie an import to the sync run they started.
+  allowedHeaders: ["Authorization", "Content-Type", "X-CSRF-Token", "X-Request-ID", "X-Access-Token", "X-Sync-Run-Id", "X-Starlane-Client"],
   // Lets the frontend read the X-CSRF-Token response header (set below in
   // authMiddleware) across origins — without this, a custom response header
   // is invisible to cross-origin fetch() even though the browser received
   // it, which is what silently broke the self-heal below the first time.
-  exposedHeaders: ["X-CSRF-Token"]
+  exposedHeaders: ["X-CSRF-Token", "X-Content-SHA256", "Content-Disposition"]
 };
 
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
+// Same-origin requests (the backend's own server-rendered pages, e.g. the
+// approval-link confirmation form) are not cross-origin and must not be
+// judged by the cross-origin allow-list. Compared by host, which is what the
+// browser put in Origin for a same-origin POST.
+function isSameOriginRequest(req) {
+  const origin = req.headers.origin;
+  if (!origin) return false;
+  try { return new URL(origin).host === req.get('host'); } catch { return false; }
+}
+const corsDelegate = (req, callback) => {
+  if (isSameOriginRequest(req)) return callback(null, { ...corsOptions, origin: true });
+  if (isNativeAppOrigin(req.headers.origin)) return callback(null, { ...corsOptions, origin: true, credentials: false });
+  return callback(null, corsOptions);
+};
+
+app.use(cors(corsDelegate));
+app.options("*", cors(corsDelegate));
 
 // Raw body preservation for Razorpay webhook (must come BEFORE express.json)
 app.use((req, res, next) => {
@@ -552,7 +573,7 @@ app.use('/api', apiLimiter);
 // client rotating IPs sidesteps it entirely; and the default MemoryStore is
 // per-process, so the effective limit multiplies by the replica count and
 // resets on every deploy.
-app.use(['/api/upload-csv', '/api/import/excel', '/api/bank/transactions/import', '/api/scan-document', '/api/purchases/scan', '/api/sales/scan', '/api/transactions/scan', '/api/ai/extract-voice'], uploadLimiter);
+app.use(['/api/upload-csv', '/api/import/excel', '/api/import/preview', '/api/bank/transactions/import', '/api/scan-document', '/api/purchases/scan', '/api/sales/scan', '/api/transactions/scan', '/api/ai/extract-voice'], uploadLimiter);
 // /api/voice/call places a real outbound PSTN call. It takes customer_phone
 // straight from the request body and dials through getTwilio() with no
 // arguments, which falls back to the platform's own TWILIO_ACCOUNT_SID rather
@@ -721,10 +742,21 @@ function authMiddleware(req, res, next) {
     // ------------------------------------------------------
     
     setNoStoreHeaders(res);
-    next();
+    return continueIfSessionActive(req, res, next);
   } catch {
     res.status(401).json({ error: 'Invalid or expired token' });
   }
+}
+
+// Native-client access tokens carry a session id (sid); signing a device out
+// must take effect on its next request, not when the 15-minute token expires.
+// Web tokens have no sid and are unaffected.
+function continueIfSessionActive(req, res, next) {
+  const sid = req.user && req.user.sid;
+  if (!sid) return next();
+  require('./lib/auth/sessions').isActive(getPool(), sid)
+    .then((active) => (active ? next() : res.status(401).json({ error: 'Session ended', code: 'SESSION_INVALID' })))
+    .catch(() => res.status(503).json({ error: 'Could not verify session' }));
 }
 
 // requireOwner — authenticates AND verifies the caller owns the :userId resource
@@ -758,7 +790,7 @@ function requireOwner(req, res, next) {
   // ------------------------------------------------------
 
   setNoStoreHeaders(res);
-  next();
+  return continueIfSessionActive(req, res, next);
 }
 
 function authenticatedUserId(req) {
@@ -1200,6 +1232,15 @@ app.post('/api/auth/signup', async (req, res) => {
     const { data: existing } = await supabase.from('users').select('id').eq('email', email).maybeSingle();
     if (existing) return res.status(409).json({ error: 'Email already registered' });
 
+    // Selective rollout: when the access gate is on, only emails with an
+    // approved access application may create an account.
+    if (isFeatureEnabled('access_gate_enabled')) {
+      const { hasApprovedApplication } = require('./lib/access/service');
+      if (!(await hasApprovedApplication(getPool(), email))) {
+        return res.status(403).json({ error: 'Starlane is in a private rollout. Request access first — you can sign up once your application is approved.', code: 'ACCESS_NOT_APPROVED' });
+      }
+    }
+
     const password_hash = await bcrypt.hash(password, 12);
     const insertPayload = { email, phone, business_name, password_hash, plan: 'free', created_at: new Date() };
 
@@ -1309,7 +1350,10 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     // JWT issuance — those all still run normally. Default/unset = normal
     // OTP-required behavior. Flip back off by unsetting the var or setting it
     // to 'false'. This is reversible and NOT a permanent security change.
-    const otpBypassed = process.env.OTP_VERIFICATION_DISABLED === 'true';
+    // Never honoured on the production deployment (lib/config/deployEnv.js):
+    // a forgotten flag there would let anyone sign up without verification.
+    const otpBypassed = process.env.OTP_VERIFICATION_DISABLED === 'true'
+      && !require('./lib/config/deployEnv').isProductionDeployment();
     if (otpBypassed) {
       console.warn(`[OTP BYPASS] OTP_VERIFICATION_DISABLED=true — skipping OTP check for userId=${decoded.userId}. This is a TEMPORARY testing bypass, not a permanent change.`);
       otpStore.delete(decoded.userId);
@@ -1821,134 +1865,127 @@ app.get('/api/invoice/:invoiceId', authMiddleware, async (req, res) => {
 // EXCEL / XLSX SMART IMPORT
 // ============================================
 
-app.post('/api/import/excel', authMiddleware, upload.single('file'), async (req, res) => {
+// Spreadsheet import of invoices/receivables from any bookkeeping software.
+// lib/import/receivablesMapper.js recognises the export (Tally, Busy, Marg,
+// Vyapar, Zoho Books, QuickBooks, Xero, Khatabook, or generic), maps the
+// columns itself, and says why any row was skipped. The same file (by
+// content hash) is never imported twice for a company. /preview writes
+// nothing; /excel imports.
+const receivablesMapper = require('./lib/import/receivablesMapper');
+
+function readSpreadsheet(file) {
+  const name = (file.originalname || '').toLowerCase();
+  if (name.endsWith('.xlsx') || name.endsWith('.xls') || (file.mimetype || '').includes('spreadsheet') || (file.mimetype || '').includes('excel')) {
+    const XLSX = require('xlsx');
+    const wb = XLSX.read(file.buffer, { type: 'buffer', cellDates: true, sheetRows: 5021 });
+    return { fileType: 'XLSX', matrix: XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: '', raw: true }) };
+  }
+  return { fileType: 'CSV', matrix: receivablesMapper.parseDelimited(file.buffer.toString('utf-8')) };
+}
+
+function mapUpload(file) {
+  const { fileType, matrix } = readSpreadsheet(file);
+  if (matrix.length > 5020) return { error: 'File has too many rows. Please import 5000 rows or fewer.' };
+  const result = receivablesMapper.mapTable(matrix);
+  return { fileType, ...result };
+}
+
+function importSummary(m) {
+  return {
+    source: m.source.name,                     // e.g. "Zoho Books", or null for a generic sheet
+    headerRow: m.headerRow,
+    columns: m.mapping.byField,                // which column became which field
+    confidence: m.mapping.confidence,
+    rows: m.invoices.length,
+    skipped: m.skipped.length,
+    skippedReasons: m.skipped.slice(0, 20),
+  };
+}
+
+app.post('/api/import/preview', authMiddleware, upload.single('file'), async (req, res) => {
   try {
-    const userId = req.user.userId;
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    let m;
+    try { m = mapUpload(req.file); } catch { return res.status(400).json({ error: 'Could not read this file. Save it as .xlsx or .csv and try again.' }); }
+    if (m.error) return res.status(400).json({ error: m.error });
+    const hash = require('crypto').createHash('sha256').update(req.file.buffer).digest('hex');
+    const { rows } = await getPool().query(`SELECT status FROM file_import_batches WHERE user_id = $1 AND file_content_hash = $2`, [req.user.userId, hash]);
+    res.json({ success: true, ...importSummary(m), alreadyImported: rows[0]?.status === 'COMPLETED', sample: m.invoices.slice(0, 10) });
+  } catch (err) {
+    console.error('Import preview error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
-    const ext = (req.file.originalname || '').toLowerCase();
-    let rows = [];
+app.post('/api/import/excel', authMiddleware, upload.single('file'), async (req, res) => {
+  const userId = req.user.userId;
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  let m;
+  try { m = mapUpload(req.file); } catch { return res.status(400).json({ error: 'Could not read this file. Save it as .xlsx or .csv and try again.' }); }
+  if (m.error) return res.status(400).json({ error: m.error });
+  if (m.mapping.confidence === 'insufficient' || m.invoices.length === 0) {
+    return res.status(400).json({
+      error: m.mapping.confidence === 'insufficient'
+        ? 'Could not find a customer name and an amount column in this file.'
+        : 'No rows could be imported from this file.',
+      ...importSummary(m),
+      headers: m.headers,
+      hint: 'Export invoices or bills receivable with the customer (party) name and the amount or balance owed.',
+    });
+  }
 
-    if (ext.endsWith('.xlsx') || ext.endsWith('.xls') || req.file.mimetype.includes('spreadsheet') || req.file.mimetype.includes('excel')) {
-      // Parse Excel
-      try {
-        const XLSX = require('xlsx');
-        const wb = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true, sheetRows: 5001 });
-        const ws = wb.Sheets[wb.SheetNames[0]];
-        rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
-      } catch (e) {
-        return res.status(400).json({ error: 'Could not parse Excel file. Please use .xlsx format.' });
-      }
-    } else {
-      // Parse CSV
-      const text = req.file.buffer.toString('utf-8');
-      const lines = text.split('\n').filter(l => l.trim());
-      if (lines.length < 2) return res.status(400).json({ error: 'CSV must have a header row and at least one data row' });
-      const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, '').toLowerCase());
-      rows = lines.slice(1).map(line => {
-        const vals = line.split(',').map(v => v.trim().replace(/"/g, ''));
-        const obj = {};
-        headers.forEach((h, i) => { obj[h] = vals[i] || ''; });
-        return obj;
-      });
+  const pool = getPool();
+  const hash = require('crypto').createHash('sha256').update(req.file.buffer).digest('hex');
+  let batchId = null;
+  try {
+    const { rows: existing } = await pool.query(`SELECT id, status, rows_accepted FROM file_import_batches WHERE user_id = $1 AND file_content_hash = $2`, [userId, hash]);
+    if (existing[0]?.status === 'COMPLETED') {
+      return res.json({ success: true, duplicate: true, imported: 0, ...importSummary(m), message: 'This exact file was already imported — nothing was added twice.' });
     }
-    if (rows.length > 5000) return res.status(400).json({ error: 'File has too many rows. Please import 5000 rows or fewer.' });
+    const { rows: b } = await pool.query(
+      `INSERT INTO file_import_batches (user_id, source_system, filename, file_type, file_content_hash, mapping_profile, status, rows_total)
+       VALUES ($1, 'file_import', $2, $3, $4, $5, 'STARTED', $6)
+       ON CONFLICT (user_id, file_content_hash) DO UPDATE SET status = 'STARTED', started_at = now() RETURNING id`,
+      [userId, String(req.file.originalname || '').slice(0, 200), m.fileType, hash, m.source.id, m.invoices.length + m.skipped.length]);
+    batchId = b[0].id;
 
-    // Smart column detection — try many possible header names
-    const findCol = (obj, candidates) => {
-      const keys = Object.keys(obj).map(k => k.toLowerCase().trim());
-      for (const c of candidates) {
-        const match = keys.find(k => k.includes(c));
-        if (match) return obj[Object.keys(obj).find(k => k.toLowerCase().trim() === match)];
-      }
-      return null;
-    };
-
-    const invoices = [];
-    const skipped = [];
-
-    for (const row of rows) {
-      const name = findCol(row, ['customer', 'party', 'client', 'debtor', 'buyer', 'name', 'company']);
-      const amountRaw = findCol(row, ['amount', 'outstanding', 'due', 'balance', 'pending', 'invoice_amount', 'receivable']);
-      const dateRaw = findCol(row, ['date', 'invoice_date', 'bill_date', 'due_date', 'created']);
-      const phone = findCol(row, ['phone', 'mobile', 'contact', 'number', 'whatsapp']);
-      const statusRaw = findCol(row, ['status', 'payment_status', 'paid', 'cleared']);
-
-      if (!name || !amountRaw) { skipped.push(row); continue; }
-
-      const amount = parseFloat(String(amountRaw).replace(/[₹,\s]/g, ''));
-      if (isNaN(amount) || amount <= 0) { skipped.push(row); continue; }
-
-      // Date parsing — handle DD/MM/YYYY, MM/DD/YYYY, YYYY-MM-DD, serial numbers
-      let invoiceDate = new Date();
-      if (dateRaw) {
-        if (dateRaw instanceof Date) {
-          invoiceDate = dateRaw;
-        } else if (typeof dateRaw === 'number') {
-          // Excel serial date
-          invoiceDate = new Date(Math.round((dateRaw - 25569) * 86400 * 1000));
-        } else {
-          const str = String(dateRaw).trim();
-          // Try DD/MM/YYYY
-          const ddmm = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
-          if (ddmm) invoiceDate = new Date(`${ddmm[3]}-${ddmm[2].padStart(2,'0')}-${ddmm[1].padStart(2,'0')}`);
-          else invoiceDate = new Date(str);
-          if (isNaN(invoiceDate.getTime())) invoiceDate = new Date();
-        }
-      }
-
-      const daysOverdue = Math.max(0, Math.floor((Date.now() - invoiceDate.getTime()) / 86400000));
-      const statusLower = String(statusRaw || '').toLowerCase();
-      // "unpaid", "not paid" and "partially paid" all contain "paid"; only a
-      // plain paid/cleared/settled status means the invoice is settled.
-      const paymentStatus = /\b(un|not|partial(ly)?|part)\s*paid\b|\bnot\s+cleared\b|\buncleared\b/.test(statusLower)
-        ? 'Pending'
-        : /\b(paid|cleared|settled|received)\b/.test(statusLower) ? 'Paid' : 'Pending';
-
-      invoices.push({
-        user_id: userId,
-        customer_name: String(name).trim(),
-        customer_phone: phone ? String(phone).replace(/\D/g, '').slice(-10) : null,
-        invoice_amount: amount,
-        invoice_date: invoiceDate.toISOString().split('T')[0],
-        payment_status: paymentStatus,
-        days_overdue: paymentStatus === 'Paid' ? 0 : daysOverdue,
-        created_at: new Date(),
-      });
-    }
-
-    if (invoices.length === 0) {
-      return res.status(400).json({
-        error: 'No valid rows found. Make sure your file has columns: Customer Name, Amount, Date.',
-        skipped: skipped.length,
-        hint: 'Column names can be: customer_name, party, amount, outstanding, invoice_date, date, phone, mobile',
-      });
-    }
-
-    const { data, error } = await supabase.from('invoices').insert(invoices).select('id');
+    const records = m.invoices.map((inv) => ({
+      user_id: userId,
+      customer_name: inv.customer_name,
+      customer_phone: inv.customer_phone,
+      customer_email: inv.customer_email,
+      invoice_number: inv.invoice_number,
+      invoice_amount: inv.invoice_amount,
+      invoice_date: inv.invoice_date || new Date().toISOString().slice(0, 10),
+      due_date: inv.due_date,
+      payment_status: inv.payment_status,
+      days_overdue: inv.days_overdue,
+      source_type: 'file_import',
+      created_at: new Date(),
+    }));
+    const { error } = await supabase.from('invoices').insert(records);
     if (error) throw error;
 
+    await pool.query(
+      `UPDATE file_import_batches SET status = 'COMPLETED', completed_at = now(), rows_accepted = $2, rows_rejected = $3 WHERE id = $1`,
+      [batchId, records.length, m.skipped.length]);
     res.json({
       success: true,
-      imported: invoices.length,
-      skipped: skipped.length,
-      message: `✅ ${invoices.length} invoices imported${skipped.length ? `, ${skipped.length} rows skipped (missing name/amount)` : ''}`,
+      imported: records.length,
+      ...importSummary(m),
+      message: `${records.length} invoices imported${m.source.name ? ` from a ${m.source.name} export` : ''}${m.skipped.length ? `; ${m.skipped.length} rows skipped` : ''}.`,
     });
   } catch (err) {
-    console.error('Import error:', err);
+    if (batchId) await pool.query(`UPDATE file_import_batches SET status = 'FAILED', error_message = $2 WHERE id = $1`, [batchId, String(err.message).slice(0, 500)]).catch(() => {});
+    console.error('Import error:', err.message);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Quick manual add — add a single customer/invoice
-// NOTE: the real /api/import/tally route (connector-authenticated, via
-// connectorOrUserAuth) lives further down this file next to the device
-// enrollment routes. It used to be shadowed by an older, JWT-only,
-// feature-flag-gated duplicate registered here — since Express dispatches
-// to the FIRST matching route, that duplicate silently ate every request
-// and made the real, connectorOrUserAuth-protected handler dead code (any
-// VantroDevice-authenticated connector request 401'd here instead of ever
-// reaching it). Removed 2026-09-23 so the real handler is reachable.
+// NOTE: /api/import/tally lives in lib/routes/tallyConnector.js. An older
+// JWT-only duplicate registered here used to shadow it (Express dispatches to
+// the first matching route); removed 2026-09-23.
 
 app.post('/api/import/manual', authMiddleware, async (req, res) => {
   try {
@@ -5523,82 +5560,12 @@ Rules: numbers only, no currency symbols or commas. Dates must be YYYY-MM-DD.`;
   }
 });
 
-// --- Local connector enrollment and device authentication -------------------
-// Re-enabled 2026-09-22: lib/domain/ingestion/deviceEnrollment.js and the
-// connector_devices/connector_enrollments schema (migrations/047_connector_devices.sql)
-// now exist for real (bcrypt-hashed device secrets, TTL'd claim-once
-// enrollment codes). See that migration file for the full design rationale.
-const { createEnrollment, claimEnrollment, authenticateDevice, listDevices, revokeDevice } = require('./lib/domain/ingestion/deviceEnrollment');
-const connectorClaimLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false });
+// --- Local connector (Tally bridge / desktop connector host) routes ---------
+// Pairing, device tokens, sync runs, heartbeat and /api/import/tally live in
+// lib/routes/tallyConnector.js.
+const { tallyConnectorRouter } = require('./lib/routes/tallyConnector');
+app.use('/api', tallyConnectorRouter({ pool: getPool(), supabase, authMiddleware }));
 
-function connectorOrUserAuth(req, res, next) {
-  const header = String(req.headers.authorization || '');
-  const match = header.match(/^VantroDevice\s+([0-9a-f-]{36})\.([A-Za-z0-9_-]{32,})$/i);
-  if (match) {
-    const [, deviceId, secret] = match;
-    authenticateDevice(deviceId, secret)
-      .then((device) => {
-        if (!device) return res.status(401).json({ error: 'Invalid or revoked device credential' });
-        req.user = { userId: device.userId };
-        req.connectorDevice = device;
-        next();
-      })
-      .catch((error) => {
-        console.error('[connector device auth]', error);
-        res.status(503).json({ error: 'Unable to authenticate connector device' });
-      });
-    return;
-  }
-  return authMiddleware(req, res, next);
-}
-
-app.post('/api/connectors/tally/enrollment', authMiddleware, async (req, res) => {
-  try {
-    const enrollment = await createEnrollment(req.user.userId);
-    res.status(201).json({ success: true, enrollmentCode: enrollment.enrollmentCode, expiresAt: enrollment.expiresAt });
-  } catch (error) {
-    console.error('[connector enrollment]', error);
-    res.status(503).json({ error: 'Unable to create connector enrollment' });
-  }
-});
-
-app.post('/api/connectors/tally/claim', connectorClaimLimiter, async (req, res) => {
-  try {
-    const { enrollmentCode, deviceName } = req.body || {};
-    const device = await claimEnrollment(enrollmentCode, deviceName);
-    res.status(201).json({ success: true, deviceId: device.deviceId, deviceSecret: device.deviceSecret, apiBase: `${req.protocol}://${req.get('host')}` });
-  } catch (error) {
-    const message = String(error.message || '');
-    const safe = /Enrollment|device name/i.test(message) ? message : 'Unable to claim connector enrollment';
-    res.status(400).json({ error: safe });
-  }
-});
-
-// Self-service visibility + kill switch for connector devices — a device
-// secret has no expiry (see deviceEnrollment.js), so this list+revoke pair
-// is the only way a tenant can see what's connected or shut one off without
-// a direct DB edit. Always authMiddleware (a device credential must never
-// be able to list or revoke devices, including itself).
-app.get('/api/connectors/tally/devices', authMiddleware, async (req, res) => {
-  try {
-    const devices = await listDevices(req.user.userId);
-    res.json({ success: true, devices });
-  } catch (error) {
-    console.error('[connector devices list]', error);
-    res.status(503).json({ error: 'Unable to list connector devices' });
-  }
-});
-
-app.post('/api/connectors/tally/devices/:deviceId/revoke', authMiddleware, async (req, res) => {
-  try {
-    const revoked = await revokeDevice(req.user.userId, req.params.deviceId);
-    if (!revoked) return res.status(404).json({ error: 'Device not found or already revoked' });
-    res.json({ success: true });
-  } catch (error) {
-    console.error('[connector device revoke]', error);
-    res.status(503).json({ error: 'Unable to revoke connector device' });
-  }
-});
 // --- Audit (read-only; audit_logs is written by lib/services/orchestrator/
 // audit.service.js on every financial change — this is the first read path
 // exposed for it). No new table, no migration needed. -----------------------
@@ -5690,95 +5657,6 @@ app.get('/api/agent-runs', authMiddleware, async (req, res) => {
   }
 });
 
-// --- Data Connections (Tally / file import / future integrations) ---------
-const {
-  getConnections,
-  upsertConnectionStatus,
-  VALID_SOURCE_TYPES,
-  VALID_STATUSES,
-} = require('./lib/domain/ingestion/connections');
-
-app.get('/api/connections', authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const connections = await getConnections(userId);
-    res.json({ success: true, connections });
-  } catch (error) {
-    console.error('[connections list]', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.post('/api/connections/heartbeat', connectorOrUserAuth, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const { sourceType, status, lastSyncAt, lastSyncError } = req.body || {};
-
-    if (!sourceType || !VALID_SOURCE_TYPES.includes(sourceType)) {
-      return res.status(400).json({ error: `sourceType must be one of ${VALID_SOURCE_TYPES.join(', ')}` });
-    }
-    if (!status || !VALID_STATUSES.includes(status)) {
-      return res.status(400).json({ error: `status must be one of ${VALID_STATUSES.join(', ')}` });
-    }
-
-    const connection = await upsertConnectionStatus(userId, sourceType, status, {
-      lastSyncAt: lastSyncAt || new Date(),
-      lastSyncError: lastSyncError ?? null,
-    });
-    res.json({ success: true, connection });
-  } catch (error) {
-    console.error('[connections heartbeat]', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// POST /api/import/tally — accepts already-extracted, already-parsed Tally
-// vouchers (contract: { vouchers: [{ type, date, party, voucherNo, amount,
-// items }] }, date as ISO or Tally's yyyymmdd) from the local Tally
-// connector script (tally-sync.mjs, runs on the shop PC since Tally itself
-// has no public API a hosted backend could reach). Commits via
-// commitTallyVouchers — the same raw_observations/entity-resolution
-// contract csvImport.js uses, not a parallel scheme. sourceQuality is
-// 'REAL' unconditionally: this route only ever receives genuine exports
-// from a live Tally instance, never seeded/demo data.
-app.post('/api/import/tally', connectorOrUserAuth, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const { vouchers } = req.body || {};
-    // Keep an explicit route-level cap as a fast, documented guard before
-    // serializing or opening any database work for a large connector request.
-    if (!Array.isArray(vouchers)) return res.status(400).json({ error: 'vouchers must be an array' });
-    if (vouchers.length > 5000) return res.status(400).json({ error: 'too many vouchers in one request (max 5000)' });
-
-    // NOTE: this used to require './lib/domain/ingestion/tallyBatchContract'
-    // and './lib/domain/ingestion/adapters/tallyCommit' — neither module
-    // exists in this repo (MODULE_NOT_FOUND on every real request, so this
-    // route always 500'd once it actually became reachable — see the
-    // removed-duplicate-route note near /api/import/manual above). The real,
-    // already-built, idempotent multi-voucher-type writer is
-    // lib/services/tallyImport.service.js (Sales->invoices,
-    // Purchase->purchases, Receipt/Payment->bank_transactions, items->
-    // products/stock_movements) — it's what the OLD duplicate route used to
-    // call under JWT-only auth. Wired in here instead so connector-device
-    // requests (VantroDevice auth) actually get a working importer.
-    const { importTallyVouchers } = require('./lib/services/tallyImport.service');
-    const result = await importTallyVouchers(supabase, userId, vouchers);
-    if (result.error) return res.status(result.status || 400).json({ error: result.error });
-
-    const { upsertConnectionStatus } = require('./lib/domain/ingestion/connections');
-    const erroredAll = result.rejected?.length > 0 && Object.values(result.imported || {}).every((n) => n === 0);
-    await upsertConnectionStatus(userId, 'TALLY', erroredAll ? 'ERROR' : 'CONNECTED', {
-      lastSyncAt: new Date(),
-      lastSyncError: result.rejected?.length ? `${result.rejected.length} voucher(s) rejected` : null,
-    }).catch((err) => console.error('[import/tally] connection status update failed', err));
-
-    res.json(result);
-  } catch (error) {
-    console.error('[import/tally]', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
 app.get('/api/health', (req, res) => {
   res.json({
     success: true,
@@ -5787,6 +5665,13 @@ app.get('/api/health', (req, res) => {
     timestamp: new Date().toISOString(),
     requestId: req.requestId
   });
+});
+
+// Which build is live and whether its database matches: release, git SHA, API
+// level the apps must speak, and the migration level expected vs applied.
+// Public on purpose (no secrets, no tenant data): it is the first post-deploy check.
+app.get('/api/version', async (req, res) => {
+  res.json({ success: true, ...(await require('./lib/release').versionReport(pgPool)) });
 });
 
 app.get('/api/live', (req, res) => {
@@ -6616,10 +6501,24 @@ function chatCompletion(messages, tools, toolChoice = 'auto') {
   return groqChat(messages, tools, toolChoice);
 }
 
+const { allowedToolsFor } = require('./lib/ai/assistantTools');
+
 app.post('/api/ai-chat', authMiddleware, async (req, res) => {
-  const { messages, business_name } = req.body;
+  const { business_name } = req.body;
+  let { messages } = req.body;
   const user_id = authenticatedUserId(req);
   if (!user_id || !messages) return res.status(400).json({ error: 'Missing messages' });
+  const readOnly = !!req.user?.sid || req.body?.mode === 'read_only';
+  const allowedTools = allowedToolsFor({ native: readOnly });
+  if (readOnly) {
+    // Only the conversation itself — a client cannot inject system or tool turns.
+    if (!Array.isArray(messages)) return res.status(400).json({ error: 'messages must be an array' });
+    messages = messages
+      .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
+      .slice(-20)
+      .map((m) => ({ role: m.role, content: m.content.slice(0, 4000) }));
+    if (!messages.length || messages[messages.length - 1].role !== 'user') return res.status(400).json({ error: 'The last message must be from the user' });
+  }
 
   // Pre-fetch top 5 overdue invoices so first response is instant and data-aware
   let overdueContext = '';
@@ -6676,8 +6575,12 @@ When generating WhatsApp messages, call scripts, or any communication: write EXA
 
   const system = `You are ${ownerName ? ownerName + "'s" : 'Vantro'} AI co-founder, built into Vantro Flow for ${business_name || 'this business'}. You help Indian MSME owners manage collections, invoices, CRM, inventory, and cash flow.
 
-You have tools: fetch data, find invoices, add prospects, get forecasts, draft messages, navigate pages. You never mark payments received or record orders; the owner does that.
-Be specific, use ₹ formatting, and when asked to do something — DO it with tools, don't just explain.
+${readOnly
+  ? `You have read-only tools: look up invoices, overdue customers, summary, inventory, calls, suppliers, prospects and the cash forecast. You cannot change anything from here: if the owner asks you to mark something paid, send a message, place an order or change a record, say that this is done from the Decisions screen or the Starlane website, and never claim you did it.
+Be specific and use ₹ formatting.`
+  : `You have tools to look things up (invoices, overdue customers, summary, inventory, calls, suppliers, prospects, cash forecast), to navigate, and to DRAFT WhatsApp messages — a draft is a link the owner opens and sends themselves; you never send anything.
+You cannot change records: you cannot mark an invoice paid, add or move a prospect, or place an order. If asked, say plainly that the owner does that in the app (Collections, CRM, Purchases) and never claim you did it.
+Be specific and use ₹ formatting.`}
 Summarise actions clearly after doing them.
 
 HARD RULE — never fabricate data you don't have: You only know what your tools return from this business's actual connected data (invoices, prospects, inventory, calls, suppliers, cash flow). You have no access to competitor data, market pricing, external market research, or anything outside this business's own records.
@@ -6695,6 +6598,7 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
   let navigateTo = null;
 
   const executeTool = async (name, args) => {
+    if (!allowedTools.has(name)) return { error: `${name} is not available — the assistant cannot change records${readOnly ? ' and is read-only in the apps' : ''}.` };
     try {
       switch(name) {
         case 'get_summary': {
@@ -6884,7 +6788,7 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
 
     while (iteration < maxIter) {
       iteration++;
-      const choice = await chatCompletion(chatMessages, AI_TOOLS);
+      const choice = await chatCompletion(chatMessages, AI_TOOLS.filter((t) => allowedTools.has(t.function.name)));
       const msg = choice.message;
       chatMessages.push(msg);
 
@@ -11678,38 +11582,130 @@ async function executeCollectionsMessage(userId, action) {
 
 function safeLogFallback(msg, meta) { try { console.log(msg, JSON.stringify(meta)); } catch { console.log(msg); } }
 
-app.get('/api/actions/:id/approve', async (req, res) => {
+// ── One-tap approval links (sent to the owner on WhatsApp) ──────────────────
+// GET never changes state. Link-preview bots (WhatsApp, Slack, mail scanners)
+// fetch every URL they see; when GET used to approve-and-execute, merely
+// sharing or previewing a link could send a supplier PO or a customer
+// reminder. GET now renders a confirmation page describing exactly what will
+// happen; the owner's tap on its button POSTs the same signed token back.
+//
+// The POST claims the action atomically (UPDATE ... WHERE status='pending'),
+// so a double tap or two devices racing execute it at most once, and the
+// terminal state reflects what actually happened (done vs failed) instead of
+// always 'done'.
+function approvalConfirmPage(action, intent, token) {
+  const verb = intent === 'approve' ? 'Approve' : 'Decline';
+  const title = escapeHtml(action.title || 'Pending action');
+  const desc = escapeHtml(action.description || '');
+  const effect = intent === 'approve'
+    ? 'Approving will carry out this action now. Nothing happens until you press the button.'
+    : 'Declining dismisses this suggestion. No action will be taken.';
+  return `<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>${verb}: ${title}</title>
+  <style>body{font-family:-apple-system,system-ui,sans-serif;background:#FAFAF9;color:#0F0E0D;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px;}
+  .card{background:#fff;border:1px solid #E3E2DE;border-radius:12px;padding:28px;max-width:440px;width:100%;}
+  h1{font-size:19px;margin:0 0 10px;line-height:1.35}p{color:#46443F;line-height:1.55;margin:0 0 14px}
+  .k{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:#7A7873;margin-bottom:8px}
+  button{font:inherit;font-weight:600;border:0;border-radius:8px;padding:12px 18px;width:100%;cursor:pointer;background:#0F0E0D;color:#fff}
+  button.secondary{background:#fff;color:#0F0E0D;border:1px solid #D2D0CA}</style></head>
+  <body><main class="card"><div class="k">Starlane · ${verb}</div><h1>${title}</h1>${desc ? `<p>${desc}</p>` : ''}<p>${effect}</p>
+  <form method="post" action="/api/actions/${encodeURIComponent(action.id)}/${intent}">
+  <input type="hidden" name="token" value="${escapeHtml(token)}">
+  <button type="submit" class="${intent === 'approve' ? '' : 'secondary'}">${verb}</button></form></main></body></html>`;
+}
+
+async function renderApprovalConfirm(req, res, intent) {
+  const { verifyActionToken, loadPendingAction } = require('./lib/services/actionApproval.service');
+  res.setHeader('X-Robots-Tag', 'noindex');
+  const token = String(req.query.token || '');
+  if (!verifyActionToken(token, req.params.id, intent)) {
+    return res.status(403).send(approvalResultPage('Link expired or invalid', 'This link is no longer valid. Please check your Action Center for the latest status.', false));
+  }
+  const { ok, action, reason } = await loadPendingAction(req.params.id);
+  if (!ok) {
+    return res.send(approvalResultPage('Nothing to do', reason === 'already_actioned'
+      ? `This was already ${action?.status || 'actioned'} — no changes made.`
+      : 'This action could not be found.'));
+  }
+  res.send(approvalConfirmPage(action, intent, token));
+}
+
+// Carry out an action that has ALREADY been atomically claimed as 'approved'
+// (by the approval-link POST or POST /api/client/actions/:id/decision), then
+// record the honest terminal state, activity log, product events and the
+// owner's notification. The single place approved actions execute.
+async function executeApprovedAction(action, { source }) {
+  const actionService = require('./lib/services/orchestrator/action.service');
+  const { track, EVENTS } = require('./lib/observability/productEvents');
+  const { notify, TYPES } = require('./lib/notifications/notify');
+  // Operator emergency stop for pilots: approvals are still recorded (the action
+  // stays APPROVED and can be carried out once this is lifted), but nothing is
+  // executed — no message, call, purchase order or payout.
+  if (process.env.ACTION_EXECUTION_PAUSED === 'true') {
+    await createActivityLog(action.user_id, 'ai_action_approved_execution_paused', {
+      entityType: 'ai_action', entityId: action.id, source, actionType: action.action_type,
+    });
+    return { ok: true, paused: true, message: 'Approved and recorded. Carrying out actions is paused by Starlane for now, so nothing was sent, called or paid.' };
+  }
+  let result;
   try {
-    const { verifyActionToken, loadPendingAction } = require('./lib/services/actionApproval.service');
-    const actionService = require('./lib/services/orchestrator/action.service');
-    const actionId = req.params.id;
-    const token = req.query.token;
-
-    if (!verifyActionToken(token, actionId, 'approve')) {
-      return res.status(403).send(approvalResultPage('Link expired or invalid', 'This approval link is no longer valid. Please check your Action Center for the latest status.', false));
-    }
-
-    const { ok, action, reason } = await loadPendingAction(actionId);
-    if (!ok) {
-      const msg = reason === 'already_actioned'
-        ? `This was already ${action?.status || 'actioned'} — no changes made.`
-        : 'This action could not be found.';
-      return res.send(approvalResultPage('Nothing to do', msg));
-    }
-
-    await actionService.updateStatus(action.user_id, actionId, 'approved');
-
-    let result;
     if (action.action_type === 'INVENTORY_PO_READY') result = await executeInventoryPO(action.user_id, action);
     else if (action.action_type === 'PAYABLES_PAYMENT_READY') result = await executePayablesPayment(action.user_id, action);
     else if (action.action_type === 'ESCALATE_COLLECTION_CALL') result = await executeCollectionCall(action.user_id, action);
     else if (['SEND_POLITE_REMINDER', 'SEND_FIRM_REMINDER', 'ESCALATE_COLLECTION'].includes(action.action_type)) result = await executeCollectionsMessage(action.user_id, action);
     else result = { ok: true, message: 'Approved.' };
+  } catch (execErr) {
+    result = { ok: false, message: 'Approved, but carrying it out failed. Nothing further was sent — please retry from your Action Center.', error: execErr.message };
+  }
+  await actionService.updateStatus(action.user_id, action.id, result.ok ? 'done' : 'failed');
+  await createActivityLog(action.user_id, result.ok ? 'ai_action_approved_and_executed' : 'ai_action_execution_failed', {
+    entityType: 'ai_action', entityId: action.id, source, actionType: action.action_type,
+  });
+  track(result.ok ? EVENTS.ACTION_EXECUTED : EVENTS.ACTION_FAILED, { userId: action.user_id, actionId: action.id, props: { action_type: action.action_type, via: source } });
+  await notify(getPool(), action.user_id, {
+    type: result.ok ? TYPES.ACTION_COMPLETED : TYPES.ACTION_FAILED,
+    severity: result.ok ? 'normal' : 'high',
+    title: result.ok ? `Done: ${String(action.title || 'Action').slice(0, 100)}` : `Failed: ${String(action.title || 'Action').slice(0, 100)}`,
+    body: result.ok ? null : 'Nothing further was sent. Open it to see what happened.',
+    entity: { type: 'ai_action', id: action.id }, actionId: action.id, route: `/actions/${action.id}`,
+    dedupeKey: `action-result:${action.id}`,
+  });
+  return result;
+}
 
-    await actionService.updateStatus(action.user_id, actionId, 'done');
-    await createActivityLog(action.user_id, 'ai_action_approved_and_executed', {
-      entityType: 'ai_action', entityId: actionId, source: 'approval_link', actionType: action.action_type,
-    });
+app.get('/api/actions/:id/approve', (req, res) => {
+  renderApprovalConfirm(req, res, 'approve').catch((err) => {
+    console.error('[actions/approve:confirm] Error:', err.message);
+    res.status(500).send(approvalResultPage('Something went wrong', 'Please try again from your Action Center.', false));
+  });
+});
+
+app.get('/api/actions/:id/reject', (req, res) => {
+  renderApprovalConfirm(req, res, 'reject').catch((err) => {
+    console.error('[actions/reject:confirm] Error:', err.message);
+    res.status(500).send(approvalResultPage('Something went wrong', 'Please try again from your Action Center.', false));
+  });
+});
+
+const approvalLinkLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
+
+app.post('/api/actions/:id/approve', approvalLinkLimiter, async (req, res) => {
+  try {
+    const { verifyActionToken, claimPendingAction } = require('./lib/services/actionApproval.service');
+    const actionId = req.params.id;
+    if (!verifyActionToken(req.body?.token, actionId, 'approve')) {
+      return res.status(403).send(approvalResultPage('Link expired or invalid', 'This approval link is no longer valid. Please check your Action Center for the latest status.', false));
+    }
+
+    const claim = await claimPendingAction(actionId, 'approved');
+    if (claim.ok) require('./lib/observability/productEvents').track('approval.completed', { userId: claim.action.user_id, actionId, props: { decision: 'approved', via: 'approval_link' } });
+    if (!claim.ok) {
+      return res.send(approvalResultPage('Nothing to do', claim.reason === 'already_actioned'
+        ? `This was already ${claim.action?.status || 'actioned'} — no changes made.`
+        : 'This action could not be found.'));
+    }
+    const action = claim.action;
+
+    const result = await executeApprovedAction(action, { source: 'approval_link' });
 
     res.send(approvalResultPage(action.title || 'Approved', result.message, result.ok));
   } catch (err) {
@@ -11718,27 +11714,43 @@ app.get('/api/actions/:id/approve', async (req, res) => {
   }
 });
 
-app.get('/api/actions/:id/reject', async (req, res) => {
+app.post('/api/actions/:id/reject', approvalLinkLimiter, async (req, res) => {
   try {
-    const { verifyActionToken, loadPendingAction } = require('./lib/services/actionApproval.service');
-    const actionService = require('./lib/services/orchestrator/action.service');
+    const { verifyActionToken, claimPendingAction } = require('./lib/services/actionApproval.service');
     const actionId = req.params.id;
-    const token = req.query.token;
-
-    if (!verifyActionToken(token, actionId, 'reject')) {
+    if (!verifyActionToken(req.body?.token, actionId, 'reject')) {
       return res.status(403).send(approvalResultPage('Link expired or invalid', 'This link is no longer valid.', false));
     }
-    const { ok, action, reason } = await loadPendingAction(actionId);
-    if (!ok) {
-      return res.send(approvalResultPage('Nothing to do', reason === 'already_actioned' ? `This was already ${action?.status}.` : 'Action not found.'));
+    const claim = await claimPendingAction(actionId, 'rejected');
+    if (!claim.ok) {
+      return res.send(approvalResultPage('Nothing to do', claim.reason === 'already_actioned' ? `This was already ${claim.action?.status}.` : 'Action not found.'));
     }
-    await actionService.updateStatus(action.user_id, actionId, 'rejected');
+    await createActivityLog(claim.action.user_id, 'ai_action_rejected', {
+      entityType: 'ai_action', entityId: actionId, source: 'approval_link', actionType: claim.action.action_type,
+    });
     res.send(approvalResultPage('Declined', 'This suggestion has been dismissed. No action was taken.'));
   } catch (err) {
     console.error('[actions/reject] Error:', err.message);
     res.status(500).send(approvalResultPage('Something went wrong', 'Please try again from your Action Center.', false));
   }
 });
+
+// Connector monitor: "Tally has stopped syncing" (once per device per day).
+cron.schedule('*/30 * * * *', () => {
+  require('./lib/notifications/connectorMonitor').checkQuietBridges(getPool())
+    .catch((e) => console.error('[connector monitor]', e.message));
+}, { timezone: 'UTC' });
+
+// Watch, mission and memory sweep for companies with a signed-in app, so a
+// phone gets its push without anyone opening Starlane.
+cron.schedule('*/15 * * * *', async () => {
+  try {
+    const { rows } = await getPool().query(
+      `SELECT DISTINCT user_id FROM auth_sessions WHERE revoked_at IS NULL AND expires_at > now()
+        UNION SELECT DISTINCT user_id FROM push_devices WHERE disabled_at IS NULL`);
+    for (const r of rows) await featuresApi.refreshFor(r.user_id).catch((e) => console.error('[watch sweep]', e.message));
+  } catch (e) { console.error('[watch sweep]', e.message); }
+}, { timezone: 'UTC' });
 
 // ============================================
 // WEEKLY SCORECARD CRON -- Sunday 6pm IST (12:30 UTC)
@@ -12357,6 +12369,27 @@ if (String(process.env.OUTBOUND_ENGINE_ENABLED || '').toLowerCase() === 'true' &
 }
 app.use('/api/outreach', outreachRouter({ pool: getPool(), authMiddleware, requireAdmin, runner: outboundRunner }));
 
+// Selective-rollout access flow: applications, deterministic eligibility,
+// admin review, download entitlements. See lib/routes/access.js.
+const { accessRouter } = require('./lib/routes/access');
+app.use('/api', accessRouter({ pool: getPool(), requireAdmin }));
+
+// Starlane's seven features (Bridge, Scan, Watch, Missions, Simulate, Memory,
+// Prepared) for the desktop and mobile apps. See lib/routes/features.js.
+const { featuresRouter } = require('./lib/routes/features');
+const featuresApi = featuresRouter({ pool: getPool(), authMiddleware, notifyFn: require('./lib/notifications/notify').notify, isEnabled: isFeatureEnabled });
+app.use('/api', featuresApi);
+
+// Desktop + mobile client API: native sessions, bootstrap, Now, action
+// evidence/decisions, canonical notifications, push devices, telemetry.
+const { clientApiRouter } = require('./lib/routes/clientApi');
+app.use('/api', clientApiRouter({ pool: getPool(), authMiddleware, executeApprovedAction }));
+
+// Connector platform — manifests (lib/connectors/registry.js) + live state
+// derived only from real rows (lib/connectors/state.js). See lib/routes/connectors.js.
+const { connectorsRouter } = require('./lib/routes/connectors');
+app.use('/api/connectors', connectorsRouter({ pool: getPool(), authMiddleware }));
+
 app.get('/api/ai-actions', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -12657,19 +12690,16 @@ app.post('/api/intelligence/signals/:id/verify-outcome', authMiddleware, async (
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
-// Demo control: resets the 2xA tenant and re-runs the seed + trigger scripts
-// via the SAME code paths as the CLI scripts (no bypass/shortcut version).
-// Deliberately authMiddleware only, not adminOnly: this always operates on
-// one hardcoded, isolated demo tenant (owner@2xa-demo-meridian.invalid) —
-// it can never read or modify any other tenant's data, so requiring a
-// separately-configured ADMIN_EMAILS entry would only get in the way of
-// running the demo itself, with no real security benefit.
-app.post('/api/demo/2xa/reset', authMiddleware, async (req, res) => {
-  // Internal demo control: it re-seeds a demo tenant and runs scripts, so a
-  // real user must never be able to trigger it. Off unless an operator
-  // switches it on for a demo environment.
-  if (String(process.env.FEATURE_DEMO_RESET_ENABLED || '').toLowerCase() !== 'true') {
-    return res.status(404).json({ error: 'Not available' });
+// Demo control: resets the 2xA demo tenant and re-runs the seed + trigger
+// scripts via the same code paths as the CLI scripts.
+// Previously open to ANY authenticated user: every signed-in customer could
+// spawn child processes on the API host (a trivially repeatable CPU/DB-load
+// lever) and the response leaked the scripts' stderr. It is now an operator
+// tool: admin only, explicitly enabled per environment, never in production,
+// and it returns no script output beyond success/failure.
+app.post('/api/demo/2xa/reset', requireAdmin, async (req, res) => {
+  if (IS_PRODUCTION || process.env.DEMO_RESET_ENABLED !== 'true') {
+    return res.status(404).json({ error: 'Not found' });
   }
   try {
     delete require.cache[require.resolve('./scripts/seed-2xa-demo.js')];
@@ -12688,8 +12718,12 @@ app.post('/api/demo/2xa/reset', authMiddleware, async (req, res) => {
         resolve(stdout);
       });
     });
-    res.json({ success: true, triggerOutput });
-  } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
+    void triggerOutput;
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[demo/2xa/reset] failed:', String(err.message || err).split('\n')[0]);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // ── CUSTOMER INTELLIGENCE (behavioral profile for customers page) ────────────
@@ -14542,7 +14576,9 @@ app.listen(PORT, () => {
   const { isEnabled: _isFE } = require('./lib/featureFlags');
   const _worldEnabled = _isFE('world_intelligence_enabled');
   console.log(`🌍 World intelligence: ${_worldEnabled ? 'ENABLED' : 'DISABLED'} (USGS ${_worldEnabled ? 'enabled' : 'disabled'}, FX ${_worldEnabled ? 'enabled' : 'disabled'}, scheduler ${_worldEnabled ? 'enabled' : 'disabled'})`);
-  if (process.env.OTP_VERIFICATION_DISABLED === 'true') {
+  if (process.env.OTP_VERIFICATION_DISABLED === 'true' && require('./lib/config/deployEnv').isProductionDeployment()) {
+    console.error('[SECURITY] OTP_VERIFICATION_DISABLED=true is IGNORED on the production deployment — OTP verification stays on. Unset the variable.');
+  } else if (process.env.OTP_VERIFICATION_DISABLED === 'true') {
     console.warn('⚠️  OTP_VERIFICATION_DISABLED=true — OTP verification is BYPASSED for signup. TEMPORARY testing mode only. Unset this var or set it to false to restore normal OTP-required behavior.');
   }
   runAutoMigrations();
