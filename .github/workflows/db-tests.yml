@@ -43,3 +43,7 @@ jobs:
         run: npx eslint . --quiet
       - name: Test suite
         run: npm test
+      - name: Pilot readiness (fixture data, every check must PASS; FRONTEND is SKIPPED here)
+        env:
+          JWT_SECRET: ci-only-jwt-secret-not-used-anywhere-else-0123456789
+        run: npm run pilot:readiness

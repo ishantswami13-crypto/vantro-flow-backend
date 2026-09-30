@@ -546,7 +546,21 @@ const authLimiter = rateLimit({
     });
   }
 });
-const apiLimiter = makeLimiter({ windowMs: 60 * 1000, max: 120 });
+// Signed-in callers are budgeted per user, not per IP: a company's staff
+// often share one office IP, and one person opening a few pages a minute
+// (each page makes 4-11 API calls) used to hit 120/min and see 429s across
+// the app. Anonymous callers keep the per-IP budget.
+const API_LIMIT_PER_USER = Number(process.env.API_RATE_LIMIT_PER_USER_PER_MINUTE || 600);
+const API_LIMIT_PER_IP = Number(process.env.API_RATE_LIMIT_PER_IP_PER_MINUTE || 120);
+function apiLimiterKey(req) {
+  if (req._apiLimiterKey === undefined) req._apiLimiterKey = authAwareKey(req);
+  return req._apiLimiterKey;
+}
+const apiLimiter = makeLimiter({
+  windowMs: 60 * 1000,
+  max: (req) => (String(apiLimiterKey(req)).startsWith('user:') ? API_LIMIT_PER_USER : API_LIMIT_PER_IP),
+  keyGenerator: apiLimiterKey,
+});
 const uploadLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, max: 20 });
 const aiLimiter = makeLimiter({ windowMs: 10 * 60 * 1000, max: 40, keyGenerator: authAwareKey });
 const publicBillLimiter = makeLimiter({ windowMs: 10 * 60 * 1000, max: 80 });
