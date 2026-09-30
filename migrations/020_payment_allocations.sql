@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS payment_allocations (
   -- this is never inferred, only set when explicitly confirmed as such.
   payer_reference TEXT NOT NULL,
   payer_customer_id UUID REFERENCES customers(id),
-  payer_supplier_id UUID REFERENCES suppliers(id),
+  -- payer_supplier_id: added below with suppliers.id's real type.
 
   -- Low-commitment classification of the payer relationship. Never asserts
   -- a corporate/ownership fact — SAME_AS_CUSTOMER is only used when
@@ -106,3 +106,18 @@ CREATE INDEX IF NOT EXISTS idx_payment_allocations_invoice_id ON payment_allocat
 CREATE INDEX IF NOT EXISTS idx_payment_allocations_sale_id ON payment_allocations(sale_id) WHERE sale_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_payment_allocations_payer_reference ON payment_allocations(user_id, payer_reference);
 CREATE INDEX IF NOT EXISTS idx_payment_allocations_status ON payment_allocations(allocation_status);
+
+-- Schema-type repair (2026-09-27): suppliers.id is BIGINT in the canonical
+-- base schema (supabase-schema.sql, BIGSERIAL) but UUID on some hand-built dev
+-- databases. Hard-coding UUID here made this file fail on every database
+-- bootstrapped from the base schema — and the old bootstrap script swallowed
+-- the error, so the table silently never existed. The supplier FK column is
+-- now added with whatever type suppliers.id actually has. Where this file
+-- already succeeded, every statement below is a no-op.
+DO $$
+DECLARE supplier_id_type TEXT;
+BEGIN
+  SELECT format_type(a.atttypid, a.atttypmod) INTO supplier_id_type
+    FROM pg_attribute a WHERE a.attrelid = 'suppliers'::regclass AND a.attname = 'id';
+  EXECUTE format('ALTER TABLE payment_allocations ADD COLUMN IF NOT EXISTS payer_supplier_id %s REFERENCES suppliers(id)', supplier_id_type);
+END $$;

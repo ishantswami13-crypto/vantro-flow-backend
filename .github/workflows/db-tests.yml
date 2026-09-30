@@ -1,0 +1,49 @@
+---
+name: Backend — migrations + test suite (real Postgres)
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  db-tests:
+    name: "Migrate empty Postgres, then npm test"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: starlane_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      # Loopback-only TLS opt-out (lib/db/pgConfig.js); hosted DBs always use TLS.
+      PGSSLMODE: disable
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/starlane_test
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+      - name: Apply every migration to an empty database (must succeed start to finish)
+        run: npm run db:migrate
+      - name: Re-run is a no-op
+        run: npm run db:migrate | tee /tmp/second-run.txt && grep -q "Schema is up to date" /tmp/second-run.txt
+      - name: Schema drift (queried tables vs migrations)
+        run: npm run security:schema-drift
+      - name: Lint (errors block)
+        run: npx eslint . --quiet
+      - name: Test suite
+        run: npm test
+      - name: Pilot readiness (fixture data, every check must PASS; FRONTEND is SKIPPED here)
+        env:
+          JWT_SECRET: ci-only-jwt-secret-not-used-anywhere-else-0123456789
+        run: npm run pilot:readiness

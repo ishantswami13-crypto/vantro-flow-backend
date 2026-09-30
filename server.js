@@ -12,6 +12,7 @@ const cron = require('node-cron');
 const rateLimit = require('express-rate-limit');
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
+const { RELEASE } = require('./lib/release');
 const path = require('path');
 const webpush = require('web-push');
 const { createClient } = require('@supabase/supabase-js');
@@ -143,7 +144,10 @@ app.use((req, res, next) => {
       statusCode: status,
       userId: req.user?.userId || req.user?.id || null,
       businessId: req.user?.businessId || null,
-      durationMs: parseFloat(durationMs)
+      durationMs: parseFloat(durationMs),
+      release: RELEASE,
+      // Set by the desktop/phone apps so a failure can be tied to the build that sent it.
+      clientVersion: typeof req.headers['x-starlane-client'] === 'string' ? req.headers['x-starlane-client'].slice(0, 40) : null
     };
 
     if (status >= 400) {
@@ -351,7 +355,7 @@ function isMissingSchemaError(error) {
 }
 
 // Middleware
-const { isAllowedOrigin } = require('./lib/security/originPolicy');
+const { isAllowedOrigin, isNativeAppOrigin } = require('./lib/security/originPolicy');
 
 // Vercel preview deployments get a generated subdomain per commit, so they can't
 // be enumerated in ALLOWED_ORIGINS. VERCEL_PROJECT_SLUGS lists the project names
@@ -386,16 +390,33 @@ const corsOptions = {
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Authorization", "Content-Type", "X-CSRF-Token", "X-Request-ID"],
+  // X-Access-Token: access-flow status/entitlement tokens (lib/routes/access.js).
+  // X-Sync-Run-Id: connector hosts tie an import to the sync run they started.
+  allowedHeaders: ["Authorization", "Content-Type", "X-CSRF-Token", "X-Request-ID", "X-Access-Token", "X-Sync-Run-Id", "X-Starlane-Client"],
   // Lets the frontend read the X-CSRF-Token response header (set below in
   // authMiddleware) across origins — without this, a custom response header
   // is invisible to cross-origin fetch() even though the browser received
   // it, which is what silently broke the self-heal below the first time.
-  exposedHeaders: ["X-CSRF-Token"]
+  exposedHeaders: ["X-CSRF-Token", "X-Content-SHA256", "Content-Disposition", "X-Request-Id"]
 };
 
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
+// Same-origin requests (the backend's own server-rendered pages, e.g. the
+// approval-link confirmation form) are not cross-origin and must not be
+// judged by the cross-origin allow-list. Compared by host, which is what the
+// browser put in Origin for a same-origin POST.
+function isSameOriginRequest(req) {
+  const origin = req.headers.origin;
+  if (!origin) return false;
+  try { return new URL(origin).host === req.get('host'); } catch { return false; }
+}
+const corsDelegate = (req, callback) => {
+  if (isSameOriginRequest(req)) return callback(null, { ...corsOptions, origin: true });
+  if (isNativeAppOrigin(req.headers.origin)) return callback(null, { ...corsOptions, origin: true, credentials: false });
+  return callback(null, corsOptions);
+};
+
+app.use(cors(corsDelegate));
+app.options("*", cors(corsDelegate));
 
 // Raw body preservation for Razorpay webhook (must come BEFORE express.json)
 app.use((req, res, next) => {
@@ -525,7 +546,21 @@ const authLimiter = rateLimit({
     });
   }
 });
-const apiLimiter = makeLimiter({ windowMs: 60 * 1000, max: 120 });
+// Signed-in callers are budgeted per user, not per IP: a company's staff
+// often share one office IP, and one person opening a few pages a minute
+// (each page makes 4-11 API calls) used to hit 120/min and see 429s across
+// the app. Anonymous callers keep the per-IP budget.
+const API_LIMIT_PER_USER = Number(process.env.API_RATE_LIMIT_PER_USER_PER_MINUTE || 600);
+const API_LIMIT_PER_IP = Number(process.env.API_RATE_LIMIT_PER_IP_PER_MINUTE || 120);
+function apiLimiterKey(req) {
+  if (req._apiLimiterKey === undefined) req._apiLimiterKey = authAwareKey(req);
+  return req._apiLimiterKey;
+}
+const apiLimiter = makeLimiter({
+  windowMs: 60 * 1000,
+  max: (req) => (String(apiLimiterKey(req)).startsWith('user:') ? API_LIMIT_PER_USER : API_LIMIT_PER_IP),
+  keyGenerator: apiLimiterKey,
+});
 const uploadLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, max: 20 });
 const aiLimiter = makeLimiter({ windowMs: 10 * 60 * 1000, max: 40, keyGenerator: authAwareKey });
 const publicBillLimiter = makeLimiter({ windowMs: 10 * 60 * 1000, max: 80 });
@@ -536,6 +571,10 @@ const heavyReadLimiter = makeLimiter({ windowMs: 5 * 60 * 1000, max: 90 });
 // is a whole statement rather than a row.
 const bulkImportLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, max: 10 });
 app.use('/api/auth', authLimiter);
+// Signup and resend-otp answer 200, so authLimiter (failures only) never
+// counted them: anyone could make Starlane send endless OTPs to a victim.
+const otpSendLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, max: Number(process.env.OTP_SEND_LIMIT_PER_15M || 6) });
+app.use(['/api/auth/signup', '/api/auth/resend-otp', '/api/auth/forgot-password'], otpSendLimiter);
 app.use('/api', apiLimiter);
 // /api/bank/transactions/import belongs here with the other upload routes: it
 // takes a multipart file and parses .xls/.xlsx through the same library. It was
@@ -552,7 +591,7 @@ app.use('/api', apiLimiter);
 // client rotating IPs sidesteps it entirely; and the default MemoryStore is
 // per-process, so the effective limit multiplies by the replica count and
 // resets on every deploy.
-app.use(['/api/upload-csv', '/api/import/excel', '/api/bank/transactions/import', '/api/scan-document', '/api/purchases/scan', '/api/sales/scan', '/api/transactions/scan', '/api/ai/extract-voice'], uploadLimiter);
+app.use(['/api/upload-csv', '/api/import/excel', '/api/import/preview', '/api/bank/transactions/import', '/api/scan-document', '/api/purchases/scan', '/api/sales/scan', '/api/transactions/scan', '/api/ai/extract-voice'], uploadLimiter);
 // /api/voice/call places a real outbound PSTN call. It takes customer_phone
 // straight from the request body and dials through getTwilio() with no
 // arguments, which falls back to the platform's own TWILIO_ACCOUNT_SID rather
@@ -721,10 +760,21 @@ function authMiddleware(req, res, next) {
     // ------------------------------------------------------
     
     setNoStoreHeaders(res);
-    next();
+    return continueIfSessionActive(req, res, next);
   } catch {
     res.status(401).json({ error: 'Invalid or expired token' });
   }
+}
+
+// Native-client access tokens carry a session id (sid); signing a device out
+// must take effect on its next request, not when the 15-minute token expires.
+// Web tokens have no sid and are unaffected.
+function continueIfSessionActive(req, res, next) {
+  const sid = req.user && req.user.sid;
+  if (!sid) return next();
+  require('./lib/auth/sessions').isActive(getPool(), sid)
+    .then((active) => (active ? next() : res.status(401).json({ error: 'Session ended', code: 'SESSION_INVALID' })))
+    .catch(() => res.status(503).json({ error: 'Could not verify session' }));
 }
 
 // requireOwner — authenticates AND verifies the caller owns the :userId resource
@@ -758,7 +808,7 @@ function requireOwner(req, res, next) {
   // ------------------------------------------------------
 
   setNoStoreHeaders(res);
-  next();
+  return continueIfSessionActive(req, res, next);
 }
 
 function authenticatedUserId(req) {
@@ -773,9 +823,34 @@ function isAdminEmail(email) {
   return admins.includes(String(email || '').toLowerCase());
 }
 
+// Admin = an ADMIN_EMAILS entry that matches the account's stored email
+// exactly (case included), on an account whose email is verified, and — when
+// ADMIN_USER_IDS is set — whose id is listed. Matching case-insensitively let
+// anyone sign up as FOUNDER@X.COM next to founder@x.com, log in without OTP
+// and pass as admin.
+function adminListExact() {
+  return (process.env.ADMIN_EMAILS || '').split(',').map((e) => e.trim()).filter(Boolean);
+}
+async function isVerifiedAdmin(userId) {
+  if (!userId) return false;
+  const ids = (process.env.ADMIN_USER_IDS || '').split(',').map((e) => e.trim()).filter(Boolean);
+  if (ids.length && !ids.includes(String(userId))) return false;
+  const { rows } = await getPool().query('SELECT email, email_verified FROM users WHERE id = $1', [userId]);
+  const row = rows[0];
+  if (!row || row.email_verified !== true) return false;
+  return adminListExact().includes(String(row.email || '').trim());
+}
+
 function requireAdmin(req, res, next) {
-  authMiddleware(req, res, () => {
-    if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: 'Forbidden' });
+  authMiddleware(req, res, async () => {
+    try {
+      if (!isAdminEmail(req.user?.email) || !(await isVerifiedAdmin(req.user?.userId || req.user?.id))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+    } catch (err) {
+      console.error('[requireAdmin]', err.message);
+      return res.status(403).json({ error: 'Forbidden' });
+    }
     next();
   });
 }
@@ -1107,8 +1182,9 @@ async function sendWhatsAppMessage(phone, message, creds = {}, opts = {}) {
       }
     }
     // Dev mode fallback — never log the phone or message body (PII/OTP/payment links).
-    console.log(`[WA MOCK] queued (no provider configured) — len=${String(message || '').length}`);
-    return { success: true, provider: 'mock' };
+    // Nothing was sent, so say so: callers must not count this as delivered.
+    console.log(`[WA] not sent: no WhatsApp provider configured — len=${String(message || '').length}`);
+    return { success: false, provider: 'none', reason: 'no_provider' };
   } catch (err) {
     console.error('[WA] Send error:', err.message);
     return { success: false, error: err.message };
@@ -1188,16 +1264,32 @@ async function sendOTPEmail(email, name, otp) {
 // AUTHENTICATION ENDPOINTS
 // ============================================
 
+function normalizeEmail(value) {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+const resetAttempts = new Map(); // email -> { first, count }; per process
+
 app.post('/api/auth/signup', async (req, res) => {
   try {
-    const { email, phone, business_name, password, referred_by } = req.body;
+    const { phone, business_name, password, referred_by } = req.body;
+    const email = normalizeEmail(req.body.email);
     if (!email || !phone || !business_name || !password) {
       return res.status(400).json({ error: 'All fields are required' });
     }
-    if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    if (typeof password !== 'string' || password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
 
-    const { data: existing } = await supabase.from('users').select('id').eq('email', email).maybeSingle();
-    if (existing) return res.status(409).json({ error: 'Email already registered' });
+    // Case-insensitive: FOUNDER@x.com and founder@x.com are one mailbox.
+    const { rows: existingRows } = await getPool().query('SELECT id FROM users WHERE lower(email) = $1 LIMIT 1', [email]);
+    if (existingRows.length) return res.status(409).json({ error: 'Email already registered' });
+
+    // Selective rollout: when the access gate is on, only emails with an
+    // approved access application may create an account.
+    if (isFeatureEnabled('access_gate_enabled')) {
+      const { hasApprovedApplication } = require('./lib/access/service');
+      if (!(await hasApprovedApplication(getPool(), email))) {
+        return res.status(403).json({ error: 'Starlane is in a private rollout. Request access first — you can sign up once your application is approved.', code: 'ACCESS_NOT_APPROVED' });
+      }
+    }
 
     const password_hash = await bcrypt.hash(password, 12);
     const insertPayload = { email, phone, business_name, password_hash, plan: 'free', created_at: new Date() };
@@ -1308,7 +1400,10 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     // JWT issuance — those all still run normally. Default/unset = normal
     // OTP-required behavior. Flip back off by unsetting the var or setting it
     // to 'false'. This is reversible and NOT a permanent security change.
-    const otpBypassed = process.env.OTP_VERIFICATION_DISABLED === 'true';
+    // Never honoured on the production deployment (lib/config/deployEnv.js):
+    // a forgotten flag there would let anyone sign up without verification.
+    const otpBypassed = process.env.OTP_VERIFICATION_DISABLED === 'true'
+      && !require('./lib/config/deployEnv').isProductionDeployment();
     if (otpBypassed) {
       console.warn(`[OTP BYPASS] OTP_VERIFICATION_DISABLED=true — skipping OTP check for userId=${decoded.userId}. This is a TEMPORARY testing bypass, not a permanent change.`);
       otpStore.delete(decoded.userId);
@@ -1334,14 +1429,15 @@ app.post('/api/auth/verify-otp', async (req, res) => {
 
 app.post('/api/auth/login', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { password } = req.body;
+    const email = typeof req.body.email === 'string' ? req.body.email.trim() : '';
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
-    const { data, error } = await supabase
-      .from('users')
-      .select('id, email, phone, business_name, plan, password_hash, created_at')
-      .eq('email', email)
-      .maybeSingle();
+    const cols = 'id, email, phone, business_name, plan, password_hash, created_at';
+    let { data, error } = await supabase.from('users').select(cols).eq('email', email).maybeSingle();
+    if (!error && !data && normalizeEmail(email) !== email) {
+      ({ data, error } = await supabase.from('users').select(cols).eq('email', normalizeEmail(email)).maybeSingle());
+    }
 
     if (error || !data) return res.status(401).json({ error: 'Invalid email or password' });
 
@@ -1427,15 +1523,16 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
 
 app.post('/api/auth/forgot-password', async (req, res) => {
   try {
-    const { email } = req.body;
+    const email = typeof req.body.email === 'string' ? req.body.email.trim() : '';
     if (!email) return res.status(400).json({ error: 'Email required' });
 
     const { data: user } = await supabase.from('users').select('id, email, business_name').eq('email', email).maybeSingle();
     // Always respond success to prevent email enumeration
     if (!user) return res.json({ success: true, message: 'If that email exists, an OTP has been sent.' });
 
-    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    const otp = String(crypto.randomInt(100000, 1000000));
     const expires_at = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+    resetAttempts.delete(email);
 
     // Invalidate previous tokens for this email
     await supabase.from('password_reset_tokens').update({ used: true }).eq('email', email).eq('used', false);
@@ -1467,9 +1564,16 @@ app.post('/api/auth/forgot-password', async (req, res) => {
 
 app.post('/api/auth/reset-password', async (req, res) => {
   try {
-    const { email, otp, new_password } = req.body;
+    const { otp, new_password } = req.body;
+    const email = typeof req.body.email === 'string' ? req.body.email.trim() : '';
     if (!email || !otp || !new_password) return res.status(400).json({ error: 'Email, OTP, and new password required' });
-    if (new_password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    if (typeof new_password !== 'string' || new_password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    // Five wrong codes burn every open code for this email (a 6-digit code
+    // must not be guessable by spreading attempts over many IPs).
+    const tries = resetAttempts.get(email);
+    if (tries && tries.count >= 5 && Date.now() - tries.first < 15 * 60 * 1000) {
+      return res.status(429).json({ error: 'Too many wrong codes. Request a new code.' });
+    }
 
     const { data: token } = await supabase
       .from('password_reset_tokens')
@@ -1482,7 +1586,14 @@ app.post('/api/auth/reset-password', async (req, res) => {
       .limit(1)
       .maybeSingle();
 
-    if (!token) return res.status(400).json({ error: 'Invalid or expired OTP' });
+    if (!token) {
+      const t = resetAttempts.get(email);
+      const next = t && Date.now() - t.first < 15 * 60 * 1000 ? { first: t.first, count: t.count + 1 } : { first: Date.now(), count: 1 };
+      resetAttempts.set(email, next);
+      if (next.count >= 5) await supabase.from('password_reset_tokens').update({ used: true }).eq('email', email).eq('used', false);
+      return res.status(400).json({ error: 'Invalid or expired OTP' });
+    }
+    resetAttempts.delete(email);
 
     const password_hash = await bcrypt.hash(new_password, 12);
     await Promise.all([
@@ -1491,6 +1602,29 @@ app.post('/api/auth/reset-password', async (req, res) => {
     ]);
 
     res.json({ success: true, message: 'Password reset successfully. Please log in.' });
+  } catch (error) {
+    logRouteError(req, error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Change password while signed in: the current password is required, so a
+// stolen session alone cannot lock the owner out.
+app.post('/api/auth/change-password', authLimiter, authMiddleware, async (req, res) => {
+  try {
+    const { current_password, new_password } = req.body || {};
+    if (typeof current_password !== 'string' || !current_password) return res.status(400).json({ error: 'Enter your current password.' });
+    if (typeof new_password !== 'string' || new_password.length < 8) return res.status(400).json({ error: 'The new password must be at least 8 characters.' });
+    if (new_password === current_password) return res.status(400).json({ error: 'The new password is the same as the current one.' });
+    const { data: user, error } = await supabase.from('users').select('id, password_hash').eq('id', req.user.userId).maybeSingle();
+    if (error) throw error;
+    if (!user || !user.password_hash || !(await bcrypt.compare(current_password, user.password_hash))) {
+      return res.status(400).json({ error: 'The current password is not correct.' });
+    }
+    const password_hash = await bcrypt.hash(new_password, 12);
+    const { error: upErr } = await supabase.from('users').update({ password_hash, updated_at: new Date() }).eq('id', req.user.userId);
+    if (upErr) throw upErr;
+    res.json({ success: true, message: 'Password changed.' });
   } catch (error) {
     logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
@@ -1820,130 +1954,127 @@ app.get('/api/invoice/:invoiceId', authMiddleware, async (req, res) => {
 // EXCEL / XLSX SMART IMPORT
 // ============================================
 
-app.post('/api/import/excel', authMiddleware, upload.single('file'), async (req, res) => {
+// Spreadsheet import of invoices/receivables from any bookkeeping software.
+// lib/import/receivablesMapper.js recognises the export (Tally, Busy, Marg,
+// Vyapar, Zoho Books, QuickBooks, Xero, Khatabook, or generic), maps the
+// columns itself, and says why any row was skipped. The same file (by
+// content hash) is never imported twice for a company. /preview writes
+// nothing; /excel imports.
+const receivablesMapper = require('./lib/import/receivablesMapper');
+
+function readSpreadsheet(file) {
+  const name = (file.originalname || '').toLowerCase();
+  if (name.endsWith('.xlsx') || name.endsWith('.xls') || (file.mimetype || '').includes('spreadsheet') || (file.mimetype || '').includes('excel')) {
+    const XLSX = require('xlsx');
+    const wb = XLSX.read(file.buffer, { type: 'buffer', cellDates: true, sheetRows: 5021 });
+    return { fileType: 'XLSX', matrix: XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: '', raw: true }) };
+  }
+  return { fileType: 'CSV', matrix: receivablesMapper.parseDelimited(file.buffer.toString('utf-8')) };
+}
+
+function mapUpload(file) {
+  const { fileType, matrix } = readSpreadsheet(file);
+  if (matrix.length > 5020) return { error: 'File has too many rows. Please import 5000 rows or fewer.' };
+  const result = receivablesMapper.mapTable(matrix);
+  return { fileType, ...result };
+}
+
+function importSummary(m) {
+  return {
+    source: m.source.name,                     // e.g. "Zoho Books", or null for a generic sheet
+    headerRow: m.headerRow,
+    columns: m.mapping.byField,                // which column became which field
+    confidence: m.mapping.confidence,
+    rows: m.invoices.length,
+    skipped: m.skipped.length,
+    skippedReasons: m.skipped.slice(0, 20),
+  };
+}
+
+app.post('/api/import/preview', authMiddleware, upload.single('file'), async (req, res) => {
   try {
-    const userId = req.user.userId;
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    let m;
+    try { m = mapUpload(req.file); } catch { return res.status(400).json({ error: 'Could not read this file. Save it as .xlsx or .csv and try again.' }); }
+    if (m.error) return res.status(400).json({ error: m.error });
+    const hash = require('crypto').createHash('sha256').update(req.file.buffer).digest('hex');
+    const { rows } = await getPool().query(`SELECT status FROM file_import_batches WHERE user_id = $1 AND file_content_hash = $2`, [req.user.userId, hash]);
+    res.json({ success: true, ...importSummary(m), alreadyImported: rows[0]?.status === 'COMPLETED', sample: m.invoices.slice(0, 10) });
+  } catch (err) {
+    console.error('Import preview error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
-    const ext = (req.file.originalname || '').toLowerCase();
-    let rows = [];
+app.post('/api/import/excel', authMiddleware, upload.single('file'), async (req, res) => {
+  const userId = req.user.userId;
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  let m;
+  try { m = mapUpload(req.file); } catch { return res.status(400).json({ error: 'Could not read this file. Save it as .xlsx or .csv and try again.' }); }
+  if (m.error) return res.status(400).json({ error: m.error });
+  if (m.mapping.confidence === 'insufficient' || m.invoices.length === 0) {
+    return res.status(400).json({
+      error: m.mapping.confidence === 'insufficient'
+        ? 'Could not find a customer name and an amount column in this file.'
+        : 'No rows could be imported from this file.',
+      ...importSummary(m),
+      headers: m.headers,
+      hint: 'Export invoices or bills receivable with the customer (party) name and the amount or balance owed.',
+    });
+  }
 
-    if (ext.endsWith('.xlsx') || ext.endsWith('.xls') || req.file.mimetype.includes('spreadsheet') || req.file.mimetype.includes('excel')) {
-      // Parse Excel
-      try {
-        const XLSX = require('xlsx');
-        const wb = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true, sheetRows: 5001 });
-        const ws = wb.Sheets[wb.SheetNames[0]];
-        rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
-      } catch (e) {
-        return res.status(400).json({ error: 'Could not parse Excel file. Please use .xlsx format.' });
-      }
-    } else {
-      // Parse CSV
-      const text = req.file.buffer.toString('utf-8');
-      const lines = text.split('\n').filter(l => l.trim());
-      if (lines.length < 2) return res.status(400).json({ error: 'CSV must have a header row and at least one data row' });
-      const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, '').toLowerCase());
-      rows = lines.slice(1).map(line => {
-        const vals = line.split(',').map(v => v.trim().replace(/"/g, ''));
-        const obj = {};
-        headers.forEach((h, i) => { obj[h] = vals[i] || ''; });
-        return obj;
-      });
+  const pool = getPool();
+  const hash = require('crypto').createHash('sha256').update(req.file.buffer).digest('hex');
+  let batchId = null;
+  try {
+    const { rows: existing } = await pool.query(`SELECT id, status, rows_accepted FROM file_import_batches WHERE user_id = $1 AND file_content_hash = $2`, [userId, hash]);
+    if (existing[0]?.status === 'COMPLETED') {
+      return res.json({ success: true, duplicate: true, imported: 0, ...importSummary(m), message: 'This exact file was already imported — nothing was added twice.' });
     }
-    if (rows.length > 5000) return res.status(400).json({ error: 'File has too many rows. Please import 5000 rows or fewer.' });
+    const { rows: b } = await pool.query(
+      `INSERT INTO file_import_batches (user_id, source_system, filename, file_type, file_content_hash, mapping_profile, status, rows_total)
+       VALUES ($1, 'file_import', $2, $3, $4, $5, 'STARTED', $6)
+       ON CONFLICT (user_id, file_content_hash) DO UPDATE SET status = 'STARTED', started_at = now() RETURNING id`,
+      [userId, String(req.file.originalname || '').slice(0, 200), m.fileType, hash, m.source.id, m.invoices.length + m.skipped.length]);
+    batchId = b[0].id;
 
-    // Smart column detection — try many possible header names
-    const findCol = (obj, candidates) => {
-      const keys = Object.keys(obj).map(k => k.toLowerCase().trim());
-      for (const c of candidates) {
-        const match = keys.find(k => k.includes(c));
-        if (match) return obj[Object.keys(obj).find(k => k.toLowerCase().trim() === match)];
-      }
-      return null;
-    };
-
-    const invoices = [];
-    const skipped = [];
-
-    for (const row of rows) {
-      const name = findCol(row, ['customer', 'party', 'client', 'debtor', 'buyer', 'name', 'company']);
-      const amountRaw = findCol(row, ['amount', 'outstanding', 'due', 'balance', 'pending', 'invoice_amount', 'receivable']);
-      const dateRaw = findCol(row, ['date', 'invoice_date', 'bill_date', 'due_date', 'created']);
-      const phone = findCol(row, ['phone', 'mobile', 'contact', 'number', 'whatsapp']);
-      const statusRaw = findCol(row, ['status', 'payment_status', 'paid', 'cleared']);
-
-      if (!name || !amountRaw) { skipped.push(row); continue; }
-
-      const amount = parseFloat(String(amountRaw).replace(/[₹,\s]/g, ''));
-      if (isNaN(amount) || amount <= 0) { skipped.push(row); continue; }
-
-      // Date parsing — handle DD/MM/YYYY, MM/DD/YYYY, YYYY-MM-DD, serial numbers
-      let invoiceDate = new Date();
-      if (dateRaw) {
-        if (dateRaw instanceof Date) {
-          invoiceDate = dateRaw;
-        } else if (typeof dateRaw === 'number') {
-          // Excel serial date
-          invoiceDate = new Date(Math.round((dateRaw - 25569) * 86400 * 1000));
-        } else {
-          const str = String(dateRaw).trim();
-          // Try DD/MM/YYYY
-          const ddmm = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
-          if (ddmm) invoiceDate = new Date(`${ddmm[3]}-${ddmm[2].padStart(2,'0')}-${ddmm[1].padStart(2,'0')}`);
-          else invoiceDate = new Date(str);
-          if (isNaN(invoiceDate.getTime())) invoiceDate = new Date();
-        }
-      }
-
-      const daysOverdue = Math.max(0, Math.floor((Date.now() - invoiceDate.getTime()) / 86400000));
-      const statusLower = String(statusRaw || '').toLowerCase();
-      const paymentStatus = statusLower.includes('paid') || statusLower.includes('clear') ? 'Paid' : 'Pending';
-
-      invoices.push({
-        user_id: userId,
-        customer_name: String(name).trim(),
-        customer_phone: phone ? String(phone).replace(/\D/g, '').slice(-10) : null,
-        invoice_amount: amount,
-        invoice_date: invoiceDate.toISOString().split('T')[0],
-        payment_status: paymentStatus,
-        days_overdue: paymentStatus === 'Paid' ? 0 : daysOverdue,
-        created_at: new Date(),
-      });
-    }
-
-    if (invoices.length === 0) {
-      return res.status(400).json({
-        error: 'No valid rows found. Make sure your file has columns: Customer Name, Amount, Date.',
-        skipped: skipped.length,
-        hint: 'Column names can be: customer_name, party, amount, outstanding, invoice_date, date, phone, mobile',
-      });
-    }
-
-    const { data, error } = await supabase.from('invoices').insert(invoices).select('id');
+    const records = m.invoices.map((inv) => ({
+      user_id: userId,
+      customer_name: inv.customer_name,
+      customer_phone: inv.customer_phone,
+      customer_email: inv.customer_email,
+      invoice_number: inv.invoice_number,
+      invoice_amount: inv.invoice_amount,
+      invoice_date: inv.invoice_date || new Date().toISOString().slice(0, 10),
+      due_date: inv.due_date,
+      payment_status: inv.payment_status,
+      days_overdue: inv.days_overdue,
+      source_type: 'file_import',
+      created_at: new Date(),
+    }));
+    const { error } = await supabase.from('invoices').insert(records);
     if (error) throw error;
 
+    await pool.query(
+      `UPDATE file_import_batches SET status = 'COMPLETED', completed_at = now(), rows_accepted = $2, rows_rejected = $3 WHERE id = $1`,
+      [batchId, records.length, m.skipped.length]);
     res.json({
       success: true,
-      imported: invoices.length,
-      skipped: skipped.length,
-      message: `✅ ${invoices.length} invoices imported${skipped.length ? `, ${skipped.length} rows skipped (missing name/amount)` : ''}`,
+      imported: records.length,
+      ...importSummary(m),
+      message: `${records.length} invoices imported${m.source.name ? ` from a ${m.source.name} export` : ''}${m.skipped.length ? `; ${m.skipped.length} rows skipped` : ''}.`,
     });
   } catch (err) {
-    console.error('Import error:', err);
+    if (batchId) await pool.query(`UPDATE file_import_batches SET status = 'FAILED', error_message = $2 WHERE id = $1`, [batchId, String(err.message).slice(0, 500)]).catch(() => {});
+    console.error('Import error:', err.message);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Quick manual add — add a single customer/invoice
-// NOTE: the real /api/import/tally route (connector-authenticated, via
-// connectorOrUserAuth) lives further down this file next to the device
-// enrollment routes. It used to be shadowed by an older, JWT-only,
-// feature-flag-gated duplicate registered here — since Express dispatches
-// to the FIRST matching route, that duplicate silently ate every request
-// and made the real, connectorOrUserAuth-protected handler dead code (any
-// VantroDevice-authenticated connector request 401'd here instead of ever
-// reaching it). Removed 2026-09-23 so the real handler is reachable.
+// NOTE: /api/import/tally lives in lib/routes/tallyConnector.js. An older
+// JWT-only duplicate registered here used to shadow it (Express dispatches to
+// the first matching route); removed 2026-09-23.
 
 app.post('/api/import/manual', authMiddleware, async (req, res) => {
   try {
@@ -5518,82 +5649,12 @@ Rules: numbers only, no currency symbols or commas. Dates must be YYYY-MM-DD.`;
   }
 });
 
-// --- Local connector enrollment and device authentication -------------------
-// Re-enabled 2026-09-22: lib/domain/ingestion/deviceEnrollment.js and the
-// connector_devices/connector_enrollments schema (migrations/047_connector_devices.sql)
-// now exist for real (bcrypt-hashed device secrets, TTL'd claim-once
-// enrollment codes). See that migration file for the full design rationale.
-const { createEnrollment, claimEnrollment, authenticateDevice, listDevices, revokeDevice } = require('./lib/domain/ingestion/deviceEnrollment');
-const connectorClaimLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false });
+// --- Local connector (Tally bridge / desktop connector host) routes ---------
+// Pairing, device tokens, sync runs, heartbeat and /api/import/tally live in
+// lib/routes/tallyConnector.js.
+const { tallyConnectorRouter } = require('./lib/routes/tallyConnector');
+app.use('/api', tallyConnectorRouter({ pool: getPool(), supabase, authMiddleware }));
 
-function connectorOrUserAuth(req, res, next) {
-  const header = String(req.headers.authorization || '');
-  const match = header.match(/^VantroDevice\s+([0-9a-f-]{36})\.([A-Za-z0-9_-]{32,})$/i);
-  if (match) {
-    const [, deviceId, secret] = match;
-    authenticateDevice(deviceId, secret)
-      .then((device) => {
-        if (!device) return res.status(401).json({ error: 'Invalid or revoked device credential' });
-        req.user = { userId: device.userId };
-        req.connectorDevice = device;
-        next();
-      })
-      .catch((error) => {
-        console.error('[connector device auth]', error);
-        res.status(503).json({ error: 'Unable to authenticate connector device' });
-      });
-    return;
-  }
-  return authMiddleware(req, res, next);
-}
-
-app.post('/api/connectors/tally/enrollment', authMiddleware, async (req, res) => {
-  try {
-    const enrollment = await createEnrollment(req.user.userId);
-    res.status(201).json({ success: true, enrollmentCode: enrollment.enrollmentCode, expiresAt: enrollment.expiresAt });
-  } catch (error) {
-    console.error('[connector enrollment]', error);
-    res.status(503).json({ error: 'Unable to create connector enrollment' });
-  }
-});
-
-app.post('/api/connectors/tally/claim', connectorClaimLimiter, async (req, res) => {
-  try {
-    const { enrollmentCode, deviceName } = req.body || {};
-    const device = await claimEnrollment(enrollmentCode, deviceName);
-    res.status(201).json({ success: true, deviceId: device.deviceId, deviceSecret: device.deviceSecret, apiBase: `${req.protocol}://${req.get('host')}` });
-  } catch (error) {
-    const message = String(error.message || '');
-    const safe = /Enrollment|device name/i.test(message) ? message : 'Unable to claim connector enrollment';
-    res.status(400).json({ error: safe });
-  }
-});
-
-// Self-service visibility + kill switch for connector devices — a device
-// secret has no expiry (see deviceEnrollment.js), so this list+revoke pair
-// is the only way a tenant can see what's connected or shut one off without
-// a direct DB edit. Always authMiddleware (a device credential must never
-// be able to list or revoke devices, including itself).
-app.get('/api/connectors/tally/devices', authMiddleware, async (req, res) => {
-  try {
-    const devices = await listDevices(req.user.userId);
-    res.json({ success: true, devices });
-  } catch (error) {
-    console.error('[connector devices list]', error);
-    res.status(503).json({ error: 'Unable to list connector devices' });
-  }
-});
-
-app.post('/api/connectors/tally/devices/:deviceId/revoke', authMiddleware, async (req, res) => {
-  try {
-    const revoked = await revokeDevice(req.user.userId, req.params.deviceId);
-    if (!revoked) return res.status(404).json({ error: 'Device not found or already revoked' });
-    res.json({ success: true });
-  } catch (error) {
-    console.error('[connector device revoke]', error);
-    res.status(503).json({ error: 'Unable to revoke connector device' });
-  }
-});
 // --- Audit (read-only; audit_logs is written by lib/services/orchestrator/
 // audit.service.js on every financial change — this is the first read path
 // exposed for it). No new table, no migration needed. -----------------------
@@ -5685,95 +5746,6 @@ app.get('/api/agent-runs', authMiddleware, async (req, res) => {
   }
 });
 
-// --- Data Connections (Tally / file import / future integrations) ---------
-const {
-  getConnections,
-  upsertConnectionStatus,
-  VALID_SOURCE_TYPES,
-  VALID_STATUSES,
-} = require('./lib/domain/ingestion/connections');
-
-app.get('/api/connections', authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const connections = await getConnections(userId);
-    res.json({ success: true, connections });
-  } catch (error) {
-    console.error('[connections list]', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.post('/api/connections/heartbeat', connectorOrUserAuth, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const { sourceType, status, lastSyncAt, lastSyncError } = req.body || {};
-
-    if (!sourceType || !VALID_SOURCE_TYPES.includes(sourceType)) {
-      return res.status(400).json({ error: `sourceType must be one of ${VALID_SOURCE_TYPES.join(', ')}` });
-    }
-    if (!status || !VALID_STATUSES.includes(status)) {
-      return res.status(400).json({ error: `status must be one of ${VALID_STATUSES.join(', ')}` });
-    }
-
-    const connection = await upsertConnectionStatus(userId, sourceType, status, {
-      lastSyncAt: lastSyncAt || new Date(),
-      lastSyncError: lastSyncError ?? null,
-    });
-    res.json({ success: true, connection });
-  } catch (error) {
-    console.error('[connections heartbeat]', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// POST /api/import/tally — accepts already-extracted, already-parsed Tally
-// vouchers (contract: { vouchers: [{ type, date, party, voucherNo, amount,
-// items }] }, date as ISO or Tally's yyyymmdd) from the local Tally
-// connector script (tally-sync.mjs, runs on the shop PC since Tally itself
-// has no public API a hosted backend could reach). Commits via
-// commitTallyVouchers — the same raw_observations/entity-resolution
-// contract csvImport.js uses, not a parallel scheme. sourceQuality is
-// 'REAL' unconditionally: this route only ever receives genuine exports
-// from a live Tally instance, never seeded/demo data.
-app.post('/api/import/tally', connectorOrUserAuth, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const { vouchers } = req.body || {};
-    // Keep an explicit route-level cap as a fast, documented guard before
-    // serializing or opening any database work for a large connector request.
-    if (!Array.isArray(vouchers)) return res.status(400).json({ error: 'vouchers must be an array' });
-    if (vouchers.length > 5000) return res.status(400).json({ error: 'too many vouchers in one request (max 5000)' });
-
-    // NOTE: this used to require './lib/domain/ingestion/tallyBatchContract'
-    // and './lib/domain/ingestion/adapters/tallyCommit' — neither module
-    // exists in this repo (MODULE_NOT_FOUND on every real request, so this
-    // route always 500'd once it actually became reachable — see the
-    // removed-duplicate-route note near /api/import/manual above). The real,
-    // already-built, idempotent multi-voucher-type writer is
-    // lib/services/tallyImport.service.js (Sales->invoices,
-    // Purchase->purchases, Receipt/Payment->bank_transactions, items->
-    // products/stock_movements) — it's what the OLD duplicate route used to
-    // call under JWT-only auth. Wired in here instead so connector-device
-    // requests (VantroDevice auth) actually get a working importer.
-    const { importTallyVouchers } = require('./lib/services/tallyImport.service');
-    const result = await importTallyVouchers(supabase, userId, vouchers);
-    if (result.error) return res.status(result.status || 400).json({ error: result.error });
-
-    const { upsertConnectionStatus } = require('./lib/domain/ingestion/connections');
-    const erroredAll = result.rejected?.length > 0 && Object.values(result.imported || {}).every((n) => n === 0);
-    await upsertConnectionStatus(userId, 'TALLY', erroredAll ? 'ERROR' : 'CONNECTED', {
-      lastSyncAt: new Date(),
-      lastSyncError: result.rejected?.length ? `${result.rejected.length} voucher(s) rejected` : null,
-    }).catch((err) => console.error('[import/tally] connection status update failed', err));
-
-    res.json(result);
-  } catch (error) {
-    console.error('[import/tally]', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
 app.get('/api/health', (req, res) => {
   res.json({
     success: true,
@@ -5782,6 +5754,13 @@ app.get('/api/health', (req, res) => {
     timestamp: new Date().toISOString(),
     requestId: req.requestId
   });
+});
+
+// Which build is live and whether its database matches: release, git SHA, API
+// level the apps must speak, and the migration level expected vs applied.
+// Public on purpose (no secrets, no tenant data): it is the first post-deploy check.
+app.get('/api/version', async (req, res) => {
+  res.json({ success: true, ...(await require('./lib/release').versionReport(pgPool)) });
 });
 
 app.get('/api/live', (req, res) => {
@@ -6383,7 +6362,7 @@ CREATE INDEX IF NOT EXISTS idx_bank_transactions_status ON bank_transactions(use
 const AI_TOOLS = [
   { type:'function', function:{ name:'get_summary', description:'Get business overview: total invoices, outstanding amount, recovery rate, total customers', parameters:{ type:'object', properties:{} } } },
   { type:'function', function:{ name:'get_invoices', description:'Get invoices list, optionally filtered by status or customer name', parameters:{ type:'object', properties:{ status:{ type:'string', description:'Pending, Paid, or all' }, customer_name:{ type:'string', description:'Filter by customer (partial match)' }, limit:{ type:'number', description:'Max records to return' } } } } },
-  { type:'function', function:{ name:'mark_invoice_paid', description:'Mark a specific invoice as paid using invoice_id or customer_name (marks the most overdue one)', parameters:{ type:'object', properties:{ invoice_id:{ type:'string' }, customer_name:{ type:'string' } } } } },
+  { type:'function', function:{ name:'mark_invoice_paid', description:'Find the invoice the owner says was paid (by invoice_id or customer_name) so the owner can mark it paid themselves. This tool never changes the invoice.', parameters:{ type:'object', properties:{ invoice_id:{ type:'string' }, customer_name:{ type:'string' } } } } },
   { type:'function', function:{ name:'get_prospects', description:'Get CRM prospects, optionally filtered by stage', parameters:{ type:'object', properties:{ status:{ type:'string', description:'cold, contacted, trial, engaged, paid, churned, or all' } } } } },
   { type:'function', function:{ name:'add_prospect', description:'Add a new prospect to the CRM pipeline', parameters:{ type:'object', properties:{ name:{ type:'string' }, phone:{ type:'string' }, business_type:{ type:'string' }, location:{ type:'string' }, amount_stuck:{ type:'number' } }, required:['name'] } } },
   { type:'function', function:{ name:'update_prospect_status', description:'Move a prospect to a different CRM stage', parameters:{ type:'object', properties:{ prospect_name:{ type:'string', description:'Name of the prospect to update' }, status:{ type:'string', enum:['cold','contacted','trial','engaged','paid','churned'] } }, required:['prospect_name','status'] } } },
@@ -6396,13 +6375,16 @@ const AI_TOOLS = [
   { type:'function', function:{ name:'send_whatsapp', description:'Compose and prepare a WhatsApp message to any contact (customer or supplier). The message will be opened ready-to-send in WhatsApp.', parameters:{ type:'object', properties:{ to:{ type:'string', description:'Recipient name' }, phone:{ type:'string', description:'Phone number (digits only or with spaces)' }, message:{ type:'string', description:'The full message text — write it naturally in Hindi/English mix if appropriate' } }, required:['to','phone','message'] } } },
   { type:'function', function:{ name:'send_collection_reminder', description:'Compose a tailored payment reminder WhatsApp message for an overdue customer', parameters:{ type:'object', properties:{ customer_name:{ type:'string' }, tone:{ type:'string', enum:['friendly','firm','urgent'], description:'Tone of the message' } }, required:['customer_name'] } } },
   { type:'function', function:{ name:'send_bulk_reminders', description:'Prepare WhatsApp payment reminders for ALL overdue customers at once (or filtered by min days overdue)', parameters:{ type:'object', properties:{ min_days:{ type:'number', description:'Only customers overdue by at least this many days (default 1)' }, tone:{ type:'string', enum:['friendly','firm','urgent'] } } } } },
-  { type:'function', function:{ name:'place_order_with_supplier', description:'Create a purchase order for a supplier and compose a WhatsApp order message to them', parameters:{ type:'object', properties:{ supplier_name:{ type:'string', description:'Name of the supplier' }, items:{ type:'array', items:{ type:'object', properties:{ name:{type:'string'}, quantity:{type:'number'}, unit:{type:'string',description:'e.g. boxes, kg, units'} } }, description:'Items to order' }, notes:{ type:'string', description:'Any special instructions' } }, required:['supplier_name','items'] } } },
+  { type:'function', function:{ name:'place_order_with_supplier', description:'Compose a draft WhatsApp order message to a supplier for the owner to send. Records nothing.', parameters:{ type:'object', properties:{ supplier_name:{ type:'string', description:'Name of the supplier' }, items:{ type:'array', items:{ type:'object', properties:{ name:{type:'string'}, quantity:{type:'number'}, unit:{type:'string',description:'e.g. boxes, kg, units'} } }, description:'Items to order' }, notes:{ type:'string', description:'Any special instructions' } }, required:['supplier_name','items'] } } },
 ];
 
 async function groqChat(messages, tools, toolChoice = 'auto') {
   const body = { model:'llama-3.3-70b-versatile', max_tokens:1500, temperature:0.2, messages };
   if (tools?.length) { body.tools = tools; body.tool_choice = toolChoice; }
-  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+  // GROQ_BASE_URL lets a local OpenAI-compatible stub stand in for Groq in
+  // tests and pilot:readiness; it is ignored on the production deployment.
+  const base = (!require('./lib/config/deployEnv').isProductionDeployment() && process.env.GROQ_BASE_URL) || 'https://api.groq.com/openai/v1';
+  const res = await fetch(`${base}/chat/completions`, {
     method:'POST',
     headers:{ 'Content-Type':'application/json', 'Authorization':`Bearer ${process.env.GROQ_API_KEY}` },
     body: JSON.stringify(body)
@@ -6611,10 +6593,25 @@ function chatCompletion(messages, tools, toolChoice = 'auto') {
   return groqChat(messages, tools, toolChoice);
 }
 
+const { allowedToolsFor } = require('./lib/ai/assistantTools');
+
 app.post('/api/ai-chat', authMiddleware, async (req, res) => {
-  const { messages, business_name } = req.body;
+  const { business_name } = req.body;
+  let { messages } = req.body;
   const user_id = authenticatedUserId(req);
   if (!user_id || !messages) return res.status(400).json({ error: 'Missing messages' });
+  const readOnly = !!req.user?.sid || req.body?.mode === 'read_only';
+  const allowedTools = allowedToolsFor({ native: readOnly });
+  {
+    // Only the conversation itself, on every surface: a client cannot inject
+    // system or tool turns (the web path used to pass them through).
+    if (!Array.isArray(messages)) return res.status(400).json({ error: 'messages must be an array' });
+    messages = messages
+      .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
+      .slice(-20)
+      .map((m) => ({ role: m.role, content: m.content.slice(0, 4000) }));
+    if (!messages.length || messages[messages.length - 1].role !== 'user') return res.status(400).json({ error: 'The last message must be from the user' });
+  }
 
   // Pre-fetch top 5 overdue invoices so first response is instant and data-aware
   let overdueContext = '';
@@ -6671,8 +6668,12 @@ When generating WhatsApp messages, call scripts, or any communication: write EXA
 
   const system = `You are ${ownerName ? ownerName + "'s" : 'Vantro'} AI co-founder, built into Vantro Flow for ${business_name || 'this business'}. You help Indian MSME owners manage collections, invoices, CRM, inventory, and cash flow.
 
-You have tools: fetch data, mark invoices paid, add prospects, get forecasts, navigate pages.
-Be specific, use ₹ formatting, and when asked to do something — DO it with tools, don't just explain.
+${readOnly
+  ? `You have read-only tools: look up invoices, overdue customers, summary, inventory, calls, suppliers, prospects and the cash forecast. You cannot change anything from here: if the owner asks you to mark something paid, send a message, place an order or change a record, say that this is done from the Decisions screen or the Starlane website, and never claim you did it.
+Be specific and use ₹ formatting.`
+  : `You have tools to look things up (invoices, overdue customers, summary, inventory, calls, suppliers, prospects, cash forecast), to navigate, and to DRAFT WhatsApp messages — a draft is a link the owner opens and sends themselves; you never send anything.
+You cannot change records: you cannot mark an invoice paid, add or move a prospect, or place an order. If asked, say plainly that the owner does that in the app (Collections, CRM, Purchases) and never claim you did it.
+Be specific and use ₹ formatting.`}
 Summarise actions clearly after doing them.
 
 HARD RULE — never fabricate data you don't have: You only know what your tools return from this business's actual connected data (invoices, prospects, inventory, calls, suppliers, cash flow). You have no access to competitor data, market pricing, external market research, or anything outside this business's own records.
@@ -6690,6 +6691,7 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
   let navigateTo = null;
 
   const executeTool = async (name, args) => {
+    if (!allowedTools.has(name)) return { error: `${name} is not available — the assistant cannot change records${readOnly ? ' and is read-only in the apps' : ''}.` };
     try {
       switch(name) {
         case 'get_summary': {
@@ -6710,39 +6712,23 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
           const { data } = await q;
           const withLiveOverdue = (data || []).map(i => ({ ...i, days_overdue: calculateDaysOverdue(i.due_date || i.invoice_date, i.payment_status === 'Paid') }));
           withLiveOverdue.sort((a, b) => b.days_overdue - a.days_overdue);
-          return withLiveOverdue.slice(0, args.limit || 20);
+          return withLiveOverdue.slice(0, Math.min(Math.max(Number(args.limit) || 20, 1), 50));
         }
         case 'mark_invoice_paid': {
+          // Hard rule: no AI action marks a payment received. The assistant
+          // finds the invoice and points the owner at it; the owner marks it
+          // paid themselves on the invoice page (a human, audited write).
           let inv;
           if (args.invoice_id) {
-            const { data } = await supabase.from('invoices').select('id,customer_name,invoice_amount,payment_status,payment_date,due_date').eq('id',args.invoice_id).eq('user_id',user_id).single();
+            const { data } = await supabase.from('invoices').select('id,customer_name,invoice_amount,payment_status').eq('id',args.invoice_id).eq('user_id',user_id).single();
             inv = data;
           } else if (args.customer_name) {
-            const { data } = await supabase.from('invoices').select('id,customer_name,invoice_amount,payment_status,payment_date,due_date').eq('user_id',user_id).ilike('customer_name',`%${args.customer_name}%`).eq('payment_status','Pending').order('days_overdue',{ascending:false}).limit(1);
+            const { data } = await supabase.from('invoices').select('id,customer_name,invoice_amount,payment_status').eq('user_id',user_id).ilike('customer_name',`%${args.customer_name}%`).eq('payment_status','Pending').order('days_overdue',{ascending:false}).limit(1);
             inv = data?.[0];
           }
           if (!inv) return { error: 'Invoice not found' };
-          const newPaymentDate = new Date().toISOString().split('T')[0];
-          await supabase.from('invoices').update({ payment_status:'Paid', payment_date:newPaymentDate, payment_amount:inv.invoice_amount }).eq('id',inv.id).eq('user_id',user_id);
-          // Global Context + Temporal Foundation, Part E — additive history
-          // write alongside the existing UPDATE above. Never blocks the
-          // actual business operation on failure.
-          try {
-            const { recordEntityStateChange } = require('./lib/domain/temporal/entityStateHistory');
-            await recordEntityStateChange({
-              userId: user_id,
-              entityType: 'invoice',
-              entityId: inv.id,
-              eventType: 'payment_received',
-              previousRow: inv,
-              newRow: { ...inv, payment_status: 'Paid', payment_date: newPaymentDate, payment_amount: inv.invoice_amount },
-              fields: ['payment_status', 'payment_date', 'payment_amount'],
-              source: 'server.js:mark_invoice_paid',
-              actor: 'ai_assistant',
-            });
-          } catch (histErr) { console.error('[entity_state_history] mark_invoice_paid write failed:', histErr.message); }
-          actions.push(`✅ Marked ${inv.customer_name} invoice (₹${Number(inv.invoice_amount).toLocaleString('en-IN')}) as paid`);
-          return { success:true, message:`Marked ${inv.customer_name} as paid`, amount:inv.invoice_amount };
+          actions.push(`🧾 Found ${inv.customer_name}'s invoice (₹${Number(inv.invoice_amount).toLocaleString('en-IN')}). Open it to mark it paid yourself.`);
+          return { success:false, requires_human:true, invoice_id: inv.id, message:`Starlane does not mark payments received. Tell the owner to open invoice ${inv.id} and mark it paid themselves if the money has arrived.` };
         }
         case 'get_prospects': {
           let q = supabase.from('prospects').select('id,name,phone,status,business_type,location,amount_stuck,created_at').eq('user_id',user_id);
@@ -6775,7 +6761,7 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
           return { total_products:prd.length, stock_value:`₹${stockValue.toLocaleString('en-IN')}`, low_stock:lowStock.map(p=>({name:p.name,stock:p.current_stock,alert:p.low_stock_alert})), out_of_stock:outOfStock.map(p=>p.name), products:prd.map(p=>({name:p.name,stock:p.current_stock,unit_price:`₹${p.unit_price}`})) };
         }
         case 'get_calls': {
-          const { data } = await supabase.from('call_logs').select('customer_name,did_pick_up,notes,promised_payment_date,created_at').eq('user_id',user_id).order('created_at',{ascending:false}).limit(args.limit||15);
+          const { data } = await supabase.from('call_logs').select('customer_name,did_pick_up,notes,promised_payment_date,created_at').eq('user_id',user_id).order('created_at',{ascending:false}).limit(Math.min(Math.max(Number(args.limit) || 15, 1), 50));
           const cls = data||[];
           const pickupRate = cls.length ? Math.round(cls.filter(c=>c.did_pick_up).length/cls.length*100) : 0;
           return { total:cls.length, pickup_rate:`${pickupRate}%`, promises:cls.filter(c=>c.promised_payment_date).length, recent:cls.slice(0,10) };
@@ -6877,19 +6863,12 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
           const itemLines = (args.items||[]).map(it=>`  • ${it.name} — ${it.quantity} ${it.unit||'units'}`).join('\n');
           const totalItems = (args.items||[]).length;
           const msg = `Namaste ${args.supplier_name} ji 🙏\n\nHumein aapki taraf se yeh order chahiye:\n\n${itemLines}\n\n${args.notes ? `Note: ${args.notes}\n\n` : ''}Kripya availability aur delivery time confirm karein.\n\nDhanyawaad!\n— ${business_name||'Vantro Flow'}`;
-          // Log as stock movement "ordered"
-          if (supplier) {
-            for (const item of (args.items||[])) {
-              const { data: prod } = await supabase.from('products').select('id,name').eq('user_id',user_id).ilike('name',`%${item.name}%`).limit(1);
-              if (prod?.[0]) {
-                await supabase.from('stock_movements').insert([{ user_id, product_id:prod[0].id, movement_type:'order', quantity:item.quantity, notes:`Order placed with ${args.supplier_name}${args.notes?'. '+args.notes:''}`, created_at:new Date() }]).catch(()=>{});
-              }
-            }
-          }
+          // Draft only: the assistant never records an order or a stock
+          // movement. The owner sends the message and records the order.
           const url = phone ? `https://wa.me/91${phone}?text=${encodeURIComponent(msg)}` : null;
           if (url) { waLinks.push({ to: args.supplier_name, phone, message: msg, url }); actions.push(`📦 Order WhatsApp ready for ${args.supplier_name}`); }
           else { actions.push(`📦 Order composed for ${args.supplier_name} (no phone on file)`); }
-          return { success:true, supplier: args.supplier_name, items_ordered: totalItems, message_preview: msg.substring(0,120), whatsapp_url: url || 'No phone number on file for this supplier', order_logged: !!supplier };
+          return { success:true, supplier: args.supplier_name, items_ordered: totalItems, message_preview: msg.substring(0,120), whatsapp_url: url || 'No phone number on file for this supplier', order_logged: false, note: 'Draft only. Nothing was recorded; send the message and record the order yourself.' };
         }
         default: return { error:`Unknown tool: ${name}` };
       }
@@ -6902,7 +6881,7 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
 
     while (iteration < maxIter) {
       iteration++;
-      const choice = await chatCompletion(chatMessages, AI_TOOLS);
+      const choice = await chatCompletion(chatMessages, AI_TOOLS.filter((t) => allowedTools.has(t.function.name)));
       const msg = choice.message;
       chatMessages.push(msg);
 
@@ -6933,12 +6912,27 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
 
 app.post('/api/payments/create-link', authMiddleware, async (req, res) => {
   try {
-    const { invoice_id, customer_name, amount, description } = req.body;
-    if (!amount || !customer_name) return res.status(400).json({ error: 'amount and customer_name required' });
+    const { invoice_id, description } = req.body;
+    let { customer_name, amount } = req.body;
+    // A link tied to an invoice must be for this company's invoice, and for
+    // what that invoice says is owed: the webhook later marks the invoice
+    // paid by this link's id.
+    if (invoice_id) {
+      const { data: inv } = await supabase.from('invoices')
+        .select('id, customer_name, invoice_amount, payment_amount, payment_status')
+        .eq('id', invoice_id).eq('user_id', req.user.userId).maybeSingle();
+      if (!inv) return res.status(404).json({ error: 'Invoice not found' });
+      if (inv.payment_status === 'Paid') return res.status(409).json({ error: 'This invoice is already paid' });
+      customer_name = inv.customer_name;
+      amount = Math.max(0, Number(inv.invoice_amount || 0) - Number(inv.payment_amount || 0)) || Number(inv.invoice_amount || 0);
+    }
+    if (!(Number(amount) > 0) || !customer_name) return res.status(400).json({ error: 'amount and customer_name required' });
 
-    // If Razorpay not configured, return a UPI deep link fallback
+    // If Razorpay not configured, return a UPI deep link to the owner's own UPI id.
     if (!razorpay) {
-      const upiId = process.env.BUSINESS_UPI_ID || 'vantro@upi';
+      const { data: owner } = await supabase.from('users').select('upi_id').eq('id', req.user.userId).maybeSingle();
+      const upiId = owner?.upi_id || '';
+      if (!upiId) return res.status(400).json({ error: 'Add your UPI ID in Settings first, so customers pay you and not someone else.', code: 'UPI_ID_MISSING' });
       const upiLink = `upi://pay?pa=${upiId}&pn=${encodeURIComponent(customer_name)}&am=${amount}&tn=${encodeURIComponent(description || 'Invoice Payment')}&cu=INR`;
       return res.json({
         success: true,
@@ -6967,7 +6961,7 @@ app.post('/api/payments/create-link', authMiddleware, async (req, res) => {
         payment_link: paymentLink.short_url,
         payment_link_id: paymentLink.id,
         payment_link_sent_at: new Date()
-      }).eq('id', invoice_id);
+      }).eq('id', invoice_id).eq('user_id', req.user.userId);
     }
 
     res.json({
@@ -7045,7 +7039,7 @@ app.post('/api/collections/send-reminder', authMiddleware, async (req, res) => {
       }
       // UPI deeplink fallback
       if (!payLink) {
-        const upiId = owner?.upi_id || process.env.BUSINESS_UPI_ID || '';
+        const upiId = owner?.upi_id || '';
         if (upiId) {
           payLink = `upi://pay?pa=${upiId}&pn=${encodeURIComponent(bizName)}&am=${inv.invoice_amount}&tn=${encodeURIComponent('Invoice Payment')}&cu=INR`;
         }
@@ -7352,7 +7346,10 @@ const PLANS = {
 app.post('/api/billing/create-order', authMiddleware, async (req, res) => {
   try {
     if (!razorpay) return res.status(503).json({ error: 'Payment gateway not configured' });
-    const { plan, period } = req.body;
+    // authMiddleware strips body.plan (mass-assignment guard), so the plan
+    // being bought travels as plan_id.
+    const plan = req.body.plan_id;
+    const { period } = req.body;
     if (!PLANS[plan]) return res.status(400).json({ error: 'Invalid plan' });
 
     const amount = period === 'annual' ? PLANS[plan].amount_annual : PLANS[plan].amount_monthly;
@@ -7371,11 +7368,23 @@ app.post('/api/billing/create-order', authMiddleware, async (req, res) => {
 
 app.post('/api/billing/verify', authMiddleware, async (req, res) => {
   try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, plan } = req.body;
-    const body = razorpay_order_id + '|' + razorpay_payment_id;
-    const expectedSig = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET || '').update(body).digest('hex');
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+    // Without the secret every signature "verifies" against an empty key.
+    if (!razorpay || !process.env.RAZORPAY_KEY_SECRET) return res.status(503).json({ error: 'Payment gateway not configured' });
+    if (typeof razorpay_order_id !== 'string' || typeof razorpay_payment_id !== 'string' || typeof razorpay_signature !== 'string') {
+      return res.status(400).json({ error: 'Payment verification failed' });
+    }
+    const expectedSig = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET).update(`${razorpay_order_id}|${razorpay_payment_id}`).digest('hex');
+    const a = Buffer.from(expectedSig);
+    const b = Buffer.from(razorpay_signature);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(400).json({ error: 'Payment verification failed' });
 
-    if (expectedSig !== razorpay_signature) return res.status(400).json({ error: 'Payment verification failed' });
+    // The plan comes from the order this user created, never from the body.
+    const order = await razorpay.orders.fetch(razorpay_order_id);
+    if (!order || order.notes?.userId !== req.user.userId || !PLANS[order.notes?.plan]) {
+      return res.status(400).json({ error: 'Payment verification failed' });
+    }
+    const plan = order.notes.plan;
 
     // Upgrade plan + auto-enable Vantro AutoPilot for all paid subscribers
     await supabase.from('users').update({
@@ -7480,6 +7489,31 @@ app.patch('/api/settings', authMiddleware, async (req, res) => {
     const { data, error } = await supabase.from('users').update(updates).eq('id', req.user.userId).select('id, email, phone, business_name, gstin, plan');
     if (error) throw error;
     res.json({ success: true, settings: data[0] });
+  } catch (error) {
+    logRouteError(req, error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// What actually delivers for this tenant right now. Settings shows these
+// instead of hard-coded "Active" badges.
+app.get('/api/settings/delivery-status', authMiddleware, async (req, res) => {
+  try {
+    const guards = require('./lib/safety/externalSend');
+    const { data: u } = await supabase.from('users').select('automation_enabled, upi_id').eq('id', req.user.userId).maybeSingle();
+    const stopped = guards.isGloballyStopped();
+    const sendingFlag = guards.externalSendEnabled();
+    const whatsappNumber = !!process.env.TWILIO_WHATSAPP_NUMBER;
+    const why = (ok, reasons) => (ok ? null : reasons.filter(Boolean)[0] || 'Not available');
+    const whatsappOn = sendingFlag && whatsappNumber && !stopped;
+    const razorpayOn = !!(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET);
+    const pushOn = guards.pushSendEnabled() && !stopped;
+    res.json({
+      whatsapp: { active: whatsappOn, reason: why(whatsappOn, [stopped && 'All outbound sending is stopped', !sendingFlag && 'Customer messaging is switched off on this server', !whatsappNumber && 'No WhatsApp sender number is configured']) },
+      paymentLinks: { active: razorpayOn, upiFallback: !!u?.upi_id, reason: why(razorpayOn, [u?.upi_id ? 'Razorpay is not configured; links fall back to your UPI ID' : 'Razorpay is not configured and no UPI ID is saved']) },
+      dunning: { active: !!u?.automation_enabled && whatsappOn, scheduledAt: '09:00 IST', reason: why(!!u?.automation_enabled && whatsappOn, [!u?.automation_enabled && 'Auto-reminders are paused in your settings', !whatsappOn && 'Reminders are prepared but not sent because WhatsApp sending is off']) },
+      push: { active: pushOn, reason: why(pushOn, [stopped && 'All outbound sending is stopped', 'Push notifications are switched off on this server']) },
+    });
   } catch (error) {
     logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
@@ -8678,6 +8712,13 @@ app.post('/api/payments/webhook', async (req, res) => {
 
         if (invoices && invoices.length > 0) {
           const inv = invoices[0];
+          // A link paid for less than the invoice (e.g. one created for a
+          // wrong amount) records the money but does not settle the invoice.
+          if (amountPaid + 0.5 < Number(inv.invoice_amount || 0)) {
+            await supabase.from('invoices').update({ payment_amount: amountPaid, payment_id: paymentId }).eq('id', inv.id).eq('user_id', inv.user_id);
+            console.warn('[razorpay webhook] partial payment on link; invoice left open', { invoiceId: inv.id });
+            return res.sendStatus(200);
+          }
 
     // Mark as paid
     await supabase.from('invoices')
@@ -9348,6 +9389,14 @@ Return JSON only:
 // ORDERS — AI voice order management
 // ============================================
 
+// The owner's calendar day, not UTC's: before 05:30 IST a UTC date is still
+// yesterday. BUSINESS_TIMEZONE overrides the default for non-Indian tenants.
+function businessToday() {
+  const tz = process.env.BUSINESS_TIMEZONE || 'Asia/Kolkata';
+  try { return new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(new Date()); }
+  catch (_) { return new Date().toISOString().split('T')[0]; }
+}
+
 app.get('/api/orders', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -9363,12 +9412,17 @@ app.get('/api/orders', authMiddleware, async (req, res) => {
     if (from && to) {
       query = query.gte('order_date', from).lte('order_date', to);
     } else {
-      const today = new Date().toISOString().split('T')[0];
-      query = query.eq('order_date', date || today);
+      query = query.eq('order_date', date || businessToday());
     }
     const { data, error } = await query;
     if (error) throw error;
     const orders = data || [];
+    // POST stores items with JSON.stringify, so older rows come back as a
+    // string; clients always get an array.
+    orders.forEach((o) => {
+      if (typeof o.items === 'string') { try { o.items = JSON.parse(o.items); } catch (_) { o.items = []; } }
+      if (!Array.isArray(o.items)) o.items = [];
+    });
 
     // Merge worker name/phone into each order, scoped by the same user_id (defensive
     // against a cross-tenant worker_id collision, even though UUIDs make that
@@ -9399,7 +9453,9 @@ app.post('/api/orders', authMiddleware, async (req, res) => {
       user_id: userId, customer_name, customer_phone,
       delivery_address, items: JSON.stringify(items || []), total_amount: total_amount || null,
       delivery_time, special_instructions, worker_id: worker_id || null,
-      source: 'manual', status: 'new',
+      // A sale recorded after the fact (Today > Add sale) is already
+      // delivered; anything else starts as new. No other status is accepted.
+      source: 'manual', status: req.body.status === 'delivered' ? 'delivered' : 'new',
       order_date: new Date().toISOString().split('T')[0], created_at: new Date(),
     }]).select().single();
     if (error) throw error;
@@ -9609,6 +9665,11 @@ app.post('/api/voice/recording', async (req, res) => {
   const userId = req.query.uid;
   const { RecordingUrl, RecordingSid, From: callerPhone } = req.body;
   if (!RecordingUrl || !userId) return;
+  // Only ever send Twilio credentials to Twilio: a forged callback could name
+  // any host as RecordingUrl and receive the Basic auth header.
+  let recHost = '';
+  try { const u = new URL(String(RecordingUrl)); recHost = u.protocol === 'https:' ? u.hostname : ''; } catch { recHost = ''; }
+  if (recHost !== 'api.twilio.com') { console.warn('[voice/recording] refused a non-Twilio RecordingUrl'); return; }
 
   try {
     // 1. Download MP3 from Twilio — use per-user credentials if env vars not set
@@ -9802,7 +9863,7 @@ app.delete('/api/expenses/:id', authMiddleware, async (req, res) => {
 app.get('/api/today/summary', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const date = req.query.date || new Date().toISOString().split('T')[0];
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.date || '')) ? req.query.date : businessToday();
 
     const [
       { data: orders },
@@ -9820,6 +9881,10 @@ app.get('/api/today/summary', authMiddleware, async (req, res) => {
       supabase.from('call_logs').select('*').eq('user_id', userId).gte('created_at', date + 'T00:00:00').lte('created_at', date + 'T23:59:59'),
     ]);
 
+    (orders || []).forEach((o) => {
+      if (typeof o.items === 'string') { try { o.items = JSON.parse(o.items); } catch (_) { o.items = []; } }
+      if (!Array.isArray(o.items)) o.items = [];
+    });
     const orderIncome = (orders || [])
       .filter(o => !['cancelled'].includes(o.status))
       .reduce((s, o) => s + (Number(o.total_amount) || 0), 0);
@@ -9841,7 +9906,7 @@ app.get('/api/today/summary', authMiddleware, async (req, res) => {
     // Top selling items from orders
     const itemMap = {};
     (orders || []).forEach(o => {
-      (o.items || []).forEach((item) => {
+      parseJsonArray(o.items).forEach((item) => {
         const key = item.name || item.local_name || 'Unknown';
         itemMap[key] = (itemMap[key] || 0) + (item.quantity || 0);
       });
@@ -10068,22 +10133,6 @@ RULES:
       {
         type: 'function',
         function: {
-          name: 'add_expense',
-          description: 'Add a new expense entry for today',
-          parameters: {
-            type: 'object',
-            properties: {
-              description: { type: 'string' },
-              amount: { type: 'number' },
-              category: { type: 'string', enum: EXPENSE_CATEGORIES },
-            },
-            required: ['description', 'amount']
-          }
-        }
-      },
-      {
-        type: 'function',
-        function: {
           name: 'get_top_customers',
           description: 'Get customers ranked by outstanding amount or order history',
           parameters: {
@@ -10103,7 +10152,7 @@ RULES:
         case 'get_invoices': {
           const order = args.sort_by === 'days_overdue' ? 'due_date' : 'invoice_amount';
           let q = supabase.from('invoices').select('customer_name,invoice_amount,due_date,payment_status')
-            .eq('user_id', userId).eq('payment_status', 'Pending').order(order, { ascending: false }).limit(args.limit || 10);
+            .eq('user_id', userId).eq('payment_status', 'Pending').order(order, { ascending: false }).limit(Math.min(Math.max(Number(args.limit) || 10, 1), 50));
           if (args.min_amount) q = q.gte('invoice_amount', args.min_amount);
           const { data } = await q;
           return (data || []).map(i => ({
@@ -10139,21 +10188,18 @@ RULES:
           ]);
           return { invoices: invRes.data || [], orders: ordRes.data || [] };
         }
-        case 'add_expense': {
-          const { data } = await supabase.from('expenses').insert([{
-            user_id: userId, description: args.description, amount: args.amount,
-            category: args.category || 'misc', expense_date: today, created_at: new Date()
-          }]).select().single();
-          return { added: true, expense: data };
-        }
+        // The assistant reads; it never writes records (a model-chosen amount
+        // must not land in the books). The owner adds expenses on Today.
+        case 'add_expense':
+          return { error: 'The assistant cannot add expenses. Add it from the Today page.' };
         case 'get_top_customers': {
           if (args.ranked_by === 'orders') {
             const { data } = await supabase.from('orders').select('customer_name,total_amount').eq('user_id', userId).not('status', 'eq', 'cancelled');
             const map = {};
             (data || []).forEach(o => { map[o.customer_name] = (map[o.customer_name] || 0) + Number(o.total_amount || 0); });
-            return Object.entries(map).sort(([,a],[,b]) => b-a).slice(0, args.limit || 5).map(([name, total]) => ({ name, total: `₹${total.toLocaleString('en-IN')}` }));
+            return Object.entries(map).sort(([,a],[,b]) => b-a).slice(0, Math.min(Math.max(Number(args.limit) || 5, 1), 50)).map(([name, total]) => ({ name, total: `₹${total.toLocaleString('en-IN')}` }));
           } else {
-            const { data } = await supabase.from('invoices').select('customer_name,invoice_amount').eq('user_id', userId).eq('payment_status','Pending').order('invoice_amount', { ascending: false }).limit(args.limit || 5);
+            const { data } = await supabase.from('invoices').select('customer_name,invoice_amount').eq('user_id', userId).eq('payment_status','Pending').order('invoice_amount', { ascending: false }).limit(Math.min(Math.max(Number(args.limit) || 5, 1), 50));
             return data || [];
           }
         }
@@ -11607,12 +11653,16 @@ async function executeInventoryPO(userId, action) {
     sendResult = await sendWhatsAppMessage(po.supplier_phone, message);
   }
 
-  await supabase.from('purchase_orders').update({ status: 'sent', sent_at: new Date().toISOString() }).eq('id', po.id);
+  // Only a delivered message makes the PO "sent". Otherwise it is approved
+  // and waiting for a person to place it; never shown as sent when it wasn't.
+  await supabase.from('purchase_orders')
+    .update(sendResult.success ? { status: 'sent', sent_at: new Date().toISOString() } : { status: 'approved' })
+    .eq('id', po.id).eq('user_id', userId);
   return {
     ok: true,
     message: sendResult.success
       ? `Purchase order sent to ${po.supplier_name} on WhatsApp.`
-      : `Purchase order marked sent, but the WhatsApp message was not delivered (${sendResult.provider === 'skipped_flag_off' ? 'external sending is currently off' : 'send failed'}). You may want to contact ${po.supplier_name} directly.`,
+      : `Purchase order approved but not sent: the WhatsApp message was not delivered (${sendResult.provider === 'skipped_flag_off' ? 'external sending is currently off' : 'no provider or the send failed'}). Place it with ${po.supplier_name} yourself.`,
   };
 }
 
@@ -11670,7 +11720,7 @@ async function executeCollectionsMessage(userId, action) {
   if (!action.recommended_message) return { ok: false, message: 'No message drafted for this action.' };
 
   if (!isFeatureEnabled('external_message_sending_enabled')) {
-    return { ok: true, message: `Marked sent, but external sending is currently off — no WhatsApp message actually went to ${invoice.customer_name}.` };
+    return { ok: true, message: `Approved, not sent: external sending is off, so no WhatsApp message went to ${invoice.customer_name}. Send it yourself if you want it to go today.` };
   }
   const sendResult = await sendWhatsAppMessage(invoice.customer_phone, action.recommended_message);
   if (sendResult.success) {
@@ -11690,38 +11740,130 @@ async function executeCollectionsMessage(userId, action) {
 
 function safeLogFallback(msg, meta) { try { console.log(msg, JSON.stringify(meta)); } catch { console.log(msg); } }
 
-app.get('/api/actions/:id/approve', async (req, res) => {
+// ── One-tap approval links (sent to the owner on WhatsApp) ──────────────────
+// GET never changes state. Link-preview bots (WhatsApp, Slack, mail scanners)
+// fetch every URL they see; when GET used to approve-and-execute, merely
+// sharing or previewing a link could send a supplier PO or a customer
+// reminder. GET now renders a confirmation page describing exactly what will
+// happen; the owner's tap on its button POSTs the same signed token back.
+//
+// The POST claims the action atomically (UPDATE ... WHERE status='pending'),
+// so a double tap or two devices racing execute it at most once, and the
+// terminal state reflects what actually happened (done vs failed) instead of
+// always 'done'.
+function approvalConfirmPage(action, intent, token) {
+  const verb = intent === 'approve' ? 'Approve' : 'Decline';
+  const title = escapeHtml(action.title || 'Pending action');
+  const desc = escapeHtml(action.description || '');
+  const effect = intent === 'approve'
+    ? 'Approving will carry out this action now. Nothing happens until you press the button.'
+    : 'Declining dismisses this suggestion. No action will be taken.';
+  return `<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>${verb}: ${title}</title>
+  <style>body{font-family:-apple-system,system-ui,sans-serif;background:#FAFAF9;color:#0F0E0D;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px;}
+  .card{background:#fff;border:1px solid #E3E2DE;border-radius:12px;padding:28px;max-width:440px;width:100%;}
+  h1{font-size:19px;margin:0 0 10px;line-height:1.35}p{color:#46443F;line-height:1.55;margin:0 0 14px}
+  .k{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:#7A7873;margin-bottom:8px}
+  button{font:inherit;font-weight:600;border:0;border-radius:8px;padding:12px 18px;width:100%;cursor:pointer;background:#0F0E0D;color:#fff}
+  button.secondary{background:#fff;color:#0F0E0D;border:1px solid #D2D0CA}</style></head>
+  <body><main class="card"><div class="k">Starlane · ${verb}</div><h1>${title}</h1>${desc ? `<p>${desc}</p>` : ''}<p>${effect}</p>
+  <form method="post" action="/api/actions/${encodeURIComponent(action.id)}/${intent}">
+  <input type="hidden" name="token" value="${escapeHtml(token)}">
+  <button type="submit" class="${intent === 'approve' ? '' : 'secondary'}">${verb}</button></form></main></body></html>`;
+}
+
+async function renderApprovalConfirm(req, res, intent) {
+  const { verifyActionToken, loadPendingAction } = require('./lib/services/actionApproval.service');
+  res.setHeader('X-Robots-Tag', 'noindex');
+  const token = String(req.query.token || '');
+  if (!verifyActionToken(token, req.params.id, intent)) {
+    return res.status(403).send(approvalResultPage('Link expired or invalid', 'This link is no longer valid. Please check your Action Center for the latest status.', false));
+  }
+  const { ok, action, reason } = await loadPendingAction(req.params.id);
+  if (!ok) {
+    return res.send(approvalResultPage('Nothing to do', reason === 'already_actioned'
+      ? `This was already ${action?.status || 'actioned'} — no changes made.`
+      : 'This action could not be found.'));
+  }
+  res.send(approvalConfirmPage(action, intent, token));
+}
+
+// Carry out an action that has ALREADY been atomically claimed as 'approved'
+// (by the approval-link POST or POST /api/client/actions/:id/decision), then
+// record the honest terminal state, activity log, product events and the
+// owner's notification. The single place approved actions execute.
+async function executeApprovedAction(action, { source }) {
+  const actionService = require('./lib/services/orchestrator/action.service');
+  const { track, EVENTS } = require('./lib/observability/productEvents');
+  const { notify, TYPES } = require('./lib/notifications/notify');
+  // Operator emergency stop for pilots: approvals are still recorded (the action
+  // stays APPROVED and can be carried out once this is lifted), but nothing is
+  // executed — no message, call, purchase order or payout.
+  if (process.env.ACTION_EXECUTION_PAUSED === 'true') {
+    await createActivityLog(action.user_id, 'ai_action_approved_execution_paused', {
+      entityType: 'ai_action', entityId: action.id, source, actionType: action.action_type,
+    });
+    return { ok: true, paused: true, message: 'Approved and recorded. Carrying out actions is paused by Starlane for now, so nothing was sent, called or paid.' };
+  }
+  let result;
   try {
-    const { verifyActionToken, loadPendingAction } = require('./lib/services/actionApproval.service');
-    const actionService = require('./lib/services/orchestrator/action.service');
-    const actionId = req.params.id;
-    const token = req.query.token;
-
-    if (!verifyActionToken(token, actionId, 'approve')) {
-      return res.status(403).send(approvalResultPage('Link expired or invalid', 'This approval link is no longer valid. Please check your Action Center for the latest status.', false));
-    }
-
-    const { ok, action, reason } = await loadPendingAction(actionId);
-    if (!ok) {
-      const msg = reason === 'already_actioned'
-        ? `This was already ${action?.status || 'actioned'} — no changes made.`
-        : 'This action could not be found.';
-      return res.send(approvalResultPage('Nothing to do', msg));
-    }
-
-    await actionService.updateStatus(action.user_id, actionId, 'approved');
-
-    let result;
     if (action.action_type === 'INVENTORY_PO_READY') result = await executeInventoryPO(action.user_id, action);
     else if (action.action_type === 'PAYABLES_PAYMENT_READY') result = await executePayablesPayment(action.user_id, action);
     else if (action.action_type === 'ESCALATE_COLLECTION_CALL') result = await executeCollectionCall(action.user_id, action);
     else if (['SEND_POLITE_REMINDER', 'SEND_FIRM_REMINDER', 'ESCALATE_COLLECTION'].includes(action.action_type)) result = await executeCollectionsMessage(action.user_id, action);
     else result = { ok: true, message: 'Approved.' };
+  } catch (execErr) {
+    result = { ok: false, message: 'Approved, but carrying it out failed. Nothing further was sent — please retry from your Action Center.', error: execErr.message };
+  }
+  await actionService.updateStatus(action.user_id, action.id, result.ok ? 'done' : 'failed');
+  await createActivityLog(action.user_id, result.ok ? 'ai_action_approved_and_executed' : 'ai_action_execution_failed', {
+    entityType: 'ai_action', entityId: action.id, source, actionType: action.action_type,
+  });
+  track(result.ok ? EVENTS.ACTION_EXECUTED : EVENTS.ACTION_FAILED, { userId: action.user_id, actionId: action.id, props: { action_type: action.action_type, via: source } });
+  await notify(getPool(), action.user_id, {
+    type: result.ok ? TYPES.ACTION_COMPLETED : TYPES.ACTION_FAILED,
+    severity: result.ok ? 'normal' : 'high',
+    title: result.ok ? `Done: ${String(action.title || 'Action').slice(0, 100)}` : `Failed: ${String(action.title || 'Action').slice(0, 100)}`,
+    body: result.ok ? null : 'Nothing further was sent. Open it to see what happened.',
+    entity: { type: 'ai_action', id: action.id }, actionId: action.id, route: `/actions/${action.id}`,
+    dedupeKey: `action-result:${action.id}`,
+  });
+  return result;
+}
 
-    await actionService.updateStatus(action.user_id, actionId, 'done');
-    await createActivityLog(action.user_id, 'ai_action_approved_and_executed', {
-      entityType: 'ai_action', entityId: actionId, source: 'approval_link', actionType: action.action_type,
-    });
+app.get('/api/actions/:id/approve', (req, res) => {
+  renderApprovalConfirm(req, res, 'approve').catch((err) => {
+    console.error('[actions/approve:confirm] Error:', err.message);
+    res.status(500).send(approvalResultPage('Something went wrong', 'Please try again from your Action Center.', false));
+  });
+});
+
+app.get('/api/actions/:id/reject', (req, res) => {
+  renderApprovalConfirm(req, res, 'reject').catch((err) => {
+    console.error('[actions/reject:confirm] Error:', err.message);
+    res.status(500).send(approvalResultPage('Something went wrong', 'Please try again from your Action Center.', false));
+  });
+});
+
+const approvalLinkLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
+
+app.post('/api/actions/:id/approve', approvalLinkLimiter, async (req, res) => {
+  try {
+    const { verifyActionToken, claimPendingAction } = require('./lib/services/actionApproval.service');
+    const actionId = req.params.id;
+    if (!verifyActionToken(req.body?.token, actionId, 'approve')) {
+      return res.status(403).send(approvalResultPage('Link expired or invalid', 'This approval link is no longer valid. Please check your Action Center for the latest status.', false));
+    }
+
+    const claim = await claimPendingAction(actionId, 'approved');
+    if (claim.ok) require('./lib/observability/productEvents').track('approval.completed', { userId: claim.action.user_id, actionId, props: { decision: 'approved', via: 'approval_link' } });
+    if (!claim.ok) {
+      return res.send(approvalResultPage('Nothing to do', claim.reason === 'already_actioned'
+        ? `This was already ${claim.action?.status || 'actioned'} — no changes made.`
+        : 'This action could not be found.'));
+    }
+    const action = claim.action;
+
+    const result = await executeApprovedAction(action, { source: 'approval_link' });
 
     res.send(approvalResultPage(action.title || 'Approved', result.message, result.ok));
   } catch (err) {
@@ -11730,27 +11872,43 @@ app.get('/api/actions/:id/approve', async (req, res) => {
   }
 });
 
-app.get('/api/actions/:id/reject', async (req, res) => {
+app.post('/api/actions/:id/reject', approvalLinkLimiter, async (req, res) => {
   try {
-    const { verifyActionToken, loadPendingAction } = require('./lib/services/actionApproval.service');
-    const actionService = require('./lib/services/orchestrator/action.service');
+    const { verifyActionToken, claimPendingAction } = require('./lib/services/actionApproval.service');
     const actionId = req.params.id;
-    const token = req.query.token;
-
-    if (!verifyActionToken(token, actionId, 'reject')) {
+    if (!verifyActionToken(req.body?.token, actionId, 'reject')) {
       return res.status(403).send(approvalResultPage('Link expired or invalid', 'This link is no longer valid.', false));
     }
-    const { ok, action, reason } = await loadPendingAction(actionId);
-    if (!ok) {
-      return res.send(approvalResultPage('Nothing to do', reason === 'already_actioned' ? `This was already ${action?.status}.` : 'Action not found.'));
+    const claim = await claimPendingAction(actionId, 'rejected');
+    if (!claim.ok) {
+      return res.send(approvalResultPage('Nothing to do', claim.reason === 'already_actioned' ? `This was already ${claim.action?.status}.` : 'Action not found.'));
     }
-    await actionService.updateStatus(action.user_id, actionId, 'rejected');
+    await createActivityLog(claim.action.user_id, 'ai_action_rejected', {
+      entityType: 'ai_action', entityId: actionId, source: 'approval_link', actionType: claim.action.action_type,
+    });
     res.send(approvalResultPage('Declined', 'This suggestion has been dismissed. No action was taken.'));
   } catch (err) {
     console.error('[actions/reject] Error:', err.message);
     res.status(500).send(approvalResultPage('Something went wrong', 'Please try again from your Action Center.', false));
   }
 });
+
+// Connector monitor: "Tally has stopped syncing" (once per device per day).
+cron.schedule('*/30 * * * *', () => {
+  require('./lib/notifications/connectorMonitor').checkQuietBridges(getPool())
+    .catch((e) => console.error('[connector monitor]', e.message));
+}, { timezone: 'UTC' });
+
+// Watch, mission and memory sweep for companies with a signed-in app, so a
+// phone gets its push without anyone opening Starlane.
+cron.schedule('*/15 * * * *', async () => {
+  try {
+    const { rows } = await getPool().query(
+      `SELECT DISTINCT user_id FROM auth_sessions WHERE revoked_at IS NULL AND expires_at > now()
+        UNION SELECT DISTINCT user_id FROM push_devices WHERE disabled_at IS NULL`);
+    for (const r of rows) await featuresApi.refreshFor(r.user_id).catch((e) => console.error('[watch sweep]', e.message));
+  } catch (e) { console.error('[watch sweep]', e.message); }
+}, { timezone: 'UTC' });
 
 // ============================================
 // WEEKLY SCORECARD CRON -- Sunday 6pm IST (12:30 UTC)
@@ -12342,6 +12500,54 @@ app.use('/api/intelligence/scenarios', scenariosRouter({ pool: getPool(), authMi
 const { preparedRouter } = require('./lib/routes/prepared');
 app.use('/api/intelligence/prepared', preparedRouter({ pool: getPool(), authMiddleware }));
 
+// Starlane decision loop: discovery, decision contracts, shadow/live
+// execution through the Action Fabric, verification, backtest and the
+// control plane (pilot mode, kill switches). See lib/routes/decisions.js
+// and lib/domain/decisions/.
+const { decisionsRouter } = require('./lib/routes/decisions');
+app.use('/api/decisions', decisionsRouter({ pool: getPool(), authMiddleware }));
+
+// Seven-surface operating system: Bridge health and knowledge, Scan
+// (process + automation discovery), Watch objectives and autopilot,
+// workflow proposals, approvals and shadow runs, outcome memory. Needs
+// migration 061. See lib/routes/os.js and lib/domain/os/.
+const { osRouter } = require('./lib/routes/os');
+app.use('/api/os', osRouter({ pool: getPool(), authMiddleware }));
+
+// Outbound engine: targets, campaigns, review, queue, rate limits, sending,
+// bounces, replies, follow-ups, START / STOP ALL OUTBOUND. Needs migration
+// 062. The runner (scheduler + workers + mailbox poller) lives in this
+// process only when OUTBOUND_ENGINE_ENABLED=true; every instance may run it
+// (leader lease + job leases prevent duplicates). See lib/domain/outbound/.
+const { outreachRouter } = require('./lib/routes/outreach');
+let outboundRunner = null;
+if (String(process.env.OUTBOUND_ENGINE_ENABLED || '').toLowerCase() === 'true' && process.env.DATABASE_URL) {
+  const { Runner } = require('./lib/domain/outbound/engine');
+  outboundRunner = new Runner(getPool());
+}
+app.use('/api/outreach', outreachRouter({ pool: getPool(), authMiddleware, requireAdmin, runner: outboundRunner }));
+
+// Selective-rollout access flow: applications, deterministic eligibility,
+// admin review, download entitlements. See lib/routes/access.js.
+const { accessRouter } = require('./lib/routes/access');
+app.use('/api', accessRouter({ pool: getPool(), requireAdmin }));
+
+// Starlane's seven features (Bridge, Scan, Watch, Missions, Simulate, Memory,
+// Prepared) for the desktop and mobile apps. See lib/routes/features.js.
+const { featuresRouter } = require('./lib/routes/features');
+const featuresApi = featuresRouter({ pool: getPool(), authMiddleware, notifyFn: require('./lib/notifications/notify').notify, isEnabled: isFeatureEnabled });
+app.use('/api', featuresApi);
+
+// Desktop + mobile client API: native sessions, bootstrap, Now, action
+// evidence/decisions, canonical notifications, push devices, telemetry.
+const { clientApiRouter } = require('./lib/routes/clientApi');
+app.use('/api', clientApiRouter({ pool: getPool(), authMiddleware, executeApprovedAction }));
+
+// Connector platform — manifests (lib/connectors/registry.js) + live state
+// derived only from real rows (lib/connectors/state.js). See lib/routes/connectors.js.
+const { connectorsRouter } = require('./lib/routes/connectors');
+app.use('/api/connectors', connectorsRouter({ pool: getPool(), authMiddleware }));
+
 app.get('/api/ai-actions', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -12642,14 +12848,17 @@ app.post('/api/intelligence/signals/:id/verify-outcome', authMiddleware, async (
   } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
-// Demo control: resets the 2xA tenant and re-runs the seed + trigger scripts
-// via the SAME code paths as the CLI scripts (no bypass/shortcut version).
-// Deliberately authMiddleware only, not adminOnly: this always operates on
-// one hardcoded, isolated demo tenant (owner@2xa-demo-meridian.invalid) —
-// it can never read or modify any other tenant's data, so requiring a
-// separately-configured ADMIN_EMAILS entry would only get in the way of
-// running the demo itself, with no real security benefit.
-app.post('/api/demo/2xa/reset', authMiddleware, async (req, res) => {
+// Demo control: resets the 2xA demo tenant and re-runs the seed + trigger
+// scripts via the same code paths as the CLI scripts.
+// Previously open to ANY authenticated user: every signed-in customer could
+// spawn child processes on the API host (a trivially repeatable CPU/DB-load
+// lever) and the response leaked the scripts' stderr. It is now an operator
+// tool: admin only, explicitly enabled per environment, never in production,
+// and it returns no script output beyond success/failure.
+app.post('/api/demo/2xa/reset', requireAdmin, async (req, res) => {
+  if (IS_PRODUCTION || process.env.DEMO_RESET_ENABLED !== 'true') {
+    return res.status(404).json({ error: 'Not found' });
+  }
   try {
     delete require.cache[require.resolve('./scripts/seed-2xa-demo.js')];
     delete require.cache[require.resolve('./scripts/trigger-2xa-event.js')];
@@ -12667,8 +12876,12 @@ app.post('/api/demo/2xa/reset', authMiddleware, async (req, res) => {
         resolve(stdout);
       });
     });
-    res.json({ success: true, triggerOutput });
-  } catch (err) { res.status(500).json({ error: 'Internal server error', detail: String(err.message || err) }); }
+    void triggerOutput;
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[demo/2xa/reset] failed:', String(err.message || err).split('\n')[0]);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // ── CUSTOMER INTELLIGENCE (behavioral profile for customers page) ────────────
@@ -13055,7 +13268,6 @@ app.post('/api/ai-actions/:id/send-whatsapp', authMiddleware, async (req, res) =
     }
 
     const sendResult = result?.sendResult;
-    res.json({ success: true, sid: sendResult?.sid || null, provider: sendResult?.provider || null });
     await supabase.from('ai_actions').update({ status: 'done', completed_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', id).eq('user_id', userId);
     res.json({ success: true, sid: sendResult?.sid || null, provider: sendResult?.provider || null });
   } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
@@ -13542,6 +13754,42 @@ cron.schedule('10 * * * *', async () => {
     if (!outcome.ran) { _log('info', '[WorldUSGSCron] Skipped — previous run still holds the lock'); return; }
     _log('info', '[WorldUSGSCron] Done', outcome.result.stats);
   } catch (err) { _log('error', '[WorldUSGSCron] Fatal', { error: err.message }); }
+}, { timezone: 'UTC' });
+
+// Starlane decisions — hourly discovery and daily contract verification per
+// tenant, gated by FEATURE_DECISION_SCHEDULER_ENABLED (default OFF). Each
+// tenant runs separately and fully scoped; a kill switch at tenant or agent
+// scope stops that tenant's run (runDiscovery checks it first).
+cron.schedule('20 * * * *', async () => {
+  const { isEnabled: _isFE } = require('./lib/featureFlags');
+  if (!_isFE('decision_scheduler_enabled')) return;
+  const { safeLog: _log } = require('./lib/observability/logger');
+  const { runDiscovery } = require('./lib/domain/decisions/discovery');
+  const { getSignalImpact } = require('./lib/domain/intelligence/supplyChainOrchestrator');
+  const pool = getPool();
+  try {
+    const tenants = await pool.query('SELECT DISTINCT user_id FROM invoices WHERE user_id IS NOT NULL');
+    for (const t of tenants.rows) {
+      try {
+        await runDiscovery(pool, t.user_id, { correlationId: `cron:${Date.now()}`, externalSendEnabled: _isFE('external_message_sending_enabled'), getSignalImpact });
+      } catch (err) { _log('error', '[DecisionDiscoveryCron] tenant failed', { userId: t.user_id, error: err.message }); }
+    }
+  } catch (err) { _log('error', '[DecisionDiscoveryCron] Fatal', { error: err.message }); }
+}, { timezone: 'UTC' });
+
+cron.schedule('40 3 * * *', async () => {
+  const { isEnabled: _isFE } = require('./lib/featureFlags');
+  if (!_isFE('decision_scheduler_enabled')) return;
+  const { safeLog: _log } = require('./lib/observability/logger');
+  const { verifyDueContracts } = require('./lib/domain/decisions/verification');
+  const pool = getPool();
+  try {
+    const tenants = await pool.query(`SELECT DISTINCT user_id FROM decision_contracts WHERE status IN ('ACTIVE','ON_TRACK','OFF_TRACK')`);
+    for (const t of tenants.rows) {
+      try { await verifyDueContracts(pool, t.user_id, { correlationId: `cron:${Date.now()}` }); }
+      catch (err) { _log('error', '[DecisionVerifyCron] tenant failed', { userId: t.user_id, error: err.message }); }
+    }
+  } catch (err) { _log('error', '[DecisionVerifyCron] Fatal', { error: err.message }); }
 }, { timezone: 'UTC' });
 
 // Outcome verification — daily at 03:10 UTC. Iterates every ACTIVE/UPDATED
@@ -14486,10 +14734,28 @@ app.listen(PORT, () => {
   const { isEnabled: _isFE } = require('./lib/featureFlags');
   const _worldEnabled = _isFE('world_intelligence_enabled');
   console.log(`🌍 World intelligence: ${_worldEnabled ? 'ENABLED' : 'DISABLED'} (USGS ${_worldEnabled ? 'enabled' : 'disabled'}, FX ${_worldEnabled ? 'enabled' : 'disabled'}, scheduler ${_worldEnabled ? 'enabled' : 'disabled'})`);
-  if (process.env.OTP_VERIFICATION_DISABLED === 'true') {
+  if (process.env.OTP_VERIFICATION_DISABLED === 'true' && require('./lib/config/deployEnv').isProductionDeployment()) {
+    console.error('[SECURITY] OTP_VERIFICATION_DISABLED=true is IGNORED on the production deployment — OTP verification stays on. Unset the variable.');
+  } else if (process.env.OTP_VERIFICATION_DISABLED === 'true') {
     console.warn('⚠️  OTP_VERIFICATION_DISABLED=true — OTP verification is BYPASSED for signup. TEMPORARY testing mode only. Unset this var or set it to false to restore normal OTP-required behavior.');
   }
   runAutoMigrations();
+  if (process.env.DATABASE_URL) require('./lib/safety/externalSend').startGlobalStopWatcher(getPool());
+  if (outboundRunner) {
+    outboundRunner.start();
+    console.log(`📮 Outbound engine runner: STARTED (${outboundRunner.concurrency} worker slot(s); sends only for tenants that pressed START)`);
+  } else {
+    console.log('📮 Outbound engine runner: OFF (OUTBOUND_ENGINE_ENABLED is not true)');
+  }
 });
+
+// Graceful shutdown for the outbound runner: stop reserving, let in-flight
+// sends finish, release reserved jobs so another instance takes them.
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.once(sig, async () => {
+    if (outboundRunner) await outboundRunner.stop().catch(() => {});
+    process.exit(0);
+  });
+}
 
 

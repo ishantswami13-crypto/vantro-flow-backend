@@ -53,6 +53,7 @@ const GLOBAL_TABLES = new Set([
   'industries',
   'migrations',
   'schema_migrations',
+  'starlane_migrations',
 ]);
 
 // How many lines of a query chain to consider when looking for filters.

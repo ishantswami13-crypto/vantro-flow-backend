@@ -18,7 +18,7 @@ async function main() {
     return;
   }
 
-  const client = new Client({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+  const client = new Client(require('../lib/db/pgConfig').buildSanitizedPgConfig(process.env.DATABASE_URL));
   await client.connect();
 
   const userId = randomUUID();
