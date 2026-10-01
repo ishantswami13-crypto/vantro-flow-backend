@@ -1523,10 +1523,11 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
 
 app.post('/api/auth/forgot-password', async (req, res) => {
   try {
-    const email = typeof req.body.email === 'string' ? req.body.email.trim() : '';
+    // Case-insensitive, like signup and login: FOUNDER@x.com is founder@x.com.
+    const email = normalizeEmail(req.body.email);
     if (!email) return res.status(400).json({ error: 'Email required' });
 
-    const { data: user } = await supabase.from('users').select('id, email, business_name').eq('email', email).maybeSingle();
+    const { rows: [user] } = await getPool().query('SELECT id, email, business_name FROM users WHERE lower(email) = $1 LIMIT 1', [email]);
     // Always respond success to prevent email enumeration
     if (!user) return res.json({ success: true, message: 'If that email exists, an OTP has been sent.' });
 
@@ -1565,7 +1566,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
 app.post('/api/auth/reset-password', async (req, res) => {
   try {
     const { otp, new_password } = req.body;
-    const email = typeof req.body.email === 'string' ? req.body.email.trim() : '';
+    const email = normalizeEmail(req.body.email);
     if (!email || !otp || !new_password) return res.status(400).json({ error: 'Email, OTP, and new password required' });
     if (typeof new_password !== 'string' || new_password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
     // Five wrong codes burn every open code for this email (a 6-digit code
@@ -1597,7 +1598,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
     const password_hash = await bcrypt.hash(new_password, 12);
     await Promise.all([
-      supabase.from('users').update({ password_hash }).eq('email', email),
+      getPool().query('UPDATE users SET password_hash = $1 WHERE lower(email) = $2', [password_hash, email]),
       supabase.from('password_reset_tokens').update({ used: true }).eq('id', token.id)
     ]);
 
