@@ -55,6 +55,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const { RELEASE } = require('../lib/release');
+const { validInstaller, freshHealthyConnector, downloadResult, assessVerdict } = require('./release-readiness-policy');
 
 const args = process.argv.slice(2);
 const opt = (n) => { const i = args.indexOf(`--${n}`); return i !== -1 ? args[i + 1] : null; };
@@ -88,8 +89,8 @@ async function checkBinary(url, expect) {
   if (!r.buf.length) return 'zero-byte file';
   if (r.buf.subarray(0, 2).toString('latin1') !== 'MZ') return 'not a Windows executable';
   const sha = crypto.createHash('sha256').update(r.buf).digest('hex');
-  if (expect && (sha !== expect.sha256 || r.buf.length !== expect.size)) return `SHA-256/size ${sha}/${r.buf.length} do not match the manifest ${expect.sha256}/${expect.size}`;
-  return { sha, size: r.buf.length, final: r.url };
+  if (expect && (sha !== expect.sha256.toLowerCase() || r.buf.length !== expect.size)) return `SHA-256/size ${sha}/${r.buf.length} do not match the manifest ${expect.sha256}/${expect.size}`;
+  return { sha, size: r.buf.length };
 }
 
 async function run() {
@@ -130,7 +131,7 @@ async function run() {
   try {
     const r = await http(`${latest}/starlane-release.json`, { redirect: 'follow' });
     if (r.status === 404) set('DESKTOP', 'FAIL', `no desktop release published on ${REPO} (releases/latest has no starlane-release.json)`);
-    else if (!r.json?.platforms?.windows?.x64?.installer) set('DESKTOP', 'FAIL', `the published manifest has no Windows installer (status ${r.status})`);
+    else if (r.status !== 200 || !validInstaller(r.json?.platforms?.windows?.x64?.installer)) set('DESKTOP', 'FAIL', `the published manifest has no valid Windows installer identity (status ${r.status})`);
     else {
       manifest = r.json;
       facts.desktop = { version: manifest.version, label: manifest.label, signed: manifest.signed, updater: manifest.updater, published_at: manifest.published_at };
@@ -154,8 +155,8 @@ async function run() {
   else {
     try {
       const got = await checkBinary(`${SITE}/download/windows`, manifest?.platforms.windows.x64.installer);
-      if (typeof got === 'string') set('DOWNLOAD_ENDPOINT', 'FAIL', `${SITE}/download/windows: ${got}`);
-      else set('DOWNLOAD_ENDPOINT', 'PASS', `${SITE}/download/windows -> ${got.final} (${got.size} bytes, matches manifest)`);
+      const assessed = downloadResult(got, manifest?.platforms.windows.x64.installer);
+      set('DOWNLOAD_ENDPOINT', assessed.status, `${SITE}/download/windows: ${assessed.detail}`);
     } catch (e) { set('DOWNLOAD_ENDPOINT', 'BLOCKED', `${SITE}/download/windows not reachable (${reason(e)})`); }
   }
 
@@ -202,7 +203,7 @@ async function run() {
 
       const conns = await get('/api/connectors');
       const list = conns.json?.connectors || [];
-      const fresh = list.filter((c) => c.state?.lastSuccessAt && Date.now() - Date.parse(c.state.lastSuccessAt) < 48 * 3600e3);
+      const fresh = list.filter((c) => freshHealthyConnector(c));
       if (conns.status !== 200) set('CONNECTOR', 'FAIL', `answered ${conns.status}`);
       else if (!fresh.length) set('CONNECTOR', 'FAIL', `no connector synced successfully in the last 48 h (${list.filter((c) => c.state?.health && c.state.health !== 'not_connected' && c.state.health !== 'unavailable').map((c) => `${c.name}: ${c.state.health}`).join(', ') || 'none connected'})`);
       else set('CONNECTOR', 'PASS', fresh.map((c) => `${c.name} ${c.state.health}, last success ${c.state.lastSuccessAt}`).join('; '));
@@ -233,6 +234,7 @@ async function run() {
   if (!API.startsWith('https://')) problems.push('API is not HTTPS');
   if (SITE && !SITE.startsWith('https://')) problems.push('website is not HTTPS');
   if (!SITE) blocked.push('website not given, HSTS not checked');
+  else if (results.FRONTEND.status !== 'PASS') blocked.push('website could not be verified, HSTS not checked');
   else if (results.FRONTEND.status === 'PASS' && !/max-age=\d{7,}/.test(facts.hsts || '')) problems.push('website sends no long HSTS header');
   if (forgedRefused === false) problems.push('a forged token was not refused');
   if (forgedRefused === null) blocked.push('backend not reachable, token handling not checked');
@@ -251,15 +253,7 @@ async function signIn(email, password) {
 }
 
 function verdict() {
-  const allPass = CHECKS.every((c) => results[c].status === 'PASS');
-  if (!allPass) return { verdict: 'NOT READY', why: `${CHECKS.filter((c) => results[c].status !== 'PASS').join(', ')} not passing` };
-  const pilots = Number(process.env.RELEASE_SUCCESSFUL_PILOTS || 0);
-  const missing = [];
-  if (!facts.desktop?.signed) missing.push('installer not code-signed');
-  if (!facts.desktop?.updater) missing.push('app cannot update itself');
-  if (pilots < 3) missing.push(`${pilots} successful real-business pilots declared (need 3)`);
-  if (missing.length) return { verdict: 'PILOT READY', why: `safe for selected real businesses with monitoring; not production: ${missing.join('; ')}` };
-  return { verdict: 'PRODUCTION READY', why: `all checks pass, signed and self-updating, ${pilots} successful pilots declared by the owner` };
+  return assessVerdict(CHECKS, results);
 }
 
 run()
