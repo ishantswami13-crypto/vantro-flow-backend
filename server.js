@@ -1269,6 +1269,15 @@ function normalizeEmail(value) {
 }
 const resetAttempts = new Map(); // email -> { first, count }; per process
 
+// Finds the account for a typed email regardless of letter case (native sign-in
+// already matches lower(email)), so reset codes are stored and checked against
+// the address as it is saved, not as it was typed.
+async function findUserByEmail(typed, cols) {
+  const pattern = typed.replace(/[\\%_]/g, (c) => '\\' + c); // ilike wildcards match literally
+  const { data } = await supabase.from('users').select(cols).ilike('email', pattern).limit(1);
+  return data && data[0] ? data[0] : null;
+}
+
 app.post('/api/auth/signup', async (req, res) => {
   try {
     const { phone, business_name, password, referred_by } = req.body;
@@ -1526,17 +1535,18 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     const email = typeof req.body.email === 'string' ? req.body.email.trim() : '';
     if (!email) return res.status(400).json({ error: 'Email required' });
 
-    const { data: user } = await supabase.from('users').select('id, email, business_name').eq('email', email).maybeSingle();
+    const user = await findUserByEmail(email, 'id, email, business_name');
     // Always respond success to prevent email enumeration
     if (!user) return res.json({ success: true, message: 'If that email exists, an OTP has been sent.' });
+    const accountEmail = user.email;
 
     const otp = String(crypto.randomInt(100000, 1000000));
     const expires_at = new Date(Date.now() + 15 * 60 * 1000).toISOString();
-    resetAttempts.delete(email);
+    resetAttempts.delete(accountEmail);
 
     // Invalidate previous tokens for this email
-    await supabase.from('password_reset_tokens').update({ used: true }).eq('email', email).eq('used', false);
-    await supabase.from('password_reset_tokens').insert([{ email, otp, expires_at }]);
+    await supabase.from('password_reset_tokens').update({ used: true }).eq('email', accountEmail).eq('used', false);
+    await supabase.from('password_reset_tokens').insert([{ email: accountEmail, otp, expires_at }]);
 
     // Send via Resend if configured, else log to console (dev mode)
     const RESEND_API_KEY = process.env.RESEND_API_KEY;
@@ -1546,7 +1556,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_API_KEY}` },
         body: JSON.stringify({
           from: 'Vantro Flow <onboarding@resend.dev>',
-          to: email,
+          to: accountEmail,
           subject: `Your Vantro OTP: ${otp}`,
           html: `<p>Hi ${escapeHtml(user.business_name)},</p><p>Your OTP to reset your Vantro Flow password is: <strong style="font-size:24px">${otp}</strong></p><p>Valid for 15 minutes. Do not share this with anyone.</p>`
         })
@@ -1570,7 +1580,10 @@ app.post('/api/auth/reset-password', async (req, res) => {
     if (typeof new_password !== 'string' || new_password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
     // Five wrong codes burn every open code for this email (a 6-digit code
     // must not be guessable by spreading attempts over many IPs).
-    const tries = resetAttempts.get(email);
+    const account = await findUserByEmail(email, 'id, email');
+    if (!account) return res.status(400).json({ error: 'Invalid or expired OTP' });
+    const accountEmail = account.email;
+    const tries = resetAttempts.get(accountEmail);
     if (tries && tries.count >= 5 && Date.now() - tries.first < 15 * 60 * 1000) {
       return res.status(429).json({ error: 'Too many wrong codes. Request a new code.' });
     }
@@ -1578,8 +1591,8 @@ app.post('/api/auth/reset-password', async (req, res) => {
     const { data: token } = await supabase
       .from('password_reset_tokens')
       .select('*')
-      .eq('email', email)
-      .eq('otp', otp)
+      .eq('email', accountEmail)
+      .eq('otp', String(otp))
       .eq('used', false)
       .gte('expires_at', new Date().toISOString())
       .order('created_at', { ascending: false })
@@ -1587,17 +1600,17 @@ app.post('/api/auth/reset-password', async (req, res) => {
       .maybeSingle();
 
     if (!token) {
-      const t = resetAttempts.get(email);
+      const t = resetAttempts.get(accountEmail);
       const next = t && Date.now() - t.first < 15 * 60 * 1000 ? { first: t.first, count: t.count + 1 } : { first: Date.now(), count: 1 };
-      resetAttempts.set(email, next);
-      if (next.count >= 5) await supabase.from('password_reset_tokens').update({ used: true }).eq('email', email).eq('used', false);
+      resetAttempts.set(accountEmail, next);
+      if (next.count >= 5) await supabase.from('password_reset_tokens').update({ used: true }).eq('email', accountEmail).eq('used', false);
       return res.status(400).json({ error: 'Invalid or expired OTP' });
     }
-    resetAttempts.delete(email);
+    resetAttempts.delete(accountEmail);
 
     const password_hash = await bcrypt.hash(new_password, 12);
     await Promise.all([
-      supabase.from('users').update({ password_hash }).eq('email', email),
+      supabase.from('users').update({ password_hash }).eq('id', account.id),
       supabase.from('password_reset_tokens').update({ used: true }).eq('id', token.id)
     ]);
 
