@@ -574,7 +574,7 @@ app.use('/api/auth', authLimiter);
 // Signup and resend-otp answer 200, so authLimiter (failures only) never
 // counted them: anyone could make Starlane send endless OTPs to a victim.
 const otpSendLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, max: Number(process.env.OTP_SEND_LIMIT_PER_15M || 6) });
-app.use(['/api/auth/signup', '/api/auth/resend-otp', '/api/auth/forgot-password'], otpSendLimiter);
+app.use(['/api/auth/signup', '/api/auth/resend-otp', '/api/auth/forgot-password', '/api/auth/phone/start'], otpSendLimiter);
 app.use('/api', apiLimiter);
 // /api/bank/transactions/import belongs here with the other upload routes: it
 // takes a multipart file and parses .xls/.xlsx through the same library. It was
@@ -12543,6 +12543,18 @@ app.use('/api', featuresApi);
 // evidence/decisions, canonical notifications, push devices, telemetry.
 const { clientApiRouter } = require('./lib/routes/clientApi');
 app.use('/api', clientApiRouter({ pool: getPool(), authMiddleware, executeApprovedAction }));
+const { authProvidersRouter } = require('./lib/routes/authProviders');
+app.use('/api', authProvidersRouter({
+  pool: getPool(),
+  authMiddleware,
+  issueWebSession: (res, user) => {
+    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    return { token, csrf_token: setSessionCookies(res, token) };
+  },
+  isAccessGateOn: () => isFeatureEnabled('access_gate_enabled'),
+  hasApprovedApplication: require('./lib/access/service').hasApprovedApplication,
+  track: require('./lib/observability/productEvents').track,
+}));
 
 // Connector platform — manifests (lib/connectors/registry.js) + live state
 // derived only from real rows (lib/connectors/state.js). See lib/routes/connectors.js.
