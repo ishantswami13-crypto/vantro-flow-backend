@@ -10,8 +10,8 @@ name: Release readiness
 #   vars.RELEASE_API_URL                         optional, defaults to production
 #   secrets.RELEASE_TEST_EMAIL / _PASSWORD       a test account
 #   secrets.RELEASE_PILOT_EMAIL / _PASSWORD      an account with a real pilot company's data
-#   vars.RELEASE_SUCCESSFUL_PILOTS               owner-declared count, for PRODUCTION READY
-# The run fails (red) whenever the verdict is NOT READY.
+# The run fails (red) whenever the verdict is NOT READY. Smoke checks alone
+# cannot certify launch readiness; real-PC and full acceptance proof is required.
 
 on:
   workflow_dispatch:
@@ -37,7 +37,6 @@ jobs:
           RELEASE_TEST_PASSWORD: ${{ secrets.RELEASE_TEST_PASSWORD }}
           RELEASE_PILOT_EMAIL: ${{ secrets.RELEASE_PILOT_EMAIL }}
           RELEASE_PILOT_PASSWORD: ${{ secrets.RELEASE_PILOT_PASSWORD }}
-          RELEASE_SUCCESSFUL_PILOTS: ${{ vars.RELEASE_SUCCESSFUL_PILOTS }}
         run: npm run release:readiness -- --out release-readiness.json | tee release-readiness.txt
         shell: bash -o pipefail {0}
       - uses: actions/upload-artifact@v4

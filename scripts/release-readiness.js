@@ -30,12 +30,12 @@
 // BLOCKED check counts as not ready. Nothing is green by default.
 //
 // Verdict:
-//   NOT READY             any check is not PASS
-//   PILOT READY           all 14 checks PASS
-//   PRODUCTION READY      PILOT READY, and the installer is code-signed, the
-//                         app can update itself, and at least 3 real-business
-//                         pilots are recorded as successful (RELEASE_SUCCESSFUL_PILOTS,
-//                         declared by the owner, reported as declared)
+//   NOT READY             any check is not PASS, or full acceptance evidence
+//                         remains outside this smoke probe. Even all 14 PASS
+//                         cannot certify real-PC installation, Tally sync,
+//                         shadow missions or runtime tenant isolation.
+//                         Manifest flags and owner-declared pilot counts are
+//                         not substitutes for verified acceptance evidence.
 //
 // Configuration (flags or environment):
 //   --api  RELEASE_API_URL    backend, default https://vantro-flow-backend-production.up.railway.app
