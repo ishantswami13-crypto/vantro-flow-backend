@@ -52,7 +52,9 @@ async function main() {
       "INSERT INTO connector_sync_runs (user_id, connector_id, status) VALUES ($1, 'tally', 'succeeded') RETURNING id",
       [userId])).rows[0].id;
     // Reproduce a legacy table that 051's CREATE TABLE IF NOT EXISTS cannot repair.
-    await c.query('ALTER TABLE connector_sync_runs DROP COLUMN device_id, DROP COLUMN client_version');
+    await c.query(`ALTER TABLE connector_sync_runs
+      DROP COLUMN device_id, DROP COLUMN client_version,
+      DROP COLUMN records_imported, DROP COLUMN records_rejected, DROP COLUMN error`);
     const insertRun = () => c.query(
       "INSERT INTO connector_sync_runs (user_id, connector_id, device_id, client_version) VALUES ($1, 'tally', $2, $3) RETURNING id, started_at",
       [userId, null, '0.1.1']);
@@ -60,11 +62,16 @@ async function main() {
     try { await insertRun(); } catch (e) { failure = e; }
     check('legacy sync table reproduces missing column failure', failure?.code === '42703');
     const applied = await migrate.run({ mode: 'apply', client: c, log: quiet });
-    check('forward repair is picked up by migration runner', applied.applied.includes('migrations/063_connector_sync_device_columns.sql'));
+    check('forward repairs are picked up by migration runner',
+      applied.applied.includes('migrations/063_connector_sync_device_columns.sql')
+      && applied.applied.includes('migrations/064_connector_sync_result_columns.sql'));
     const run = await insertRun();
     check('device sync insert works after repair', !!run.rows[0]?.id && !!run.rows[0]?.started_at);
-    const repair = fs.readFileSync(path.join(ROOT, 'migrations/063_connector_sync_device_columns.sql'), 'utf8');
-    await c.query(repair);
+    await c.query("UPDATE connector_sync_runs SET status='succeeded', finished_at=now(), records_imported=3, records_rejected=1, error=NULL WHERE id=$1", [run.rows[0].id]);
+    const completed = await c.query('SELECT status, records_imported, records_rejected, error FROM connector_sync_runs WHERE id=$1', [run.rows[0].id]);
+    check('sync completion stores import totals and error state', completed.rows[0]?.status === 'succeeded' && completed.rows[0]?.records_imported === 3 && completed.rows[0]?.records_rejected === 1 && completed.rows[0]?.error === null);
+    await c.query(fs.readFileSync(path.join(ROOT, 'migrations/063_connector_sync_device_columns.sql'), 'utf8'));
+    await c.query(fs.readFileSync(path.join(ROOT, 'migrations/064_connector_sync_result_columns.sql'), 'utf8'));
     const old = (await c.query('SELECT status, device_id, client_version FROM connector_sync_runs WHERE id=$1', [historical])).rows[0];
     check('repair is repeatable and preserves historical rows', old?.status === 'succeeded' && old.device_id === null && old.client_version === null);
     const rls = await c.query("SELECT relrowsecurity FROM pg_class WHERE oid='connector_sync_runs'::regclass");
