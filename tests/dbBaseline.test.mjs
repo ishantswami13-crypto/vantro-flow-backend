@@ -43,6 +43,38 @@ const tableColumns = async (c, t) => (await c.query(`SELECT column_name FROM inf
 const FOREIGN_LEDGER_DDL = 'CREATE TABLE schema_migrations (version text, checksum text, applied_at timestamptz, applied_by text)';
 
 async function main() {
+  await withScratch('syncdevice', async (c) => {
+    await migrate.run({ mode: 'apply', client: c, log: quiet,
+      throughFile: 'migrations/062_outbound_engine.sql' });
+    const userId = randomUUID();
+    await c.query('INSERT INTO users (id, email) VALUES ($1, $2)', [userId, `${userId}@example.invalid`]);
+    const historical = (await c.query(
+      "INSERT INTO connector_sync_runs (user_id, connector_id, status) VALUES ($1, 'tally', 'succeeded') RETURNING id",
+      [userId])).rows[0].id;
+    // Reproduce a legacy table that 051's CREATE TABLE IF NOT EXISTS cannot repair.
+    await c.query('ALTER TABLE connector_sync_runs DROP COLUMN device_id, DROP COLUMN client_version');
+    const insertRun = () => c.query(
+      "INSERT INTO connector_sync_runs (user_id, connector_id, device_id, client_version) VALUES ($1, 'tally', $2, $3) RETURNING id, started_at",
+      [userId, null, '0.1.1']);
+    let failure;
+    try { await insertRun(); } catch (e) { failure = e; }
+    check('legacy sync table reproduces missing column failure', failure?.code === '42703');
+    const applied = await migrate.run({ mode: 'apply', client: c, log: quiet });
+    check('forward repair is picked up by migration runner', applied.applied.includes('migrations/063_connector_sync_device_columns.sql'));
+    const run = await insertRun();
+    check('device sync insert works after repair', !!run.rows[0]?.id && !!run.rows[0]?.started_at);
+    const repair = fs.readFileSync(path.join(ROOT, 'migrations/063_connector_sync_device_columns.sql'), 'utf8');
+    await c.query(repair);
+    const old = (await c.query('SELECT status, device_id, client_version FROM connector_sync_runs WHERE id=$1', [historical])).rows[0];
+    check('repair is repeatable and preserves historical rows', old?.status === 'succeeded' && old.device_id === null && old.client_version === null);
+    const rls = await c.query("SELECT relrowsecurity FROM pg_class WHERE oid='connector_sync_runs'::regclass");
+    check('repair preserves row-level security', rls.rows[0].relrowsecurity === true);
+    let invalidDevice;
+    try {
+      await c.query("INSERT INTO connector_sync_runs (user_id, connector_id, device_id) VALUES ($1, 'tally', $2)", [userId, randomUUID()]);
+    } catch (e) { invalidDevice = e; }
+    check('new device column enforces device foreign key', invalidDevice?.code === '23503');
+  });
   await withScratch('happy', async (c) => {
     await prodLike(c);
     const r = await preflight(c);
