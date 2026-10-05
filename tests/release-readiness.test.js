@@ -11,7 +11,7 @@ test('installer identity must include safe filename, SHA-256 and positive byte c
   }
 });
 test('a downloaded executable cannot pass without a valid manifest', () => {
-  assert.equal(downloadResult({ sha: installer.sha256, size: 100 }, null).status, 'BLOCKED');
+  assert.equal(downloadResult({ sha: installer.sha256, size: 100 }, null).status, 'EXTERNAL VALIDATION REQUIRED');
   assert.equal(downloadResult({ sha: installer.sha256, size: 100 }, installer).status, 'PASS');
   assert.equal(downloadResult({ sha: 'b'.repeat(64), size: 100 }, installer).status, 'FAIL');
   assert.equal(downloadResult({ sha: installer.sha256, size: 101 }, installer).status, 'FAIL');
@@ -36,7 +36,7 @@ test('smoke passes alone never certify a pilot or production launch', () => {
   assert.match(result.why, /shadow mission/);
 });
 test('blocked, failed and missing checks remain visible in the verdict', () => {
-  const result = assessVerdict(['AUTH', 'MISSIONS', 'BRIDGE'], { AUTH: { status: 'BLOCKED' }, MISSIONS: { status: 'FAIL' } });
+  const result = assessVerdict(['AUTH', 'MISSIONS', 'BRIDGE'], { AUTH: { status: 'EXTERNAL VALIDATION REQUIRED' }, MISSIONS: { status: 'FAIL' } });
   assert.equal(result.verdict, 'NOT READY');
   assert.equal(result.why, 'AUTH, MISSIONS, BRIDGE not passing');
 });

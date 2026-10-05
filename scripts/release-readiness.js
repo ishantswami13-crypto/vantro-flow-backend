@@ -6,34 +6,49 @@
 // a local database), this looks at the *deployed* system from the outside, the
 // way a new customer meets it:
 //
-//   DATABASE           production migrations match this code (/api/version)
+//   DATABASE           the production database answers through the API
+//   MIGRATIONS         production migrations match this code (/api/version)
 //   BACKEND            the API is up over HTTPS and runs this release
 //   FRONTEND           the website serves its sign-in page over HTTPS
-//   DESKTOP            a Windows release is published and matches this release
-//   INSTALLER          that installer downloads, is a Windows executable and
-//                      matches its published SHA-256 and size
-//   DOWNLOAD_ENDPOINT  the website's /download/windows hands out that binary
 //   AUTH               no token and a forged token are refused; a real test
 //                      account signs in, loads its company, signs out
+//   TENANCY            the tenant-isolation scan passes, forged tokens are
+//                      refused, and the pilot account cannot open an id it
+//                      does not own (404)
 //   BRIDGE             a real (pilot) company's Bridge loads from real data
-//   CONNECTOR          that company has a connector whose last sync succeeded
+//   CONNECTORS         that company has a connector whose last sync succeeded
 //                      within 48 hours
 //   SCAN               Scan answers from that company's own records
 //   WATCH              Watch loads for that company
+//   DECISIONS          that company's decisions load
 //   SIMULATE           a cash simulation runs over that company's open invoices
+//   PREPARED           that company's prepared work (approvals) loads
 //   MISSIONS           Missions load for that company
-//   MODELS             Ask Starlane has at least one AI model provider configured
-//                      (/api/ai/health; never shows keys)
+//   AGENTS             the agent registry loads with at least one agent
+//   CHAT               Ask Starlane has at least one AI model provider
+//                      configured (/api/ai/health; never shows keys)
+//   MEMORY             that company's memory (outcomes, knowledge) loads
+//   POLICY             controls load: pilot mode and kill switches are readable
+//   ACTIONS            never exercised against production by this probe (it
+//                      takes no action); proved on fixtures by pilot:readiness
+//   OUTCOME            the track record (verified outcomes) loads
+//   DESKTOP            a Windows release is published and matches this release
+//   INSTALLER          that installer downloads, is a Windows executable and
+//                      matches its published SHA-256 and size
+//   DOWNLOAD           the website's /download/windows hands out that binary
 //   SECURITY           HTTPS + HSTS, forged tokens refused, tenant-isolation and
 //                      secret scans of this code pass
 //
+// Statuses: PASS, FAIL, or EXTERNAL VALIDATION REQUIRED (could not be
+// exercised from here, with the reason).
+//
 // Every check is PASS only when it was exercised against the real system just
-// now. Anything that could not be exercised is BLOCKED with the reason, and a
-// BLOCKED check counts as not ready. Nothing is green by default.
+// now. Anything that could not be exercised is EXTERNAL VALIDATION REQUIRED
+// with the reason, and counts as not ready. Nothing is green by default.
 //
 // Verdict:
 //   NOT READY             any check is not PASS, or full acceptance evidence
-//                         remains outside this smoke probe. Even all 15 PASS
+//                         remains outside this smoke probe. Even all checks PASS
 //                         cannot certify real-PC installation, Tally sync,
 //                         shadow missions or runtime tenant isolation.
 //                         Manifest flags and owner-declared pilot counts are
@@ -45,7 +60,8 @@
 //   --repo RELEASE_REPO       GitHub repo holding desktop releases, default ishantswami13-crypto/vantro-flow-frontend
 //   RELEASE_TEST_EMAIL / RELEASE_TEST_PASSWORD     a test account (AUTH)
 //   RELEASE_PILOT_EMAIL / RELEASE_PILOT_PASSWORD   an account holding a real pilot company's data
-//                                                  (BRIDGE, CONNECTOR, SCAN, WATCH, SIMULATE, MISSIONS)
+//                                                  (TENANCY, BRIDGE, CONNECTORS, SCAN, WATCH, DECISIONS, SIMULATE,
+//                                                   PREPARED, MISSIONS, AGENTS, CHAT, MEMORY, POLICY, OUTCOME)
 //   --out FILE                 also write the results as JSON
 //
 // Read-only against production: it signs in, reads, runs a simulation (which is
@@ -66,8 +82,9 @@ const SITE = (opt('site') || process.env.RELEASE_SITE_URL || '').replace(/\/+$/,
 const REPO = opt('repo') || process.env.RELEASE_REPO || 'ishantswami13-crypto/vantro-flow-frontend';
 const OUT = opt('out');
 
-const CHECKS = ['DATABASE', 'BACKEND', 'FRONTEND', 'DESKTOP', 'INSTALLER', 'DOWNLOAD_ENDPOINT', 'AUTH', 'BRIDGE', 'CONNECTOR', 'SCAN', 'WATCH', 'SIMULATE', 'MISSIONS', 'MODELS', 'SECURITY'];
-const results = Object.fromEntries(CHECKS.map((c) => [c, { status: 'BLOCKED', detail: 'not reached' }]));
+const CHECKS = ['DATABASE', 'MIGRATIONS', 'BACKEND', 'FRONTEND', 'AUTH', 'TENANCY', 'BRIDGE', 'CONNECTORS', 'SCAN', 'WATCH', 'DECISIONS', 'SIMULATE', 'PREPARED', 'MISSIONS', 'AGENTS', 'CHAT', 'MEMORY', 'POLICY', 'ACTIONS', 'OUTCOME', 'DESKTOP', 'INSTALLER', 'DOWNLOAD', 'SECURITY'];
+const EVR = 'EXTERNAL VALIDATION REQUIRED';
+const results = Object.fromEntries(CHECKS.map((c) => [c, { status: EVR, detail: 'not reached' }]));
 const set = (c, status, detail) => { results[c] = { status, detail }; };
 const facts = {};
 
@@ -106,16 +123,20 @@ async function run() {
     else if (version.json?.release !== RELEASE) set('BACKEND', 'FAIL', `deployed release ${version.json?.release} is not this release ${RELEASE}`);
     else set('BACKEND', 'PASS', `release ${RELEASE}, git ${version.json.gitSha || 'unknown'}`);
     const m = version.json?.migrations;
-    if (!m) set('DATABASE', 'FAIL', '/api/version did not report migrations');
-    else if (m.upToDate) set('DATABASE', 'PASS', `applied ${m.applied} = expected ${m.expected}`);
-    else set('DATABASE', 'FAIL', `applied ${m.applied || 'none (not baselined)'}, this code expects ${m.expected}`);
+    if (!m) { set('DATABASE', 'FAIL', '/api/version could not read the migration ledger'); set('MIGRATIONS', 'FAIL', '/api/version did not report migrations'); }
+    else {
+      set('DATABASE', 'PASS', 'the API reads the production migration ledger');
+      if (m.upToDate) set('MIGRATIONS', 'PASS', `applied ${m.applied} = expected ${m.expected}`);
+      else set('MIGRATIONS', 'FAIL', `applied ${m.applied || 'none (not baselined)'}, this code expects ${m.expected}`);
+    }
   } catch (e) {
-    set('BACKEND', 'BLOCKED', `${API} not reachable (${reason(e)})`);
-    set('DATABASE', 'BLOCKED', 'backend not reachable');
+    set('BACKEND', EVR, `${API} not reachable (${reason(e)})`);
+    set('DATABASE', EVR, 'backend not reachable');
+    set('MIGRATIONS', EVR, 'backend not reachable');
   }
 
   // ── FRONTEND ──────────────────────────────────────────────────────────
-  if (!SITE) set('FRONTEND', 'BLOCKED', 'no website URL (--site or RELEASE_SITE_URL)');
+  if (!SITE) set('FRONTEND', EVR, 'no website URL (--site or RELEASE_SITE_URL)');
   else {
     try {
       const r = await http(`${SITE}/login`);
@@ -124,7 +145,7 @@ async function run() {
       if (!SITE.startsWith('https://')) set('FRONTEND', 'FAIL', `${SITE} is not HTTPS`);
       else if (r.status !== 200 || !html) set('FRONTEND', 'FAIL', `/login answered ${r.status} ${r.headers.get('content-type')}`);
       else set('FRONTEND', 'PASS', `${SITE}/login 200`);
-    } catch (e) { set('FRONTEND', 'BLOCKED', `${SITE} not reachable (${reason(e)})`); }
+    } catch (e) { set('FRONTEND', EVR, `${SITE} not reachable (${reason(e)})`); }
   }
 
   // ── DESKTOP + INSTALLER ───────────────────────────────────────────────
@@ -140,26 +161,26 @@ async function run() {
       if (manifest.version !== RELEASE) set('DESKTOP', 'FAIL', `published desktop ${manifest.version} does not match backend release ${RELEASE}`);
       else set('DESKTOP', 'PASS', `${manifest.label}, published ${manifest.published_at}${manifest.signed ? ', code-signed' : ', NOT code-signed'}${manifest.updater ? ', self-updating' : ', no self-update'}`);
     }
-  } catch (e) { set('DESKTOP', 'BLOCKED', `GitHub not reachable (${reason(e)})`); }
+  } catch (e) { set('DESKTOP', EVR, `GitHub not reachable (${reason(e)})`); }
 
-  if (!manifest) set('INSTALLER', results.DESKTOP.status === 'BLOCKED' ? 'BLOCKED' : 'FAIL', 'no published installer to check');
+  if (!manifest) set('INSTALLER', results.DESKTOP.status === EVR ? EVR : 'FAIL', 'no published installer to check');
   else {
     const inst = manifest.platforms.windows.x64.installer;
     try {
       const got = await checkBinary(`${latest}/${inst.filename}`, inst);
       if (typeof got === 'string') set('INSTALLER', 'FAIL', got);
       else set('INSTALLER', 'PASS', `${inst.filename}, ${got.size} bytes, sha256 ${got.sha}`);
-    } catch (e) { set('INSTALLER', 'BLOCKED', `download failed (${reason(e)})`); }
+    } catch (e) { set('INSTALLER', EVR, `download failed (${reason(e)})`); }
   }
 
-  // ── DOWNLOAD_ENDPOINT ─────────────────────────────────────────────────
-  if (!SITE) set('DOWNLOAD_ENDPOINT', 'BLOCKED', 'no website URL (--site or RELEASE_SITE_URL)');
+  // ── DOWNLOAD ─────────────────────────────────────────────────────────
+  if (!SITE) set('DOWNLOAD', EVR, 'no website URL (--site or RELEASE_SITE_URL)');
   else {
     try {
       const got = await checkBinary(`${SITE}/download/windows`, manifest?.platforms.windows.x64.installer);
       const assessed = downloadResult(got, manifest?.platforms.windows.x64.installer);
-      set('DOWNLOAD_ENDPOINT', assessed.status, `${SITE}/download/windows: ${assessed.detail}`);
-    } catch (e) { set('DOWNLOAD_ENDPOINT', 'BLOCKED', `${SITE}/download/windows not reachable (${reason(e)})`); }
+      set('DOWNLOAD', assessed.status, `${SITE}/download/windows: ${assessed.detail}`);
+    } catch (e) { set('DOWNLOAD', EVR, `${SITE}/download/windows not reachable (${reason(e)})`); }
   }
 
   // ── AUTH ──────────────────────────────────────────────────────────────
@@ -171,7 +192,7 @@ async function run() {
     const email = process.env.RELEASE_TEST_EMAIL || process.env.RELEASE_PILOT_EMAIL;
     const password = process.env.RELEASE_TEST_PASSWORD || process.env.RELEASE_PILOT_PASSWORD;
     if (!forgedRefused) set('AUTH', 'FAIL', `no token -> ${none.status}, forged token -> ${forged.status} (both must be 401)`);
-    else if (!email || !password) set('AUTH', 'BLOCKED', 'no token and forged token are refused (401), but no test account is configured (RELEASE_TEST_EMAIL/PASSWORD), so sign-in was not exercised');
+    else if (!email || !password) set('AUTH', EVR, 'no token and forged token are refused (401), but no test account is configured (RELEASE_TEST_EMAIL/PASSWORD), so sign-in was not exercised');
     else {
       const wrong = await http(`${API}/api/auth/native/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password: `${password}-wrong` }) });
       const s = await signIn(email, password);
@@ -186,12 +207,13 @@ async function run() {
         else set('AUTH', 'PASS', 'no/forged token 401, wrong password 401, sign-in 200, company loads, sign-out ends the session');
       }
     }
-  } catch (e) { set('AUTH', 'BLOCKED', `backend not reachable (${reason(e)})`); }
+  } catch (e) { set('AUTH', EVR, `backend not reachable (${reason(e)})`); }
 
   // ── Real company: BRIDGE, CONNECTOR, SCAN, WATCH, SIMULATE, MISSIONS ──
-  const product = ['BRIDGE', 'CONNECTOR', 'SCAN', 'WATCH', 'SIMULATE', 'MISSIONS', 'MODELS'];
+  const product = ['BRIDGE', 'CONNECTORS', 'SCAN', 'WATCH', 'DECISIONS', 'SIMULATE', 'PREPARED', 'MISSIONS', 'AGENTS', 'CHAT', 'MEMORY', 'POLICY', 'OUTCOME'];
+  let pilotForeignId = null;
   const pe = process.env.RELEASE_PILOT_EMAIL; const pp = process.env.RELEASE_PILOT_PASSWORD;
-  if (!pe || !pp) for (const c of product) set(c, 'BLOCKED', 'no real pilot account configured (RELEASE_PILOT_EMAIL/PASSWORD); fixture proof is pilot:readiness, which says nothing about a real business');
+  if (!pe || !pp) for (const c of product) set(c, EVR, 'no real pilot account configured (RELEASE_PILOT_EMAIL/PASSWORD); fixture proof is pilot:readiness, which says nothing about a real business');
   else {
     try {
       const s = await signIn(pe, pp);
@@ -206,9 +228,9 @@ async function run() {
       const conns = await get('/api/connectors');
       const list = conns.json?.connectors || [];
       const fresh = list.filter((c) => freshHealthyConnector(c));
-      if (conns.status !== 200) set('CONNECTOR', 'FAIL', `answered ${conns.status}`);
-      else if (!fresh.length) set('CONNECTOR', 'FAIL', `no connector synced successfully in the last 48 h (${list.filter((c) => c.state?.health && c.state.health !== 'not_connected' && c.state.health !== 'unavailable').map((c) => `${c.name}: ${c.state.health}`).join(', ') || 'none connected'})`);
-      else set('CONNECTOR', 'PASS', fresh.map((c) => `${c.name} ${c.state.health}, last success ${c.state.lastSuccessAt}`).join('; '));
+      if (conns.status !== 200) set('CONNECTORS', 'FAIL', `answered ${conns.status}`);
+      else if (!fresh.length) set('CONNECTORS', 'FAIL', `no connector synced successfully in the last 48 h (${list.filter((c) => c.state?.health && c.state.health !== 'not_connected' && c.state.health !== 'unavailable').map((c) => `${c.name}: ${c.state.health}`).join(', ') || 'none connected'})`);
+      else set('CONNECTORS', 'PASS', fresh.map((c) => `${c.name} ${c.state.health}, last success ${c.state.lastSuccessAt}`).join('; '));
 
       const invoices = await get('/api/client/scan/search?q=' + encodeURIComponent('in'));
       const hits = (invoices.json?.customers?.length || 0) + (invoices.json?.invoices?.length || 0);
@@ -224,15 +246,47 @@ async function run() {
       else if (!sim.json?.simulation) set('SIMULATE', 'FAIL', `no simulation (${sim.json?.emptyReason || `${sim.json?.invoiceCount} open invoices`})`);
       else set('SIMULATE', 'PASS', `simulated ${sim.json.invoiceCount} open invoices (not persisted)`);
 
-      const mi = await get('/api/client/missions');
-      set('MISSIONS', mi.status === 200 ? 'PASS' : 'FAIL', mi.status === 200 ? `${(mi.json?.missions || []).length} missions` : `answered ${mi.status}`);
+      // The unified list the Missions screen shows (decisions being handled,
+      // workflows and collection missions), not only the legacy table.
+      const mi = await get('/api/os/missions');
+      set('MISSIONS', mi.status === 200 ? 'PASS' : 'FAIL', mi.status === 200 ? `${(mi.json?.missions || []).length} missions${Object.keys(mi.json?.byState || {}).length ? ` (${Object.entries(mi.json.byState).map(([k, v]) => `${v} ${k.toLowerCase()}`).join(', ')})` : ''}` : `answered ${mi.status}`);
 
       const ai = await get('/api/ai/health');
-      if (ai.status !== 200) set('MODELS', 'FAIL', `/api/ai/health answered ${ai.status}`);
-      else if (!(ai.json?.configured || []).length) set('MODELS', 'FAIL', 'no AI model provider is configured, so Ask Starlane answers "No AI model is set up" (set GROQ_API_KEY, GEMINI_API_KEY or ANTHROPIC_API_KEY)');
-      else set('MODELS', 'PASS', `providers ${ai.json.configured.join(' > ')}; usage ledger ${ai.json.usageLedger}`);
+      if (ai.status !== 200) set('CHAT', 'FAIL', `/api/ai/health answered ${ai.status}`);
+      else if (!(ai.json?.configured || []).length) set('CHAT', 'FAIL', 'no AI model provider is configured, so Ask Starlane answers "No AI model is set up" (set GROQ_API_KEY, GEMINI_API_KEY or ANTHROPIC_API_KEY)');
+      else set('CHAT', 'PASS', `providers ${ai.json.configured.join(' > ')}; usage ledger ${ai.json.usageLedger}`);
+      const loads = async (check, p, describe) => {
+        const r = await get(p);
+        if (r.status !== 200) set(check, 'FAIL', `${p} answered ${r.status}`);
+        else set(check, 'PASS', describe(r.json || {}));
+      };
+      await loads('DECISIONS', '/api/decisions', (j) => `${(j.decisions || []).length} active decisions`);
+      await loads('PREPARED', '/api/os/workflows/items', (j) => `${(j.items || []).length} prepared items`);
+      await loads('MEMORY', '/api/os/memory', (j) => `${(j.recentOutcomes || []).length} recent outcomes, ${(j.decisionContracts || []).length} decision contracts`);
+      await loads('POLICY', '/api/decisions/controls', (j) => `pilot mode ${j.pilotMode || 'unknown'}, external sending ${j.externalSendEnabled ? 'ON' : 'off'}, global stop ${j.globalStop ? 'ON' : 'off'}, ${(j.controls || []).filter((c) => c.stopped).length} kill switches on`);
+      await loads('OUTCOME', '/api/decisions/track-record', (j) => `track record loads: ${j.contracts ?? 0} decision contracts`);
+      const ag = await get('/api/os/agents');
+      if (ag.status !== 200) set('AGENTS', 'FAIL', `/api/os/agents answered ${ag.status}`);
+      else if (!(ag.json?.agents || []).length) set('AGENTS', 'FAIL', 'no agents registered');
+      else set('AGENTS', 'PASS', `${ag.json.agents.length} agents: ${ag.json.agents.map((a) => `${a.name} ${a.status}`).join(', ')}`);
+      // TENANCY (runtime part): an id this account does not own is a 404, never data.
+      const foreign = await get(`/api/decisions/${crypto.randomUUID()}`);
+      pilotForeignId = foreign.status;
       await http(`${API}/api/auth/native/logout`, { method: 'POST', headers: { Authorization: `Bearer ${s.token}` } }).catch(() => {});
-    } catch (e) { for (const c of product) if (results[c].detail === 'not reached') set(c, 'BLOCKED', reason(e)); }
+    } catch (e) { for (const c of product) if (results[c].detail === 'not reached') set(c, EVR, reason(e)); }
+  }
+
+  // ── ACTIONS: this probe never acts on production ──────────────────────
+  set('ACTIONS', EVR, 'not exercised against production on purpose (this probe takes no action). Approval gate, kill switches, stale-data block, idempotency and shadow mode are proved on fixtures by pilot:readiness ACTIONS and tests/realityProof.test.mjs');
+
+  // ── TENANCY ───────────────────────────────────────────────────────────
+  {
+    const scan = spawnSync(process.execPath, [path.join(__dirname, 'check-tenant-isolation.js')], { encoding: 'utf8', timeout: 120_000 });
+    if (scan.status !== 0) set('TENANCY', 'FAIL', 'tenant-isolation scan of this code failed');
+    else if (forgedRefused === false) set('TENANCY', 'FAIL', 'a forged token was accepted');
+    else if (pilotForeignId != null && pilotForeignId !== 404) set('TENANCY', 'FAIL', `an id the pilot account does not own answered ${pilotForeignId}, not 404`);
+    else if (forgedRefused === null || pilotForeignId == null) set('TENANCY', EVR, 'tenant-isolation scan passes; runtime check needs the backend and a pilot account (RELEASE_PILOT_EMAIL/PASSWORD)');
+    else set('TENANCY', 'PASS', 'tenant-isolation scan passes, forged token refused, a foreign id is 404');
   }
 
   // ── SECURITY ──────────────────────────────────────────────────────────
@@ -250,7 +304,7 @@ async function run() {
     if (r.status !== 0) problems.push(`${name} failed`);
   }
   if (problems.length) set('SECURITY', 'FAIL', problems.join('; '));
-  else if (blocked.length) set('SECURITY', 'BLOCKED', `tenant isolation and secret scans pass; ${blocked.join('; ')}`);
+  else if (blocked.length) set('SECURITY', EVR, `tenant isolation and secret scans pass; ${blocked.join('; ')}`);
   else set('SECURITY', 'PASS', 'HTTPS + HSTS, forged tokens refused, tenant-isolation and secret scans pass');
 }
 
@@ -271,7 +325,7 @@ run()
       'STARLANE RELEASE READINESS',
       `run at ${new Date().toISOString()} · release ${RELEASE} · api ${API} · site ${SITE || '(not given)'} · releases ${REPO}`,
       '',
-      ...CHECKS.map((c) => `${c.padEnd(18)} ${results[c].status.padEnd(8)} ${results[c].detail}`),
+      ...CHECKS.map((c) => `${c.padEnd(18)} ${results[c].status.padEnd(29)} ${results[c].detail}`),
       '',
       `VERDICT: ${v.verdict}`,
       v.why,
