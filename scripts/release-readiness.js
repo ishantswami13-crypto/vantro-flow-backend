@@ -22,6 +22,8 @@
 //   WATCH              Watch loads for that company
 //   SIMULATE           a cash simulation runs over that company's open invoices
 //   MISSIONS           Missions load for that company
+//   MODELS             Ask Starlane has at least one AI model provider configured
+//                      (/api/ai/health; never shows keys)
 //   SECURITY           HTTPS + HSTS, forged tokens refused, tenant-isolation and
 //                      secret scans of this code pass
 //
@@ -31,7 +33,7 @@
 //
 // Verdict:
 //   NOT READY             any check is not PASS, or full acceptance evidence
-//                         remains outside this smoke probe. Even all 14 PASS
+//                         remains outside this smoke probe. Even all 15 PASS
 //                         cannot certify real-PC installation, Tally sync,
 //                         shadow missions or runtime tenant isolation.
 //                         Manifest flags and owner-declared pilot counts are
@@ -64,7 +66,7 @@ const SITE = (opt('site') || process.env.RELEASE_SITE_URL || '').replace(/\/+$/,
 const REPO = opt('repo') || process.env.RELEASE_REPO || 'ishantswami13-crypto/vantro-flow-frontend';
 const OUT = opt('out');
 
-const CHECKS = ['DATABASE', 'BACKEND', 'FRONTEND', 'DESKTOP', 'INSTALLER', 'DOWNLOAD_ENDPOINT', 'AUTH', 'BRIDGE', 'CONNECTOR', 'SCAN', 'WATCH', 'SIMULATE', 'MISSIONS', 'SECURITY'];
+const CHECKS = ['DATABASE', 'BACKEND', 'FRONTEND', 'DESKTOP', 'INSTALLER', 'DOWNLOAD_ENDPOINT', 'AUTH', 'BRIDGE', 'CONNECTOR', 'SCAN', 'WATCH', 'SIMULATE', 'MISSIONS', 'MODELS', 'SECURITY'];
 const results = Object.fromEntries(CHECKS.map((c) => [c, { status: 'BLOCKED', detail: 'not reached' }]));
 const set = (c, status, detail) => { results[c] = { status, detail }; };
 const facts = {};
@@ -187,7 +189,7 @@ async function run() {
   } catch (e) { set('AUTH', 'BLOCKED', `backend not reachable (${reason(e)})`); }
 
   // ── Real company: BRIDGE, CONNECTOR, SCAN, WATCH, SIMULATE, MISSIONS ──
-  const product = ['BRIDGE', 'CONNECTOR', 'SCAN', 'WATCH', 'SIMULATE', 'MISSIONS'];
+  const product = ['BRIDGE', 'CONNECTOR', 'SCAN', 'WATCH', 'SIMULATE', 'MISSIONS', 'MODELS'];
   const pe = process.env.RELEASE_PILOT_EMAIL; const pp = process.env.RELEASE_PILOT_PASSWORD;
   if (!pe || !pp) for (const c of product) set(c, 'BLOCKED', 'no real pilot account configured (RELEASE_PILOT_EMAIL/PASSWORD); fixture proof is pilot:readiness, which says nothing about a real business');
   else {
@@ -224,6 +226,11 @@ async function run() {
 
       const mi = await get('/api/client/missions');
       set('MISSIONS', mi.status === 200 ? 'PASS' : 'FAIL', mi.status === 200 ? `${(mi.json?.missions || []).length} missions` : `answered ${mi.status}`);
+
+      const ai = await get('/api/ai/health');
+      if (ai.status !== 200) set('MODELS', 'FAIL', `/api/ai/health answered ${ai.status}`);
+      else if (!(ai.json?.configured || []).length) set('MODELS', 'FAIL', 'no AI model provider is configured, so Ask Starlane answers "No AI model is set up" (set GROQ_API_KEY, GEMINI_API_KEY or ANTHROPIC_API_KEY)');
+      else set('MODELS', 'PASS', `providers ${ai.json.configured.join(' > ')}; usage ledger ${ai.json.usageLedger}`);
       await http(`${API}/api/auth/native/logout`, { method: 'POST', headers: { Authorization: `Bearer ${s.token}` } }).catch(() => {});
     } catch (e) { for (const c of product) if (results[c].detail === 'not reached') set(c, 'BLOCKED', reason(e)); }
   }

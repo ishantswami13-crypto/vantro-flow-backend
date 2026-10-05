@@ -5665,17 +5665,47 @@ app.get('/api/audit', authMiddleware, async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
     const before = req.query.before || null; // ISO timestamp cursor for pagination
 
-    let query = supabase
-      .from('audit_logs')
-      .select('id, action, entity_type, entity_id, old_value_json, new_value_json, created_at')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false })
-      .limit(limit);
-    if (before) query = query.lt('created_at', before);
-
-    const { data, error } = await query;
-    if (error) throw error;
-    res.json({ success: true, events: data || [] });
+    // Two append-only sources, one timeline: audit_logs (financial changes) and
+    // decision_events (every decision step: who opened, simulated, approved,
+    // which agent ran it, under which policy, in which mode).
+    const pool = getPool();
+    const params = before ? [userId, limit, before] : [userId, limit];
+    const cursor = before ? 'AND created_at < $3' : '';
+    const [fin, dec] = await Promise.all([
+      pool.query(
+        `SELECT id::text, action, entity_type, entity_id::text, old_value_json, new_value_json, created_at
+           FROM audit_logs WHERE user_id = $1 ${cursor} ORDER BY created_at DESC LIMIT $2`, params),
+      pool.query(
+        `SELECT e.id::text, e.event_type, e.decision_id::text, e.actor_type, e.actor_id, e.agent_key, e.agent_version, e.model,
+                e.policy, e.payload, e.correlation_id, e.created_at, d.title
+           FROM decision_events e LEFT JOIN decisions d ON d.id = e.decision_id AND d.user_id = e.user_id
+          WHERE e.user_id = $1 ${cursor.replace('created_at', 'e.created_at')} ORDER BY e.created_at DESC LIMIT $2`, params)
+        .catch((err) => { if (err.code === '42P01') return { rows: [] }; throw err; }),
+    ]);
+    const events = [
+      ...fin.rows.map((r) => ({ ...r, source: 'ledger', actor: null, result: null })),
+      ...dec.rows.map((r) => {
+        const p = r.payload || {};
+        return {
+          id: r.id,
+          action: r.event_type,
+          entity_type: 'decision',
+          entity_id: r.decision_id,
+          title: r.title || null,
+          actor: r.actor_type === 'agent' ? `Agent ${r.agent_key || r.actor_id}` : r.actor_type === 'human' ? (r.actor_id === String(userId) ? 'You' : 'A teammate') : 'Starlane',
+          actor_type: r.actor_type,
+          agent: r.agent_key ? { key: r.agent_key, version: r.agent_version } : null,
+          model: r.model || null,
+          policy: r.policy || null,
+          source: 'decision',
+          result: p.result || p.status || p.mode || null,
+          correlation_id: r.correlation_id || null,
+          new_value_json: p,
+          created_at: r.created_at,
+        };
+      }),
+    ].sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).slice(0, limit);
+    res.json({ success: true, events });
   } catch (error) {
     console.error('[audit list]', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -6392,7 +6422,7 @@ async function groqChat(messages, tools, toolChoice = 'auto') {
   });
   const data = await res.json();
   if (!res.ok) throw new Error(data.error?.message || 'Groq error');
-  return data.choices[0];
+  return { ...data.choices[0], usage: data.usage, model: data.model };
 }
 
 // ---------------------------------------------------------------
@@ -6572,29 +6602,38 @@ async function geminiChat(messages, tools, toolChoice = 'auto') {
       // openAiMessagesToGeminiContents() where this is replayed back.
       _geminiThoughtSignature: p.thoughtSignature || null,
     }));
-    return { message: { role: 'assistant', content: null, tool_calls }, finish_reason: 'tool_calls' };
+    return { message: { role: 'assistant', content: null, tool_calls }, finish_reason: 'tool_calls', usage: data.usageMetadata };
   }
 
   const text = parts.map(p => p.text || '').filter(Boolean).join('\n').trim();
-  return { message: { role: 'assistant', content: text }, finish_reason: 'stop' };
-}
-
-// Provider selector for /api/ai-chat ONLY. Does not affect vision
-// extraction (runGeminiVisionExtraction / runGroqVisionExtraction above),
-// the OCR fallback chain, or any Anthropic-based subsystem — those are
-// untouched and keep using their own existing provider logic.
-//
-// To revert to Groq: unset SCAN_LLM_PROVIDER, or set it to "groq"
-// (or anything unrecognized — default is always Groq, so an unset/typo'd
-// value never silently changes existing behavior for anyone who hasn't
-// opted in).
-function chatCompletion(messages, tools, toolChoice = 'auto') {
-  const provider = (process.env.SCAN_LLM_PROVIDER || 'groq').trim().toLowerCase();
-  if (provider === 'gemini') return geminiChat(messages, tools, toolChoice);
-  return groqChat(messages, tools, toolChoice);
+  return { message: { role: 'assistant', content: text }, finish_reason: 'stop', usage: data.usageMetadata };
 }
 
 const { allowedToolsFor } = require('./lib/ai/assistantTools');
+const { createModelRouter, ModelUnavailableError } = require('./lib/ai/modelRouter');
+const modelRouter = createModelRouter({
+  providers: { groq: groqChat, gemini: geminiChat, anthropic: require('./lib/ai/anthropicChat').makeAnthropicChat() },
+  pool: getPool(),
+});
+
+// Which model providers Ask Starlane can use right now, and this company's AI
+// spend today. Never returns keys.
+app.get('/api/ai/health', authMiddleware, async (req, res) => {
+  const health = modelRouter.health();
+  let today = null;
+  try {
+    const { rows } = await getPool().query(
+      `SELECT provider, model, COUNT(*)::int AS calls, SUM(input_tokens)::int AS input_tokens, SUM(output_tokens)::int AS output_tokens,
+              ROUND(AVG(latency_ms))::int AS avg_latency_ms, SUM(CASE WHEN ok THEN 0 ELSE 1 END)::int AS failures
+         FROM ai_usage WHERE user_id = $1 AND created_at >= date_trunc('day', now()) GROUP BY provider, model`,
+      [authenticatedUserId(req)],
+    );
+    today = rows;
+  } catch (err) {
+    if (err.code !== '42P01') { logRouteError(req, err); return res.status(500).json({ error: 'Could not read AI usage' }); }
+  }
+  res.json({ ...health, usageLedger: today ? 'recording' : 'not installed (migration 065 pending)', today: today || [] });
+});
 
 app.post('/api/ai-chat', authMiddleware, async (req, res) => {
   const { business_name } = req.body;
@@ -6876,13 +6915,14 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
     } catch(err) { return { error: err.message }; }
   };
 
+  const modelSession = modelRouter.session({ userId: user_id, purpose: 'chat', correlationId: req.requestId });
   try {
     let iteration = 0;
     const maxIter = 5;
 
     while (iteration < maxIter) {
       iteration++;
-      const choice = await chatCompletion(chatMessages, AI_TOOLS.filter((t) => allowedTools.has(t.function.name)));
+      const choice = await modelSession.chat(chatMessages, AI_TOOLS.filter((t) => allowedTools.has(t.function.name)));
       const msg = choice.message;
       chatMessages.push(msg);
 
@@ -6902,6 +6942,19 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
 
     return res.json({ success:true, message:'Done! Let me know if you need anything else.', actions, navigate:navigateTo, waLinks });
   } catch(err) {
+    if (err instanceof ModelUnavailableError) {
+      // Say what failed and what still works, instead of a bare 500.
+      const why = {
+        NO_PROVIDER: 'No AI model is set up for Ask Starlane yet.',
+        BUDGET_EXCEEDED: 'Today\'s AI budget for this company is used up. It resets at midnight.',
+        PROVIDERS_FAILED: 'Ask Starlane could not reach its AI model just now.',
+      }[err.code] || err.message;
+      console.warn('AI chat unavailable:', err.code, JSON.stringify(err.detail || {}));
+      return res.status(503).json({
+        error: `${why} Your data is safe. Scan my books, Watch, Decisions and Missions still work without it.`,
+        code: `AI_${err.code}`,
+      });
+    }
     console.error('AI chat error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -13789,6 +13842,29 @@ cron.schedule('20 * * * *', async () => {
     }
   } catch (err) { _log('error', '[DecisionDiscoveryCron] Fatal', { error: err.message }); }
 }, { timezone: 'UTC' });
+
+// Refresh the stored invoices.days_overdue every day at 00:05 UTC. It is set
+// at import and nothing else moved it, so the dunning cycle, morning brief and
+// the older agents that read it saw an invoice 88 days late as 0 days. Same
+// rule as LIVE_OVERDUE_SQL (UTC day); open invoices with a real due date only.
+async function refreshStoredDaysOverdue() {
+  const { LIVE_OVERDUE_SQL } = require('./lib/features/core');
+  const r = await getPool().query(
+    `UPDATE invoices SET days_overdue = ${LIVE_OVERDUE_SQL}
+      WHERE (payment_status IS NULL OR payment_status <> 'Paid')
+        AND due_date IS NOT NULL
+        AND days_overdue IS DISTINCT FROM ${LIVE_OVERDUE_SQL}`,
+  );
+  return r.rowCount;
+}
+cron.schedule('5 0 * * *', async () => {
+  try { console.log(`[DaysOverdueCron] refreshed ${await refreshStoredDaysOverdue()} invoices`); }
+  catch (err) { console.error('[DaysOverdueCron] failed:', err.message); }
+}, { timezone: 'UTC' });
+// And once shortly after boot, so a deploy does not wait for midnight.
+if (process.env.NODE_ENV !== 'test') {
+  setTimeout(() => refreshStoredDaysOverdue().catch((err) => console.error('[DaysOverdueCron] boot refresh failed:', err.message)), 60_000).unref();
+}
 
 cron.schedule('40 3 * * *', async () => {
   const { isEnabled: _isFE } = require('./lib/featureFlags');
