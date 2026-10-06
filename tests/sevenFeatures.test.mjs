@@ -48,7 +48,7 @@ async function main() {
     check('prepared on an empty company says it has no data', prepEmpty.body.horizons.every((h) => h.status === 'insufficient_data'));
     check('telemetry keeps optional auth (features router does not swallow /api/client/*)', (await post('/api/client/telemetry', null, { events: [{ name: 'client.app_started' }] })).status === 202);
     const ver = await get('/api/version');
-    check('version: release, API level and migration level (this database is up to date)', ver.status === 200 && ver.body.release === '0.1.2' && ver.body.apiLevel && ver.body.migrations.expected === LATEST_MIGRATION && ver.body.migrations.upToDate === true, ver.body);
+    check('version: release, API level and migration level (this database is up to date)', ver.status === 200 && ver.body.release === '0.1.3' && ver.body.apiLevel && ver.body.migrations.expected === LATEST_MIGRATION && ver.body.migrations.upToDate === true, ver.body);
     check('features require sign-in',(await get('/api/client/bridge')).status === 401 && (await get('/api/client/missions')).status === 401);
 
     await pool.query(`INSERT INTO invoices (user_id, customer_name, customer_phone, invoice_number, invoice_amount, payment_status, days_overdue, due_date, source_type) VALUES
