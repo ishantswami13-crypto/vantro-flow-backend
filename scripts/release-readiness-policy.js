@@ -17,7 +17,7 @@ function freshHealthyConnector(connector, now = Date.now()) {
 
 function downloadResult(got, installer) {
   if (typeof got === 'string') return { status: 'FAIL', detail: got };
-  if (!validInstaller(installer)) return { status: 'BLOCKED', detail: 'binary downloaded, but no valid published manifest is available to verify it' };
+  if (!validInstaller(installer)) return { status: 'EXTERNAL VALIDATION REQUIRED', detail: 'binary downloaded, but no valid published manifest is available to verify it' };
   if (got.sha.toLowerCase() !== installer.sha256.toLowerCase() || got.size !== installer.size) {
     return { status: 'FAIL', detail: 'download SHA-256/size do not match the manifest' };
   }
