@@ -62,6 +62,31 @@ async function main() {
     check('duplicate sync imports nothing new', inv[0].n === 2 && dup.syncRunId && dup.syncRunId !== run2.id);
     check('other tenant still not_connected (isolation)', (await health(other)).health === 'not_connected');
 
+    // Failures close the run with their error code; a run that never reports
+    // back is closed as timed out on read; the last-sync time and health
+    // follow the latest run, not an older success.
+    await pool.query(`UPDATE connector_sync_runs SET started_at = now() - interval '61 minutes', finished_at = now() - interval '60 minutes' WHERE user_id = $1 AND status = 'succeeded'`, [owner.id]);
+    const run3 = (await (await fetch(`${base}/api/connectors/device/sync-runs`, { method: 'POST', headers: j(tokenAuth), body: '{}' })).json()).syncRun;
+    await fetch(`${base}/api/connectors/device/sync-runs/${run3.id}`, { method: 'PATCH', headers: j(tokenAuth), body: JSON.stringify({ status: 'failed', code: 'tally_unreachable', error: 'TallyPrime is not answering on this computer.' }) });
+    const r3 = (await pool.query('SELECT status, finished_at, error FROM connector_sync_runs WHERE id = $1', [run3.id])).rows[0];
+    check('failed attempt closed with its error code', r3.status === 'failed' && !!r3.finished_at && r3.error === 'tally_unreachable: TallyPrime is not answering on this computer.', r3);
+    st = await health();
+    check('after a failure: error, not healthy; message without the code', st.health === 'error' && st.lastAttempt.errorCode === 'tally_unreachable' && st.lastError === 'TallyPrime is not answering on this computer.', st);
+    check('last sync time is the last succeeded run (an hour ago)', Date.now() - Date.parse(st.lastSyncAt) > 59 * 60 * 1000, st.lastSyncAt);
+    // Earlier attempts in this test move back so the stuck run is the latest.
+    await pool.query(`UPDATE connector_sync_runs SET started_at = now() - interval '30 minutes' WHERE user_id = $1 AND started_at > now() - interval '25 minutes'`, [owner.id]);
+    const stuck = (await pool.query(`INSERT INTO connector_sync_runs (user_id, connector_id, device_id, started_at) VALUES ($1, 'tally', $2, now() - interval '20 minutes') RETURNING id`, [owner.id, claim.deviceId])).rows[0].id;
+    st = await health();
+    const rs = (await pool.query('SELECT status, error FROM connector_sync_runs WHERE id = $1', [stuck])).rows[0];
+    check('a run left running past the timeout is closed as failed on read', rs.status === 'failed' && /^sync_timed_out: /.test(rs.error || ''), rs);
+    check('...and Sources reads it as an error, not healthy', st.health === 'error' && st.lastAttempt.errorCode === 'sync_timed_out', st.lastAttempt);
+    const fresh = (await pool.query(`INSERT INTO connector_sync_runs (user_id, connector_id, device_id, started_at) VALUES ($1, 'tally', $2, now() - interval '20 minutes') RETURNING id`, [owner.id, claim.deviceId])).rows[0].id;
+    const run4 = (await (await fetch(`${base}/api/connectors/device/sync-runs`, { method: 'POST', headers: j(tokenAuth), body: '{}' })).json()).syncRun;
+    check('starting a sync closes stale running attempts first', (await pool.query('SELECT status FROM connector_sync_runs WHERE id = $1', [fresh])).rows[0].status === 'failed');
+    await fetch(`${base}/api/import/tally`, { method: 'POST', headers: j({ ...tokenAuth, 'X-Sync-Run-Id': run4.id }), body: JSON.stringify({ vouchers: VOUCHERS }) });
+    st = await health();
+    check('after a new successful sync: healthy, last sync just now, no error', st.health === 'healthy' && Date.now() - Date.parse(st.lastSyncAt) < 60 * 1000 && st.lastError === null, st);
+
     const { rows: ev } = await pool.query(`SELECT event FROM product_events WHERE user_id = $1 OR device_id = $2`, [owner.id, claim.deviceId]);
     const names = new Set(ev.map((r) => r.event));
     check('events recorded: pairing, paired, token, sync started/failed/succeeded, rejected',
