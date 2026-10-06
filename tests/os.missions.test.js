@@ -191,3 +191,25 @@ test('Today, Agents and the funnel are counted from real rows and scoped to the 
   assert.equal(eAg.reduce((s, x) => s + x.runs, 0), 0);
   assert.equal((await ce.get('/api/os/funnel')).body.reached, 0);
 });
+
+test('the morning brief and Today count the Bridge\'s "need attention" items', async (t) => {
+  if (!env.ok) return t.skip(`no database: ${env.reason}`);
+  const r = await env.pool.query(`SELECT to_regclass('public.watch_events') AS t`);
+  if (!r.rows[0].t) return t.skip('migration 053_seven_features.sql not applied');
+  const a = await tenant('brief-attention');
+  await seedGolden(env.pool, a.id, todayIso());
+  const ca = client(server.base, a);
+  for (const [k, sev] of [['a', 'critical'], ['b', 'high'], ['c', 'normal']]) {
+    await env.pool.query(
+      `INSERT INTO watch_events (user_id, kind, dedupe_key, severity, state, title) VALUES ($1, 'invoice_overdue', $2, $3, 'open', 'Overdue')`,
+      [a.id, `test:${k}`, sev]);
+  }
+  const brief = await ca.get('/api/os/watch/brief');
+  assert.equal(brief.status, 200);
+  const line = brief.body.lines.find((l) => l.kind === 'needs_you');
+  assert.match(line.text, /^2 items need attention/);
+  assert.equal(line.tone, 'attention');
+  const td = await ca.get('/api/os/today');
+  assert.equal(td.body.counts.needAttention, 2);
+  assert.match(td.body.lines.find((l) => l.key === 'needs_you').text, /2 items need attention/);
+});
