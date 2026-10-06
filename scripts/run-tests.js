@@ -41,6 +41,11 @@ const files = ['lib', 'tests']
   .sort();
 
 const hasDb = !!process.env.DATABASE_URL;
+const dbProblem = require('../lib/testing/assertTestDatabase').testDatabaseProblem();
+if (dbProblem) {
+  console.error(`REFUSED: ${dbProblem}`);
+  process.exit(2);
+}
 if (!process.env.JWT_SECRET) process.env.JWT_SECRET = require('crypto').randomBytes(32).toString('hex');
 
 const results = [];

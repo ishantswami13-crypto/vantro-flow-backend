@@ -19,6 +19,7 @@ const migrate = require('../scripts/migrate');
 const { check, done } = makeChecker();
 const quiet = () => {};
 
+require('../lib/testing/assertTestDatabase').assertTestDatabase();
 const adminCfg = buildSanitizedPgConfig(process.env.DATABASE_URL);
 async function withScratch(name, fn) {
   const db = `bl_${name}_${randomUUID().slice(0, 8)}`;
