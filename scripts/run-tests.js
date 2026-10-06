@@ -41,6 +41,10 @@ const files = ['lib', 'tests']
   .sort();
 
 const hasDb = !!process.env.DATABASE_URL;
+{
+  const problem = require('../lib/db/testDatabaseGuard').testDatabaseProblem();
+  if (problem) { console.error(`FATAL ${problem}`); process.exit(2); }
+}
 if (!process.env.JWT_SECRET) process.env.JWT_SECRET = require('crypto').randomBytes(32).toString('hex');
 
 const results = [];
