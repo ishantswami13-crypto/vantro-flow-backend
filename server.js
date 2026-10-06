@@ -774,7 +774,11 @@ function continueIfSessionActive(req, res, next) {
   if (!sid) return next();
   require('./lib/auth/sessions').isActive(getPool(), sid)
     .then((active) => (active ? next() : res.status(401).json({ error: 'Session ended', code: 'SESSION_INVALID' })))
-    .catch(() => res.status(503).json({ error: 'Could not verify session' }));
+    .catch((err) => {
+      safeLog('error', '[auth] session check failed', { code: err && err.code, error: err && err.message });
+      const code = typeof err?.code === 'string' && /^[A-Z0-9_]{2,32}$/.test(err.code) ? err.code : 'UNKNOWN';
+      res.status(503).json({ error: 'Could not verify session', code });
+    });
 }
 
 // requireOwner — authenticates AND verifies the caller owns the :userId resource

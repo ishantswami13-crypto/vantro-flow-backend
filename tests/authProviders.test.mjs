@@ -55,6 +55,23 @@ async function main() {
   codes.consume('t:b', 'x', { maxAttempts: 1 });
   check('one wrong guess burns a single-attempt code', codes.consume('t:b', '333333', { maxAttempts: 1 }) === null);
 
+  // A database blip does not end a session that was just confirmed active.
+  {
+    const realSessions = require('../lib/auth/sessions');
+    let up = true;
+    const sp = { query: async () => { if (!up) throw new Error('db down'); return { rows: [{}] }; } };
+    check('session active while the database answers', await realSessions.isActive(sp, 'fam-blip') === true);
+    up = false;
+    const realNow = Date.now; Date.now = () => realNow() + 20 * 1000;
+    check('a recently confirmed session survives a database blip', await realSessions.isActive(sp, 'fam-blip') === true);
+    Date.now = () => realNow() + 11 * 60 * 1000;
+    let threw = false; try { await realSessions.isActive(sp, 'fam-blip'); } catch { threw = true; }
+    check('after 10 minutes of outage it is no longer assumed', threw);
+    threw = false; try { await realSessions.isActive(sp, 'fam-never-seen'); } catch { threw = true; }
+    check('an unseen session is never assumed active', threw);
+    Date.now = realNow;
+  }
+
   // Router with a fake pool.
   const users = [{ id: 'u-owner', email: 'owner@example.com', phone: '9876543210', business_name: 'Owner Co', plan: 'free', created_at: new Date() }];
   const pool = { query: async (sql, params) => {
@@ -70,7 +87,8 @@ async function main() {
   const { authProvidersRouter } = require('../lib/routes/authProviders');
   const app = express();
   app.use(express.json());
-  const authMiddleware = (req, res, next) => (req.headers.authorization === 'Bearer web-u-owner' ? ((req.user = { userId: 'u-owner' }), next()) : res.status(401).json({}));
+  const authMiddleware = (req, res, next) => (req.headers.authorization === 'Bearer web-u-owner' ? ((req.user = { userId: 'u-owner' }), next())
+    : req.headers.authorization === 'Bearer native-u-owner' ? ((req.user = { userId: 'u-owner', sid: 'fam-1' }), next()) : res.status(401).json({}));
   app.use('/api', authProvidersRouter({ pool, authMiddleware, issueWebSession: (_res, u) => ({ token: `web-${u.id}`, csrf_token: null }),
     isAccessGateOn: () => gateOn, hasApprovedApplication: async () => false }));
   const server = app.listen(0);
@@ -117,6 +135,27 @@ async function main() {
     await post('/auth/native/exchange', { code: 'wrong', state, client: 'desktop' });
     r = await post('/auth/native/exchange', { code: r.body.code, state, client: 'desktop' });
     check('one wrong guess burns the handoff', r.status === 401, r);
+
+    // App -> website: the app's own window signs in to the website.
+    r = await post('/auth/web/handoff', {});
+    check('web handoff needs a signed-in app', r.status === 401, r);
+    r = await post('/auth/web/handoff', {}, { authorization: 'Bearer web-u-owner' });
+    check('a web session cannot mint a web handoff', r.status === 403, r);
+    r = await post('/auth/web/handoff', {}, { authorization: 'Bearer native-u-owner' });
+    const w = r.body;
+    check('the app gets an id and a code', r.status === 200 && typeof w.id === 'string' && typeof w.code === 'string' && w.code.length >= 30, r);
+    r = await post('/auth/web/exchange', { id: crypto.randomBytes(16).toString('base64url'), code: w.code });
+    check('the code does not work with another id', r.status === 401, r);
+    r = await post('/auth/web/exchange', { id: w.id, code: w.code });
+    check('the website exchanges it for a web session', r.status === 200 && r.body.token === 'web-u-owner' && r.body.user.email === 'owner@example.com', r);
+    r = await post('/auth/web/exchange', { id: w.id, code: w.code });
+    check('the web code works only once', r.status === 401, r);
+    r = await post('/auth/web/handoff', {}, { authorization: 'Bearer native-u-owner' });
+    await post('/auth/web/exchange', { id: r.body.id, code: 'wrong' });
+    r = await post('/auth/web/exchange', { id: r.body.id, code: r.body.code });
+    check('one wrong guess burns the web handoff', r.status === 401, r);
+    r = await post('/auth/web/exchange', { id: '../x', code: 'y' });
+    check('a malformed id is refused', r.status === 400, r);
   } finally { server.close(); }
   console.log(failed ? `\n${failed} failed` : '\nall passed');
   process.exit(failed ? 1 : 0);
