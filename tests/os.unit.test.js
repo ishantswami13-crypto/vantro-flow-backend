@@ -184,3 +184,65 @@ test('helpers: wilson interval, retry then give up, duplicate customer names', a
   assert.equal(dups[0].names.length, 3);
   assert.ok(!dups.some((d) => d.names.includes('Mehta Stores')));
 });
+
+// ── Owner-facing text and live figures (real-books fixes) ─────────────────
+
+test('the brief counts the Bridge\'s "need attention" items, never "Nothing needs you" over them', () => {
+  const { needsYouText } = require('../lib/routes/os');
+  assert.equal(needsYouText({}), null);
+  assert.equal(needsYouText({ urgent: 2 }), '2 items need attention.');
+  assert.equal(needsYouText({ urgent: 1, decisions: 1 }), '1 item needs attention; 1 decision is waiting for you.');
+  assert.equal(needsYouText({ decisions: 2, approvals: 1, proposals: 1 }), '2 decisions, 1 reminder approval, 1 automation proposal are waiting for you.');
+  const { isUrgent } = require('../lib/features/watch');
+  assert.ok(isUrgent({ state: 'open', severity: 'critical' }));
+  assert.ok(isUrgent({ state: 'acknowledged', severity: 'high' }));
+  assert.ok(!isUrgent({ state: 'open', severity: 'normal' }));
+  assert.ok(!isUrgent({ state: 'resolved', severity: 'critical' }));
+});
+
+test('Simulate never shows internal table codes or file names to the owner', () => {
+  const { buildFxScenarioChain } = require('../lib/domain/intelligence/fxScenarioEngine');
+  const internal = /CURRENCY_DENOMINATED|business_exposure|\.js\b|tenant/;
+  const none = buildFxScenarioChain({ fxSignal: null, currencyExposure: null });
+  assert.equal(none.impact_mode, 'NO_EFFECT');
+  assert.doesNotMatch(none.reason, internal);
+  const noAmount = buildFxScenarioChain({ fxSignal: null, currencyExposure: { id: 'x' }, openPayablesInExposedCurrency: 0 });
+  assert.equal(noAmount.impact_mode, 'INSUFFICIENT_CONTEXT');
+  assert.doesNotMatch(noAmount.reason, internal);
+  const { buildScenario, compareScenarios } = require('../lib/domain/intelligence/scenarioEngine');
+  const baseline = { status: 'PROJECTED', userId: 'u1', totalOpenReceivables: 90000, totalOverdue: 90000, projection: { evidence: [{ id: 'i1', amount: 50000 }] } };
+  const sim = buildScenario(baseline, { name: 'Collected', targetInvoiceId: 'i1', daysEarlier: 0 });
+  assert.match(sim.projected_state.narrative, /₹50,000/);
+  assert.doesNotMatch(sim.projected_state.narrative, /baseline/);
+  assert.doesNotMatch(compareScenarios(baseline, sim).note, /arithmetic|baseline/);
+});
+
+test('a Prepared bad-debt card shows live days overdue, why now, evidence and what approve/reject do', () => {
+  const { actionCard } = require('../lib/routes/prepared');
+  const now = Date.UTC(2026, 9, 6);
+  const row = {
+    id: 'a1', action_type: 'FLAG_BAD_DEBT', title: 'Bad Debt Risk: SWAMI ENTERPRISES', description: '₹50,000 — 124 days overdue',
+    created_at: '2026-10-03T00:00:00Z', related_entity_type: 'invoice', related_entity_id: 'i1', status: 'pending', recommended_message: null,
+    reason_json: { rule: 'collections_stage_by_days_overdue', facts: { invoice_amount: 50000, days_overdue: 124 }, stage: { chosen: 'FLAG_BAD_DEBT', band_days: [90, null] } },
+  };
+  // Due 127 days before `now`.
+  const inv = { id: 'i1', customer_name: 'SWAMI ENTERPRISES', invoice_amount: 50000, open_amount: 50000, due_date: new Date(now - 127 * DAY).toISOString().slice(0, 10), days_overdue: 124, last_reminder_sent: null, payment_status: 'Pending' };
+  const card = actionCard(row, inv, now);
+  assert.match(card.detail, /₹50,000 owed by SWAMI ENTERPRISES, 127 days overdue today/);
+  assert.doesNotMatch(card.detail, /124/);
+  assert.match(card.detail, /Why now: it is past the 90-day line/);
+  assert.match(card.detail, /No reminder is recorded/);
+  assert.equal(card.evidence.facts.days_overdue, 127);
+  assert.equal(card.evidence.facts.days_overdue_when_prepared, 124);
+  assert.match(card.approve_does, /^Approve records/);
+  assert.match(card.approve_does, /Reject dismisses/);
+  // Without its invoice the card falls back to what was stored.
+  assert.equal(actionCard(row, null, now).detail, row.description);
+});
+
+test('every mission names a registered agent', () => {
+  const { collectionMission, workflowMission } = require('../lib/domain/os/missions');
+  const { AGENT_KEY } = require('../lib/domain/os/workflowTemplates');
+  assert.equal(collectionMission({ id: 'm1', status: 'active', title: 't' }).assigned.agent, AGENT_KEY);
+  assert.equal(workflowMission({ id: 'w1', status: 'SHADOW', name: 'w' }, null, {}).assigned.agent, AGENT_KEY);
+});
