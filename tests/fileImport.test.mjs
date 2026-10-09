@@ -24,7 +24,7 @@ async function main() {
   try {
     const a = await seedUser(pool, 'import-a'); users.push(a.id);
     const b = await seedUser(pool, 'import-b'); users.push(b.id);
-    server = await startServer(PORT);
+    server = await startServer(PORT, { DECISIONS_AFTER_INGEST_DEBOUNCE_MS: '300' });
     const up = (path, token, name, text) => {
       const fd = new FormData();
       fd.append('file', new Blob([text], { type: 'text/csv' }), name);
@@ -47,6 +47,12 @@ async function main() {
     const again = await (await up('/api/import/excel', a.token, 'zoho-copy.csv', ZOHO)).json();
     check('the same file is never imported twice', again.duplicate === true && (await count(a.id)) === 2, again);
     const { rows: batches } = await pool.query(`SELECT status, mapping_profile, rows_accepted FROM file_import_batches WHERE user_id = $1`, [a.id]);
+    let runs = [];
+    for (let i = 0; i < 40 && !runs.length; i++) {
+      await new Promise((r) => setTimeout(r, 250));
+      ({ rows: runs } = await pool.query(`SELECT input_json->>'correlationId' AS cid FROM agent_runs WHERE user_id = $1 AND input_json->>'correlationId' LIKE 'file_import:%'`, [a.id]));
+    }
+    check('an import looks for decisions in the new data without anyone opening Decisions', runs.length >= 1, runs);
     check('the import is recorded as a completed batch (feeds Sources health)', batches.length === 1 && batches[0].status === 'COMPLETED' && batches[0].mapping_profile === 'zoho_books' && batches[0].rows_accepted === 2, batches);
 
     const edited = ZOHO.replace('INV-0002,Kapoor & Co,Paid', 'INV-0002,Kapoor & Co ,Paid') + '\n20/09/2026,INV-0003,Rao Stores,Overdue,20/10/2026,5000,5000';
@@ -74,6 +80,7 @@ async function main() {
   } finally {
     if (server) server.stop();
     await pool.query('DELETE FROM file_import_batches WHERE user_id = ANY($1)', [users]).catch(() => {});
+    await pool.query('DELETE FROM agent_runs WHERE user_id = ANY($1)', [users]).catch(() => {});
     await deleteUsers(pool, users);
     await pool.end();
   }

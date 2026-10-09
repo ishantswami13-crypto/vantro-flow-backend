@@ -1197,6 +1197,14 @@ async function sendWhatsAppMessage(phone, message, creds = {}, opts = {}) {
 
 
 // ── Email OTP helper (uses Resend if RESEND_API_KEY is set) ──────────────────
+// Transactional sender. Resend's onboarding@resend.dev sandbox address only
+// delivers to the Resend account's own email, so production must set
+// EMAIL_FROM to an address on a verified domain (same fallback chain as
+// lib/access/notify.js).
+function emailSender() {
+  return process.env.EMAIL_FROM || process.env.ACCESS_EMAIL_FROM || 'Starlane <onboarding@resend.dev>';
+}
+
 async function sendOTPEmail(email, name, otp) {
   const displayName = name || 'there';
   const html = `
@@ -1209,32 +1217,24 @@ async function sendOTPEmail(email, name, otp) {
       <table width="480" cellpadding="0" cellspacing="0" style="background:#141419;border-radius:16px;border:1px solid #2a2a35;overflow:hidden;">
         <tr>
           <td style="background:linear-gradient(135deg,#0066ff,#00c853);padding:24px 32px;">
-            <p style="margin:0;color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-0.5px;">⚡ Vantro Flow</p>
-            <p style="margin:4px 0 0;color:rgba(255,255,255,0.75);font-size:13px;">Collections OS for Indian MSMEs</p>
+            <p style="margin:0;color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-0.5px;">Starlane</p>
           </td>
         </tr>
         <tr>
           <td style="padding:32px;">
             <p style="margin:0 0 8px;color:#e0e0e8;font-size:16px;">Hi ${escapeHtml(displayName)},</p>
             <p style="margin:0 0 24px;color:#9090a0;font-size:14px;line-height:1.6;">
-              Use this OTP to verify your Vantro Flow account. It expires in <strong style="color:#e0e0e8;">10 minutes</strong>.
+              Use this code to verify your Starlane account. It expires in <strong style="color:#e0e0e8;">10 minutes</strong>.
             </p>
             <div style="background:#0d1117;border:2px solid #0066ff;border-radius:12px;padding:24px;text-align:center;margin:0 0 24px;">
               <p style="margin:0 0 6px;color:#6060a0;font-size:12px;letter-spacing:2px;text-transform:uppercase;">Your OTP</p>
               <p style="margin:0;color:#ffffff;font-size:40px;font-weight:900;letter-spacing:12px;font-family:monospace;">${otp}</p>
             </div>
             <p style="margin:0 0 8px;color:#6060a0;font-size:12px;line-height:1.6;">
-              🔒 Never share this code with anyone. Vantro will never ask for your OTP over call or chat.
+              🔒 Never share this code with anyone. Starlane will never ask for it over a call or chat.
             </p>
             <p style="margin:0;color:#6060a0;font-size:12px;">
-              If you didn't sign up for Vantro Flow, ignore this email.
-            </p>
-          </td>
-        </tr>
-        <tr>
-          <td style="padding:16px 32px;border-top:1px solid #2a2a35;">
-            <p style="margin:0;color:#404050;font-size:11px;text-align:center;">
-              © 2025 Vantro Flow · Pune, India
+              If you didn't sign up for Starlane, ignore this email.
             </p>
           </td>
         </tr>
@@ -1250,14 +1250,16 @@ async function sendOTPEmail(email, name, otp) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_API_KEY}` },
       body: JSON.stringify({
-        from: 'Vantro Flow <onboarding@resend.dev>',
+        from: emailSender(),
         to: email,
-        subject: `${otp} is your Vantro Flow OTP`,
+        subject: `${otp} is your Starlane verification code`,
         html,
       }),
     });
     const data = await res.json().catch(() => ({}));
-    console.log(`[EMAIL OTP] Resend delivery: ${data.id ? 'sent' : 'failed'}`);
+    // The reason (e.g. a sandbox sender that may only mail the account owner)
+    // is logged; the code and the recipient never are.
+    console.log(`[EMAIL OTP] Resend delivery: ${data.id ? 'sent' : `failed (${res.status}${data.name ? ` ${data.name}` : ''})`}`);
   } else {
     // Email delivery not configured. NEVER log the OTP value or the recipient.
     console.log('[EMAIL OTP] delivery not configured (RESEND_API_KEY unset) — OTP not emailed');
@@ -1342,7 +1344,7 @@ app.post('/api/auth/signup', async (req, res) => {
 
     // Generate and send OTP
     const otp = storeOTP(user.id);
-    const otpMsg = `Vantro Flow verification code: *${otp}*\n\nYe code 10 minute mein expire ho jaayega. Kisi ke saath share mat karein.`;
+    const otpMsg = `Starlane verification code: *${otp}*\n\nYe code 10 minute mein expire ho jaayega. Kisi ke saath share mat karein.`;
 
     // WhatsApp OTP — transactional owner-auth delivery (exempt from external-send kill switch)
     if (user.phone) {
@@ -1376,7 +1378,7 @@ app.post('/api/auth/resend-otp', async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found' });
 
     const otp = storeOTP(user.id);
-    const otpMsg = `Vantro Flow verification code: *${otp}*\n\nYe code 10 minute mein expire ho jaayega. Kisi ke saath share mat karein.`;
+    const otpMsg = `Starlane verification code: *${otp}*\n\nYe code 10 minute mein expire ho jaayega. Kisi ke saath share mat karein.`;
 
     if (user.phone) sendWhatsAppMessage(user.phone, otpMsg, {}, { transactional: true }).catch(() => {});
     sendOTPEmail(user.email, user.business_name, otp).catch(() => {});
@@ -1550,10 +1552,10 @@ app.post('/api/auth/forgot-password', async (req, res) => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_API_KEY}` },
         body: JSON.stringify({
-          from: 'Vantro Flow <onboarding@resend.dev>',
+          from: emailSender(),
           to: email,
-          subject: `Your Vantro OTP: ${otp}`,
-          html: `<p>Hi ${escapeHtml(user.business_name)},</p><p>Your OTP to reset your Vantro Flow password is: <strong style="font-size:24px">${otp}</strong></p><p>Valid for 15 minutes. Do not share this with anyone.</p>`
+          subject: `${otp} is your Starlane password reset code`,
+          html: `<p>Hi ${escapeHtml(user.business_name)},</p><p>Your code to reset your Starlane password is: <strong style="font-size:24px">${otp}</strong></p><p>Valid for 15 minutes. Do not share this with anyone.</p>`
         })
       });
     } else {
@@ -2079,6 +2081,7 @@ app.post('/api/import/excel', authMiddleware, upload.single('file'), async (req,
     await pool.query(
       `UPDATE file_import_batches SET status = 'COMPLETED', completed_at = now(), rows_accepted = $2, rows_rejected = $3 WHERE id = $1`,
       [batchId, records.length, m.skipped.length + alreadyInStarlane]);
+    if (records.length) require('./lib/domain/decisions/afterIngest').refreshDecisionsAfterIngest(pool, userId, { source: 'file_import' });
     res.json({
       success: true,
       imported: records.length,
@@ -3944,6 +3947,10 @@ async function calculateCashFlowForecast(userId, current_cash = 0, days = 30) {
 
   // Prefer bank transaction credits for actual daily inflows, fallback to historical collections average
   const avgDailyCollections = bankInflowDaily !== null ? bankInflowDaily : (paidLast90.length > 0 ? Math.round(totalRecovered / 90) : Math.round(totalOutstanding * 0.03));
+  // Where the inflow rate came from, so the page never calls an assumption
+  // "history": bank credits, paid invoices, or (no history yet) 3% of open
+  // receivables a day.
+  const collectionsBasis = bankInflowDaily !== null ? 'bank' : (paidLast90.length > 0 ? 'history' : 'assumed');
 
   const cashStart = Number(current_cash);
   const burnRate = calculatedBurnRate;
@@ -3977,6 +3984,7 @@ async function calculateCashFlowForecast(userId, current_cash = 0, days = 30) {
     cashStart,
     burnRate,
     avgDailyCollections,
+    collectionsBasis,
     totalOutstanding,
     totalPayable,
     totalOverdue30,
