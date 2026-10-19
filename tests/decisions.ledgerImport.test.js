@@ -264,3 +264,12 @@ test('feedback is recorded append-only; another tenant can neither see the data 
   assert.ok(pa.body.counts.invoices > 0);
   assert.equal(pa.body.sources.ledger_import, pa.body.counts.invoices);
 });
+
+test("a Tally Bills Receivable export maps without help, including Party's Name", () => {
+  const headers = ['Date', 'Ref. No.', "Party's Name", 'Pending Amount', 'Due on', 'Overdue by days'];
+  const r = L.proposeMapping(headers, [['08-May-26', 'AIS/26-27/2401', 'Narmada Valves', 685000, '22-Jun-26', 119]]);
+  assert.equal(r.fields.customer?.header, "Party's Name");
+  assert.equal(r.fields.outstanding?.header, 'Pending Amount');
+  assert.equal(r.fields.invoice_date?.header, 'Date');
+  assert.equal(r.fields.due_date?.header, 'Due on');
+});
