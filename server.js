@@ -2486,6 +2486,9 @@ app.post('/api/mark-paid', authMiddleware, requireSafeSettlementMutation, async 
       }
     }
     // ─────────────────────────────────────────────────────────────────────────
+    // A recorded payment is new ledger data: decisions it settles resolve and
+    // missions waiting on it are checked (debounced, fire-and-forget).
+    require('./lib/domain/decisions/afterIngest').refreshDecisionsAfterIngest(getPool(), req.user.userId, { source: 'mark_paid' });
     res.json({ success: true, data: inv });
   } catch (error) {
     logRouteError(req, error);
