@@ -5844,7 +5844,12 @@ app.get('/api/ready', (req, res) => {
       database_connectivity: 'not_checked',
       authConfig: process.env.JWT_SECRET ? 'ok' : 'missing',
       supabaseConfig: process.env.SUPABASE_URL ? 'ok' : 'missing',
-      metrics: process.env.METRICS_TOKEN ? 'ok' : 'missing'
+      metrics: process.env.METRICS_TOKEN ? 'ok' : 'missing',
+      // Whether a new user can receive a sign-up code, without naming the
+      // sender or any key: Resend's sandbox sender only reaches the Resend
+      // account owner, so it counts as not ready for real sign-ups.
+      signupEmail: !process.env.RESEND_API_KEY ? 'not_configured' : /@resend\.dev>?\s*$/i.test(emailSender()) ? 'sandbox_sender' : 'own_sender',
+      signupWhatsapp: process.env.TWILIO_WHATSAPP_NUMBER ? 'ok' : 'missing'
     },
     db_readiness_endpoint: '/api/health/deep',
     ready_for_data_load: false,

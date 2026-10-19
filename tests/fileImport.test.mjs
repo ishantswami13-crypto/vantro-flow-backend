@@ -53,6 +53,12 @@ async function main() {
       ({ rows: runs } = await pool.query(`SELECT input_json->>'correlationId' AS cid FROM agent_runs WHERE user_id = $1 AND input_json->>'correlationId' LIKE 'file_import:%'`, [a.id]));
     }
     check('an import looks for decisions in the new data without anyone opening Decisions', runs.length >= 1, runs);
+    let raised = [];
+    for (let i = 0; i < 40 && !raised.length; i++) {
+      await new Promise((r) => setTimeout(r, 250));
+      ({ rows: raised } = await pool.query(`SELECT kind FROM watch_events WHERE user_id = $1 AND kind = 'invoice_overdue'`, [a.id]));
+    }
+    check('an import raises its overdue bills on Watch without anyone opening the Bridge', raised.length >= 1, raised);
     check('the import is recorded as a completed batch (feeds Sources health)', batches.length === 1 && batches[0].status === 'COMPLETED' && batches[0].mapping_profile === 'zoho_books' && batches[0].rows_accepted === 2, batches);
 
     const edited = ZOHO.replace('INV-0002,Kapoor & Co,Paid', 'INV-0002,Kapoor & Co ,Paid') + '\n20/09/2026,INV-0003,Rao Stores,Overdue,20/10/2026,5000,5000';
