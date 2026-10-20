@@ -61,3 +61,6 @@ performance-lab/report.md
 .staging-token
 cortex-lab/.env.test
 .railway_vars
+
+# Demo files are dated the day they are made: npm run demo:dataset
+/demo/
