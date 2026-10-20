@@ -1218,6 +1218,7 @@ async function sendOTPEmail(email, name, otp) {
         <tr>
           <td style="background:linear-gradient(135deg,#0066ff,#00c853);padding:24px 32px;">
             <p style="margin:0;color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-0.5px;">Starlane</p>
+            <p style="margin:4px 0 0;color:rgba(255,255,255,0.75);font-size:13px;">The operating layer every modern business runs on</p>
           </td>
         </tr>
         <tr>
@@ -1227,14 +1228,21 @@ async function sendOTPEmail(email, name, otp) {
               Use this code to verify your Starlane account. It expires in <strong style="color:#e0e0e8;">10 minutes</strong>.
             </p>
             <div style="background:#0d1117;border:2px solid #0066ff;border-radius:12px;padding:24px;text-align:center;margin:0 0 24px;">
-              <p style="margin:0 0 6px;color:#6060a0;font-size:12px;letter-spacing:2px;text-transform:uppercase;">Your OTP</p>
+              <p style="margin:0 0 6px;color:#6060a0;font-size:12px;letter-spacing:2px;text-transform:uppercase;">Your code</p>
               <p style="margin:0;color:#ffffff;font-size:40px;font-weight:900;letter-spacing:12px;font-family:monospace;">${otp}</p>
             </div>
             <p style="margin:0 0 8px;color:#6060a0;font-size:12px;line-height:1.6;">
-              🔒 Never share this code with anyone. Starlane will never ask for it over a call or chat.
+              Never share this code with anyone. Starlane will never ask for it over a call or chat.
             </p>
             <p style="margin:0;color:#6060a0;font-size:12px;">
-              If you didn't sign up for Starlane, ignore this email.
+              If you didn't sign up for Starlane, you can ignore this email.
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:16px 32px;border-top:1px solid #2a2a35;">
+            <p style="margin:0;color:#404050;font-size:11px;text-align:center;">
+              Starlane · Pune, India
             </p>
           </td>
         </tr>
@@ -1252,7 +1260,7 @@ async function sendOTPEmail(email, name, otp) {
       body: JSON.stringify({
         from: emailSender(),
         to: email,
-        subject: `${otp} is your Starlane verification code`,
+        subject: `${otp} is your Starlane code`,
         html,
       }),
     });
@@ -1816,7 +1824,7 @@ app.post('/api/invoices/create', authMiddleware, async (req, res) => {
       (async () => {
         try {
           const waCreds = { interakt_api_key: owner.interakt_api_key, wati_api_url: owner.wati_api_url, wati_token: owner.wati_token };
-          const bizName = owner.business_name || 'Vantro';
+          const bizName = owner.business_name || 'Starlane';
           let payLink = null;
           let payLinkId = null;
 
@@ -2141,7 +2149,7 @@ app.post('/api/import/manual', authMiddleware, async (req, res) => {
 
         if (!owner?.automation_enabled) return; // automation off — skip
 
-        const bizName = owner.business_name || 'Vantro';
+        const bizName = owner.business_name || 'Starlane';
         const waCreds = {
           interakt_api_key: owner.interakt_api_key,
           wati_api_url:     owner.wati_api_url,
@@ -6903,11 +6911,11 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
           const tone = args.tone || 'friendly';
           let msg;
           if (tone === 'friendly') {
-            msg = `Namaste ${name} ji 🙏\n\nAapke account mein ₹${total.toLocaleString('en-IN')} outstanding hai (${maxOverdue} din se).\n\nKripya jaldi payment karlein. Koi problem ho toh batayein, hum help karenge.\n\nDhanyawaad 🙏\n— ${business_name || 'Vantro Flow'}`;
+            msg = `Namaste ${name} ji 🙏\n\nAapke account mein ₹${total.toLocaleString('en-IN')} outstanding hai (${maxOverdue} din se).\n\nKripya jaldi payment karlein. Koi problem ho toh batayein, hum help karenge.\n\nDhanyawaad 🙏${business_name ? `\n— ${business_name}` : ''}`;
           } else if (tone === 'firm') {
-            msg = `Dear ${name},\n\nYe aapko yaad dilaana hai ki ₹${total.toLocaleString('en-IN')} ki payment ${maxOverdue} din se pending hai.\n\nKripya aaj hi payment karein ya 2 din mein confirm karein.\n\n— ${business_name || 'Vantro Flow'}`;
+            msg = `Dear ${name},\n\nYe aapko yaad dilaana hai ki ₹${total.toLocaleString('en-IN')} ki payment ${maxOverdue} din se pending hai.\n\nKripya aaj hi payment karein ya 2 din mein confirm karein.${business_name ? `\n\n— ${business_name}` : ''}`;
           } else {
-            msg = `URGENT: ${name} ji, ₹${total.toLocaleString('en-IN')} ki payment ${maxOverdue} din overdue hai. Aaj payment nahi hui toh delivery ruk sakti hai. Turant sampark karein.\n— ${business_name || 'Vantro Flow'}`;
+            msg = `URGENT: ${name} ji, ₹${total.toLocaleString('en-IN')} ki payment ${maxOverdue} din overdue hai. Aaj payment nahi hui toh delivery ruk sakti hai. Turant sampark karein.${business_name ? `\n— ${business_name}` : ''}`;
           }
           const url = phone ? `https://wa.me/91${phone}?text=${encodeURIComponent(msg)}` : null;
           if (url) { waLinks.push({ to: name, phone, message: msg, url }); actions.push(`💬 Reminder ready for ${name}`); }
@@ -6952,7 +6960,7 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
           // Compose order message
           const itemLines = (args.items||[]).map(it=>`  • ${it.name} — ${it.quantity} ${it.unit||'units'}`).join('\n');
           const totalItems = (args.items||[]).length;
-          const msg = `Namaste ${args.supplier_name} ji 🙏\n\nHumein aapki taraf se yeh order chahiye:\n\n${itemLines}\n\n${args.notes ? `Note: ${args.notes}\n\n` : ''}Kripya availability aur delivery time confirm karein.\n\nDhanyawaad!\n— ${business_name||'Vantro Flow'}`;
+          const msg = `Namaste ${args.supplier_name} ji 🙏\n\nHumein aapki taraf se yeh order chahiye:\n\n${itemLines}\n\n${args.notes ? `Note: ${args.notes}\n\n` : ''}Kripya availability aur delivery time confirm karein.\n\nDhanyawaad!${business_name ? `\n— ${business_name}` : ''}`;
           // Draft only: the assistant never records an order or a stock
           // movement. The owner sends the message and records the order.
           const url = phone ? `https://wa.me/91${phone}?text=${encodeURIComponent(msg)}` : null;
@@ -7166,7 +7174,7 @@ app.post('/api/collections/send-reminder', authMiddleware, async (req, res) => {
       wati_token:       owner?.wati_token,
     };
 
-    const bizName = owner?.business_name || 'Vantro';
+    const bizName = owner?.business_name || 'Starlane';
 
     // Reuse existing payment link or create a new one
     let payLink = inv.payment_link;
@@ -7344,7 +7352,7 @@ app.post('/api/collections/bulk-remind', authMiddleware, async (req, res) => {
       .eq('id', req.user.userId)
       .single();
 
-    const bizName = owner?.business_name || 'Vantro';
+    const bizName = owner?.business_name || 'Starlane';
     let sent = 0;
     const results = [];
 
@@ -7493,9 +7501,9 @@ app.get('/api/collections/timeline/:userId', requireOwner, async (req, res) => {
 // ============================================
 
 const PLANS = {
-  starter: { name: 'Vantro Starter', amount_monthly: 99900,  amount_annual: 95904  },
-  growth:  { name: 'Vantro Growth',  amount_monthly: 249900, amount_annual: 239904 },
-  pro:     { name: 'Vantro Pro',     amount_monthly: 499900, amount_annual: 479904 },
+  starter: { name: 'Starlane Starter', amount_monthly: 99900,  amount_annual: 95904  },
+  growth:  { name: 'Starlane Growth',  amount_monthly: 249900, amount_annual: 239904 },
+  pro:     { name: 'Starlane Pro',     amount_monthly: 499900, amount_annual: 479904 },
 };
 
 app.post('/api/billing/create-order', authMiddleware, async (req, res) => {
@@ -7818,7 +7826,7 @@ app.post('/api/settings/whatsapp/test', authMiddleware, async (req, res) => {
     };
 
     const bizName = user.business_name || 'your business';
-    const msg = `✅ Vantro Flow se test message!\n\nYeh confirm karta hai ki WhatsApp automation ${bizName} ke liye ready hai. Ab se reminders, payment links, aur follow-ups automatically jayenge!\n\n— Vantro Flow`;
+    const msg = `Starlane se test message.\n\nYeh confirm karta hai ki WhatsApp ${bizName} ke liye connect ho gaya hai.\n\n— Starlane`;
 
     const result = await sendWhatsAppMessage(user.phone, msg, creds);
 
@@ -7904,7 +7912,7 @@ async function makeAutoCall(userId, invoice) {
       .eq('id', userId)
       .single();
 
-    const bizName = profile?.business_name || 'Vantro';
+    const bizName = profile?.business_name || 'Starlane';
 
     // AI-generated opening script (Groq) with Hinglish fallback
     let openingScript = `Namaste ${invoice.customer_name} ji, main ${bizName} se bol raha hoon. Aapka ₹${Number(invoice.invoice_amount).toLocaleString('en-IN')} payment ${invoice.days_overdue} din se pending hai. Kya aaj payment ho sakti hai?`;
@@ -8690,7 +8698,7 @@ app.post('/api/voice/call', authMiddleware, async (req, res) => {
       .select('business_name, owner_name, ai_persona').eq('id', userId).single();
 
     // Generate opening script via Groq
-    let openingScript = `Namaste ${customer_name} ji, main ${profile?.business_name || 'Vantro'} se bol raha hoon. Aapka rupaye ${invoice_amount} pending hai. Kya aaj payment ho sakti hai?`;
+    let openingScript = `Namaste ${customer_name} ji, main ${profile?.business_name || 'Starlane'} se bol raha hoon. Aapka rupaye ${invoice_amount} pending hai. Kya aaj payment ho sakti hai?`;
     try {
       const gr = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
@@ -8919,8 +8927,8 @@ app.post('/api/payments/webhook', async (req, res) => {
     // Send push notification to the business owner
           await sendPushToUser(
             inv.user_id,
-            `💰 Payment Received!`,
-            `${inv.customer_name} ne ₹${Number(inv.invoice_amount).toLocaleString('en-IN')} bheja! Invoice auto-closed. 🎉`,
+            `Payment received`,
+            `${inv.customer_name} ne ₹${Number(inv.invoice_amount).toLocaleString('en-IN')} bheja. Invoice paid mark ho gaya.`,
             { type: 'payment_received', invoice_id: inv.id, amount: inv.invoice_amount }
           );
 
@@ -9087,7 +9095,7 @@ cron.schedule('30 2 * * *', async () => {
         // Push notification
         await sendPushToUser(
           user.id,
-          `Subah ka briefing - Vantro Flow`,
+          `Starlane: aaj ki briefing`,
           `${overdue.length} overdue invoices. Top: ${topDebtor.customer_name} (Rs.${Number(topDebtor.invoice_amount).toLocaleString('en-IN')}). Total pending: Rs.${totalOverdue.toLocaleString('en-IN')}`,
           { type: 'morning_briefing', count: overdue.length, total: totalOverdue }
         );
@@ -9100,13 +9108,13 @@ cron.schedule('30 2 * * *', async () => {
             const tag = days > 30 ? '(urgent)' : days > 15 ? '(follow up)' : '(due)';
             return `${i+1}. ${inv.customer_name} - Rs.${amt} ${tag}`;
           }).join('\n');
-          const waMsg = `Subah ka update - Vantro Flow
+          const waMsg = `Starlane: aaj ka update
 
 Aaj collect karna hai: Rs.${totalOverdue.toLocaleString('en-IN')}
 
 ${top3}
 
-Vantro ne aapke liye auto-reminders queue kar diye hain. App kholein aur ek click mein sab bhejein.`;
+App kholein, dekhein kise aaj yaad dilana hai, aur jo theek lage use approve karein.`;
           await sendWhatsAppMessage(user.phone, waMsg);
         }
       } catch (userErr) {
@@ -9779,7 +9787,7 @@ app.post('/api/voice/inbound', async (req, res) => {
     if (!voiceSecret) return res.sendStatus(403);
     if (voiceSecret && !timingSafeEqualString(provided, voiceSecret)) return res.sendStatus(403);
     const userId = req.query.uid;
-    let greeting = 'Vantro Business';
+    let greeting = 'Starlane';
     if (userId) {
       const { data: u } = await supabase.from('users')
         .select('business_name, owner_name').eq('id', userId).single();
@@ -9907,7 +9915,7 @@ Extract order from Hindi/Hinglish transcript. Return ONLY valid JSON, no comment
     // 6. Push notification to owner
     if (savedOrder) {
       await sendPushToUser(userId,
-        '📞 Naya Order Aaya — Call Se!',
+        'Call se naya order aaya',
         `${extracted.customer_name || callerPhone}: ${extracted.summary || (extracted.items?.[0] ? `${extracted.items[0].quantity} ${extracted.items[0].unit} ${extracted.items[0].name}` : 'Order received')}`,
         { type: 'new_order', order_id: savedOrder.id }
       );
@@ -12087,13 +12095,13 @@ cron.schedule('30 12 * * 0', async () => {
         const callCount = calls?.length || 0;
         if (collectedAmt === 0 && callCount === 0) continue;
         const parts = [
-          'Is Hafte ka Report - Vantro Flow',
+          'Starlane: is hafte ka report',
           '',
           'Collections: Rs.' + collectedAmt.toLocaleString('en-IN'),
           'Calls made: ' + callCount,
-          riskParty ? 'Risky account: ' + riskParty + ' (' + riskDays + ' din overdue - personally call karein)' : 'Koi risky account nahi!',
+          riskParty ? 'Risky account: ' + riskParty + ' (' + riskDays + ' din overdue - personally call karein)' : 'Koi risky account nahi.',
           '',
-          'Vantro ne is hafte aapke liye kaam kiya. Agli hafte aur zyada collect karein!',
+          'Poori details ke liye app kholein.',
         ];
         await sendWhatsAppMessage(user.phone, parts.join('\n'));
       } catch (e) { console.error('Scorecard error user', user.id, e.message); }
@@ -12493,8 +12501,8 @@ app.get('/api/reports/export', authMiddleware, async (req, res) => {
   tr:nth-child(even) td{background:#f8fafc}
   @media print{body{padding:0} button{display:none}}
 </style></head><body>
-<button onclick="window.print()" style="float:right;padding:8px 16px;background:#0066FF;color:#fff;border:none;border-radius:8px;font-weight:600;cursor:pointer;font-size:13px">🖨 Print / Save PDF</button>
-<h1>Vantro Flow — ${escapeHtml(REPORT_NAMES[report] || report)}</h1>
+<button onclick="window.print()" style="float:right;padding:8px 16px;background:#0066FF;color:#fff;border:none;border-radius:8px;font-weight:600;cursor:pointer;font-size:13px">Print or save as PDF</button>
+<h1>${escapeHtml(REPORT_NAMES[report] || report)}</h1>
 <p class="meta">Period: ${escapeHtml(fromDate)} to ${escapeHtml(toDate)} &nbsp;·&nbsp; Generated: ${new Date().toLocaleDateString('en-IN', { day:'numeric',month:'long',year:'numeric' })}</p>
 ${sheetsHtml}
 </body></html>`;
