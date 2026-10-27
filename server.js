@@ -6685,9 +6685,10 @@ app.post('/api/ai-chat', authMiddleware, async (req, res) => {
     if (!messages.length || messages[messages.length - 1].role !== 'user') return res.status(400).json({ error: 'The last message must be from the user' });
   }
 
-  // Pre-fetch top 5 overdue invoices so first response is instant and data-aware
+  // Pre-fetch top 5 overdue invoices and the owner's voice profile, in
+  // parallel, so the first response is quick and data-aware.
   let overdueContext = '';
-  try {
+  const loadOverdue = (async () => { try {
     const { data: topInvoicesRaw } = await supabase
       .from('invoices')
       .select('customer_name, invoice_amount, due_date, invoice_date, created_at, customer_phone')
@@ -6707,12 +6708,12 @@ app.post('/api/ai-chat', authMiddleware, async (req, res) => {
         `- ${i.customer_name}: ₹${Number(i.invoice_amount).toLocaleString('en-IN')} (${i.days_overdue} days overdue${i.customer_phone ? ', phone: ' + i.customer_phone : ''})`
       ).join('\n')}`;
     }
-  } catch (_) {}
+  } catch (_) {} })();
 
   // Fetch owner voice profile
   let ownerName = '';
   let voiceContext = '';
-  try {
+  const loadProfile = (async () => { try {
     const { data: userProfile } = await supabase.from('users')
       .select('owner_name, city, voice_style, ai_persona')
       .eq('id', user_id).single();
@@ -6736,9 +6737,18 @@ ${userProfile.ai_persona ? `- How they write/talk: ${userProfile.ai_persona}` : 
 When generating WhatsApp messages, call scripts, or any communication: write EXACTLY as ${ownerName || 'the owner'} would — matching their exact style, tone, and language mix. Sound like a real person, not a bot.`;
       }
     }
-  } catch (_) {}
+  } catch (_) {} })();
+  await Promise.all([loadOverdue, loadProfile]);
 
   const system = `You are Ask Starlane, ${ownerName ? ownerName + "'s" : 'the owner\'s'} assistant inside Starlane for ${business_name || 'this business'}. You answer from the same system the owner sees on screen: Scan, Watch, Decisions, Simulate, Missions and the ledger. For "what changed" use what_changed, for open decisions use get_decisions, for "what if sales fall X%" use what_if_sales, for what is running use get_missions, and to stop something the owner names use get_missions then stop_mission.
+
+HOW TO ANSWER WELL:
+- Work out what the owner actually needs, then gather it. When a question needs several facts (for example who owes the most AND whether they broke a promise), call every tool you need in the same turn rather than one at a time.
+- Lead with the answer in the first sentence: the name, the amount, the date. Then the few facts that back it, taken from tool results, with real figures. Never pad.
+- Rank, compare and total when it helps the owner decide (largest first, oldest first, share of the total). Do the arithmetic from tool results; never estimate a figure you did not get from a tool.
+- Use short markdown: a sentence or two, then a compact list or table when there are several items. No headings for a short answer.
+- End with one concrete next step the owner can take in Starlane, when there is one. Do not end with a question unless the request was genuinely ambiguous.
+- If the data does not cover the question, say exactly what is missing in one line.
 
 ${readOnly
   ? `You have read-only tools: look up invoices, overdue customers, summary, inventory, calls, suppliers, prospects and the cash forecast. You cannot change anything from here: if the owner asks you to mark something paid, send a message, place an order or change a record, say that this is done from the Decisions screen or the Starlane website, and never claim you did it.
@@ -7002,30 +7012,37 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
   const modelSession = modelRouter.session({ userId: user_id, purpose: 'chat', correlationId: req.requestId });
   try {
     let iteration = 0;
-    const maxIter = 5;
+    const maxIter = 6;
+    const tools = AI_TOOLS.filter((t) => allowedTools.has(t.function.name));
 
     while (iteration < maxIter) {
       iteration++;
-      const choice = await modelSession.chat(chatMessages, AI_TOOLS.filter((t) => allowedTools.has(t.function.name)));
+      // On the last round the model is told to answer from what it has
+      // gathered, instead of the loop running out on another tool call. Tools
+      // stay declared because the transcript already holds tool calls.
+      const lastRound = iteration === maxIter;
+      if (lastRound) chatMessages.push({ role: 'user', content: 'Answer my question now from the results above. Do not look anything else up.' });
+      const choice = await modelSession.chat(chatMessages, tools);
       const msg = choice.message;
       chatMessages.push(msg);
 
-      if (choice.finish_reason === 'tool_calls' && msg.tool_calls?.length) {
-        const toolResults = [];
-        for (const tc of msg.tool_calls) {
+      if (!lastRound && choice.finish_reason === 'tool_calls' && msg.tool_calls?.length) {
+        // Independent lookups run together; results keep the model's call order.
+        const toolResults = await Promise.all(msg.tool_calls.map(async (tc) => {
           let args = {};
           try { args = JSON.parse(tc.function.arguments||'{}'); } catch(e) {}
           const result = await executeTool(tc.function.name, args);
           // Wrapped and labelled so the model treats it as data, never as instructions.
-          toolResults.push({ role:'tool', tool_call_id:tc.id, content:JSON.stringify({ untrusted_data: result }) });
-        }
+          return { role:'tool', tool_call_id:tc.id, content:JSON.stringify({ untrusted_data: result }) };
+        }));
         chatMessages.push(...toolResults);
       } else {
-        return res.json({ success:true, message:msg.content, actions, navigate:navigateTo, waLinks });
+        const text = typeof msg.content === 'string' && msg.content.trim() ? msg.content : 'I could not put an answer together from your data just now. Try asking it a different way.';
+        return res.json({ success:true, message:text, actions, navigate:navigateTo, waLinks });
       }
     }
 
-    return res.json({ success:true, message:'Done! Let me know if you need anything else.', actions, navigate:navigateTo, waLinks });
+    return res.json({ success:true, message:'I could not put an answer together from your data just now. Try asking it a different way.', actions, navigate:navigateTo, waLinks });
   } catch(err) {
     if (err instanceof ModelUnavailableError) {
       // Say what failed and what still works, instead of a bare 500.
