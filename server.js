@@ -3217,7 +3217,7 @@ async function ensureConnectedBusinessData(userId) {
       await supabase.from('bank_transactions').insert([{
         user_id: userId,
         txn_date: inv.payment_date || inv.invoice_date || new Date().toISOString().split('T')[0],
-        description: `Auto-backfill: Payment from ${inv.customer_name} for inv ${inv.invoice_number || inv.id}`,
+        description: `Payment from ${inv.customer_name}${inv.invoice_number ? ` for invoice ${inv.invoice_number}` : ''}`,
         amount: toMoney(inv.payment_amount || inv.invoice_amount),
         type: 'credit', status: 'matched', matched_type: 'invoice', matched_id: String(inv.id),
       }]);
@@ -3234,7 +3234,7 @@ async function ensureConnectedBusinessData(userId) {
       await supabase.from('bank_transactions').insert([{
         user_id: userId,
         txn_date: s.sale_date || new Date().toISOString().split('T')[0],
-        description: `Auto-backfill: Payment from ${s.customer_name} for sale ${s.invoice_number || s.id}`,
+        description: `Payment from ${s.customer_name}${s.invoice_number ? ` for sale ${s.invoice_number}` : ''}`,
         amount: paidAmt,
         type: 'credit', status: 'matched', matched_type: 'sale', matched_id: String(s.id),
       }]);
@@ -3251,7 +3251,7 @@ async function ensureConnectedBusinessData(userId) {
       await supabase.from('bank_transactions').insert([{
         user_id: userId,
         txn_date: p.purchase_date || new Date().toISOString().split('T')[0],
-        description: `Auto-backfill: Payment to ${p.supplier_name} for purchase ${p.bill_number || p.id}`,
+        description: `Payment to ${p.supplier_name}${p.bill_number ? ` for bill ${p.bill_number}` : ''}`,
         amount: paidAmt,
         type: 'debit', status: 'matched', matched_type: 'purchase', matched_id: String(p.id),
       }]);
@@ -7002,7 +7002,7 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
             actions.push(`⏸ Stopped ${rows[0].title}`);
             return { stopped: true, mission_id: id, how_to_resume: 'Control → Decisions → resume this decision' };
           }
-          return { error: 'This mission is paused from its own page in Missions.', link: '/missions' };
+          return { error: 'This task is paused from its own page in Tasks.', link: '/missions' };
         }
         default: return { error:`Unknown tool: ${name}` };
       }
@@ -7053,7 +7053,7 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
       }[err.code] || err.message;
       console.warn('AI chat unavailable:', err.code, JSON.stringify(err.detail || {}));
       return res.status(503).json({
-        error: `${why} Your data is safe. Scan my books, Watch, Decisions and Missions still work without it.`,
+        error: `${why} Your data is safe. Decisions, Monitors, Tasks and Scan my books still work without it.`,
         code: `AI_${err.code}`,
       });
     }
@@ -7494,9 +7494,9 @@ app.get('/api/collections/timeline/:userId', requireOwner, async (req, res) => {
 // ============================================
 
 const PLANS = {
-  starter: { name: 'Starlane Starter', amount_monthly: 99900,  amount_annual: 95904  },
-  growth:  { name: 'Starlane Growth',  amount_monthly: 249900, amount_annual: 239904 },
-  pro:     { name: 'Starlane Pro',     amount_monthly: 499900, amount_annual: 479904 },
+  starter: { name: 'Starlane Starter', amount_monthly: 99900,  amount_annual: 958800  },
+  growth:  { name: 'Starlane Growth',  amount_monthly: 249900, amount_annual: 2398800 },
+  pro:     { name: 'Starlane Pro',     amount_monthly: 499900, amount_annual: 4798800 },
 };
 
 app.post('/api/billing/create-order', authMiddleware, async (req, res) => {
