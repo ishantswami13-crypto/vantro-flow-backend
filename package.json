@@ -67,7 +67,7 @@
     "@anthropic-ai/sdk": "^0.113.0",
     "@supabase/supabase-js": "^2.49.8",
     "bcryptjs": "^2.4.3",
-    "compression": "^1.8.1",
+    "compression": "^1.8.2",
     "cors": "^2.8.5",
     "dotenv": "^16.5.0",
     "express": "^4.21.2",
