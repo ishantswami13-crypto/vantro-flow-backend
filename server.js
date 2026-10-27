@@ -360,6 +360,11 @@ function warmBusinessCache(userId) {
 // Initialize Supabase
 const { supabase } = require('./lib/config/supabaseClient');
 const { fetchAllRows } = require('./lib/db/fetchAllRows');
+// allRows(() => supabase.from(...).select(...)...) has the same { data, error }
+// shape as awaiting the query, but pages past Supabase's 1,000-row response
+// cap, so a tenant's 1,001st invoice, sale or call is no longer silently
+// missing from totals and lists.
+const allRows = (build) => fetchAllRows(build).then((data) => ({ data, error: null }), (error) => ({ data: null, error }));
 const { getBusinessContext } = require('./lib/businessContext');
 const salesService = require('./lib/services/SalesService');
 const purchaseService = require('./lib/services/PurchaseService');
@@ -2298,11 +2303,11 @@ app.post('/api/calculate-priority/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
 
-    const { data: invoices, error } = await supabase
+    const { data: invoices, error } = await allRows(() => supabase
       .from('invoices')
       .select('*')
       .eq('user_id', userId)
-      .eq('payment_status', 'Pending');
+      .eq('payment_status', 'Pending'));
 
     if (error) throw error;
 
@@ -2567,11 +2572,11 @@ app.get('/api/calls/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
 
-    const { data, error } = await supabase
+    const { data, error } = await allRows(() => supabase
       .from('call_logs')
       .select('*')
       .eq('user_id', userId)
-      .order('called_at', { ascending: false });
+      .order('called_at', { ascending: false }));
 
     if (error) throw error;
 
@@ -2637,7 +2642,7 @@ app.get('/api/metrics/:userId', requireOwner, async (req, res) => {
     const [receivables, payables, { data: callLogs }] = await Promise.all([
       getReceivableRows(userId),
       getPayableRows(userId),
-      supabase.from('call_logs').select('*').eq('user_id', userId),
+      allRows(() => supabase.from('call_logs').select('*').eq('user_id', userId)),
     ]);
 
     const safeCallLogs = callLogs || [];
@@ -2782,7 +2787,7 @@ app.get('/api/analytics/:userId', requireOwner, async (req, res) => {
 async function sendInventoryForUser(userId, res) {
   await ensureConnectedBusinessData(userId);
   const [{ data: products }, { data: movements }, summary] = await Promise.all([
-    supabase.from('products').select('*').eq('user_id', userId).order('name'),
+    allRows(() => supabase.from('products').select('*').eq('user_id', userId).order('name')),
     supabase.from('stock_movements').select('*').eq('user_id', userId).order('moved_at', { ascending: false }).limit(50),
     calculateInventorySummary(userId)
   ]);
@@ -2933,11 +2938,11 @@ app.post('/api/stock/move', authMiddleware, async (req, res) => {
 app.get('/api/stock/movements/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
-    const { data, error } = await supabase
+    const { data, error } = await allRows(() => supabase
       .from('stock_movements')
       .select('*, products(name, unit)')
       .eq('user_id', userId)
-      .order('moved_at', { ascending: false });
+      .order('moved_at', { ascending: false }));
 
     if (error) throw error;
     res.json({ success: true, movements: data });
@@ -3195,8 +3200,8 @@ async function ensureConnectedBusinessData(userId) {
 
   try {
     // 1. BACKFILL PURCHASES
-    const { data: purchases } = await supabase.from('purchases').select('*').eq('user_id', userId);
-    const { data: pMovements } = await supabase.from('stock_movements').select('reference').eq('user_id', userId).not('reference', 'is', null);
+    const { data: purchases } = await allRows(() => supabase.from('purchases').select('*').eq('user_id', userId));
+    const { data: pMovements } = await allRows(() => supabase.from('stock_movements').select('reference').eq('user_id', userId).not('reference', 'is', null));
     const movementRefs = new Set((pMovements || []).map(m => m.reference));
 
     for (const p of (purchases || [])) {
@@ -3222,7 +3227,7 @@ async function ensureConnectedBusinessData(userId) {
     }
 
     // 2. BACKFILL SALES
-    const { data: sales } = await supabase.from('sales').select('*').eq('user_id', userId);
+    const { data: sales } = await allRows(() => supabase.from('sales').select('*').eq('user_id', userId));
     for (const s of (sales || [])) {
       const ref = s.invoice_number || String(s.id);
       if (movementRefs.has(ref)) continue;
@@ -3242,8 +3247,8 @@ async function ensureConnectedBusinessData(userId) {
     }
 
     // 3. BACKFILL PAID INVOICES
-    const { data: invoices } = await supabase.from('invoices').select('*').eq('user_id', userId).eq('payment_status', 'Paid');
-    const { data: bTxns } = await supabase.from('bank_transactions').select('matched_id').eq('user_id', userId).eq('matched_type', 'invoice');
+    const { data: invoices } = await allRows(() => supabase.from('invoices').select('*').eq('user_id', userId).eq('payment_status', 'Paid'));
+    const { data: bTxns } = await allRows(() => supabase.from('bank_transactions').select('matched_id').eq('user_id', userId).eq('matched_type', 'invoice'));
     const matchedIds = new Set((bTxns || []).map(t => String(t.matched_id)));
 
     for (const inv of (invoices || [])) {
@@ -3258,7 +3263,7 @@ async function ensureConnectedBusinessData(userId) {
     }
 
     // 3a. BACKFILL PAID/PARTIAL SALES TO BANK TRANSACTIONS
-    const { data: bTxnsSales } = await supabase.from('bank_transactions').select('matched_id').eq('user_id', userId).eq('matched_type', 'sale');
+    const { data: bTxnsSales } = await allRows(() => supabase.from('bank_transactions').select('matched_id').eq('user_id', userId).eq('matched_type', 'sale'));
     const matchedSaleIds = new Set((bTxnsSales || []).map(t => String(t.matched_id)));
 
     for (const s of (sales || [])) {
@@ -3275,7 +3280,7 @@ async function ensureConnectedBusinessData(userId) {
     }
 
     // 3b. BACKFILL PAID/PARTIAL PURCHASES TO BANK TRANSACTIONS
-    const { data: bTxnsPurchases } = await supabase.from('bank_transactions').select('matched_id').eq('user_id', userId).eq('matched_type', 'purchase');
+    const { data: bTxnsPurchases } = await allRows(() => supabase.from('bank_transactions').select('matched_id').eq('user_id', userId).eq('matched_type', 'purchase'));
     const matchedPurchaseIds = new Set((bTxnsPurchases || []).map(t => String(t.matched_id)));
 
     for (const p of (purchases || [])) {
@@ -3292,12 +3297,12 @@ async function ensureConnectedBusinessData(userId) {
     }
 
     // 4. RECALCULATE STOCK
-    const { data: products } = await supabase.from('products').select('id, name').eq('user_id', userId);
+    const { data: products } = await allRows(() => supabase.from('products').select('id, name').eq('user_id', userId));
     for (const prod of (products || [])) {
       // Scoped by owner as well as product: products above are already fetched
       // for this user, but with RLS bypassed the user_id filter is what actually
       // keeps another tenant's movements out of the recount.
-      const { data: movements } = await supabase.from('stock_movements').select('movement_type, quantity').eq('product_id', prod.id).eq('user_id', userId);
+      const { data: movements } = await allRows(() => supabase.from('stock_movements').select('movement_type, quantity').eq('product_id', prod.id).eq('user_id', userId));
       let stock = 0;
       (movements || []).forEach(m => {
         if (m.movement_type === 'in') stock += toMoney(m.quantity);
@@ -3465,10 +3470,10 @@ async function safelyRunConnectedUpdates(userId, eventType, payload) {
 
 // ─── Shared Ledger Summary Service ───────────────────────────────────────────
 async function calculateLedgerSummary(userId) {
-  const { data, error } = await supabase
+  const { data, error } = await allRows(() => supabase
     .from('bank_transactions')
     .select('*')
-    .eq('user_id', userId);
+    .eq('user_id', userId));
   if (error) throw error;
   const transactions = (data || []).map(mapBankTransactionToLedger);
   return buildLedgerSummary(transactions);
@@ -3481,7 +3486,7 @@ async function calculateAnalyticsSummary(userId) {
   const [receivables, payables, { data: callLogs }] = await Promise.all([
     getReceivableRows(userId),
     getPayableRows(userId),
-    supabase.from('call_logs').select('*').eq('user_id', userId)
+    allRows(() => supabase.from('call_logs').select('*').eq('user_id', userId))
   ]);
 
   const safeCallLogs = callLogs || [];
@@ -3660,8 +3665,8 @@ async function calculateDashboardControlRoom(userId) {
 // ─── Shared Customer Timeline Service ────────────────────────────────────────
 async function getCustomerTimeline(userId, customerId) {
   const [invoicesRes, callsRes, logsRes] = await Promise.all([
-    supabase.from('invoices').select('*').eq('user_id', userId).eq('customer_name', customerId),
-    supabase.from('call_logs').select('*').eq('user_id', userId).eq('customer_name', customerId),
+    allRows(() => supabase.from('invoices').select('*').eq('user_id', userId).eq('customer_name', customerId)),
+    allRows(() => supabase.from('call_logs').select('*').eq('user_id', userId).eq('customer_name', customerId)),
     supabase.from('activity_logs').select('*').eq('user_id', userId).order('created_at', { ascending: false }).limit(100),
   ]);
 
@@ -3742,7 +3747,7 @@ async function getCustomerTimeline(userId, customerId) {
 // ─── Shared Supplier Timeline Service ────────────────────────────────────────
 async function getSupplierTimeline(userId, supplierId) {
   const [purchasesRes, logsRes] = await Promise.all([
-    supabase.from('purchases').select('*').eq('user_id', userId).eq('supplier_name', supplierId),
+    allRows(() => supabase.from('purchases').select('*').eq('user_id', userId).eq('supplier_name', supplierId)),
     supabase.from('activity_logs').select('*').eq('user_id', userId).order('created_at', { ascending: false }).limit(100),
   ]);
 
@@ -3806,7 +3811,7 @@ async function getSupplierTimeline(userId, supplierId) {
 
 // ─── Shared Inventory Summary Service ─────────────────────────────────────────
 async function calculateInventorySummary(userId) {
-  const { data: products } = await supabase.from('products').select('*').eq('user_id', userId).order('name');
+  const { data: products } = await allRows(() => supabase.from('products').select('*').eq('user_id', userId).order('name'));
   const safeProducts = products || [];
   const totalValue = safeProducts.reduce((sum, p) => sum + Number(p.current_stock || 0) * Number(p.unit_price || 0), 0);
   const lowStock = safeProducts.filter(p => p.current_stock > 0 && p.current_stock <= p.low_stock_alert);
@@ -3814,12 +3819,12 @@ async function calculateInventorySummary(userId) {
 
   // Fast-moving products (past 30 days)
   const thirtyDaysAgo = new Date(); thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-  const { data: recentOutMovements } = await supabase
+  const { data: recentOutMovements } = await allRows(() => supabase
     .from('stock_movements')
     .select('product_id, quantity')
     .eq('user_id', userId)
     .eq('movement_type', 'out')
-    .gte('moved_at', thirtyDaysAgo.toISOString());
+    .gte('moved_at', thirtyDaysAgo.toISOString()));
 
   const fastMovingMap = {};
   (recentOutMovements || []).forEach(m => {
@@ -3840,11 +3845,11 @@ async function calculateInventorySummary(userId) {
 
   // Dead stock (no movements in past 60 days)
   const sixtyDaysAgo = new Date(); sixtyDaysAgo.setDate(sixtyDaysAgo.getDate() - 60);
-  const { data: recentMovements } = await supabase
+  const { data: recentMovements } = await allRows(() => supabase
     .from('stock_movements')
     .select('product_id')
     .eq('user_id', userId)
-    .gte('moved_at', sixtyDaysAgo.toISOString());
+    .gte('moved_at', sixtyDaysAgo.toISOString()));
 
   const movedProductIds = new Set((recentMovements || []).map(m => m.product_id));
   const deadStock = safeProducts.filter(p => !movedProductIds.has(p.id) && Number(p.current_stock) > 0);
@@ -3935,7 +3940,7 @@ async function calculateCashFlowForecast(userId, current_cash = 0, days = 30) {
   const [receivables, payables, bankTxnsResult] = await Promise.all([
     getReceivableRows(userId),
     getPayableRows(userId),
-    supabase.from('bank_transactions').select('*').eq('user_id', userId)
+    allRows(() => supabase.from('bank_transactions').select('*').eq('user_id', userId))
   ]);
 
   const bankTxns = bankTxnsResult.error ? [] : bankTxnsResult.data || [];
@@ -4130,13 +4135,13 @@ async function getReceivableRows(userId) {
 }
 
 async function getPayableRows(userId) {
-  const { data, error } = await supabase.from('purchases').select('*').eq('user_id', userId);
+  const { data, error } = await allRows(() => supabase.from('purchases').select('*').eq('user_id', userId));
   if (error) return [];
   return stripCortexTestRows(data || []).map(normalizePayablePurchase).filter((row) => row.supplier_name && row.amount > 0);
 }
 
 async function syncExistingSalesReceivables(userId) {
-  const { data: sales, error } = await supabase.from('sales').select('*').eq('user_id', userId);
+  const { data: sales, error } = await allRows(() => supabase.from('sales').select('*').eq('user_id', userId));
   if (error || !sales?.length) return;
   for (const sale of sales.slice(0, 100)) {
     await syncReceivableFromSale(userId, sale);
@@ -4147,7 +4152,7 @@ async function buildKhataEntries(userId, partyName = null) {
   await syncExistingSalesReceivables(userId);
 
   const [{ data: manualEntries, error: manualError }, receivables, payables] = await Promise.all([
-    supabase.from('khata_entries').select('*').eq('user_id', userId),
+    allRows(() => supabase.from('khata_entries').select('*').eq('user_id', userId)),
     getReceivableRows(userId),
     getPayableRows(userId),
   ]);
@@ -4544,15 +4549,15 @@ app.get('/api/suppliers/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
     const [{ data, error }, { data: purchases, error: purchaseError }] = await Promise.all([
-      supabase
+      allRows(() => supabase
         .from('suppliers')
         .select('*')
         .eq('user_id', userId)
-        .order('name'),
-      supabase
+        .order('name')),
+      allRows(() => supabase
         .from('purchases')
         .select('*')
-        .eq('user_id', userId),
+        .eq('user_id', userId)),
     ]);
     if (error) throw error;
     if (purchaseError) throw purchaseError;
@@ -4730,10 +4735,10 @@ app.get('/api/ai-insights/:userId', requireOwner, async (req, res) => {
   const { userId } = req.params;
   try {
     const [{ data: invoices }, { data: calls }, { data: movements }, { data: products }] = await Promise.all([
-      supabase.from('invoices').select('*').eq('user_id', userId),
-      supabase.from('call_logs').select('*').eq('user_id', userId),
-      supabase.from('stock_movements').select('*, products(name)').eq('user_id', userId),
-      supabase.from('products').select('*').eq('user_id', userId),
+      allRows(() => supabase.from('invoices').select('*').eq('user_id', userId)),
+      allRows(() => supabase.from('call_logs').select('*').eq('user_id', userId)),
+      allRows(() => supabase.from('stock_movements').select('*, products(name)').eq('user_id', userId)),
+      allRows(() => supabase.from('products').select('*').eq('user_id', userId)),
     ]);
 
     const safeInv = invoices || [];
@@ -4826,11 +4831,11 @@ app.get('/api/ai-deep-analysis/:userId', requireOwner, async (req, res) => {
   const { userId } = req.params;
   try {
     const [{ data: invoices }, { data: calls }, { data: movements }, { data: products }, { data: suppliers }] = await Promise.all([
-      supabase.from('invoices').select('*').eq('user_id', userId),
-      supabase.from('call_logs').select('*').eq('user_id', userId),
-      supabase.from('stock_movements').select('*, products(name)').eq('user_id', userId),
-      supabase.from('products').select('*').eq('user_id', userId),
-      supabase.from('suppliers').select('*').eq('user_id', userId),
+      allRows(() => supabase.from('invoices').select('*').eq('user_id', userId)),
+      allRows(() => supabase.from('call_logs').select('*').eq('user_id', userId)),
+      allRows(() => supabase.from('stock_movements').select('*, products(name)').eq('user_id', userId)),
+      allRows(() => supabase.from('products').select('*').eq('user_id', userId)),
+      allRows(() => supabase.from('suppliers').select('*').eq('user_id', userId)),
     ]);
 
     const inv = invoices || [];
@@ -6029,11 +6034,11 @@ app.get('/api/prospects/:userId', requireOwner, async (req, res) => {
   const { userId } = req.params;
   try {
     const [{ data, error }, receivables] = await Promise.all([
-      supabase
+      allRows(() => supabase
       .from('prospects')
       .select('*, prospect_notes(*)')
       .eq('user_id', userId)
-        .order('created_at', { ascending: false }),
+        .order('created_at', { ascending: false })),
       getReceivableRows(userId),
     ]);
     if (error) throw error;
@@ -6208,7 +6213,7 @@ app.get('/api/intelligence/forecast/v2/:userId', requireOwner, async (req, res) 
 
     const [forecast, bankTxnsResult] = await Promise.all([
       calculateCashFlowForecast(userId, 0, horizon),
-      supabase.from('bank_transactions').select('*').eq('user_id', userId).order('txn_date', { ascending: false }),
+      allRows(() => supabase.from('bank_transactions').select('*').eq('user_id', userId).order('txn_date', { ascending: false })),
     ]);
 
     const bankTxns = bankTxnsResult.error ? [] : bankTxnsResult.data || [];
@@ -6812,13 +6817,13 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
     try {
       switch(name) {
         case 'get_summary': {
-          const { data:inv } = await supabase.from('invoices').select('invoice_amount,payment_status,days_overdue').eq('user_id', user_id);
+          const { data:inv } = await allRows(() => supabase.from('invoices').select('invoice_amount,payment_status,days_overdue').eq('user_id', user_id));
           const safe = inv || [];
           const paid = safe.filter(i=>i.payment_status==='Paid');
           const pending = safe.filter(i=>i.payment_status!=='Paid');
           const outstanding = pending.reduce((s,i)=>s+Number(i.invoice_amount),0);
           const recovered = paid.reduce((s,i)=>s+Number(i.invoice_amount),0);
-          const { data:cust } = await supabase.from('invoices').select('customer_name').eq('user_id',user_id);
+          const { data:cust } = await allRows(() => supabase.from('invoices').select('customer_name').eq('user_id',user_id));
           const uniqueCustomers = new Set((cust||[]).map(c=>c.customer_name)).size;
           return { total_invoices:safe.length, paid:paid.length, pending:pending.length, outstanding:`₹${outstanding.toLocaleString('en-IN')}`, recovered:`₹${recovered.toLocaleString('en-IN')}`, recovery_rate:`${safe.length?Math.round(paid.length/safe.length*100):0}%`, total_customers:uniqueCustomers };
         }
@@ -6870,7 +6875,7 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
           return { success:true, message:`${p.name} moved to ${args.status}` };
         }
         case 'get_inventory': {
-          const { data:products } = await supabase.from('products').select('*').eq('user_id',user_id);
+          const { data:products } = await allRows(() => supabase.from('products').select('*').eq('user_id',user_id));
           const prd = products||[];
           const lowStock = prd.filter(p=>p.current_stock>0&&p.current_stock<=p.low_stock_alert);
           const outOfStock = prd.filter(p=>p.current_stock===0);
@@ -6885,7 +6890,7 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
         }
         case 'get_cash_forecast': {
           const days = args.days||30;
-          const { data:invoices } = await supabase.from('invoices').select('invoice_amount,payment_status,payment_date').eq('user_id',user_id);
+          const { data:invoices } = await allRows(() => supabase.from('invoices').select('invoice_amount,payment_status,payment_date').eq('user_id',user_id));
           const safe = invoices||[];
           const paid = safe.filter(i=>i.payment_status==='Paid'&&i.payment_date);
           const totalRecovered = paid.reduce((s,i)=>s+Number(i.invoice_amount),0);
@@ -6908,7 +6913,7 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
           return { success:true, navigating_to:args.page, reason:args.reason };
         }
         case 'get_suppliers': {
-          const { data } = await supabase.from('suppliers').select('*').eq('user_id', user_id);
+          const { data } = await allRows(() => supabase.from('suppliers').select('*').eq('user_id', user_id));
           return data || [];
         }
         case 'send_whatsapp': {
@@ -6943,7 +6948,7 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
         case 'send_bulk_reminders': {
           const minDays = args.min_days || 1;
           const tone = args.tone || 'friendly';
-          const { data: inv } = await supabase.from('invoices').select('customer_name,customer_phone,invoice_amount,days_overdue').eq('user_id', user_id).eq('payment_status','Pending').gte('days_overdue', minDays).order('days_overdue',{ascending:false});
+          const { data: inv } = await allRows(() => supabase.from('invoices').select('customer_name,customer_phone,invoice_amount,days_overdue').eq('user_id', user_id).eq('payment_status','Pending').gte('days_overdue', minDays).order('days_overdue',{ascending:false}));
           if (!inv?.length) return { message: 'No overdue invoices found matching criteria' };
           // Group by customer
           const custMap = {};
@@ -7364,13 +7369,13 @@ app.post('/api/collections/bulk-remind', authMiddleware, async (req, res) => {
   try {
     const { min_days = 1, tone = 'friendly' } = req.body;
 
-    const { data: invoices } = await supabase
+    const { data: invoices } = await allRows(() => supabase
       .from('invoices')
       .select('id, customer_name, customer_phone, invoice_amount, days_overdue, payment_link, reminder_count')
       .eq('user_id', req.user.userId)
       .eq('payment_status', 'Pending')
       .gte('days_overdue', Number(min_days))
-      .not('customer_phone', 'is', null);
+      .not('customer_phone', 'is', null));
 
     const { data: owner } = await supabase
       .from('users')
@@ -7436,8 +7441,8 @@ app.get('/api/collections/timeline/:userId', requireOwner, async (req, res) => {
     
     // Fetch calls, invoices, and activity logs
     const [callsRes, invoicesRes, logsRes] = await Promise.all([
-      supabase.from('call_logs').select('*').eq('user_id', userId).order('called_at', { ascending: false }),
-      supabase.from('invoices').select('*').eq('user_id', userId).order('invoice_date', { ascending: false }),
+      allRows(() => supabase.from('call_logs').select('*').eq('user_id', userId).order('called_at', { ascending: false })),
+      allRows(() => supabase.from('invoices').select('*').eq('user_id', userId).order('invoice_date', { ascending: false })),
       supabase.from('activity_logs').select('*').eq('user_id', userId).order('created_at', { ascending: false }).limit(50),
     ]);
 
@@ -7736,8 +7741,8 @@ app.post('/api/settings/twilio', authMiddleware, async (req, res) => {
 
 app.get('/api/dunning/:userId', requireOwner, async (req, res) => {
   try {
-    const { data, error } = await supabase.from('dunning_rules')
-      .select('*').eq('user_id', req.params.userId).order('trigger_day');
+    const { data, error } = await allRows(() => supabase.from('dunning_rules')
+      .select('*').eq('user_id', req.params.userId).order('trigger_day'));
     if (error) throw error;
     res.json({ success: true, rules: data || [] });
   } catch (error) {
@@ -7749,12 +7754,12 @@ app.get('/api/dunning/:userId', requireOwner, async (req, res) => {
 app.get('/api/dunning/logs/:userId', requireOwner, async (req, res) => {
   try {
     const { userId } = req.params;
-    const { data, error } = await supabase
+    const { data, error } = await allRows(() => supabase
       .from('activity_logs')
       .select('*')
       .eq('user_id', userId)
       .in('action', ['reminder_sent', 'dunning_triggered', 'whatsapp_sent'])
-      .order('created_at', { ascending: false });
+      .order('created_at', { ascending: false }));
 
     if (error) throw error;
     res.json({ success: true, logs: data || [] });
@@ -8263,8 +8268,8 @@ app.post('/api/ml/briefing', authMiddleware, async (req, res) => {
       { data: callsRaw },
       { data: userData },
     ] = await Promise.all([
-      supabase.from('invoices').select('id,customer_name,customer_phone,invoice_amount,payment_status,days_overdue,invoice_date').eq('user_id', userId).eq('payment_status', 'Pending').order('invoice_amount', { ascending: false }),
-      supabase.from('call_logs').select('customer_name,did_pick_up,promised_payment_date,created_at').eq('user_id', userId).order('created_at', { ascending: false }),
+      allRows(() => supabase.from('invoices').select('id,customer_name,customer_phone,invoice_amount,payment_status,days_overdue,invoice_date').eq('user_id', userId).eq('payment_status', 'Pending').order('invoice_amount', { ascending: false })),
+      allRows(() => supabase.from('call_logs').select('customer_name,did_pick_up,promised_payment_date,created_at').eq('user_id', userId).order('created_at', { ascending: false })),
       supabase.from('users').select('business_name,plan').eq('id', userId).single(),
     ]);
 
@@ -9185,8 +9190,8 @@ app.post('/api/reconcile/backfill', requireAdmin, async (req, res) => {
     };
 
     // 1. BACKFILL PURCHASES -> INVENTORY
-    const { data: purchases } = await supabase.from('purchases').select('*').eq('user_id', userId);
-    const { data: pMovements } = await supabase.from('stock_movements').select('reference').eq('user_id', userId).not('reference', 'is', null);
+    const { data: purchases } = await allRows(() => supabase.from('purchases').select('*').eq('user_id', userId));
+    const { data: pMovements } = await allRows(() => supabase.from('stock_movements').select('reference').eq('user_id', userId).not('reference', 'is', null));
     const movementRefs = new Set((pMovements || []).map(m => m.reference));
 
     for (const p of (purchases || [])) {
@@ -9227,7 +9232,7 @@ app.post('/api/reconcile/backfill', requireAdmin, async (req, res) => {
     }
 
     // 2. BACKFILL SALES -> INVENTORY
-    const { data: sales } = await supabase.from('sales').select('*').eq('user_id', userId);
+    const { data: sales } = await allRows(() => supabase.from('sales').select('*').eq('user_id', userId));
     for (const s of (sales || [])) {
       const ref = s.invoice_number || String(s.id);
       if (movementRefs.has(ref)) {
@@ -9261,8 +9266,8 @@ app.post('/api/reconcile/backfill', requireAdmin, async (req, res) => {
     }
 
     // 3. BACKFILL PAID INVOICES -> LEDGER
-    const { data: invoices } = await supabase.from('invoices').select('*').eq('user_id', userId).eq('payment_status', 'Paid');
-    const { data: bTxns } = await supabase.from('bank_transactions').select('matched_id').eq('user_id', userId).eq('matched_type', 'invoice');
+    const { data: invoices } = await allRows(() => supabase.from('invoices').select('*').eq('user_id', userId).eq('payment_status', 'Paid'));
+    const { data: bTxns } = await allRows(() => supabase.from('bank_transactions').select('matched_id').eq('user_id', userId).eq('matched_type', 'invoice'));
     const matchedIds = new Set((bTxns || []).map(t => String(t.matched_id)));
 
     for (const inv of (invoices || [])) {
@@ -9289,12 +9294,12 @@ app.post('/api/reconcile/backfill', requireAdmin, async (req, res) => {
 
     // 4. RECALCULATE PRODUCT STOCK
     if (!isDryRun) {
-      const { data: products } = await supabase.from('products').select('id, name').eq('user_id', userId);
+      const { data: products } = await allRows(() => supabase.from('products').select('id, name').eq('user_id', userId));
       for (const prod of (products || [])) {
         // Scoped by owner as well as product: products above are already
         // fetched for this user, but with RLS bypassed the user_id filter is
         // what actually keeps another tenant's movements out of the recount.
-        const { data: movements } = await supabase.from('stock_movements').select('movement_type, quantity').eq('product_id', prod.id).eq('user_id', userId);
+        const { data: movements } = await allRows(() => supabase.from('stock_movements').select('movement_type, quantity').eq('product_id', prod.id).eq('user_id', userId));
         let stock = 0;
         (movements || []).forEach(m => {
           if (m.movement_type === 'in') stock += toMoney(m.quantity);
@@ -9619,8 +9624,8 @@ app.get('/api/orders', authMiddleware, async (req, res) => {
     // astronomically unlikely). Orders with a null/missing worker_id are left as-is.
     const workerIds = [...new Set(orders.map(o => o.worker_id).filter(Boolean))];
     if (workerIds.length) {
-      const { data: workerRows } = await supabase.from('workers')
-        .select('id, name, phone').eq('user_id', userId).in('id', workerIds);
+      const { data: workerRows } = await allRows(() => supabase.from('workers')
+        .select('id, name, phone').eq('user_id', userId).in('id', workerIds));
       const workerById = {};
       (workerRows || []).forEach(w => { workerById[w.id] = w; });
       orders.forEach(o => {
@@ -9680,8 +9685,8 @@ app.delete('/api/orders/:id', authMiddleware, async (req, res) => {
 
 app.get('/api/workers', authMiddleware, async (req, res) => {
   try {
-    const { data, error } = await supabase.from('workers')
-      .select('*').eq('user_id', req.user.userId).order('name');
+    const { data, error } = await allRows(() => supabase.from('workers')
+      .select('*').eq('user_id', req.user.userId).order('name'));
     if (error) throw error;
     res.json({ success: true, workers: data || [] });
   } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
@@ -10063,12 +10068,12 @@ app.get('/api/today/summary', authMiddleware, async (req, res) => {
       { data: paidInvoices },
       { data: callLogs },
     ] = await Promise.all([
-      supabase.from('orders').select('*').eq('user_id', userId).eq('order_date', date),
-      supabase.from('expenses').select('*').eq('user_id', userId).eq('expense_date', date),
-      supabase.from('sales').select('*').eq('user_id', userId).eq('sale_date', date),
-      supabase.from('purchases').select('*').eq('user_id', userId).eq('purchase_date', date),
-      supabase.from('invoices').select('*').eq('user_id', userId).eq('payment_status', 'Paid').eq('payment_date', date),
-      supabase.from('call_logs').select('*').eq('user_id', userId).gte('created_at', date + 'T00:00:00').lte('created_at', date + 'T23:59:59'),
+      allRows(() => supabase.from('orders').select('*').eq('user_id', userId).eq('order_date', date)),
+      allRows(() => supabase.from('expenses').select('*').eq('user_id', userId).eq('expense_date', date)),
+      allRows(() => supabase.from('sales').select('*').eq('user_id', userId).eq('sale_date', date)),
+      allRows(() => supabase.from('purchases').select('*').eq('user_id', userId).eq('purchase_date', date)),
+      allRows(() => supabase.from('invoices').select('*').eq('user_id', userId).eq('payment_status', 'Paid').eq('payment_date', date)),
+      allRows(() => supabase.from('call_logs').select('*').eq('user_id', userId).gte('created_at', date + 'T00:00:00').lte('created_at', date + 'T23:59:59')),
     ]);
 
     (orders || []).forEach((o) => {
@@ -10203,10 +10208,10 @@ app.post('/api/ai/brain', authMiddleware, async (req, res) => {
       supabase.from('users').select('business_name,city,business_type,owner_name,voice_style,ai_persona').eq('id', userId).single(),
       supabase.from('business_vocabulary').select('term,meaning,aliases').eq('user_id', userId).limit(50),
       supabase.from('brain_rules').select('rule,category').eq('user_id', userId).limit(30),
-      supabase.from('workers').select('name,role,is_active').eq('user_id', userId),
+      allRows(() => supabase.from('workers').select('name,role,is_active').eq('user_id', userId)),
       supabase.from('invoices').select('customer_name,invoice_amount,due_date,payment_status').eq('user_id', userId).eq('payment_status','Pending').order('invoice_amount', { ascending: false }).limit(10),
-      supabase.from('orders').select('customer_name,items,status,total_amount,delivery_time').eq('user_id', userId).eq('order_date', today),
-      supabase.from('expenses').select('description,amount,category').eq('user_id', userId).eq('expense_date', today),
+      allRows(() => supabase.from('orders').select('customer_name,items,status,total_amount,delivery_time').eq('user_id', userId).eq('order_date', today)),
+      allRows(() => supabase.from('expenses').select('description,amount,category').eq('user_id', userId).eq('expense_date', today)),
     ]);
 
     // Build today's numbers for context
@@ -10363,8 +10368,8 @@ RULES:
         case 'get_expenses_summary': {
           const from = args.from_date || today;
           const to = args.to_date || today;
-          const { data } = await supabase.from('expenses').select('description,amount,category,expense_date')
-            .eq('user_id', userId).gte('expense_date', from).lte('expense_date', to);
+          const { data } = await allRows(() => supabase.from('expenses').select('description,amount,category,expense_date')
+            .eq('user_id', userId).gte('expense_date', from).lte('expense_date', to));
           const total = (data || []).reduce((s, e) => s + Number(e.amount || 0), 0);
           const byCategory = {};
           (data || []).forEach(e => { byCategory[e.category] = (byCategory[e.category] || 0) + Number(e.amount); });
@@ -10384,7 +10389,7 @@ RULES:
           return { error: 'The assistant cannot add expenses. Add it from the Today page.' };
         case 'get_top_customers': {
           if (args.ranked_by === 'orders') {
-            const { data } = await supabase.from('orders').select('customer_name,total_amount').eq('user_id', userId).not('status', 'eq', 'cancelled');
+            const { data } = await allRows(() => supabase.from('orders').select('customer_name,total_amount').eq('user_id', userId).not('status', 'eq', 'cancelled'));
             const map = {};
             (data || []).forEach(o => { map[o.customer_name] = (map[o.customer_name] || 0) + Number(o.total_amount || 0); });
             return Object.entries(map).sort(([,a],[,b]) => b-a).slice(0, Math.min(Math.max(Number(args.limit) || 5, 1), 50)).map(([name, total]) => ({ name, total: `₹${total.toLocaleString('en-IN')}` }));
@@ -10823,10 +10828,10 @@ app.get('/api/bills/gstr1', authMiddleware, async (req, res) => {
     // a NULL status, so a plain .neq() drops those rows from the return instead
     // of including them. A bill omitted from a GST filing is the more expensive
     // error of the two, so anything that is not explicitly cancelled is filed.
-    const { data: bills, error: billsErr } = await supabase.from('bills').select('*')
+    const { data: bills, error: billsErr } = await allRows(() => supabase.from('bills').select('*')
       .eq('user_id', req.user.userId)
       .gte('bill_date', from).lt('bill_date', to)
-      .or('status.is.null,status.neq.cancelled');
+      .or('status.is.null,status.neq.cancelled'));
     if (billsErr) throw billsErr;
     const b2b = (bills || []).filter(b => b.customer_gstin).map(b => ({
       'GSTIN of Recipient': b.customer_gstin, 'Receiver Name': b.customer_name,
@@ -11335,8 +11340,8 @@ app.get('/api/attendance', authMiddleware, async (req, res) => {
     const year = req.query.year || new Date().getFullYear();
     const { from, to } = monthDateRange(year, month);
     const [{ data: workers }, { data: attendance }] = await Promise.all([
-      supabase.from('workers').select('*').eq('user_id', req.user.userId).eq('is_active', true),
-      supabase.from('attendance').select('*').eq('user_id', req.user.userId).gte('attendance_date', from).lt('attendance_date', to),
+      allRows(() => supabase.from('workers').select('*').eq('user_id', req.user.userId).eq('is_active', true)),
+      allRows(() => supabase.from('attendance').select('*').eq('user_id', req.user.userId).gte('attendance_date', from).lt('attendance_date', to)),
     ]);
     res.json({ success: true, workers: workers || [], attendance: attendance || [], month, year });
   } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
@@ -11360,8 +11365,8 @@ app.get('/api/attendance/salary', authMiddleware, async (req, res) => {
     const year = req.query.year || new Date().getFullYear();
     const { from, to } = monthDateRange(year, month);
     const [{ data: workers }, { data: attendance }] = await Promise.all([
-      supabase.from('workers').select('*').eq('user_id', req.user.userId).eq('is_active', true),
-      supabase.from('attendance').select('*').eq('user_id', req.user.userId).gte('attendance_date', from).lt('attendance_date', to),
+      allRows(() => supabase.from('workers').select('*').eq('user_id', req.user.userId).eq('is_active', true)),
+      allRows(() => supabase.from('attendance').select('*').eq('user_id', req.user.userId).gte('attendance_date', from).lt('attendance_date', to)),
     ]);
     // Count working days in month
     const daysInMonth = new Date(Number(year), Number(month), 0).getDate();
@@ -11398,11 +11403,11 @@ app.patch('/api/workers/:id/salary', authMiddleware, async (req, res) => {
 
 app.get('/api/bank/accounts', authMiddleware, async (req, res) => {
   try {
-    const { data, error } = await supabase
+    const { data, error } = await allRows(() => supabase
       .from('bank_accounts')
       .select('*')
       .eq('user_id', req.user.userId)
-      .order('created_at', { ascending: false });
+      .order('created_at', { ascending: false }));
     if (error) throw error;
     res.json({ success: true, accounts: data || [] });
   } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
@@ -11453,11 +11458,11 @@ app.delete('/api/bank/accounts/:id', authMiddleware, async (req, res) => {
 
 app.get('/api/bank/transactions', authMiddleware, async (req, res) => {
   try {
-    const { data, error } = await supabase
+    const { data, error } = await allRows(() => supabase
       .from('bank_transactions')
       .select('*')
       .eq('user_id', req.user.userId)
-      .order('txn_date', { ascending: false });
+      .order('txn_date', { ascending: false }));
     if (error) throw error;
     res.json({ success: true, transactions: data || [] });
   } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
@@ -12112,9 +12117,9 @@ cron.schedule('30 12 * * 0', async () => {
     for (const user of users) {
       try {
         const [{ data: collected }, { data: pending }, { data: calls }] = await Promise.all([
-          supabase.from('invoices').select('payment_amount, invoice_amount').eq('user_id', user.id).eq('payment_status', 'Paid').gte('payment_date', weekAgo),
+          allRows(() => supabase.from('invoices').select('payment_amount, invoice_amount').eq('user_id', user.id).eq('payment_status', 'Paid').gte('payment_date', weekAgo)),
           supabase.from('invoices').select('invoice_amount, customer_name, days_overdue').eq('user_id', user.id).eq('payment_status', 'Pending').order('days_overdue', { ascending: false }).limit(1),
-          supabase.from('call_logs').select('id').eq('user_id', user.id).gte('called_at', weekAgo),
+          allRows(() => supabase.from('call_logs').select('id').eq('user_id', user.id).gte('called_at', weekAgo)),
         ]);
         const collectedAmt = (collected || []).reduce((s, i) => s + Number(i.payment_amount || i.invoice_amount), 0);
         const riskParty = pending?.[0]?.customer_name || null;
@@ -12143,7 +12148,7 @@ cron.schedule('30 12 * * 0', async () => {
 
 app.get('/api/disputes', authMiddleware, async (req, res) => {
   try {
-    const { data, error } = await supabase.from('disputes').select('*').eq('user_id', req.user.userId).order('created_at', { ascending: false });
+    const { data, error } = await allRows(() => supabase.from('disputes').select('*').eq('user_id', req.user.userId).order('created_at', { ascending: false }));
     if (error) throw error;
     res.json({ success: true, disputes: data || [] });
   } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
@@ -12193,7 +12198,7 @@ app.delete('/api/disputes/:id', authMiddleware, async (req, res) => {
 
 app.get('/api/bad-debt-flags/:userId', requireOwner, async (req, res) => {
   try {
-    const { data: invoices } = await supabase.from('invoices').select('id, customer_name, invoice_amount, days_overdue, customer_phone').eq('user_id', req.params.userId).eq('payment_status', 'Pending').gte('days_overdue', 60).order('days_overdue', { ascending: false });
+    const { data: invoices } = await allRows(() => supabase.from('invoices').select('id, customer_name, invoice_amount, days_overdue, customer_phone').eq('user_id', req.params.userId).eq('payment_status', 'Pending').gte('days_overdue', 60).order('days_overdue', { ascending: false }));
     if (!invoices?.length) return res.json({ success: true, flagged: [] });
     const flagged = (invoices || []).map(inv => {
       const risk = inv.days_overdue >= 120 ? 'critical' : inv.days_overdue >= 90 ? 'high' : 'medium';
@@ -12298,12 +12303,12 @@ app.get('/api/reports/export', authMiddleware, async (req, res) => {
 
     // ── 1. Outstanding Receivables ──────────────────────────────────────────
     if (report === 'outstanding') {
-      const { data: invoices, error } = await supabase
+      const { data: invoices, error } = await allRows(() => supabase
         .from('invoices')
         .select('customer_name, customer_phone, invoice_amount, invoice_date, days_overdue, payment_status, due_date')
         .eq('user_id', userId)
         .eq('payment_status', 'Pending')
-        .order('days_overdue', { ascending: false });
+        .order('days_overdue', { ascending: false }));
       if (error) throw error;
 
       const rows = (invoices || []).map(inv => ({
@@ -12334,22 +12339,22 @@ app.get('/api/reports/export', authMiddleware, async (req, res) => {
 
     // ── 2. Collection Performance (Paid in date range) ──────────────────────
     else if (report === 'collection') {
-      const { data: paid } = await supabase
+      const { data: paid } = await allRows(() => supabase
         .from('invoices')
         .select('customer_name, payment_amount, invoice_amount, payment_date, payment_method, days_overdue')
         .eq('user_id', userId)
         .eq('payment_status', 'Paid')
         .gte('payment_date', fromDate)
         .lte('payment_date', toDate)
-        .order('payment_date', { ascending: false });
+        .order('payment_date', { ascending: false }));
 
-      const { data: calls } = await supabase
+      const { data: calls } = await allRows(() => supabase
         .from('call_logs')
         .select('customer_name, did_pick_up, promised_payment_date, notes, called_at')
         .eq('user_id', userId)
         .gte('called_at', fromDate)
         .lte('called_at', toDate)
-        .order('called_at', { ascending: false });
+        .order('called_at', { ascending: false }));
 
       wb = XLSX.utils.book_new();
 
@@ -12375,13 +12380,13 @@ app.get('/api/reports/export', authMiddleware, async (req, res) => {
 
     // ── 3. GST Summary ──────────────────────────────────────────────────────
     else if (report === 'gst') {
-      const { data: bills } = await supabase
+      const { data: bills } = await allRows(() => supabase
         .from('bills')
         .select('bill_number, customer_name, customer_gstin, invoice_date, subtotal, tax_amount, total_amount, status')
         .eq('user_id', userId)
         .gte('invoice_date', fromDate)
         .lte('invoice_date', toDate)
-        .order('invoice_date', { ascending: false });
+        .order('invoice_date', { ascending: false }));
 
       const rows = (bills || []).map(b => ({
         'Bill No.':         b.bill_number || '',
@@ -12399,12 +12404,12 @@ app.get('/api/reports/export', authMiddleware, async (req, res) => {
 
     // ── 4. Cash Flow Forecast (simple 30d projection) ───────────────────────
     else if (report === 'cashflow') {
-      const { data: pending } = await supabase
+      const { data: pending } = await allRows(() => supabase
         .from('invoices')
         .select('customer_name, invoice_amount, days_overdue, due_date')
         .eq('user_id', userId)
         .eq('payment_status', 'Pending')
-        .order('due_date', { ascending: true });
+        .order('due_date', { ascending: true }));
 
       const rows = (pending || []).map(inv => {
         const overdue = Number(inv.days_overdue || 0);
@@ -12424,13 +12429,13 @@ app.get('/api/reports/export', authMiddleware, async (req, res) => {
 
     // ── 5. Calls Log ────────────────────────────────────────────────────────
     else if (report === 'calls') {
-      const { data: calls } = await supabase
+      const { data: calls } = await allRows(() => supabase
         .from('call_logs')
         .select('customer_name, customer_phone, amount, did_pick_up, promised_payment_date, promised_amount, notes, called_at')
         .eq('user_id', userId)
         .gte('called_at', fromDate)
         .lte('called_at', toDate)
-        .order('called_at', { ascending: false });
+        .order('called_at', { ascending: false }));
 
       const rows = (calls || []).map(c => ({
         'Customer':        c.customer_name || '',
@@ -12448,12 +12453,12 @@ app.get('/api/reports/export', authMiddleware, async (req, res) => {
 
     // ── 6. Customer Statement (all invoices per customer) ───────────────────
     else if (report === 'customer') {
-      const { data: invoices } = await supabase
+      const { data: invoices } = await allRows(() => supabase
         .from('invoices')
         .select('customer_name, invoice_amount, payment_amount, payment_status, invoice_date, payment_date, days_overdue')
         .eq('user_id', userId)
         .order('customer_name', { ascending: true })
-        .order('invoice_date', { ascending: false });
+        .order('invoice_date', { ascending: false }));
 
       wb = XLSX.utils.book_new();
       // Group by customer
@@ -12788,8 +12793,8 @@ app.get('/api/ai-actions', authMiddleware, async (req, res) => {
     }));
 
     // Priority counts for badge display
-    const { data: summary } = await supabase
-      .from('ai_actions').select('priority').eq('user_id', userId).eq('status', 'pending');
+    const { data: summary } = await allRows(() => supabase
+      .from('ai_actions').select('priority').eq('user_id', userId).eq('status', 'pending'));
     const counts = {};
     (summary || []).forEach(r => { counts[r.priority] = (counts[r.priority] || 0) + 1; });
     res.json({ success: true, actions: actionsWithCustomer, counts, total: actionsWithCustomer.length });
@@ -13247,11 +13252,11 @@ app.get('/api/ai-actions/counts', authMiddleware, async (req, res) => {
     const { isEnabled: _isFE } = require('./lib/featureFlags');
     if (!_isFE('ai_action_center')) return res.json({ urgent: 0, high: 0, total: 0 });
     const userId = req.user.userId;
-    const { data, error } = await supabase
+    const { data, error } = await allRows(() => supabase
       .from('ai_actions')
       .select('priority')
       .eq('user_id', userId)
-      .eq('status', 'pending');
+      .eq('status', 'pending'));
     if (error) throw error;
     const rows = data || [];
     const urgent = rows.filter(r => r.priority === 'urgent').length;
@@ -13302,11 +13307,11 @@ app.get('/api/customer-scores', authMiddleware, async (req, res) => {
     const userId = req.user.userId;
 
     const fetchScores = async () => {
-      const { data, error } = await supabase
+      const { data, error } = await allRows(() => supabase
         .from('customer_scores')
         .select('customer_id, credit_risk_score, collection_priority_score, max_delay_days, score_reason_json, customers(name)')
         .eq('user_id', userId)
-        .order('credit_risk_score', { ascending: false });
+        .order('credit_risk_score', { ascending: false }));
       if (error) throw error;
       return (data || []).map(r => {
         const raw = parseFloat(r.credit_risk_score || 0);
@@ -13489,8 +13494,8 @@ app.post('/api/cortex/run-briefing', authMiddleware, async (req, res) => {
       pendingResult,
     ] = await Promise.all([
       supabase.from('invoices').select('customer_name, invoice_amount, days_overdue').eq('user_id', userId).eq('payment_status', 'Pending').order('days_overdue', { ascending: false }).limit(1),
-      supabase.from('promises').select('id').eq('user_id', userId).eq('status', 'broken').gte('resolved_at', new Date(Date.now() - 86400000).toISOString()),
-      supabase.from('ai_actions').select('id').eq('user_id', userId).eq('status', 'pending'),
+      allRows(() => supabase.from('promises').select('id').eq('user_id', userId).eq('status', 'broken').gte('resolved_at', new Date(Date.now() - 86400000).toISOString())),
+      allRows(() => supabase.from('ai_actions').select('id').eq('user_id', userId).eq('status', 'pending')),
     ]);
 
     const overdue       = overdueResult.data || [];
@@ -13528,9 +13533,9 @@ app.get('/api/cortex/cashflow-week', authMiddleware, async (req, res) => {
 
     // Also fetch overdue payables total
     const today = new Date().toISOString().split('T')[0];
-    const { data: payables } = await supabase
+    const { data: payables } = await allRows(() => supabase
       .from('purchases').select('total_amount, paid_amount')
-      .eq('user_id', userId).neq('status', 'paid').lt('due_date', today);
+      .eq('user_id', userId).neq('status', 'paid').lt('due_date', today));
 
     const overduePayables = (payables || []).reduce((s, p) => {
       return s + Math.max(0, Number(p.total_amount || 0) - Number(p.paid_amount || 0));
@@ -13770,8 +13775,8 @@ cron.schedule('30 1 * * *', async () => {
       try {
         const [{ data: overdue }, { data: pendingActions }, { data: brokenToday }] = await Promise.all([
           supabase.from('invoices').select('customer_name, invoice_amount, days_overdue').eq('user_id', user.id).eq('payment_status', 'Pending').order('days_overdue', { ascending: false }).limit(3),
-          supabase.from('ai_actions').select('id').eq('user_id', user.id).eq('status', 'pending'),
-          supabase.from('promises').select('id').eq('user_id', user.id).eq('status', 'broken').gte('resolved_at', today),
+          allRows(() => supabase.from('ai_actions').select('id').eq('user_id', user.id).eq('status', 'pending')),
+          allRows(() => supabase.from('promises').select('id').eq('user_id', user.id).eq('status', 'broken').gte('resolved_at', today)),
         ]);
         const pendingCount = pendingActions?.length || 0;
         if (pendingCount === 0 && !overdue?.length) continue;
@@ -13808,12 +13813,12 @@ const AUTO_EXECUTE_ACTION_TYPES = ['INVENTORY_PO_READY', 'PAYABLES_PAYMENT_READY
 async function notifyPendingAutoExecuteActions(userId) {
   if (!isFeatureEnabled('agent_autoexecute_enabled')) return;
   try {
-    const { data: pending } = await supabase.from('ai_actions')
+    const { data: pending } = await allRows(() => supabase.from('ai_actions')
       .select('id, action_type, title, description')
       .eq('user_id', userId)
       .eq('status', 'pending')
       .is('notified_at', null)
-      .in('action_type', AUTO_EXECUTE_ACTION_TYPES);
+      .in('action_type', AUTO_EXECUTE_ACTION_TYPES));
     if (!pending?.length) return;
 
     const { data: owner } = await supabase.from('users')
@@ -13849,13 +13854,13 @@ async function notifyPendingAutoExecuteActions(userId) {
 async function autoSendCollectionsReminders(userId) {
   if (!isFeatureEnabled('agent_autoexecute_enabled') || !isFeatureEnabled('external_message_sending_enabled')) return;
   try {
-    const { data: pending } = await supabase.from('ai_actions')
+    const { data: pending } = await allRows(() => supabase.from('ai_actions')
       .select('id, related_entity_id, recommended_message')
       .eq('user_id', userId)
       .eq('status', 'pending')
       .eq('action_type', 'SEND_POLITE_REMINDER')
       .eq('requires_approval', false)
-      .is('notified_at', null);
+      .is('notified_at', null));
     if (!pending?.length) return;
 
     for (const action of pending) {
@@ -14387,7 +14392,7 @@ app.get('/api/v1/dashboard/bootstrap', authMiddleware, async (req, res) => {
       { count: lowStockCount },
       { data: topActions }
     ] = await Promise.all([
-      supabase.from('invoices').select('invoice_amount', { count: 'exact' }).eq('user_id', userId).gte('created_at', new Date(new Date().setHours(0,0,0,0)).toISOString()),
+      allRows(() => supabase.from('invoices').select('invoice_amount', { count: 'exact' }).eq('user_id', userId).gte('created_at', new Date(new Date().setHours(0,0,0,0)).toISOString())),
       supabase.from('purchases').select('*', { count: 'exact', head: true }).eq('user_id', userId).gte('created_at', new Date(new Date().setHours(0,0,0,0)).toISOString()),
       // Phase 2C.35-P1: canonical overdue predicate — no row is ever stored as 'Overdue'.
       supabase.from('invoices').select('*', { count: 'exact', head: true }).eq('user_id', userId).eq('payment_status', 'Pending').gt('days_overdue', 0),
@@ -14426,7 +14431,7 @@ app.get('/api/v1/collections/bootstrap', authMiddleware, async (req, res) => {
       { data: invoices },
       { data: promises }
     ] = await Promise.all([
-      supabase.from('invoices').select('invoice_amount, payment_amount, payment_status, days_overdue, due_date').eq('user_id', userId).not('payment_status', 'eq', 'Paid'),
+      allRows(() => supabase.from('invoices').select('invoice_amount, payment_amount, payment_status, days_overdue, due_date').eq('user_id', userId).not('payment_status', 'eq', 'Paid')),
       supabase.from('promises').select('id', { count: 'exact', head: true }).eq('user_id', userId).eq('status', 'broken')
     ]);
 
