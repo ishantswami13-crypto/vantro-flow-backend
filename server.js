@@ -279,24 +279,19 @@ const IS_PRODUCTION = process.env.NODE_ENV === 'production' || Boolean(
 );
 
 
-// ── In-memory OTP store (keyed by userId) ──────────────────────────────────
-// Structure: Map<userId, { code: string, expiresAt: number, attempts: number }>
-const otpStore = new Map();
-function generateOTP() { return String(Math.floor(100000 + Math.random() * 900000)); }
-function storeOTP(userId) {
+// ── Sign-up verification codes (keyed by userId) ──────────────────────────
+// Held by lib/auth/oneTimeCodes: in Postgres when DATABASE_URL is set, so the
+// code works whichever server instance checks it and survives a redeploy.
+const oneTimeCodes = require('./lib/auth/oneTimeCodes');
+function generateOTP() { return String(crypto.randomInt(100000, 1000000)); }
+async function storeOTP(userId) {
   const code = generateOTP();
-  otpStore.set(userId, { code, expiresAt: Date.now() + 10 * 60 * 1000, attempts: 0 });
+  await oneTimeCodes.issue(`signup:${userId}`, code, { userId }, 10 * 60 * 1000);
   return code;
 }
-function verifyOTP(userId, code) {
-  const entry = otpStore.get(userId);
-  if (!entry) return { valid: false, reason: 'No OTP found. Click Resend.' };
-  if (Date.now() > entry.expiresAt) { otpStore.delete(userId); return { valid: false, reason: 'OTP expired. Click Resend.' }; }
-  if (entry.attempts >= 5) { otpStore.delete(userId); return { valid: false, reason: 'Too many attempts. Click Resend.' }; }
-  entry.attempts++;
-  if (entry.code !== String(code)) return { valid: false, reason: 'Wrong OTP. Try again.' };
-  otpStore.delete(userId);
-  return { valid: true };
+async function verifyOTP(userId, code) {
+  const hit = await oneTimeCodes.consume(`signup:${userId}`, String(code), { maxAttempts: 5 });
+  return hit ? { valid: true } : { valid: false, reason: 'That code is wrong or has expired. Try again, or click Resend.' };
 }
 
 // ── In-memory User-Scoped Summary Cache ──────────────────────────────────────
@@ -936,6 +931,7 @@ if (process.env.DATABASE_URL) {
   const { Pool } = require('pg');
   const { buildSanitizedPgConfig, estimateStartupPacket } = require('./lib/db/pgConfig');
   pgPool = new Pool(buildSanitizedPgConfig(process.env.DATABASE_URL));
+  oneTimeCodes.useDatabase(() => pgPool);
   // Confirmed live: this crashed the entire server process on a routine
   // Neon idle-connection drop (ECONNRESET) — node-postgres emits 'error' on
   // the Pool when an idle client's socket closes, and per Node's own
@@ -1375,7 +1371,7 @@ app.post('/api/auth/signup', async (req, res) => {
     const user = data[0];
 
     // Generate and send OTP
-    const otp = storeOTP(user.id);
+    const otp = await storeOTP(user.id);
     const otpMsg = `Starlane verification code: *${otp}*\n\nYe code 10 minute mein expire ho jaayega. Kisi ke saath share mat karein.`;
 
     // WhatsApp OTP — transactional owner-auth delivery (exempt from external-send kill switch)
@@ -1409,7 +1405,7 @@ app.post('/api/auth/resend-otp', async (req, res) => {
     const { data: user } = await supabase.from('users').select('id, email, phone, business_name').eq('id', decoded.userId).single();
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    const otp = storeOTP(user.id);
+    const otp = await storeOTP(user.id);
     const otpMsg = `Starlane verification code: *${otp}*\n\nYe code 10 minute mein expire ho jaayega. Kisi ke saath share mat karein.`;
 
     if (user.phone) sendWhatsAppMessage(user.phone, otpMsg, {}, { transactional: true }).catch(() => {});
@@ -1444,10 +1440,10 @@ app.post('/api/auth/verify-otp', async (req, res) => {
       && !require('./lib/config/deployEnv').isProductionDeployment();
     if (otpBypassed) {
       console.warn(`[OTP BYPASS] OTP_VERIFICATION_DISABLED=true — skipping OTP check for userId=${decoded.userId}. This is a TEMPORARY testing bypass, not a permanent change.`);
-      otpStore.delete(decoded.userId);
+      await oneTimeCodes.discard(`signup:${decoded.userId}`);
     } else {
       if (!otp) return res.status(400).json({ error: 'OTP required' });
-      const result = verifyOTP(decoded.userId, String(otp).trim());
+      const result = await verifyOTP(decoded.userId, String(otp).trim());
       if (!result.valid) return res.status(400).json({ error: result.reason });
     }
 
