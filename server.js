@@ -1231,6 +1231,14 @@ async function sendWhatsAppMessage(phone, message, creds = {}, opts = {}) {
 
 
 // ── Email OTP helper (uses Resend if RESEND_API_KEY is set) ──────────────────
+// Transactional sender. Resend's onboarding@resend.dev sandbox address only
+// delivers to the Resend account's own email, so production must set
+// EMAIL_FROM to an address on a verified domain (same fallback chain as
+// lib/access/notify.js).
+function emailSender() {
+  return process.env.EMAIL_FROM || process.env.ACCESS_EMAIL_FROM || 'Starlane <onboarding@resend.dev>';
+}
+
 async function sendOTPEmail(email, name, otp) {
   const displayName = name || 'there';
   const html = `
@@ -1284,14 +1292,16 @@ async function sendOTPEmail(email, name, otp) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_API_KEY}` },
       body: JSON.stringify({
-        from: 'Starlane <onboarding@resend.dev>',
+        from: emailSender(),
         to: email,
         subject: `${otp} is your Starlane code`,
         html,
       }),
     });
     const data = await res.json().catch(() => ({}));
-    console.log(`[EMAIL OTP] Resend delivery: ${data.id ? 'sent' : 'failed'}`);
+    // The reason (e.g. a sandbox sender that may only mail the account owner)
+    // is logged; the code and the recipient never are.
+    console.log(`[EMAIL OTP] Resend delivery: ${data.id ? 'sent' : `failed (${res.status}${data.name ? ` ${data.name}` : ''})`}`);
   } else {
     // Email delivery not configured. NEVER log the OTP value or the recipient.
     console.log('[EMAIL OTP] delivery not configured (RESEND_API_KEY unset) — OTP not emailed');
@@ -1584,7 +1594,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_API_KEY}` },
         body: JSON.stringify({
-          from: 'Starlane <onboarding@resend.dev>',
+          from: emailSender(),
           to: email,
           subject: `${otp} is your Starlane password reset code`,
           html: `<p>Hi ${escapeHtml(user.business_name)},</p><p>Your code to reset your Starlane password is: <strong style="font-size:24px">${otp}</strong></p><p>Valid for 15 minutes. Do not share this with anyone.</p>`
@@ -2113,6 +2123,7 @@ app.post('/api/import/excel', authMiddleware, upload.single('file'), async (req,
     await pool.query(
       `UPDATE file_import_batches SET status = 'COMPLETED', completed_at = now(), rows_accepted = $2, rows_rejected = $3 WHERE id = $1`,
       [batchId, records.length, m.skipped.length + alreadyInStarlane]);
+    if (records.length) require('./lib/domain/decisions/afterIngest').refreshDecisionsAfterIngest(pool, userId, { source: 'file_import' });
     res.json({
       success: true,
       imported: records.length,
@@ -2517,6 +2528,9 @@ app.post('/api/mark-paid', authMiddleware, requireSafeSettlementMutation, async 
       }
     }
     // ─────────────────────────────────────────────────────────────────────────
+    // A recorded payment is new ledger data: decisions it settles resolve and
+    // missions waiting on it are checked (debounced, fire-and-forget).
+    require('./lib/domain/decisions/afterIngest').refreshDecisionsAfterIngest(getPool(), req.user.userId, { source: 'mark_paid' });
     res.json({ success: true, data: inv });
   } catch (error) {
     logRouteError(req, error);
@@ -3977,6 +3991,10 @@ async function calculateCashFlowForecast(userId, current_cash = 0, days = 30) {
 
   // Prefer bank transaction credits for actual daily inflows, fallback to historical collections average
   const avgDailyCollections = bankInflowDaily !== null ? bankInflowDaily : (paidLast90.length > 0 ? Math.round(totalRecovered / 90) : Math.round(totalOutstanding * 0.03));
+  // Where the inflow rate came from, so the page never calls an assumption
+  // "history": bank credits, paid invoices, or (no history yet) 3% of open
+  // receivables a day.
+  const collectionsBasis = bankInflowDaily !== null ? 'bank' : (paidLast90.length > 0 ? 'history' : 'assumed');
 
   const cashStart = Number(current_cash);
   const burnRate = calculatedBurnRate;
@@ -4010,6 +4028,7 @@ async function calculateCashFlowForecast(userId, current_cash = 0, days = 30) {
     cashStart,
     burnRate,
     avgDailyCollections,
+    collectionsBasis,
     totalOutstanding,
     totalPayable,
     totalOverdue30,
@@ -5866,7 +5885,12 @@ app.get('/api/ready', (req, res) => {
       database_connectivity: 'not_checked',
       authConfig: process.env.JWT_SECRET ? 'ok' : 'missing',
       supabaseConfig: process.env.SUPABASE_URL ? 'ok' : 'missing',
-      metrics: process.env.METRICS_TOKEN ? 'ok' : 'missing'
+      metrics: process.env.METRICS_TOKEN ? 'ok' : 'missing',
+      // Whether a new user can receive a sign-up code, without naming the
+      // sender or any key: Resend's sandbox sender only reaches the Resend
+      // account owner, so it counts as not ready for real sign-ups.
+      signupEmail: !process.env.RESEND_API_KEY ? 'not_configured' : /@resend\.dev>?\s*$/i.test(emailSender()) ? 'sandbox_sender' : 'own_sender',
+      signupWhatsapp: process.env.TWILIO_WHATSAPP_NUMBER ? 'ok' : 'missing'
     },
     db_readiness_endpoint: '/api/health/deep',
     ready_for_data_load: false,

@@ -222,3 +222,32 @@ test('definitions: overrides are validated and cannot smuggle unknown keys', () 
   assert.equal(validateOverrides({ drop_table: 1 }).ok, false);
   assert.equal(effectiveDefinitions({ material_amount_min: 50000 }).material_amount_min, 50000);
 });
+
+test('an option that cannot be chosen never competes for "best in" futures', () => {
+  const lots = [{ age: 40, amount: 100000 }];
+  const options = [
+    { key: 'do_nothing', kind: 'baseline' },
+    { key: 'escalate', kind: 'contact', params: [{ name: 'hazard_multiplier', lo: 1.05, hi: 1.6 }] },
+    { key: 'hold', kind: 'credit_hold', params: [{ name: 'hazard_multiplier', lo: 3, hi: 4 }, { name: 'churn', lo: 0, hi: 0 }, { name: 'gross_margin', lo: 0, hi: 0 }] },
+  ];
+  const base = { lots, daily: constDaily(0.01), options, iterations: 300, seed: 11 };
+  const all = simulateOptions(base).summary;
+  const real = simulateOptions({ ...base, eligibleKeys: new Set(['do_nothing', 'escalate']) }).summary;
+  assert.ok(all.find((s) => s.key === 'hold').bestShare > all.find((s) => s.key === 'escalate').bestShare, 'the ruled-out option would otherwise take futures from the real ones');
+  assert.ok(real.find((s) => s.key === 'escalate').bestShare >= all.find((s) => s.key === 'escalate').bestShare);
+  assert.equal(real.find((s) => s.key === 'hold').bestShare, null);
+  const shares = real.filter((s) => s.bestShare !== null).reduce((a, s) => a + s.bestShare, 0);
+  assert.ok(Math.abs(shares - 1) < 0.002, `choosable options share every future (${shares})`);
+  assert.deepEqual(real.find((s) => s.key === 'escalate').cash, all.find((s) => s.key === 'escalate').cash, 'cash figures are unchanged');
+});
+
+test('options that tie in a simulated future share it instead of doing nothing taking it', () => {
+  const options = [
+    { key: 'do_nothing', kind: 'baseline' },
+    { key: 'escalate', kind: 'contact', params: [{ name: 'hazard_multiplier', lo: 1.05, hi: 1.6 }] },
+  ];
+  // Nobody ever pays, so every future is a tie.
+  const s = simulateOptions({ lots: [{ age: 40, amount: 100000 }], daily: constDaily(0), options, iterations: 100, seed: 5 }).summary;
+  assert.equal(s[0].bestShare, 0.5);
+  assert.equal(s[1].bestShare, 0.5);
+});
