@@ -3,12 +3,21 @@
 // Deploy to: Railway.app
 
 require('dotenv').config();
+// Before anything else can capture fetch: give outgoing calls a default time limit.
+require('./lib/http/fetchTimeout').installFetchTimeout();
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const cron = require('node-cron');
+// Every cron.schedule() below goes through lib/jobs/scheduler.js: one run per
+// firing across all replicas (claimed in cron_runs), never two overlapping
+// runs of one job in this process, and CRON_ENABLED=false turns them off.
+const cron = require('./lib/jobs/scheduler').createScheduler({
+  cron: require('node-cron'),
+  getPool: () => getPool(),
+  hasDatabase: () => !!pgPool,
+});
 const rateLimit = require('express-rate-limit');
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
@@ -99,6 +108,24 @@ const httpErrorsTotal = new promClient.Counter({
 register.registerMetric(httpRequestDurationMicroseconds);
 register.registerMetric(httpRequestsTotal);
 register.registerMetric(httpErrorsTotal);
+// Database pool pressure: requests waiting for a connection is the first sign
+// the pool (PG_POOL_MAX) or the database is the bottleneck.
+for (const [name, help, field] of [
+  ['pg_pool_connections_total', 'Open connections in the pg pool', 'totalCount'],
+  ['pg_pool_connections_idle', 'Idle connections in the pg pool', 'idleCount'],
+  ['pg_pool_requests_waiting', 'Queries waiting for a free pg connection', 'waitingCount'],
+]) {
+  register.registerMetric(new promClient.Gauge({
+    name, help, labelNames: ['pool'],
+    collect() {
+      try {
+        if (pgPool) this.set({ pool: 'server' }, pgPool[field]);
+        const libPg = require('./lib/db/pg');
+        if (libPg.isAvailable()) this.set({ pool: 'lib' }, libPg.getPool()[field]);
+      } catch { /* pools not created yet */ }
+    },
+  }));
+}
 
 function normalizeRoute(path) {
   return (path || '').replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ig, ':id')
@@ -299,6 +326,7 @@ function setCache(key, value, ttlSeconds = 60) {
 
 function invalidateBusinessCache(userId) {
   if (!userId) return;
+  require('./lib/domain/decisions/rawReceivablesCache').invalidateRawReceivables(userId);
   const prefix = `biz:${userId}:`;
   for (const key of summaryCache.keys()) {
     if (key.startsWith(prefix)) {
@@ -331,6 +359,7 @@ function warmBusinessCache(userId) {
 
 // Initialize Supabase
 const { supabase } = require('./lib/config/supabaseClient');
+const { fetchAllRows } = require('./lib/db/fetchAllRows');
 const { getBusinessContext } = require('./lib/businessContext');
 const salesService = require('./lib/services/SalesService');
 const purchaseService = require('./lib/services/PurchaseService');
@@ -417,6 +446,11 @@ const corsDelegate = (req, callback) => {
 
 app.use(cors(corsDelegate));
 app.options("*", cors(corsDelegate));
+
+// gzip JSON responses. The invoice list for a 10,000-invoice company is ~8 MB
+// of JSON; compressed it is a small fraction of that, which is most of the
+// load time on a phone. Bodies under 1 KB are sent as they are.
+app.use(require('compression')({ threshold: 1024 }));
 
 // Raw body preservation for Razorpay webhook (must come BEFORE express.json)
 app.use((req, res, next) => {
@@ -2225,13 +2259,13 @@ app.get('/api/invoices/:userId', requireOwner, async (req, res) => {
     await ensureConnectedBusinessData(userId);
     await syncExistingSalesReceivables(userId);
 
-    const { data: rawInvoices, error } = await supabase
+    // Every invoice, not the first 1,000 Supabase returns in one response:
+    // the totals below are computed from this list.
+    const rawInvoices = await fetchAllRows(() => supabase
       .from('invoices')
       .select('*')
       .eq('user_id', userId)
-      .order('days_overdue', { ascending: false });
-
-    if (error) throw error;
+      .order('days_overdue', { ascending: false }));
 
     // Hide synthetic cortex-lab seed rows from the tenant's invoice list
     const data = stripCortexTestRows(rawInvoices || []);
@@ -3231,7 +3265,7 @@ async function ensureConnectedBusinessData(userId) {
       await supabase.from('bank_transactions').insert([{
         user_id: userId,
         txn_date: inv.payment_date || inv.invoice_date || new Date().toISOString().split('T')[0],
-        description: `Auto-backfill: Payment from ${inv.customer_name} for inv ${inv.invoice_number || inv.id}`,
+        description: `Payment from ${inv.customer_name}${inv.invoice_number ? ` for invoice ${inv.invoice_number}` : ''}`,
         amount: toMoney(inv.payment_amount || inv.invoice_amount),
         type: 'credit', status: 'matched', matched_type: 'invoice', matched_id: String(inv.id),
       }]);
@@ -3248,7 +3282,7 @@ async function ensureConnectedBusinessData(userId) {
       await supabase.from('bank_transactions').insert([{
         user_id: userId,
         txn_date: s.sale_date || new Date().toISOString().split('T')[0],
-        description: `Auto-backfill: Payment from ${s.customer_name} for sale ${s.invoice_number || s.id}`,
+        description: `Payment from ${s.customer_name}${s.invoice_number ? ` for sale ${s.invoice_number}` : ''}`,
         amount: paidAmt,
         type: 'credit', status: 'matched', matched_type: 'sale', matched_id: String(s.id),
       }]);
@@ -3265,7 +3299,7 @@ async function ensureConnectedBusinessData(userId) {
       await supabase.from('bank_transactions').insert([{
         user_id: userId,
         txn_date: p.purchase_date || new Date().toISOString().split('T')[0],
-        description: `Auto-backfill: Payment to ${p.supplier_name} for purchase ${p.bill_number || p.id}`,
+        description: `Payment to ${p.supplier_name}${p.bill_number ? ` for bill ${p.bill_number}` : ''}`,
         amount: paidAmt,
         type: 'debit', status: 'matched', matched_type: 'purchase', matched_id: String(p.id),
       }]);
@@ -3859,8 +3893,7 @@ async function calculateInventorySummary(userId) {
 
 // ─── Shared Collections Summary Service ───────────────────────────────────────
 async function calculateCollectionsSummary(userId) {
-  const { data: invoices } = await supabase.from('invoices').select('*').eq('user_id', userId);
-  const safeInvoices = invoices || [];
+  const safeInvoices = await fetchAllRows(() => supabase.from('invoices').select('*').eq('user_id', userId)).catch(() => []);
   
   let totalOutstanding = 0;
   let dueToday = 0;
@@ -4096,8 +4129,8 @@ function normalizePayablePurchase(purchase) {
 
 async function getReceivableRows(userId) {
   const [invoiceResult, saleResult] = await Promise.all([
-    supabase.from('invoices').select('*').eq('user_id', userId),
-    supabase.from('sales').select('*').eq('user_id', userId),
+    fetchAllRows(() => supabase.from('invoices').select('*').eq('user_id', userId)).then((data) => ({ data }), (error) => ({ error })),
+    fetchAllRows(() => supabase.from('sales').select('*').eq('user_id', userId)).then((data) => ({ data }), (error) => ({ error })),
   ]);
 
   const invoices = stripCortexTestRows(invoiceResult.error ? [] : invoiceResult.data || []);
@@ -6709,9 +6742,10 @@ app.post('/api/ai-chat', authMiddleware, async (req, res) => {
     if (!messages.length || messages[messages.length - 1].role !== 'user') return res.status(400).json({ error: 'The last message must be from the user' });
   }
 
-  // Pre-fetch top 5 overdue invoices so first response is instant and data-aware
+  // Pre-fetch top 5 overdue invoices and the owner's voice profile, in
+  // parallel, so the first response is quick and data-aware.
   let overdueContext = '';
-  try {
+  const loadOverdue = (async () => { try {
     const { data: topInvoicesRaw } = await supabase
       .from('invoices')
       .select('customer_name, invoice_amount, due_date, invoice_date, created_at, customer_phone')
@@ -6731,12 +6765,12 @@ app.post('/api/ai-chat', authMiddleware, async (req, res) => {
         `- ${i.customer_name}: ₹${Number(i.invoice_amount).toLocaleString('en-IN')} (${i.days_overdue} days overdue${i.customer_phone ? ', phone: ' + i.customer_phone : ''})`
       ).join('\n')}`;
     }
-  } catch (_) {}
+  } catch (_) {} })();
 
   // Fetch owner voice profile
   let ownerName = '';
   let voiceContext = '';
-  try {
+  const loadProfile = (async () => { try {
     const { data: userProfile } = await supabase.from('users')
       .select('owner_name, city, voice_style, ai_persona')
       .eq('id', user_id).single();
@@ -6760,9 +6794,18 @@ ${userProfile.ai_persona ? `- How they write/talk: ${userProfile.ai_persona}` : 
 When generating WhatsApp messages, call scripts, or any communication: write EXACTLY as ${ownerName || 'the owner'} would — matching their exact style, tone, and language mix. Sound like a real person, not a bot.`;
       }
     }
-  } catch (_) {}
+  } catch (_) {} })();
+  await Promise.all([loadOverdue, loadProfile]);
 
   const system = `You are Ask Starlane, ${ownerName ? ownerName + "'s" : 'the owner\'s'} assistant inside Starlane for ${business_name || 'this business'}. You answer from the same system the owner sees on screen: Scan, Watch, Decisions, Simulate, Missions and the ledger. For "what changed" use what_changed, for open decisions use get_decisions, for "what if sales fall X%" use what_if_sales, for what is running use get_missions, and to stop something the owner names use get_missions then stop_mission.
+
+HOW TO ANSWER WELL:
+- Work out what the owner actually needs, then gather it. When a question needs several facts (for example who owes the most AND whether they broke a promise), call every tool you need in the same turn rather than one at a time.
+- Lead with the answer in the first sentence: the name, the amount, the date. Then the few facts that back it, taken from tool results, with real figures. Never pad.
+- Rank, compare and total when it helps the owner decide (largest first, oldest first, share of the total). Do the arithmetic from tool results; never estimate a figure you did not get from a tool.
+- Use short markdown: a sentence or two, then a compact list or table when there are several items. No headings for a short answer.
+- End with one concrete next step the owner can take in Starlane, when there is one. Do not end with a question unless the request was genuinely ambiguous.
+- If the data does not cover the question, say exactly what is missing in one line.
 
 ${readOnly
   ? `You have read-only tools: look up invoices, overdue customers, summary, inventory, calls, suppliers, prospects and the cash forecast. You cannot change anything from here: if the owner asks you to mark something paid, send a message, place an order or change a record, say that this is done from the Decisions screen or the Starlane website, and never claim you did it.
@@ -7016,7 +7059,7 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
             actions.push(`⏸ Stopped ${rows[0].title}`);
             return { stopped: true, mission_id: id, how_to_resume: 'Control → Decisions → resume this decision' };
           }
-          return { error: 'This mission is paused from its own page in Missions.', link: '/missions' };
+          return { error: 'This task is paused from its own page in Tasks.', link: '/missions' };
         }
         default: return { error:`Unknown tool: ${name}` };
       }
@@ -7026,30 +7069,37 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
   const modelSession = modelRouter.session({ userId: user_id, purpose: 'chat', correlationId: req.requestId });
   try {
     let iteration = 0;
-    const maxIter = 5;
+    const maxIter = 6;
+    const tools = AI_TOOLS.filter((t) => allowedTools.has(t.function.name));
 
     while (iteration < maxIter) {
       iteration++;
-      const choice = await modelSession.chat(chatMessages, AI_TOOLS.filter((t) => allowedTools.has(t.function.name)));
+      // On the last round the model is told to answer from what it has
+      // gathered, instead of the loop running out on another tool call. Tools
+      // stay declared because the transcript already holds tool calls.
+      const lastRound = iteration === maxIter;
+      if (lastRound) chatMessages.push({ role: 'user', content: 'Answer my question now from the results above. Do not look anything else up.' });
+      const choice = await modelSession.chat(chatMessages, tools);
       const msg = choice.message;
       chatMessages.push(msg);
 
-      if (choice.finish_reason === 'tool_calls' && msg.tool_calls?.length) {
-        const toolResults = [];
-        for (const tc of msg.tool_calls) {
+      if (!lastRound && choice.finish_reason === 'tool_calls' && msg.tool_calls?.length) {
+        // Independent lookups run together; results keep the model's call order.
+        const toolResults = await Promise.all(msg.tool_calls.map(async (tc) => {
           let args = {};
           try { args = JSON.parse(tc.function.arguments||'{}'); } catch(e) {}
           const result = await executeTool(tc.function.name, args);
           // Wrapped and labelled so the model treats it as data, never as instructions.
-          toolResults.push({ role:'tool', tool_call_id:tc.id, content:JSON.stringify({ untrusted_data: result }) });
-        }
+          return { role:'tool', tool_call_id:tc.id, content:JSON.stringify({ untrusted_data: result }) };
+        }));
         chatMessages.push(...toolResults);
       } else {
-        return res.json({ success:true, message:msg.content, actions, navigate:navigateTo, waLinks });
+        const text = typeof msg.content === 'string' && msg.content.trim() ? msg.content : 'I could not put an answer together from your data just now. Try asking it a different way.';
+        return res.json({ success:true, message:text, actions, navigate:navigateTo, waLinks });
       }
     }
 
-    return res.json({ success:true, message:'Done! Let me know if you need anything else.', actions, navigate:navigateTo, waLinks });
+    return res.json({ success:true, message:'I could not put an answer together from your data just now. Try asking it a different way.', actions, navigate:navigateTo, waLinks });
   } catch(err) {
     if (err instanceof ModelUnavailableError) {
       // Say what failed and what still works, instead of a bare 500.
@@ -7060,7 +7110,7 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
       }[err.code] || err.message;
       console.warn('AI chat unavailable:', err.code, JSON.stringify(err.detail || {}));
       return res.status(503).json({
-        error: `${why} Your data is safe. Scan my books, Watch, Decisions and Missions still work without it.`,
+        error: `${why} Your data is safe. Decisions, Monitors, Tasks and Scan my books still work without it.`,
         code: `AI_${err.code}`,
       });
     }
@@ -7501,9 +7551,9 @@ app.get('/api/collections/timeline/:userId', requireOwner, async (req, res) => {
 // ============================================
 
 const PLANS = {
-  starter: { name: 'Starlane Starter', amount_monthly: 99900,  amount_annual: 95904  },
-  growth:  { name: 'Starlane Growth',  amount_monthly: 249900, amount_annual: 239904 },
-  pro:     { name: 'Starlane Pro',     amount_monthly: 499900, amount_annual: 479904 },
+  starter: { name: 'Starlane Starter', amount_monthly: 99900,  amount_annual: 958800  },
+  growth:  { name: 'Starlane Growth',  amount_monthly: 249900, amount_annual: 2398800 },
+  pro:     { name: 'Starlane Pro',     amount_monthly: 499900, amount_annual: 4798800 },
 };
 
 app.post('/api/billing/create-order', authMiddleware, async (req, res) => {
@@ -8011,12 +8061,13 @@ async function runDunningCycle() {
 
     // Get all pending invoices (exclude snoozed ones and disputed/dunning-paused ones)
     // Also fetch invoice_date so we can compute days_overdue dynamically
-    const { data: invoices } = await supabase
+    const snoozeCutoff = new Date().toISOString();
+    const invoices = await fetchAllRows(() => supabase
       .from('invoices')
       .select('id, user_id, customer_name, customer_phone, invoice_amount, invoice_date, due_date, days_overdue, payment_link, payment_link_id, reminder_count, snooze_until, dunning_paused, last_reminder_sent')
       .eq('payment_status', 'Pending')
       .eq('dunning_paused', false)
-      .or(`snooze_until.is.null,snooze_until.lt.${new Date().toISOString()}`);
+      .or(`snooze_until.is.null,snooze_until.lt.${snoozeCutoff}`));
     if (!invoices?.length) return;
 
     const todayStr = new Date().toISOString().split('T')[0];
@@ -9068,10 +9119,10 @@ cron.schedule('30 2 * * *', async () => {
   console.log('⏰ Morning briefing cron running — 8am IST');
   try {
     // Get all users who have a phone number (for WA brief) OR push subscription
-    const { data: users } = await supabase
+    const users = await fetchAllRows(() => supabase
       .from('users')
       .select('id, business_name, phone, push_subscription')
-      .or('phone.not.is.null,push_subscription.not.is.null');
+      .or('phone.not.is.null,push_subscription.not.is.null'));
 
     if (!users || users.length === 0) return;
 
@@ -12079,7 +12130,7 @@ cron.schedule('*/15 * * * *', async () => {
 cron.schedule('30 12 * * 0', async () => {
   console.log('Weekly scorecard cron running...');
   try {
-    const { data: users } = await supabase.from('users').select('id, phone, business_name, owner_name').not('phone', 'is', null);
+    const users = await fetchAllRows(() => supabase.from('users').select('id, phone, business_name, owner_name').not('phone', 'is', null));
     if (!users?.length) return;
     const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
     for (const user of users) {
@@ -13735,7 +13786,7 @@ cron.schedule('30 1 * * *', async () => {
   const { safeLog } = require('./lib/observability/logger');
   safeLog('info', '[BriefingCron] Running daily owner briefing');
   try {
-    const { data: users } = await supabase.from('users').select('id').limit(500);
+    const users = await fetchAllRows(() => supabase.from('users').select('id'));
     if (!users?.length) return;
     const today = new Date().toISOString().split('T')[0];
     const { create: createAction } = require('./lib/services/orchestrator/action.service');
@@ -13863,7 +13914,7 @@ cron.schedule('45 1 * * *', async () => {
   _log('info', '[AgentsCron] Running all agents');
   try {
     const { runAllAgents } = require('./lib/services/orchestrator/orchestrator.service');
-    const { data: users } = await supabase.from('users').select('id').limit(500);
+    const users = await fetchAllRows(() => supabase.from('users').select('id'));
     for (const user of (users || [])) {
       try {
         // Skip briefing (already ran at 7am) and data_quality (weekly)
@@ -13884,7 +13935,7 @@ cron.schedule('30 4 * * *', async () => {
   _log('info', '[EvalCron] Running action effectiveness evaluation');
   try {
     const { run: evalRun } = require('./lib/services/agents/evaluationAgent');
-    const { data: users } = await supabase.from('users').select('id').limit(500);
+    const users = await fetchAllRows(() => supabase.from('users').select('id'));
     let totalEvaluated = 0;
     for (const user of (users || [])) {
       try {
@@ -13904,7 +13955,7 @@ cron.schedule('30 2 * * 0', async () => {
   _log('info', '[DataQualityCron] Running weekly data quality scan');
   try {
     const { runAllAgents } = require('./lib/services/orchestrator/orchestrator.service');
-    const { data: users } = await supabase.from('users').select('id').limit(500);
+    const users = await fetchAllRows(() => supabase.from('users').select('id'));
     for (const user of (users || [])) {
       try { await runAllAgents(user.id, ['data_quality']); } catch {}
     }
@@ -14936,7 +14987,7 @@ app.get('/api/atlas/action-approvals/:id', authMiddleware, async (req, res) => {
 });
 // END ATLAS ACTION APPROVAL (Phase 2C.30)
 
-app.listen(PORT, () => {
+const httpServer = app.listen(PORT, () => {
   console.log(`✅ Vantro Flow Backend running on port ${PORT}`);
   console.log(`📝 API Base URL: http://localhost:${PORT}`);
   // Close the Loop mission, part A: state world-intelligence config plainly
@@ -14961,13 +15012,37 @@ app.listen(PORT, () => {
   }
 });
 
-// Graceful shutdown for the outbound runner: stop reserving, let in-flight
-// sends finish, release reserved jobs so another instance takes them.
-for (const sig of ['SIGTERM', 'SIGINT']) {
-  process.once(sig, async () => {
-    if (outboundRunner) await outboundRunner.stop().catch(() => {});
-    process.exit(0);
-  });
+// Railway's proxy keeps connections to this server open and reuses them. Node's
+// default keep-alive timeout (5s) is shorter than the proxy's, so the server
+// could close a socket just as the proxy sent a request on it, which the user
+// sees as a random 502. Keep sockets open longer than the proxy does.
+httpServer.keepAliveTimeout = Number(process.env.HTTP_KEEP_ALIVE_TIMEOUT_MS || 65000);
+httpServer.headersTimeout = httpServer.keepAliveTimeout + 1000;
+// A request that has not finished in this time is cut off rather than holding
+// a connection and memory forever. Imports and AI answers finish well inside it.
+httpServer.requestTimeout = Number(process.env.HTTP_REQUEST_TIMEOUT_MS || 180000);
+
+// Graceful shutdown on every deploy and restart: stop taking new connections,
+// let requests already in progress finish, stop the outbound runner (it
+// releases reserved jobs so another instance takes them), close the database
+// pools, then exit. Requests still running after SHUTDOWN_GRACE_MS are cut.
+let shuttingDown = false;
+async function shutdown(sig) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const graceMs = Number(process.env.SHUTDOWN_GRACE_MS || 10000);
+  console.log(`[shutdown] ${sig}: finishing in-flight requests (up to ${graceMs}ms)`);
+  const force = setTimeout(() => process.exit(0), graceMs + 2000);
+  force.unref();
+  const closed = new Promise((resolve) => httpServer.close(resolve));
+  httpServer.closeIdleConnections?.();
+  await Promise.race([closed, new Promise((r) => setTimeout(r, graceMs))]);
+  httpServer.closeAllConnections?.();
+  if (outboundRunner) await outboundRunner.stop().catch(() => {});
+  await Promise.allSettled([
+    pgPool ? pgPool.end() : null,
+    require('./lib/db/pg').isAvailable() ? require('./lib/db/pg').getPool().end() : null,
+  ]);
+  process.exit(0);
 }
-
-
+for (const sig of ['SIGTERM', 'SIGINT']) process.once(sig, () => { shutdown(sig); });
