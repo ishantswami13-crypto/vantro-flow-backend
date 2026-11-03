@@ -475,6 +475,8 @@ app.use((req, res, next) => {
 const jsonParser = express.json({ limit: '10mb' });
 app.use((req, res, next) => {
   if (req.path === '/api/payments/webhook') return next();
+  // Incoming webhooks keep the raw body for signature checks (lib/routes/connections.js).
+  if (req.path.startsWith('/api/hooks/')) return next();
   return jsonParser(req, res, next);
 });
 app.use(express.urlencoded({ extended: true })); // Twilio webhooks send form-encoded
@@ -12808,6 +12810,12 @@ app.use('/api/settings/region', regionRouter({ pool: getPool(), authMiddleware }
 const { customWorkflowsRouter, runScheduledCustomWorkflows } = require('./lib/routes/customWorkflows');
 app.use('/api/custom-workflows', customWorkflowsRouter({ pool: getPool(), authMiddleware, isEnabled: isFeatureEnabled }));
 
+// Connect any software: incoming webhooks, any REST API, Gmail as a source
+// (lib/connectors/connections.js, gmailInbox.js). Needs migration 069.
+const { connectionsRouter, hooksRouter } = require('./lib/routes/connections');
+app.use('/api/integrations', connectionsRouter({ pool: getPool(), authMiddleware }));
+app.use('/api/hooks', hooksRouter({ pool: getPool() }));
+
 app.get('/api/ai-actions', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -14028,6 +14036,21 @@ cron.schedule('*/15 * * * *', async () => {
     const out = await runScheduledCustomWorkflows(getPool());
     if (out.ran || out.failed) _log('info', '[CustomWorkflowCron] Done', out);
   } catch (err) { _log('error', '[CustomWorkflowCron] Fatal', { error: err.message }); }
+}, { timezone: 'UTC' });
+
+// Workflows that start from a Gmail message — new inbox messages are read every
+// 5 minutes for tenants with such a workflow turned on, under the same flag
+// as scheduled workflows. Each message runs a workflow at most once.
+cron.schedule('*/5 * * * *', async () => {
+  const { isEnabled: _isFE } = require('./lib/featureFlags');
+  if (!_isFE('custom_workflow_scheduler_enabled') || !process.env.DATABASE_URL) return;
+  const { safeLog: _log } = require('./lib/observability/logger');
+  try {
+    const { pollAllInboxes } = require('./lib/connectors/gmailInbox');
+    const { dispatchEvent } = require('./lib/domain/workflows/customWorkflows');
+    const out = await pollAllInboxes(getPool(), { dispatch: dispatchEvent });
+    if (out.events || out.failed) _log('info', '[GmailWorkflowCron] Done', out);
+  } catch (err) { _log('error', '[GmailWorkflowCron] Fatal', { error: err.message }); }
 }, { timezone: 'UTC' });
 
 // Starlane decisions — hourly discovery and daily contract verification per

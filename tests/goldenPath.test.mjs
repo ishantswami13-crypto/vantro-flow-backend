@@ -45,8 +45,8 @@ async function main() {
     console.log('— CONNECT');
     const catalog = await (await fetch(`${base}/api/connectors/catalog`)).json();
     check('catalog is public and lists Tally as available', catalog.connectors?.some((c) => c.id === 'tally' && c.availability === 'available'));
-    check('catalog never lists an OAuth connector as available',
-      catalog.connectors?.filter((c) => c.authType === 'oauth').every((c) => c.availability === 'not_available'));
+    check('catalog lists no OAuth connector as available except Gmail, which is built',
+      catalog.connectors?.filter((c) => c.authType === 'oauth' && c.availability === 'available').map((c) => c.id).join(',') === 'gmail');
 
     const pairRes = await fetch(`${base}/api/connectors/tally/pairing`, { method: 'POST', headers: auth(owner) });
     const pair = (await pairRes.json()).pairing;
@@ -108,7 +108,8 @@ async function main() {
     const theirs = (await (await fetch(`${base}/api/connectors`, { headers: auth(other) })).json()).connectors || [];
     check('another tenant sees Tally not connected and no devices (isolation)',
       theirs.find((c) => c.id === 'tally')?.state?.health === 'not_connected' && theirs.find((c) => c.id === 'tally')?.state?.devices.length === 0);
-    check('unconnected OAuth sources report unavailable, never connected', mine.filter((c) => c.authType === 'oauth').every((c) => c.state.health === 'unavailable'));
+    check('unconnected OAuth sources report unavailable or not connected, never connected',
+      mine.filter((c) => c.authType === 'oauth').every((c) => (c.id === 'gmail' ? c.state.health === 'not_connected' : c.state.health === 'unavailable')));
 
     console.log('— DETECT');
     // Make the imported receivables overdue so the collections agent has

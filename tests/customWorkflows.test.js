@@ -22,7 +22,7 @@ test('every starter template validates', () => {
 });
 
 test('a workflow cannot use a trigger, agent or action that is not built', () => {
-  const comingSoonTrigger = cw.validateDefinition({ trigger: { type: 'email_received' }, steps: [{ id: 'a', type: 'agent', agent: 'starlane.scan' }] });
+  const comingSoonTrigger = cw.validateDefinition({ trigger: { type: 'payment_received' }, steps: [{ id: 'a', type: 'agent', agent: 'starlane.scan' }] });
   assert.equal(comingSoonTrigger.ok, false);
   assert.match(comingSoonTrigger.errors[0], /not available yet/);
 
@@ -31,13 +31,15 @@ test('a workflow cannot use a trigger, agent or action that is not built', () =>
 
   const comingSoonAction = cw.validateDefinition({ trigger: { type: 'manual' }, steps: [
     { id: 'a', type: 'agent', agent: 'starlane.scan' },
-    { id: 'b', type: 'action', action: 'send_email', params: { title: 'x' } },
+    { id: 'b', type: 'action', action: 'send_whatsapp', params: { title: 'x' } },
   ] });
   assert.equal(comingSoonAction.ok, false);
-  assert.match(comingSoonAction.errors[0], /Gmail or Outlook/);
+  assert.match(comingSoonAction.errors[0], /not available yet/);
 
   for (const a of cw.ACTIONS.filter((x) => x.availability !== 'available')) assert.ok(a.reason, `${a.key} says why it is not available`);
-  assert.deepEqual(cw.ACTIONS.filter((x) => x.availability === 'available').map((x) => x.key), ['notify_owner'], 'the only live action stays inside Starlane');
+  // Every live action that reaches outside Starlane names the server flag that gates it.
+  for (const a of cw.ACTIONS.filter((x) => x.availability === 'available' && x.external)) assert.ok(a.flag, `${a.key} is behind a flag`);
+  assert.deepEqual(cw.ACTIONS.filter((x) => x.availability === 'available' && !x.external).map((x) => x.key), ['notify_owner', 'create_task']);
 });
 
 test('conditions must test an earlier agent step and a number it really produces', () => {
