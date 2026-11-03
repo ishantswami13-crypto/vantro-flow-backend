@@ -231,6 +231,20 @@ test('Gmail messages become events once and start matching workflows; a reply wa
   await assert.rejects(cw.decideApproval(env.pool, b.id, approval.id, 'reject', {}), /not found/, 'another tenant cannot touch it');
 });
 
+test('a draft to "Name <address>" goes to the address (sample emails and webhook data send names too)', async (t) => {
+  if (!env.ok) return t.skip(`no database: ${env.reason}`);
+  const a = await tenant('named-to');
+  const wf = await cw.createWorkflow(env.pool, a.id, { name: 'Named', definition: {
+    trigger: { type: 'email_received' },
+    steps: [{ id: 'reply', type: 'action', action: 'send_email', params: { to: '{{trigger.from}}', subject: 'Re: {{trigger.subject}}', body: 'Thanks.' } }],
+  } });
+  const event = { payload: { from: 'Priya Shah <Priya@Acme.example>', fromAddress: '', subject: 'Hello', body: 'Hi' } };
+  const r = await cw.executeWorkflow(env.pool, a.id, wf, { trigger: 'manual', slot: 'named:1', event, notifyFn: async () => ({ id: 'n' }) });
+  assert.equal(r.status, 'COMPLETED', JSON.stringify(r.steps));
+  const [approval] = await cw.listApprovals(env.pool, a.id, { status: 'PENDING' });
+  assert.equal(approval.to, 'priya@acme.example');
+});
+
 test('an incoming webhook starts its workflows over HTTP, once per delivery, per tenant', async (t) => {
   if (!env.ok) return t.skip(`no database: ${env.reason}`);
   const a = await tenant('hook');

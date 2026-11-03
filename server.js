@@ -547,7 +547,7 @@ function authAwareKey(req) {
   }
 }
 
-function makeLimiter({ windowMs, max, skipSuccessfulRequests = false, keyGenerator }) {
+function makeLimiter({ windowMs, max, skipSuccessfulRequests = false, keyGenerator, skip }) {
   return rateLimit({
     windowMs,
     max,
@@ -555,6 +555,7 @@ function makeLimiter({ windowMs, max, skipSuccessfulRequests = false, keyGenerat
     legacyHeaders: false,
     skipSuccessfulRequests,
     ...(keyGenerator ? { keyGenerator } : {}),
+    ...(skip ? { skip } : {}),
     handler: (req, res, next, options) => {
       const requestId = req.requestId || crypto.randomUUID();
       res.status(options.statusCode).json({
@@ -596,6 +597,11 @@ const apiLimiter = makeLimiter({
   windowMs: 60 * 1000,
   max: (req) => (String(apiLimiterKey(req)).startsWith('user:') ? API_LIMIT_PER_USER : API_LIMIT_PER_IP),
   keyGenerator: apiLimiterKey,
+  // Incoming webhooks have their own limits (lib/routes/connections.js): per
+  // webhook URL, plus a wider per-IP backstop. Senders such as Stripe or
+  // Zapier post for every tenant from a few shared IPs, so the anonymous
+  // 120/min per-IP budget here would throttle all tenants together.
+  skip: (req) => String(req.originalUrl || '').startsWith('/api/hooks/'),
 });
 const uploadLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, max: 20 });
 const aiLimiter = makeLimiter({ windowMs: 10 * 60 * 1000, max: 40, keyGenerator: authAwareKey });
