@@ -6673,6 +6673,7 @@ async function geminiChat(messages, tools, toolChoice = 'auto', modelOverride = 
 
 const { allowedToolsFor } = require('./lib/ai/assistantTools');
 const { createModelRouter, ModelUnavailableError } = require('./lib/ai/modelRouter');
+const { makeResponsesChat } = require('./lib/ai/responsesChat');
 const osMissions = require('./lib/domain/os/missions');
 const osWorkflows = require('./lib/domain/os/workflows');
 const decisionControls = require('./lib/domain/decisions/controls');
@@ -6680,7 +6681,15 @@ const decisionStore = require('./lib/domain/decisions/store');
 const { salesChangeWhatIf } = require('./lib/domain/os/whatIf');
 const { whatChangedOverWindow } = require('./lib/domain/intelligence/whatChangedSinceLastLook');
 const modelRouter = createModelRouter({
-  providers: { groq: groqChat, gemini: geminiChat, anthropic: require('./lib/ai/anthropicChat').makeAnthropicChat() },
+  providers: {
+    groq: groqChat,
+    gemini: geminiChat,
+    anthropic: require('./lib/ai/anthropicChat').makeAnthropicChat(),
+    // OpenAI, xAI (Grok) and Perplexity: switched on by setting their key.
+    openai: makeResponsesChat('openai'),
+    xai: makeResponsesChat('xai'),
+    perplexity: makeResponsesChat('perplexity'),
+  },
   pool: getPool(),
 });
 
