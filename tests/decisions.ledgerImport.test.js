@@ -81,6 +81,16 @@ test('date order: proven from the data when possible, otherwise the human must c
   assert.ok(v.errors.some((e) => e.includes('day/month')));
 });
 
+test("Tally Bills Receivable: \"Party's Name\" is the customer and Pending Amount stands in for the amount", () => {
+  const csv = "Date,Ref. No.,Party's Name,Pending Amount,Due on,Overdue by days\n08-May-26,AIS/1,Narmada Valves (Fixture),685000,22-Jun-26,119\n";
+  const p = preview(csv);
+  assert.equal(p.proposal.fields.customer?.header, "Party's Name");
+  assert.equal(p.proposal.fields.customer.verdict, 'CONFIRMED');
+  assert.equal(p.proposal.fields.outstanding?.header, 'Pending Amount');
+  assert.deepEqual(p.proposal.missingRequired, []);
+  assert.equal(L.validateMapping(p.file.columns, p.suggestedInput).ok, true);
+});
+
 test('no status, paid or balance column: Starlane asks before treating everything as unpaid', () => {
   const csv = 'Customer,Invoice Date,Due Date,Amount\nA (Fixture),2026-08-01,2026-08-31,1000\n';
   const p = preview(csv);

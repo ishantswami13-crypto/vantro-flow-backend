@@ -45,7 +45,10 @@ async function main() {
     const prospects = await A.get(`/api/prospects/${a.id}`);
     check('CRM prospects load', prospects.status === 200 && Array.isArray(prospects.body.prospects), prospects.body);
 
-    const chat = await A.post('/api/ai-chat', { messages: [{ role: 'user', content: 'who owes us the most?' }] });
+    // A ledger question is answered exactly without a model; anything else says the model is missing.
+    const ledgerChat = await A.post('/api/ai-chat', { messages: [{ role: 'user', content: 'who owes us the most?' }] });
+    check('without a model, "who owes the most" is answered from the ledger', ledgerChat.status === 200 && ledgerChat.body.mode === 'ledger' && /owes you the most/.test(ledgerChat.body.message) && /without an AI model/.test(ledgerChat.body.message), ledgerChat);
+    const chat = await A.post('/api/ai-chat', { messages: [{ role: 'user', content: 'write a polite reminder for my oldest customer' }] });
     check('chat without a model says so (503, AI_NO_PROVIDER)', chat.status === 503 && chat.body.code === 'AI_NO_PROVIDER' && /No AI model/.test(chat.body.error), chat);
     const health = await A.get('/api/ai/health');
     check('AI health lists no configured provider and never a key', health.status === 200 && health.body.configured.length === 0 && !/sk-|gsk_|AIza/.test(JSON.stringify(health.body)), health.body);
