@@ -8595,7 +8595,7 @@ app.post('/api/ai/bulk-whatsapp', authMiddleware, async (req, res) => {
       const { data: profile } = await supabase.from('users')
         .select('owner_name, city, voice_style, ai_persona').eq('id', userId).single();
       if (profile?.owner_name || profile?.ai_persona) {
-        bulkVoiceCtx = `\nGenerate these messages as if written by ${profile.owner_name || 'the business owner'} personally. Style: ${profile.voice_style || 'casual_hinglish'}. ${profile.ai_persona ? profile.ai_persona : ''} Sound like a real person they know, not a robot.`;
+        bulkVoiceCtx = `\nGenerate these messages as if written by ${profile.owner_name || 'the business owner'} personally. Style: ${profile.voice_style || 'direct_english'}. ${profile.ai_persona ? profile.ai_persona : ''} Sound like a real person they know, not a robot.`;
       }
     } catch (_) {}
 
@@ -8692,7 +8692,7 @@ Output JSON: { "style_description": "2-3 sentences describing exact style", "det
     // Auto-save the detected style to user profile
     await supabase.from('users').update({
       ai_persona: result.style_description,
-      voice_style: result.detected_style || 'casual_hinglish',
+      voice_style: result.detected_style || 'direct_english',
       updated_at: new Date(),
     }).eq('id', userId);
 
@@ -10276,7 +10276,7 @@ LIVE BUSINESS SNAPSHOT (right now):
 • Team: ${(workers || []).filter(w => w.is_active).map(w => w.name).join(', ') || 'no workers yet'}`;
 
     // Voice/persona context
-    const styleDesc = { casual_hinglish:'Mix of Hindi + English (Hinglish)', formal_hindi:'Formal Hindi', direct_english:'Direct English', friendly_urdu:'Friendly Urdu-influenced', regional_hindi:'Regional Hindi dialect' }[profile?.voice_style || ''] || 'Hinglish';
+    const styleDesc = { casual_hinglish:'Mix of Hindi + English (Hinglish)', formal_hindi:'Formal Hindi', direct_english:'Direct English', friendly_urdu:'Friendly Urdu-influenced', regional_hindi:'Regional Hindi dialect' }[profile?.voice_style || ''] || 'Direct English';
     const voiceCtx = profile?.owner_name ? `\nSPEAK TO OWNER AS: ${profile.owner_name} ji. Style: ${styleDesc}. ${profile?.ai_persona ? 'Their style: ' + profile.ai_persona : ''}` : '';
 
     const systemPrompt = `You are Vantro Brain — a specialized AI built exclusively for this Indian MSME business.
@@ -10616,7 +10616,17 @@ app.post('/api/onboarding/business', authMiddleware, async (req, res) => {
     };
     const { error } = await supabase.from('users').update(update).eq('id', userId);
     if (error) throw error;
-    res.json({ success: true });
+    // The country sets the business's currency, number format, timezone and
+    // tax label (only the ones not already chosen). A failure here does not
+    // fail onboarding; Settings can set them later.
+    let region = null;
+    if (process.env.DATABASE_URL) {
+      region = await applyCountryDefaults(getPool(), userId, update.country).catch((e) => {
+        logRouteError(req, e);
+        return null;
+      });
+    }
+    res.json({ success: true, region });
   } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
@@ -12788,6 +12798,16 @@ app.use('/api', authProvidersRouter({
 const { connectorsRouter } = require('./lib/routes/connectors');
 app.use('/api/connectors', connectorsRouter({ pool: getPool(), authMiddleware }));
 
+// Region: country, currency, number/date format, timezone and tax label for
+// the business (lib/locale/region.js). Stored as versioned definitions.
+const { regionRouter, applyCountryDefaults } = require('./lib/routes/region');
+app.use('/api/settings/region', regionRouter({ pool: getPool(), authMiddleware }));
+
+// Custom workflows: owners chain agents, conditions and actions behind a
+// trigger (lib/domain/workflows/customWorkflows.js). Needs migration 068.
+const { customWorkflowsRouter, runScheduledCustomWorkflows } = require('./lib/routes/customWorkflows');
+app.use('/api/custom-workflows', customWorkflowsRouter({ pool: getPool(), authMiddleware, isEnabled: isFeatureEnabled }));
+
 app.get('/api/ai-actions', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -13994,6 +14014,20 @@ cron.schedule('10 * * * *', async () => {
     if (!outcome.ran) { _log('info', '[WorldUSGSCron] Skipped — previous run still holds the lock'); return; }
     _log('info', '[WorldUSGSCron] Done', outcome.result.stats);
   } catch (err) { _log('error', '[WorldUSGSCron] Fatal', { error: err.message }); }
+}, { timezone: 'UTC' });
+
+// Custom workflows with a schedule trigger — checked every 15 minutes, gated by
+// FEATURE_CUSTOM_WORKFLOW_SCHEDULER_ENABLED (default OFF). Each run is claimed
+// by (workflow, schedule slot), so a firing never runs twice, and every agent
+// step still checks its kill switches.
+cron.schedule('*/15 * * * *', async () => {
+  const { isEnabled: _isFE } = require('./lib/featureFlags');
+  if (!_isFE('custom_workflow_scheduler_enabled') || !process.env.DATABASE_URL) return;
+  const { safeLog: _log } = require('./lib/observability/logger');
+  try {
+    const out = await runScheduledCustomWorkflows(getPool());
+    if (out.ran || out.failed) _log('info', '[CustomWorkflowCron] Done', out);
+  } catch (err) { _log('error', '[CustomWorkflowCron] Fatal', { error: err.message }); }
 }, { timezone: 'UTC' });
 
 // Starlane decisions — hourly discovery and daily contract verification per

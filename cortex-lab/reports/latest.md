@@ -1,9 +1,9 @@
 # Vantro Cortex Harness X — Report
 
-- **Run ID:** `ctx_mw06qazv_8143930a`
+- **Run ID:** `ctx_mw08edul_1d921180`
 - **Mode:** `static`
-- **Started:** 2026-11-03T04:25:49.867Z
-- **Finished:** 2026-11-03T04:25:49.881Z
+- **Started:** 2026-11-03T05:12:32.925Z
+- **Finished:** 2026-11-03T05:12:32.952Z
 - **Result:** ✅ PASS
 - **Overall Score:** 100 / 100  (gate 90)
 
