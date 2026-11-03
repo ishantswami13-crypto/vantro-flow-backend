@@ -6693,6 +6693,18 @@ const modelRouter = createModelRouter({
   pool: getPool(),
 });
 
+// Vault: this company's uploaded files, customer ledgers and agent outputs,
+// all read from its own rows (lib/domain/vault/files.js).
+const { vaultFiles } = require('./lib/domain/vault/files');
+app.get('/api/vault', authMiddleware, async (req, res) => {
+  try {
+    res.json({ success: true, ...(await vaultFiles(getPool(), authenticatedUserId(req))) });
+  } catch (err) {
+    console.error('Vault error:', err.message);
+    res.status(500).json({ error: 'Could not load your files just now.' });
+  }
+});
+
 // Which model providers Ask Starlane can use right now, and this company's AI
 // spend today. Never returns keys.
 app.get('/api/ai/health', authMiddleware, async (req, res) => {
