@@ -208,6 +208,8 @@ test('HTTP: build, activate, run with real agents, see the run, and stay inside 
   assert.equal(act.body.workflow.status, 'ACTIVE');
   assert.equal(act.body.workflow.nextRunAt, null, 'no next run is promised while the scheduler is off');
 
+  const minute = () => new Date().toISOString().slice(0, 16);
+  const firstMinute = minute();
   const run = await ca.post(`/api/custom-workflows/${id}/run`);
   assert.equal(run.status, 200, JSON.stringify(run.body));
   assert.equal(run.body.run.status, 'COMPLETED', JSON.stringify(run.body.run));
@@ -219,10 +221,17 @@ test('HTTP: build, activate, run with real agents, see the run, and stay inside 
   assert.equal(inbox.rows.length, 1);
   assert.match(inbox.rows[0].route, new RegExp(id));
 
-  assert.equal((await ca.post(`/api/custom-workflows/${id}/run`)).status, 429, 'a second run in the same minute is refused');
+  // Manual runs are idempotent per minute. The test can straddle a minute
+  // boundary, so the expectation follows the clock it actually ran in.
+  const before = minute();
+  const second = await ca.post(`/api/custom-workflows/${id}/run`);
+  const after = minute();
+  if (before === firstMinute && after === firstMinute) assert.equal(second.status, 429, 'a second run in the same minute is refused');
+  else if (before !== firstMinute) assert.equal(second.status, 200, 'a run in the next minute is a new run');
+  else assert.ok([200, 429].includes(second.status), 'the minute turned during the request');
 
   const detail = await ca.get(`/api/custom-workflows/${id}`);
-  assert.equal(detail.body.runs.length, 1);
+  assert.equal(detail.body.runs.length, second.status === 429 ? 1 : 2);
   assert.equal(detail.body.runs[0].status, 'COMPLETED');
 
   const edited = await ca.put(`/api/custom-workflows/${id}`, { name: 'Cash check (renamed)' });
