@@ -1525,8 +1525,11 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
     if (error) throw error;
     if (!data) return res.status(404).json({ error: 'User not found' });
 
-    // Auto-reconcile and connect business data
-    await ensureConnectedBusinessData(tokenUserId);
+    // Auto-reconcile and connect business data. Not awaited: the profile
+    // below does not depend on it, and every page load calls /auth/me, so
+    // waiting here put the whole reconcile on the critical path. Pages that
+    // read the reconciled tables still await it themselves.
+    ensureConnectedBusinessData(tokenUserId).catch(() => {});
 
     const user = {
       ...data,
@@ -3183,23 +3186,56 @@ async function syncInventoryFromSale(userId, sale) {
 const RECONCILE_THROTTLE_MS = 5 * 60 * 1000; // 5 minutes
 const lastReconciled = {}; // userId -> timestamp
 
+const reconcileInFlight = new Map(); // userId -> promise of the running reconcile
+
+// A caller that arrives while a reconcile is running waits for that run
+// instead of reading half-reconciled tables (/auth/me starts it without
+// waiting, and the page's data requests land right behind it).
 async function ensureConnectedBusinessData(userId) {
   if (!userId) return;
+  const running = reconcileInFlight.get(userId);
+  if (running) return running;
   const now = Date.now();
   if (lastReconciled[userId] && (now - lastReconciled[userId] < RECONCILE_THROTTLE_MS)) {
     return; // Already ran recently
   }
+  const run = reconcileBusinessData(userId).finally(() => reconcileInFlight.delete(userId));
+  reconcileInFlight.set(userId, run);
+  return run;
+}
+
+async function reconcileBusinessData(userId) {
+  const now = Date.now();
 
   console.log(`[Auto-Reconcile] Starting for user ${maskId(userId)}...`);
   lastReconciled[userId] = now;
 
   try {
-    // 1. BACKFILL PURCHASES
-    const { data: purchases } = await supabase.from('purchases').select('*').eq('user_id', userId);
-    const { data: pMovements } = await supabase.from('stock_movements').select('reference').eq('user_id', userId).not('reference', 'is', null);
-    const movementRefs = new Set((pMovements || []).map(m => m.reference));
+    // Reads are batched: one read per table (paged past the 1,000-row cap),
+    // a product lookup map instead of one query per line item, inserts in
+    // chunks instead of one round trip per row, and the stock recount reads
+    // every movement once and only writes products whose stock changed.
+    const lc = (v) => String(v || '').trim().toLowerCase();
+    const [purchases, sales, pMovements, existingProducts] = await Promise.all([
+      fetchAllRows(() => supabase.from('purchases').select('*').eq('user_id', userId)),
+      fetchAllRows(() => supabase.from('sales').select('*').eq('user_id', userId)),
+      fetchAllRows(() => supabase.from('stock_movements').select('id, reference').eq('user_id', userId).not('reference', 'is', null)),
+      fetchAllRows(() => supabase.from('products').select('id, name, current_stock').eq('user_id', userId)),
+    ]);
+    const movementRefs = new Set(pMovements.map(m => m.reference));
+    const productByName = new Map();
+    for (const prod of existingProducts) if (!productByName.has(lc(prod.name))) productByName.set(lc(prod.name), prod);
 
-    for (const p of (purchases || [])) {
+    async function insertChunks(table, rows) {
+      for (let i = 0; i < rows.length; i += 500) {
+        const { error } = await supabase.from(table).insert(rows.slice(i, i + 500));
+        if (error) throw error;
+      }
+    }
+
+    // 1. BACKFILL PURCHASES
+    const newMovements = [];
+    for (const p of purchases) {
       const ref = p.bill_number || String(p.id);
       if (movementRefs.has(ref)) continue;
       const items = getPurchaseItems(p);
@@ -3208,22 +3244,24 @@ async function ensureConnectedBusinessData(userId) {
       for (const item of items) {
         const qty = toMoney(item.qty);
         if (qty <= 0) continue;
-        let { data: product } = await supabase.from('products').select('id').eq('user_id', userId).ilike('name', item.description).maybeSingle();
+        let product = productByName.get(lc(item.description));
         if (!product) {
           const { data: newProd } = await supabase.from('products').insert([{ user_id: userId, name: item.description, current_stock: 0 }]).select().single();
+          if (!newProd) continue;
           product = newProd;
+          productByName.set(lc(item.description), product);
+          existingProducts.push(product);
         }
-        await supabase.from('stock_movements').insert([{
+        newMovements.push({
           user_id: userId, product_id: product.id, movement_type: 'in', quantity: qty,
           unit_cost: toMoney(item.unit_price) || null, reference: ref,
           notes: `Auto-backfilled from purchase ${ref}`
-        }]);
+        });
       }
     }
 
     // 2. BACKFILL SALES
-    const { data: sales } = await supabase.from('sales').select('*').eq('user_id', userId);
-    for (const s of (sales || [])) {
+    for (const s of sales) {
       const ref = s.invoice_number || String(s.id);
       if (movementRefs.has(ref)) continue;
       const items = getPurchaseItems(s);
@@ -3231,79 +3269,79 @@ async function ensureConnectedBusinessData(userId) {
       for (const item of items) {
         const qty = toMoney(item.qty);
         if (qty <= 0) continue;
-        let { data: product } = await supabase.from('products').select('id').eq('user_id', userId).ilike('name', item.description).maybeSingle();
+        const product = productByName.get(lc(item.description));
         if (product) {
-          await supabase.from('stock_movements').insert([{
+          newMovements.push({
             user_id: userId, product_id: product.id, movement_type: 'out', quantity: qty,
             reference: ref, notes: `Auto-backfilled from sale ${ref}`
-          }]);
+          });
         }
       }
     }
+    await insertChunks('stock_movements', newMovements);
 
-    // 3. BACKFILL PAID INVOICES
-    const { data: invoices } = await supabase.from('invoices').select('*').eq('user_id', userId).eq('payment_status', 'Paid');
-    const { data: bTxns } = await supabase.from('bank_transactions').select('matched_id').eq('user_id', userId).eq('matched_type', 'invoice');
-    const matchedIds = new Set((bTxns || []).map(t => String(t.matched_id)));
+    // 3. BACKFILL PAID INVOICES, SALES AND PURCHASES TO BANK TRANSACTIONS
+    const [invoices, bTxns] = await Promise.all([
+      fetchAllRows(() => supabase.from('invoices').select('*').eq('user_id', userId).eq('payment_status', 'Paid')),
+      fetchAllRows(() => supabase.from('bank_transactions').select('id, matched_id, matched_type').eq('user_id', userId).in('matched_type', ['invoice', 'sale', 'purchase'])),
+    ]);
+    const matched = { invoice: new Set(), sale: new Set(), purchase: new Set() };
+    for (const t of bTxns) if (matched[t.matched_type]) matched[t.matched_type].add(String(t.matched_id));
+    const today = new Date().toISOString().split('T')[0];
+    const newTxns = [];
 
-    for (const inv of (invoices || [])) {
-      if (matchedIds.has(String(inv.id))) continue;
-      await supabase.from('bank_transactions').insert([{
+    for (const inv of invoices) {
+      if (matched.invoice.has(String(inv.id))) continue;
+      newTxns.push({
         user_id: userId,
-        txn_date: inv.payment_date || inv.invoice_date || new Date().toISOString().split('T')[0],
+        txn_date: inv.payment_date || inv.invoice_date || today,
         description: `Payment from ${inv.customer_name}${inv.invoice_number ? ` for invoice ${inv.invoice_number}` : ''}`,
         amount: toMoney(inv.payment_amount || inv.invoice_amount),
         type: 'credit', status: 'matched', matched_type: 'invoice', matched_id: String(inv.id),
-      }]);
+      });
     }
 
-    // 3a. BACKFILL PAID/PARTIAL SALES TO BANK TRANSACTIONS
-    const { data: bTxnsSales } = await supabase.from('bank_transactions').select('matched_id').eq('user_id', userId).eq('matched_type', 'sale');
-    const matchedSaleIds = new Set((bTxnsSales || []).map(t => String(t.matched_id)));
-
-    for (const s of (sales || [])) {
+    for (const s of sales) {
       const paidAmt = toMoney(s.paid_amount || (s.status === 'paid' ? s.amount : 0));
       if (paidAmt <= 0) continue;
-      if (matchedSaleIds.has(String(s.id))) continue;
-      await supabase.from('bank_transactions').insert([{
+      if (matched.sale.has(String(s.id))) continue;
+      newTxns.push({
         user_id: userId,
-        txn_date: s.sale_date || new Date().toISOString().split('T')[0],
+        txn_date: s.sale_date || today,
         description: `Payment from ${s.customer_name}${s.invoice_number ? ` for sale ${s.invoice_number}` : ''}`,
         amount: paidAmt,
         type: 'credit', status: 'matched', matched_type: 'sale', matched_id: String(s.id),
-      }]);
+      });
     }
 
-    // 3b. BACKFILL PAID/PARTIAL PURCHASES TO BANK TRANSACTIONS
-    const { data: bTxnsPurchases } = await supabase.from('bank_transactions').select('matched_id').eq('user_id', userId).eq('matched_type', 'purchase');
-    const matchedPurchaseIds = new Set((bTxnsPurchases || []).map(t => String(t.matched_id)));
-
-    for (const p of (purchases || [])) {
+    for (const p of purchases) {
       const paidAmt = toMoney(p.paid_amount || (p.status === 'paid' ? p.amount : 0));
       if (paidAmt <= 0) continue;
-      if (matchedPurchaseIds.has(String(p.id))) continue;
-      await supabase.from('bank_transactions').insert([{
+      if (matched.purchase.has(String(p.id))) continue;
+      newTxns.push({
         user_id: userId,
-        txn_date: p.purchase_date || new Date().toISOString().split('T')[0],
+        txn_date: p.purchase_date || today,
         description: `Payment to ${p.supplier_name}${p.bill_number ? ` for bill ${p.bill_number}` : ''}`,
         amount: paidAmt,
         type: 'debit', status: 'matched', matched_type: 'purchase', matched_id: String(p.id),
-      }]);
+      });
     }
+    await insertChunks('bank_transactions', newTxns);
 
     // 4. RECALCULATE STOCK
-    const { data: products } = await supabase.from('products').select('id, name').eq('user_id', userId);
-    for (const prod of (products || [])) {
-      // Scoped by owner as well as product: products above are already fetched
-      // for this user, but with RLS bypassed the user_id filter is what actually
-      // keeps another tenant's movements out of the recount.
-      const { data: movements } = await supabase.from('stock_movements').select('movement_type, quantity').eq('product_id', prod.id).eq('user_id', userId);
-      let stock = 0;
-      (movements || []).forEach(m => {
-        if (m.movement_type === 'in') stock += toMoney(m.quantity);
-        else stock -= toMoney(m.quantity);
-      });
-      await supabase.from('products').update({ current_stock: stock, updated_at: new Date() }).eq('id', prod.id);
+    // Scoped by owner: with RLS bypassed the user_id filter is what keeps
+    // another tenant's movements out of the recount.
+    const movements = await fetchAllRows(() => supabase.from('stock_movements').select('id, product_id, movement_type, quantity').eq('user_id', userId));
+    const stockByProduct = new Map();
+    for (const m of movements) {
+      const k = String(m.product_id);
+      const delta = m.movement_type === 'in' ? toMoney(m.quantity) : -toMoney(m.quantity);
+      stockByProduct.set(k, (stockByProduct.get(k) || 0) + delta);
+    }
+    for (const prod of existingProducts) {
+      const stock = stockByProduct.get(String(prod.id)) || 0;
+      if (Math.abs(stock - toMoney(prod.current_stock)) < 1e-9) continue;
+      await supabase.from('products').update({ current_stock: stock, updated_at: new Date() }).eq('id', prod.id).eq('user_id', userId);
     }
     console.log(`[Auto-Reconcile] Completed for user ${maskId(userId)}.`);
   } catch (err) {
