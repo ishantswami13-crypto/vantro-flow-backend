@@ -6,6 +6,9 @@ require('dotenv').config();
 // Before anything else can capture fetch: give outgoing calls a default time limit.
 require('./lib/http/fetchTimeout').installFetchTimeout();
 const express = require('express');
+// Groq shut down the Llama 3.x / 4 models on 16 Aug 2026 (console.groq.com/docs/deprecations);
+// GPT-OSS 120B is its listed replacement. GROQ_MODEL overrides it.
+const GROQ_MODEL = (process.env.GROQ_MODEL || '').trim() || 'openai/gpt-oss-120b';
 const cors = require('cors');
 const multer = require('multer');
 const bcrypt = require('bcryptjs');
@@ -2374,7 +2377,7 @@ app.post('/api/generate-message', authMiddleware, async (req, res) => {
         'Authorization': `Bearer ${process.env.GROQ_API_KEY}`
       },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
+        model: GROQ_MODEL,
         max_tokens: 200,
         messages: [
           { role: 'system', content: MESSAGE_SYSTEM_PROMPT },
@@ -4837,7 +4840,7 @@ Calls made: ${totalCalls}, Pick-up rate: ${totalCalls ? Math.round(pickedUp/tota
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
+        model: GROQ_MODEL,
         max_tokens: 600,
         messages: [
           { role: 'system', content: 'You are a sharp business analyst for Indian MSMEs. Given data, provide 4-5 specific, actionable insights in plain English. Be direct and data-driven. Format as a JSON array of objects: [{title, insight, action, type}] where type is "success"|"warning"|"danger"|"info". No markdown, pure JSON only.' },
@@ -4984,7 +4987,7 @@ Return a JSON object with this exact structure (no markdown, pure JSON):
         'Authorization': `Bearer ${process.env.GROQ_API_KEY}`
       },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
+        model: GROQ_MODEL,
         max_tokens: 3000,
         temperature: 0.3,
         messages: [
@@ -6514,8 +6517,8 @@ const AI_TOOLS = [
   { type:'function', function:{ name:'place_order_with_supplier', description:'Compose a draft WhatsApp order message to a supplier for the owner to send. Records nothing.', parameters:{ type:'object', properties:{ supplier_name:{ type:'string', description:'Name of the supplier' }, items:{ type:'array', items:{ type:'object', properties:{ name:{type:'string'}, quantity:{type:'number'}, unit:{type:'string',description:'e.g. boxes, kg, units'} } }, description:'Items to order' }, notes:{ type:'string', description:'Any special instructions' } }, required:['supplier_name','items'] } } },
 ];
 
-async function groqChat(messages, tools, toolChoice = 'auto') {
-  const body = { model:'llama-3.3-70b-versatile', max_tokens:1500, temperature:0.2, messages };
+async function groqChat(messages, tools, toolChoice = 'auto', modelOverride = null) {
+  const body = { model: modelOverride || GROQ_MODEL, max_tokens:1500, temperature:0.2, messages };
   if (tools?.length) { body.tools = tools; body.tool_choice = toolChoice; }
   // GROQ_BASE_URL lets a local OpenAI-compatible stub stand in for Groq in
   // tests and pilot:readiness; it is ignored on the production deployment.
@@ -6629,7 +6632,7 @@ function openAiMessagesToGeminiContents(messages) {
   return { systemInstruction, contents };
 }
 
-async function geminiChat(messages, tools, toolChoice = 'auto') {
+async function geminiChat(messages, tools, toolChoice = 'auto', modelOverride = null) {
   const apiKey = cleanScanString(process.env.GEMINI_API_KEY);
   // Reject empty/placeholder keys clearly rather than silently failing
   // or silently falling back to Groq (that would be a hidden behavior
@@ -6648,7 +6651,7 @@ async function geminiChat(messages, tools, toolChoice = 'auto') {
   // same conditions (function-calling confirmed working, honest no-data
   // answers confirmed, no 503s). Revisit this once the 3.6/3.8 rollout
   // stabilizes — GEMINI_MODEL can be overridden without a code change.
-  const model = cleanScanString(process.env.GEMINI_MODEL) || 'gemini-3.1-flash-lite';
+  const model = modelOverride || cleanScanString(process.env.GEMINI_MODEL) || 'gemini-3.1-flash-lite';
   const modelPath = model.replace(/^models\//i, '');
   const { systemInstruction, contents } = openAiMessagesToGeminiContents(messages);
   const geminiTools = openAiToolsToGeminiDeclarations(tools);
@@ -6716,6 +6719,7 @@ async function geminiChat(messages, tools, toolChoice = 'auto') {
 
 const { allowedToolsFor } = require('./lib/ai/assistantTools');
 const { createModelRouter, ModelUnavailableError } = require('./lib/ai/modelRouter');
+const { makeResponsesChat } = require('./lib/ai/responsesChat');
 const { answerFromLedger } = require('./lib/ai/directAnswers');
 const { readRegion } = require('./lib/routes/region');
 const osMissions = require('./lib/domain/os/missions');
@@ -6725,8 +6729,28 @@ const decisionStore = require('./lib/domain/decisions/store');
 const { salesChangeWhatIf } = require('./lib/domain/os/whatIf');
 const { whatChangedOverWindow } = require('./lib/domain/intelligence/whatChangedSinceLastLook');
 const modelRouter = createModelRouter({
-  providers: { groq: groqChat, gemini: geminiChat, anthropic: require('./lib/ai/anthropicChat').makeAnthropicChat() },
+  providers: {
+    groq: groqChat,
+    gemini: geminiChat,
+    anthropic: require('./lib/ai/anthropicChat').makeAnthropicChat(),
+    // OpenAI, xAI (Grok) and Perplexity: switched on by setting their key.
+    openai: makeResponsesChat('openai'),
+    xai: makeResponsesChat('xai'),
+    perplexity: makeResponsesChat('perplexity'),
+  },
   pool: getPool(),
+});
+
+// Vault: this company's uploaded files, customer ledgers and agent outputs,
+// all read from its own rows (lib/domain/vault/files.js).
+const { vaultFiles } = require('./lib/domain/vault/files');
+app.get('/api/vault', authMiddleware, async (req, res) => {
+  try {
+    res.json({ success: true, ...(await vaultFiles(getPool(), authenticatedUserId(req))) });
+  } catch (err) {
+    console.error('Vault error:', err.message);
+    res.status(500).json({ error: 'Could not load your files just now.' });
+  }
 });
 
 // Which model providers Ask Starlane can use right now, and this company's AI
@@ -7090,8 +7114,12 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
     } catch(err) { return { error: err.message }; }
   };
 
-  const modelSession = modelRouter.session({ userId: user_id, purpose: 'chat', correlationId: req.requestId });
+  let modelSession;
   try {
+    // The person may pick a model in the composer. Only catalog ids are
+    // accepted; anything else is refused before any model is called.
+    const requestedModel = typeof req.body?.model === 'string' ? req.body.model.trim().slice(0, 64) : null;
+    modelSession = modelRouter.session({ userId: user_id, purpose: 'chat', correlationId: req.requestId, model: requestedModel || null });
     let iteration = 0;
     const maxIter = 6;
     const tools = AI_TOOLS.filter((t) => allowedTools.has(t.function.name));
@@ -7119,12 +7147,20 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
         chatMessages.push(...toolResults);
       } else {
         const text = typeof msg.content === 'string' && msg.content.trim() ? msg.content : 'I could not put an answer together from your data just now. Try asking it a different way.';
-        return res.json({ success:true, message:text, actions, navigate:navigateTo, waLinks });
+        return res.json({ success:true, message:text, actions, navigate:navigateTo, waLinks, model: modelSession.model, requested_model: modelSession.requested });
       }
     }
 
-    return res.json({ success:true, message:'I could not put an answer together from your data just now. Try asking it a different way.', actions, navigate:navigateTo, waLinks });
+    return res.json({ success:true, message:'I could not put an answer together from your data just now. Try asking it a different way.', actions, navigate:navigateTo, waLinks, model: modelSession.model, requested_model: modelSession.requested });
   } catch(err) {
+    if (err instanceof ModelUnavailableError && (err.code === 'UNKNOWN_MODEL' || err.code === 'MODEL_NOT_CONFIGURED')) {
+      return res.status(400).json({
+        error: err.code === 'UNKNOWN_MODEL'
+          ? 'That model is not one Ask Starlane offers. Pick another model and ask again.'
+          : `${err.message} Pick another model, or Auto, and ask again.`,
+        code: `AI_${err.code}`,
+      });
+    }
     if (err instanceof ModelUnavailableError) {
       // Say what failed and what still works, instead of a bare 500.
       const why = {
@@ -8027,7 +8063,7 @@ async function makeAutoCall(userId, invoice) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
         body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
+          model: GROQ_MODEL,
           messages: [{ role: 'user', content: `Write a 25-word Hinglish phone call opening for collecting ₹${invoice.invoice_amount} from ${invoice.customer_name}, ${invoice.days_overdue} days overdue. Business: ${bizName}. Output only the script text, no quotes.` }],
           temperature: 0.3, max_tokens: 80,
         }),
@@ -8410,7 +8446,7 @@ Write a crisp 3-sentence morning briefing for the business owner. Be specific, u
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
         body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
+          model: GROQ_MODEL,
           max_tokens: 200,
           temperature: 0.4,
           messages: [{ role: 'user', content: briefingPrompt }],
@@ -8588,7 +8624,7 @@ Use natural Hinglish like "bhai", "aap", "theek hai", "koi baat nahi", "kal tak"
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
+        model: GROQ_MODEL,
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.4,
         response_format: { type: 'json_object' },
@@ -8659,7 +8695,7 @@ Sort by urgency (most overdue first). Use natural Hinglish.`;
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
+        model: GROQ_MODEL,
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.3,
         response_format: { type: 'json_object' },
@@ -8721,7 +8757,7 @@ Output JSON: { "style_description": "2-3 sentences describing exact style", "det
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
+        model: GROQ_MODEL,
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.3,
         response_format: { type: 'json_object' },
@@ -8811,7 +8847,7 @@ app.post('/api/voice/call', authMiddleware, async (req, res) => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
         body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
+          model: GROQ_MODEL,
           messages: [{ role: 'user', content: `Write a 20-word Hinglish phone call opening for collecting ₹${invoice_amount} from ${customer_name}, ${days_overdue} days overdue. Tone: ${tone}. Business: ${profile?.business_name}. ${profile?.ai_persona || ''}. Output only the script text.` }],
           temperature: 0.3,
         }),
@@ -9645,7 +9681,7 @@ Return JSON only:
     const aiRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
-      body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'user', content: prompt }], temperature: 0.2, max_tokens: 1200 })
+      body: JSON.stringify({ model: GROQ_MODEL, messages: [{ role: 'user', content: prompt }], temperature: 0.2, max_tokens: 1200 })
     });
     const aiData = await aiRes.json();
     const text = aiData.choices?.[0]?.message?.content || '{}';
@@ -9992,7 +10028,7 @@ Extract order from Hindi/Hinglish transcript. Return ONLY valid JSON, no comment
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile', temperature: 0.1, max_tokens: 500,
+        model: GROQ_MODEL, temperature: 0.1, max_tokens: 500,
         messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
       }),
     });
@@ -10492,7 +10528,7 @@ RULES:
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
         body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
+          model: GROQ_MODEL,
           messages,
           tools,
           tool_choice: 'auto',
