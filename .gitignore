@@ -1,4 +1,12 @@
 node_modules/
+
+# Local dev tooling artifacts (not product code)
+.claude/launch.json
+.claude/skills/neon/
+.claude/skills/neon-postgres/
+skills-lock.json
+Tempnpm-cache-fix/
+
 .env
 .env.local
 .env.production
@@ -16,6 +24,12 @@ secrets/
 service-account*.json
 .vercel/
 .railway/
+
+# Local Tally connector script — config.json can hold a plaintext email/
+# password, and the device-credential file holds an unhashed device secret.
+tally-connector/config.json
+tally-connector/.vantro-device-credentials.json
+tally-connector/state.json
 
 # Rust build output
 /target/

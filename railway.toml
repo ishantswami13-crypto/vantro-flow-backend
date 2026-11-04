@@ -5,3 +5,8 @@ builder = "NIXPACKS"
 startCommand = "node server.js"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
+# Railway sends traffic to a new deploy only after this answers 2xx, so a
+# build that crashes on boot never replaces the running one. /api/live does
+# no database work.
+healthcheckPath = "/api/live"
+healthcheckTimeout = 60

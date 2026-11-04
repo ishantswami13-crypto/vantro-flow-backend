@@ -25,7 +25,7 @@
 //
 // ── What counts as provisioned ─────────────────────────────────────────────
 // A table being creatable somewhere in the repo is not the same as it existing:
-//   applied   — created by a .sql file scripts/setup-fresh-database.js runs.
+//   applied   — created by a .sql file scripts/migrate.js applies.
 //               The list is read from that script so the two cannot drift.
 //   boot-only — created by DDL inside server.js, which runs through pgPool and
 //               therefore only when DATABASE_URL is set. Reported, not failed.
@@ -185,28 +185,12 @@ function readOrDie(p, why) {
   return fs.readFileSync(p, 'utf8');
 }
 
-// ── applied: the SQL setup:database actually runs ───────────────────────────
-const setupRel = path.join('scripts', 'setup-fresh-database.js');
-const setupSrc = readOrDie(path.join(ROOT, setupRel), 'defines the applied-file list');
-
-// Anchored to the identifier: an unanchored first-match found an unrelated
-// earlier array of .sql strings and validated the wrong list while reporting
-// confidence, including telling the reader to delete a still-valid exception.
-const setupAst = parse(setupSrc, setupRel);
-let appliedFiles = null;
-walk(setupAst, node => {
-  if (appliedFiles) return;
-  if (node.type === 'VariableDeclarator' && node.id.type === 'Identifier' && node.id.name === 'SQL_FILES'
-      && node.init && node.init.type === 'ArrayExpression') {
-    const vals = node.init.elements.map(staticString);
-    if (vals.every(v => typeof v === 'string')) appliedFiles = vals;
-  }
-});
-if (!appliedFiles) {
-  console.error(`[SCHEMA] Could not read the SQL_FILES array from ${setupRel}.`);
-  console.error('         It must be a const array of string literals. Update this check rather than deleting it.');
-  process.exit(1);
-}
+// ── applied: the SQL the migration runner actually applies ─────────────────
+// scripts/migrate.js owns the ordered file list (prelude + every
+// migrations/*.sql); reading it from the runner itself means this check and
+// what a fresh database receives cannot drift.
+const setupRel = path.join('scripts', 'migrate.js');
+const appliedFiles = require(path.join(ROOT, setupRel)).orderedMigrationFiles();
 
 const applied = new Set();
 for (const rel of appliedFiles) {
@@ -326,6 +310,6 @@ for (const m of missing) {
   if (m.sites.length > 6) console.error(`    ... and ${m.sites.length - 6} more`);
   console.error('');
 }
-console.error('Add the table to supabase-schema.sql (or to the SQL_FILES list if it has its own');
-console.error('file), or to KNOWN_MISSING in this file with what it breaks.\n');
+console.error('Add a migration under migrations/ that creates the table, or add it to');
+console.error('KNOWN_MISSING in this file with what it breaks.\n');
 process.exit(1);

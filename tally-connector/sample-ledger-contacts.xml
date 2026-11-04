@@ -1,0 +1,24 @@
+<ENVELOPE>
+ <!-- Fictional answer, in the shape of a TallyPrime collection export, to
+      the StarlaneDebtorContacts request (customer ledgers under Sundry
+      Debtors, name and phone fields only). Includes a mobile with +91 and
+      spaces, a number only in the phone field, a landline, a ledger with no
+      number and an ampersand. NOT yet checked against a real TallyPrime. -->
+ <BODY><DATA><COLLECTION>
+  <LEDGER NAME="Mehta Hardware" RESERVEDNAME="">
+   <LEDGERMOBILE>+91 98100 00001</LEDGERMOBILE>
+   <LEDGERPHONE>022-24567890</LEDGERPHONE>
+  </LEDGER>
+  <LEDGER NAME="Sharma Traders" RESERVEDNAME="">
+   <LEDGERMOBILE>9876501234</LEDGERMOBILE>
+  </LEDGER>
+  <LEDGER NAME="Gupta &amp; Sons" RESERVEDNAME="">
+   <LEDGERPHONE>098111 22233</LEDGERPHONE>
+  </LEDGER>
+  <LEDGER NAME="Kapoor &amp; Co" RESERVEDNAME="">
+   <LEDGERPHONE>011-2345678</LEDGERPHONE>
+  </LEDGER>
+  <LEDGER NAME="Walk-in Customer" RESERVEDNAME="">
+  </LEDGER>
+ </COLLECTION></DATA></BODY>
+</ENVELOPE>

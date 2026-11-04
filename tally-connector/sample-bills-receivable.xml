@@ -1,0 +1,39 @@
+<ENVELOPE>
+ <!-- Fictional data in the shape of a TallyPrime "Bills Receivable" export
+      as of 31-Mar-2026: bills from earlier years still unpaid when the
+      current financial year's day book starts. Each bill is a BILLFIXED
+      block followed by its pending amount (BILLCL, debit = negative), due
+      date and days overdue. Includes a two-digit year, an ampersand, a bill
+      with no due date and an on-account credit balance. NOT yet checked
+      against a real TallyPrime export. -->
+ <BILLFIXED>
+  <BILLDATE>10-Jan-2026</BILLDATE>
+  <BILLREF>S/1450</BILLREF>
+  <BILLPARTY>Mehta Hardware</BILLPARTY>
+ </BILLFIXED>
+ <BILLCL>-32000.00</BILLCL>
+ <BILLDUE>9-Feb-2026</BILLDUE>
+ <BILLOVERDUE>50</BILLOVERDUE>
+ <BILLFIXED>
+  <BILLDATE>5-Mar-26</BILLDATE>
+  <BILLREF>S/1502</BILLREF>
+  <BILLPARTY>Rao &amp; Sons</BILLPARTY>
+ </BILLFIXED>
+ <BILLCL>-18500.00</BILLCL>
+ <BILLDUE>4-Apr-26</BILLDUE>
+ <BILLOVERDUE>0</BILLOVERDUE>
+ <BILLFIXED>
+  <BILLDATE>20-Nov-2025</BILLDATE>
+  <BILLREF>S/1320</BILLREF>
+  <BILLPARTY>Gupta Traders</BILLPARTY>
+ </BILLFIXED>
+ <BILLCL>-7250.50</BILLCL>
+ <BILLOVERDUE>131</BILLOVERDUE>
+ <BILLFIXED>
+  <BILLDATE>15-Mar-2026</BILLDATE>
+  <BILLREF>On Account</BILLREF>
+  <BILLPARTY>Kapoor &amp; Co</BILLPARTY>
+ </BILLFIXED>
+ <BILLCL>5000.00</BILLCL>
+ <BILLOVERDUE>0</BILLOVERDUE>
+</ENVELOPE>
