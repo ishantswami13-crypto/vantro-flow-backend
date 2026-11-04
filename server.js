@@ -1482,7 +1482,7 @@ app.post('/api/auth/login', async (req, res) => {
     const email = typeof req.body.email === 'string' ? req.body.email.trim() : '';
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
-    const cols = 'id, email, phone, business_name, plan, password_hash, created_at';
+    const cols = 'id, email, phone, business_name, owner_name, plan, password_hash, created_at';
     let { data, error } = await supabase.from('users').select(cols).eq('email', email).maybeSingle();
     if (!error && !data && normalizeEmail(email) !== email) {
       ({ data, error } = await supabase.from('users').select(cols).eq('email', normalizeEmail(email)).maybeSingle());
@@ -6720,6 +6720,8 @@ async function geminiChat(messages, tools, toolChoice = 'auto', modelOverride = 
 const { allowedToolsFor } = require('./lib/ai/assistantTools');
 const { createModelRouter, ModelUnavailableError } = require('./lib/ai/modelRouter');
 const { makeResponsesChat } = require('./lib/ai/responsesChat');
+const { answerFromLedger } = require('./lib/ai/directAnswers');
+const { readRegion } = require('./lib/routes/region');
 const osMissions = require('./lib/domain/os/missions');
 const osWorkflows = require('./lib/domain/os/workflows');
 const decisionControls = require('./lib/domain/decisions/controls');
@@ -7167,6 +7169,18 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
         PROVIDERS_FAILED: 'Ask Starlane could not reach its AI model just now.',
       }[err.code] || err.message;
       console.warn('AI chat unavailable:', err.code, JSON.stringify(err.detail || {}));
+      // The common questions (who owes the most, totals, how late) are sums
+      // over the ledger: answer those exactly instead of failing.
+      try {
+        const question = messages[messages.length - 1].content;
+        const { data: openInvoices } = await supabase.from('invoices')
+          .select('customer_name, invoice_number, invoice_amount, payment_amount, payment_status, due_date, invoice_date, currency')
+          .eq('user_id', user_id).neq('payment_status', 'Paid').limit(20000);
+        let region = { currency: 'INR', locale: null };
+        if (pgPool) { try { region = await readRegion(pgPool, user_id); } catch (_) { /* default region */ } }
+        const direct = answerFromLedger(question, openInvoices || [], { currency: region.currency, locale: region.locale });
+        if (direct) return res.json({ success: true, message: direct.message, actions, navigate: null, waLinks, mode: 'ledger', model_unavailable: err.code });
+      } catch (e) { console.warn('AI chat ledger answer failed:', e.message); }
       return res.status(503).json({
         error: `${why} Your data is safe. Decisions, Monitors, Tasks and Scan my books still work without it.`,
         code: `AI_${err.code}`,
@@ -7180,6 +7194,26 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
 // ============================================
 // PAYMENT LINKS — Send UPI link to debtor
 // ============================================
+
+// Invoices marked paid in the last two days, newest first, for the
+// "payment landed" moment every signed-in page shows. Small on purpose: the
+// browser used to download the whole invoice list every 30 seconds for this.
+app.get('/api/payments/recent', authMiddleware, async (req, res) => {
+  const userId = authenticatedUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Not signed in' });
+  try {
+    const since = new Date(Date.now() - 2 * 86_400_000).toISOString().slice(0, 10);
+    const { data, error } = await supabase.from('invoices')
+      .select('id, customer_name, invoice_amount, payment_amount, currency, payment_date')
+      .eq('user_id', userId).eq('payment_status', 'Paid').gte('payment_date', since)
+      .order('payment_date', { ascending: false }).limit(50);
+    if (error) throw error;
+    res.json({ success: true, payments: (data || []).map((i) => ({ id: i.id, customer_name: i.customer_name, amount: Number(i.payment_amount) || Number(i.invoice_amount) || 0, currency: i.currency || null, payment_date: i.payment_date })) });
+  } catch (error) {
+    logRouteError(req, error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 app.post('/api/payments/create-link', authMiddleware, async (req, res) => {
   try {
