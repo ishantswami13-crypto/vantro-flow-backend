@@ -506,7 +506,7 @@ async function run() {
       const ag = await co.get('/api/os/agents');
       const list = ag.body.agents || [];
       const col = list.find((x) => x.key === 'starlane.collections_agent');
-      if (list.length !== 4) problems.push(`${list.length} agents listed`);
+      if (list.length !== 5) problems.push(`${list.length} agents listed`);
       if (!col || col.runs < 1 || col.status !== 'ACTIVE') problems.push(`collections agent ${col?.status} with ${col?.runs} runs`);
       if (list.some((x) => (x.permissions || []).includes('EXECUTE'))) problems.push('an agent holds EXECUTE');
       if (!(ag.body.notBuilt || []).length) problems.push('agents that are not built are not disclosed');

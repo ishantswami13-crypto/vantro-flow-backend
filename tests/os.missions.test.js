@@ -174,7 +174,7 @@ test('Today, Agents and the funnel are counted from real rows and scoped to the 
   assert.equal(openedAgain.rows[0].n, 1, 'reopening does not inflate the funnel');
 
   const ag = await ca.get('/api/os/agents');
-  assert.equal(ag.body.agents.length, 4);
+  assert.equal(ag.body.agents.length, 5);
   assert.ok(ag.body.notBuilt.length >= 1, 'agents that do not exist are disclosed as not built');
   for (const x of ag.body.agents) assert.ok(!x.permissions.includes('EXECUTE'), `${x.name} cannot hold EXECUTE`);
   const engine = ag.body.agents.find((x) => x.key === 'starlane.decision_engine');

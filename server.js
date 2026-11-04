@@ -6,6 +6,9 @@ require('dotenv').config();
 // Before anything else can capture fetch: give outgoing calls a default time limit.
 require('./lib/http/fetchTimeout').installFetchTimeout();
 const express = require('express');
+// Groq shut down the Llama 3.x / 4 models on 16 Aug 2026 (console.groq.com/docs/deprecations);
+// GPT-OSS 120B is its listed replacement. GROQ_MODEL overrides it.
+const GROQ_MODEL = (process.env.GROQ_MODEL || '').trim() || 'openai/gpt-oss-120b';
 const cors = require('cors');
 const multer = require('multer');
 const bcrypt = require('bcryptjs');
@@ -475,6 +478,8 @@ app.use((req, res, next) => {
 const jsonParser = express.json({ limit: '10mb' });
 app.use((req, res, next) => {
   if (req.path === '/api/payments/webhook') return next();
+  // Incoming webhooks keep the raw body for signature checks (lib/routes/connections.js).
+  if (req.path.startsWith('/api/hooks/')) return next();
   return jsonParser(req, res, next);
 });
 app.use(express.urlencoded({ extended: true })); // Twilio webhooks send form-encoded
@@ -545,7 +550,7 @@ function authAwareKey(req) {
   }
 }
 
-function makeLimiter({ windowMs, max, skipSuccessfulRequests = false, keyGenerator }) {
+function makeLimiter({ windowMs, max, skipSuccessfulRequests = false, keyGenerator, skip }) {
   return rateLimit({
     windowMs,
     max,
@@ -553,6 +558,7 @@ function makeLimiter({ windowMs, max, skipSuccessfulRequests = false, keyGenerat
     legacyHeaders: false,
     skipSuccessfulRequests,
     ...(keyGenerator ? { keyGenerator } : {}),
+    ...(skip ? { skip } : {}),
     handler: (req, res, next, options) => {
       const requestId = req.requestId || crypto.randomUUID();
       res.status(options.statusCode).json({
@@ -594,6 +600,11 @@ const apiLimiter = makeLimiter({
   windowMs: 60 * 1000,
   max: (req) => (String(apiLimiterKey(req)).startsWith('user:') ? API_LIMIT_PER_USER : API_LIMIT_PER_IP),
   keyGenerator: apiLimiterKey,
+  // Incoming webhooks have their own limits (lib/routes/connections.js): per
+  // webhook URL, plus a wider per-IP backstop. Senders such as Stripe or
+  // Zapier post for every tenant from a few shared IPs, so the anonymous
+  // 120/min per-IP budget here would throttle all tenants together.
+  skip: (req) => String(req.originalUrl || '').startsWith('/api/hooks/'),
 });
 const uploadLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, max: 20 });
 const aiLimiter = makeLimiter({ windowMs: 10 * 60 * 1000, max: 40, keyGenerator: authAwareKey });
@@ -1471,7 +1482,7 @@ app.post('/api/auth/login', async (req, res) => {
     const email = typeof req.body.email === 'string' ? req.body.email.trim() : '';
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
-    const cols = 'id, email, phone, business_name, plan, password_hash, created_at';
+    const cols = 'id, email, phone, business_name, owner_name, plan, password_hash, created_at';
     let { data, error } = await supabase.from('users').select(cols).eq('email', email).maybeSingle();
     if (!error && !data && normalizeEmail(email) !== email) {
       ({ data, error } = await supabase.from('users').select(cols).eq('email', normalizeEmail(email)).maybeSingle());
@@ -1525,8 +1536,11 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
     if (error) throw error;
     if (!data) return res.status(404).json({ error: 'User not found' });
 
-    // Auto-reconcile and connect business data
-    await ensureConnectedBusinessData(tokenUserId);
+    // Auto-reconcile and connect business data. Not awaited: the profile
+    // below does not depend on it, and every page load calls /auth/me, so
+    // waiting here put the whole reconcile on the critical path. Pages that
+    // read the reconciled tables still await it themselves.
+    ensureConnectedBusinessData(tokenUserId).catch(() => {});
 
     const user = {
       ...data,
@@ -2363,7 +2377,7 @@ app.post('/api/generate-message', authMiddleware, async (req, res) => {
         'Authorization': `Bearer ${process.env.GROQ_API_KEY}`
       },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
+        model: GROQ_MODEL,
         max_tokens: 200,
         messages: [
           { role: 'system', content: MESSAGE_SYSTEM_PROMPT },
@@ -3183,23 +3197,56 @@ async function syncInventoryFromSale(userId, sale) {
 const RECONCILE_THROTTLE_MS = 5 * 60 * 1000; // 5 minutes
 const lastReconciled = {}; // userId -> timestamp
 
+const reconcileInFlight = new Map(); // userId -> promise of the running reconcile
+
+// A caller that arrives while a reconcile is running waits for that run
+// instead of reading half-reconciled tables (/auth/me starts it without
+// waiting, and the page's data requests land right behind it).
 async function ensureConnectedBusinessData(userId) {
   if (!userId) return;
+  const running = reconcileInFlight.get(userId);
+  if (running) return running;
   const now = Date.now();
   if (lastReconciled[userId] && (now - lastReconciled[userId] < RECONCILE_THROTTLE_MS)) {
     return; // Already ran recently
   }
+  const run = reconcileBusinessData(userId).finally(() => reconcileInFlight.delete(userId));
+  reconcileInFlight.set(userId, run);
+  return run;
+}
+
+async function reconcileBusinessData(userId) {
+  const now = Date.now();
 
   console.log(`[Auto-Reconcile] Starting for user ${maskId(userId)}...`);
   lastReconciled[userId] = now;
 
   try {
-    // 1. BACKFILL PURCHASES
-    const { data: purchases } = await supabase.from('purchases').select('*').eq('user_id', userId);
-    const { data: pMovements } = await supabase.from('stock_movements').select('reference').eq('user_id', userId).not('reference', 'is', null);
-    const movementRefs = new Set((pMovements || []).map(m => m.reference));
+    // Reads are batched: one read per table (paged past the 1,000-row cap),
+    // a product lookup map instead of one query per line item, inserts in
+    // chunks instead of one round trip per row, and the stock recount reads
+    // every movement once and only writes products whose stock changed.
+    const lc = (v) => String(v || '').trim().toLowerCase();
+    const [purchases, sales, pMovements, existingProducts] = await Promise.all([
+      fetchAllRows(() => supabase.from('purchases').select('*').eq('user_id', userId)),
+      fetchAllRows(() => supabase.from('sales').select('*').eq('user_id', userId)),
+      fetchAllRows(() => supabase.from('stock_movements').select('id, reference').eq('user_id', userId).not('reference', 'is', null)),
+      fetchAllRows(() => supabase.from('products').select('id, name, current_stock').eq('user_id', userId)),
+    ]);
+    const movementRefs = new Set(pMovements.map(m => m.reference));
+    const productByName = new Map();
+    for (const prod of existingProducts) if (!productByName.has(lc(prod.name))) productByName.set(lc(prod.name), prod);
 
-    for (const p of (purchases || [])) {
+    async function insertChunks(table, rows) {
+      for (let i = 0; i < rows.length; i += 500) {
+        const { error } = await supabase.from(table).insert(rows.slice(i, i + 500));
+        if (error) throw error;
+      }
+    }
+
+    // 1. BACKFILL PURCHASES
+    const newMovements = [];
+    for (const p of purchases) {
       const ref = p.bill_number || String(p.id);
       if (movementRefs.has(ref)) continue;
       const items = getPurchaseItems(p);
@@ -3208,22 +3255,24 @@ async function ensureConnectedBusinessData(userId) {
       for (const item of items) {
         const qty = toMoney(item.qty);
         if (qty <= 0) continue;
-        let { data: product } = await supabase.from('products').select('id').eq('user_id', userId).ilike('name', item.description).maybeSingle();
+        let product = productByName.get(lc(item.description));
         if (!product) {
           const { data: newProd } = await supabase.from('products').insert([{ user_id: userId, name: item.description, current_stock: 0 }]).select().single();
+          if (!newProd) continue;
           product = newProd;
+          productByName.set(lc(item.description), product);
+          existingProducts.push(product);
         }
-        await supabase.from('stock_movements').insert([{
+        newMovements.push({
           user_id: userId, product_id: product.id, movement_type: 'in', quantity: qty,
           unit_cost: toMoney(item.unit_price) || null, reference: ref,
           notes: `Auto-backfilled from purchase ${ref}`
-        }]);
+        });
       }
     }
 
     // 2. BACKFILL SALES
-    const { data: sales } = await supabase.from('sales').select('*').eq('user_id', userId);
-    for (const s of (sales || [])) {
+    for (const s of sales) {
       const ref = s.invoice_number || String(s.id);
       if (movementRefs.has(ref)) continue;
       const items = getPurchaseItems(s);
@@ -3231,79 +3280,79 @@ async function ensureConnectedBusinessData(userId) {
       for (const item of items) {
         const qty = toMoney(item.qty);
         if (qty <= 0) continue;
-        let { data: product } = await supabase.from('products').select('id').eq('user_id', userId).ilike('name', item.description).maybeSingle();
+        const product = productByName.get(lc(item.description));
         if (product) {
-          await supabase.from('stock_movements').insert([{
+          newMovements.push({
             user_id: userId, product_id: product.id, movement_type: 'out', quantity: qty,
             reference: ref, notes: `Auto-backfilled from sale ${ref}`
-          }]);
+          });
         }
       }
     }
+    await insertChunks('stock_movements', newMovements);
 
-    // 3. BACKFILL PAID INVOICES
-    const { data: invoices } = await supabase.from('invoices').select('*').eq('user_id', userId).eq('payment_status', 'Paid');
-    const { data: bTxns } = await supabase.from('bank_transactions').select('matched_id').eq('user_id', userId).eq('matched_type', 'invoice');
-    const matchedIds = new Set((bTxns || []).map(t => String(t.matched_id)));
+    // 3. BACKFILL PAID INVOICES, SALES AND PURCHASES TO BANK TRANSACTIONS
+    const [invoices, bTxns] = await Promise.all([
+      fetchAllRows(() => supabase.from('invoices').select('*').eq('user_id', userId).eq('payment_status', 'Paid')),
+      fetchAllRows(() => supabase.from('bank_transactions').select('id, matched_id, matched_type').eq('user_id', userId).in('matched_type', ['invoice', 'sale', 'purchase'])),
+    ]);
+    const matched = { invoice: new Set(), sale: new Set(), purchase: new Set() };
+    for (const t of bTxns) if (matched[t.matched_type]) matched[t.matched_type].add(String(t.matched_id));
+    const today = new Date().toISOString().split('T')[0];
+    const newTxns = [];
 
-    for (const inv of (invoices || [])) {
-      if (matchedIds.has(String(inv.id))) continue;
-      await supabase.from('bank_transactions').insert([{
+    for (const inv of invoices) {
+      if (matched.invoice.has(String(inv.id))) continue;
+      newTxns.push({
         user_id: userId,
-        txn_date: inv.payment_date || inv.invoice_date || new Date().toISOString().split('T')[0],
+        txn_date: inv.payment_date || inv.invoice_date || today,
         description: `Payment from ${inv.customer_name}${inv.invoice_number ? ` for invoice ${inv.invoice_number}` : ''}`,
         amount: toMoney(inv.payment_amount || inv.invoice_amount),
         type: 'credit', status: 'matched', matched_type: 'invoice', matched_id: String(inv.id),
-      }]);
+      });
     }
 
-    // 3a. BACKFILL PAID/PARTIAL SALES TO BANK TRANSACTIONS
-    const { data: bTxnsSales } = await supabase.from('bank_transactions').select('matched_id').eq('user_id', userId).eq('matched_type', 'sale');
-    const matchedSaleIds = new Set((bTxnsSales || []).map(t => String(t.matched_id)));
-
-    for (const s of (sales || [])) {
+    for (const s of sales) {
       const paidAmt = toMoney(s.paid_amount || (s.status === 'paid' ? s.amount : 0));
       if (paidAmt <= 0) continue;
-      if (matchedSaleIds.has(String(s.id))) continue;
-      await supabase.from('bank_transactions').insert([{
+      if (matched.sale.has(String(s.id))) continue;
+      newTxns.push({
         user_id: userId,
-        txn_date: s.sale_date || new Date().toISOString().split('T')[0],
+        txn_date: s.sale_date || today,
         description: `Payment from ${s.customer_name}${s.invoice_number ? ` for sale ${s.invoice_number}` : ''}`,
         amount: paidAmt,
         type: 'credit', status: 'matched', matched_type: 'sale', matched_id: String(s.id),
-      }]);
+      });
     }
 
-    // 3b. BACKFILL PAID/PARTIAL PURCHASES TO BANK TRANSACTIONS
-    const { data: bTxnsPurchases } = await supabase.from('bank_transactions').select('matched_id').eq('user_id', userId).eq('matched_type', 'purchase');
-    const matchedPurchaseIds = new Set((bTxnsPurchases || []).map(t => String(t.matched_id)));
-
-    for (const p of (purchases || [])) {
+    for (const p of purchases) {
       const paidAmt = toMoney(p.paid_amount || (p.status === 'paid' ? p.amount : 0));
       if (paidAmt <= 0) continue;
-      if (matchedPurchaseIds.has(String(p.id))) continue;
-      await supabase.from('bank_transactions').insert([{
+      if (matched.purchase.has(String(p.id))) continue;
+      newTxns.push({
         user_id: userId,
-        txn_date: p.purchase_date || new Date().toISOString().split('T')[0],
+        txn_date: p.purchase_date || today,
         description: `Payment to ${p.supplier_name}${p.bill_number ? ` for bill ${p.bill_number}` : ''}`,
         amount: paidAmt,
         type: 'debit', status: 'matched', matched_type: 'purchase', matched_id: String(p.id),
-      }]);
+      });
     }
+    await insertChunks('bank_transactions', newTxns);
 
     // 4. RECALCULATE STOCK
-    const { data: products } = await supabase.from('products').select('id, name').eq('user_id', userId);
-    for (const prod of (products || [])) {
-      // Scoped by owner as well as product: products above are already fetched
-      // for this user, but with RLS bypassed the user_id filter is what actually
-      // keeps another tenant's movements out of the recount.
-      const { data: movements } = await supabase.from('stock_movements').select('movement_type, quantity').eq('product_id', prod.id).eq('user_id', userId);
-      let stock = 0;
-      (movements || []).forEach(m => {
-        if (m.movement_type === 'in') stock += toMoney(m.quantity);
-        else stock -= toMoney(m.quantity);
-      });
-      await supabase.from('products').update({ current_stock: stock, updated_at: new Date() }).eq('id', prod.id);
+    // Scoped by owner: with RLS bypassed the user_id filter is what keeps
+    // another tenant's movements out of the recount.
+    const movements = await fetchAllRows(() => supabase.from('stock_movements').select('id, product_id, movement_type, quantity').eq('user_id', userId));
+    const stockByProduct = new Map();
+    for (const m of movements) {
+      const k = String(m.product_id);
+      const delta = m.movement_type === 'in' ? toMoney(m.quantity) : -toMoney(m.quantity);
+      stockByProduct.set(k, (stockByProduct.get(k) || 0) + delta);
+    }
+    for (const prod of existingProducts) {
+      const stock = stockByProduct.get(String(prod.id)) || 0;
+      if (Math.abs(stock - toMoney(prod.current_stock)) < 1e-9) continue;
+      await supabase.from('products').update({ current_stock: stock, updated_at: new Date() }).eq('id', prod.id).eq('user_id', userId);
     }
     console.log(`[Auto-Reconcile] Completed for user ${maskId(userId)}.`);
   } catch (err) {
@@ -4791,7 +4840,7 @@ Calls made: ${totalCalls}, Pick-up rate: ${totalCalls ? Math.round(pickedUp/tota
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
+        model: GROQ_MODEL,
         max_tokens: 600,
         messages: [
           { role: 'system', content: 'You are a sharp business analyst for Indian MSMEs. Given data, provide 4-5 specific, actionable insights in plain English. Be direct and data-driven. Format as a JSON array of objects: [{title, insight, action, type}] where type is "success"|"warning"|"danger"|"info". No markdown, pure JSON only.' },
@@ -4938,7 +4987,7 @@ Return a JSON object with this exact structure (no markdown, pure JSON):
         'Authorization': `Bearer ${process.env.GROQ_API_KEY}`
       },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
+        model: GROQ_MODEL,
         max_tokens: 3000,
         temperature: 0.3,
         messages: [
@@ -6468,8 +6517,8 @@ const AI_TOOLS = [
   { type:'function', function:{ name:'place_order_with_supplier', description:'Compose a draft WhatsApp order message to a supplier for the owner to send. Records nothing.', parameters:{ type:'object', properties:{ supplier_name:{ type:'string', description:'Name of the supplier' }, items:{ type:'array', items:{ type:'object', properties:{ name:{type:'string'}, quantity:{type:'number'}, unit:{type:'string',description:'e.g. boxes, kg, units'} } }, description:'Items to order' }, notes:{ type:'string', description:'Any special instructions' } }, required:['supplier_name','items'] } } },
 ];
 
-async function groqChat(messages, tools, toolChoice = 'auto') {
-  const body = { model:'llama-3.3-70b-versatile', max_tokens:1500, temperature:0.2, messages };
+async function groqChat(messages, tools, toolChoice = 'auto', modelOverride = null) {
+  const body = { model: modelOverride || GROQ_MODEL, max_tokens:1500, temperature:0.2, messages };
   if (tools?.length) { body.tools = tools; body.tool_choice = toolChoice; }
   // GROQ_BASE_URL lets a local OpenAI-compatible stub stand in for Groq in
   // tests and pilot:readiness; it is ignored on the production deployment.
@@ -6583,7 +6632,7 @@ function openAiMessagesToGeminiContents(messages) {
   return { systemInstruction, contents };
 }
 
-async function geminiChat(messages, tools, toolChoice = 'auto') {
+async function geminiChat(messages, tools, toolChoice = 'auto', modelOverride = null) {
   const apiKey = cleanScanString(process.env.GEMINI_API_KEY);
   // Reject empty/placeholder keys clearly rather than silently failing
   // or silently falling back to Groq (that would be a hidden behavior
@@ -6602,7 +6651,7 @@ async function geminiChat(messages, tools, toolChoice = 'auto') {
   // same conditions (function-calling confirmed working, honest no-data
   // answers confirmed, no 503s). Revisit this once the 3.6/3.8 rollout
   // stabilizes — GEMINI_MODEL can be overridden without a code change.
-  const model = cleanScanString(process.env.GEMINI_MODEL) || 'gemini-3.1-flash-lite';
+  const model = modelOverride || cleanScanString(process.env.GEMINI_MODEL) || 'gemini-3.1-flash-lite';
   const modelPath = model.replace(/^models\//i, '');
   const { systemInstruction, contents } = openAiMessagesToGeminiContents(messages);
   const geminiTools = openAiToolsToGeminiDeclarations(tools);
@@ -6670,6 +6719,9 @@ async function geminiChat(messages, tools, toolChoice = 'auto') {
 
 const { allowedToolsFor } = require('./lib/ai/assistantTools');
 const { createModelRouter, ModelUnavailableError } = require('./lib/ai/modelRouter');
+const { makeResponsesChat } = require('./lib/ai/responsesChat');
+const { answerFromLedger } = require('./lib/ai/directAnswers');
+const { readRegion } = require('./lib/routes/region');
 const osMissions = require('./lib/domain/os/missions');
 const osWorkflows = require('./lib/domain/os/workflows');
 const decisionControls = require('./lib/domain/decisions/controls');
@@ -6677,8 +6729,28 @@ const decisionStore = require('./lib/domain/decisions/store');
 const { salesChangeWhatIf } = require('./lib/domain/os/whatIf');
 const { whatChangedOverWindow } = require('./lib/domain/intelligence/whatChangedSinceLastLook');
 const modelRouter = createModelRouter({
-  providers: { groq: groqChat, gemini: geminiChat, anthropic: require('./lib/ai/anthropicChat').makeAnthropicChat() },
+  providers: {
+    groq: groqChat,
+    gemini: geminiChat,
+    anthropic: require('./lib/ai/anthropicChat').makeAnthropicChat(),
+    // OpenAI, xAI (Grok) and Perplexity: switched on by setting their key.
+    openai: makeResponsesChat('openai'),
+    xai: makeResponsesChat('xai'),
+    perplexity: makeResponsesChat('perplexity'),
+  },
   pool: getPool(),
+});
+
+// Vault: this company's uploaded files, customer ledgers and agent outputs,
+// all read from its own rows (lib/domain/vault/files.js).
+const { vaultFiles } = require('./lib/domain/vault/files');
+app.get('/api/vault', authMiddleware, async (req, res) => {
+  try {
+    res.json({ success: true, ...(await vaultFiles(getPool(), authenticatedUserId(req))) });
+  } catch (err) {
+    console.error('Vault error:', err.message);
+    res.status(500).json({ error: 'Could not load your files just now.' });
+  }
 });
 
 // Which model providers Ask Starlane can use right now, and this company's AI
@@ -7042,8 +7114,12 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
     } catch(err) { return { error: err.message }; }
   };
 
-  const modelSession = modelRouter.session({ userId: user_id, purpose: 'chat', correlationId: req.requestId });
+  let modelSession;
   try {
+    // The person may pick a model in the composer. Only catalog ids are
+    // accepted; anything else is refused before any model is called.
+    const requestedModel = typeof req.body?.model === 'string' ? req.body.model.trim().slice(0, 64) : null;
+    modelSession = modelRouter.session({ userId: user_id, purpose: 'chat', correlationId: req.requestId, model: requestedModel || null });
     let iteration = 0;
     const maxIter = 6;
     const tools = AI_TOOLS.filter((t) => allowedTools.has(t.function.name));
@@ -7071,12 +7147,20 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
         chatMessages.push(...toolResults);
       } else {
         const text = typeof msg.content === 'string' && msg.content.trim() ? msg.content : 'I could not put an answer together from your data just now. Try asking it a different way.';
-        return res.json({ success:true, message:text, actions, navigate:navigateTo, waLinks });
+        return res.json({ success:true, message:text, actions, navigate:navigateTo, waLinks, model: modelSession.model, requested_model: modelSession.requested });
       }
     }
 
-    return res.json({ success:true, message:'I could not put an answer together from your data just now. Try asking it a different way.', actions, navigate:navigateTo, waLinks });
+    return res.json({ success:true, message:'I could not put an answer together from your data just now. Try asking it a different way.', actions, navigate:navigateTo, waLinks, model: modelSession.model, requested_model: modelSession.requested });
   } catch(err) {
+    if (err instanceof ModelUnavailableError && (err.code === 'UNKNOWN_MODEL' || err.code === 'MODEL_NOT_CONFIGURED')) {
+      return res.status(400).json({
+        error: err.code === 'UNKNOWN_MODEL'
+          ? 'That model is not one Ask Starlane offers. Pick another model and ask again.'
+          : `${err.message} Pick another model, or Auto, and ask again.`,
+        code: `AI_${err.code}`,
+      });
+    }
     if (err instanceof ModelUnavailableError) {
       // Say what failed and what still works, instead of a bare 500.
       const why = {
@@ -7085,6 +7169,18 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
         PROVIDERS_FAILED: 'Ask Starlane could not reach its AI model just now.',
       }[err.code] || err.message;
       console.warn('AI chat unavailable:', err.code, JSON.stringify(err.detail || {}));
+      // The common questions (who owes the most, totals, how late) are sums
+      // over the ledger: answer those exactly instead of failing.
+      try {
+        const question = messages[messages.length - 1].content;
+        const { data: openInvoices } = await supabase.from('invoices')
+          .select('customer_name, invoice_number, invoice_amount, payment_amount, payment_status, due_date, invoice_date, currency')
+          .eq('user_id', user_id).neq('payment_status', 'Paid').limit(20000);
+        let region = { currency: 'INR', locale: null };
+        if (pgPool) { try { region = await readRegion(pgPool, user_id); } catch (_) { /* default region */ } }
+        const direct = answerFromLedger(question, openInvoices || [], { currency: region.currency, locale: region.locale });
+        if (direct) return res.json({ success: true, message: direct.message, actions, navigate: null, waLinks, mode: 'ledger', model_unavailable: err.code });
+      } catch (e) { console.warn('AI chat ledger answer failed:', e.message); }
       return res.status(503).json({
         error: `${why} Your data is safe. Decisions, Monitors, Tasks and Scan my books still work without it.`,
         code: `AI_${err.code}`,
@@ -7098,6 +7194,26 @@ HARD RULE — never fabricate data you don't have: You only know what your tools
 // ============================================
 // PAYMENT LINKS — Send UPI link to debtor
 // ============================================
+
+// Invoices marked paid in the last two days, newest first, for the
+// "payment landed" moment every signed-in page shows. Small on purpose: the
+// browser used to download the whole invoice list every 30 seconds for this.
+app.get('/api/payments/recent', authMiddleware, async (req, res) => {
+  const userId = authenticatedUserId(req);
+  if (!userId) return res.status(401).json({ error: 'Not signed in' });
+  try {
+    const since = new Date(Date.now() - 2 * 86_400_000).toISOString().slice(0, 10);
+    const { data, error } = await supabase.from('invoices')
+      .select('id, customer_name, invoice_amount, payment_amount, currency, payment_date')
+      .eq('user_id', userId).eq('payment_status', 'Paid').gte('payment_date', since)
+      .order('payment_date', { ascending: false }).limit(50);
+    if (error) throw error;
+    res.json({ success: true, payments: (data || []).map((i) => ({ id: i.id, customer_name: i.customer_name, amount: Number(i.payment_amount) || Number(i.invoice_amount) || 0, currency: i.currency || null, payment_date: i.payment_date })) });
+  } catch (error) {
+    logRouteError(req, error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 app.post('/api/payments/create-link', authMiddleware, async (req, res) => {
   try {
@@ -7947,7 +8063,7 @@ async function makeAutoCall(userId, invoice) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
         body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
+          model: GROQ_MODEL,
           messages: [{ role: 'user', content: `Write a 25-word Hinglish phone call opening for collecting ₹${invoice.invoice_amount} from ${invoice.customer_name}, ${invoice.days_overdue} days overdue. Business: ${bizName}. Output only the script text, no quotes.` }],
           temperature: 0.3, max_tokens: 80,
         }),
@@ -8330,7 +8446,7 @@ Write a crisp 3-sentence morning briefing for the business owner. Be specific, u
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
         body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
+          model: GROQ_MODEL,
           max_tokens: 200,
           temperature: 0.4,
           messages: [{ role: 'user', content: briefingPrompt }],
@@ -8508,7 +8624,7 @@ Use natural Hinglish like "bhai", "aap", "theek hai", "koi baat nahi", "kal tak"
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
+        model: GROQ_MODEL,
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.4,
         response_format: { type: 'json_object' },
@@ -8557,7 +8673,7 @@ app.post('/api/ai/bulk-whatsapp', authMiddleware, async (req, res) => {
       const { data: profile } = await supabase.from('users')
         .select('owner_name, city, voice_style, ai_persona').eq('id', userId).single();
       if (profile?.owner_name || profile?.ai_persona) {
-        bulkVoiceCtx = `\nGenerate these messages as if written by ${profile.owner_name || 'the business owner'} personally. Style: ${profile.voice_style || 'casual_hinglish'}. ${profile.ai_persona ? profile.ai_persona : ''} Sound like a real person they know, not a robot.`;
+        bulkVoiceCtx = `\nGenerate these messages as if written by ${profile.owner_name || 'the business owner'} personally. Style: ${profile.voice_style || 'direct_english'}. ${profile.ai_persona ? profile.ai_persona : ''} Sound like a real person they know, not a robot.`;
       }
     } catch (_) {}
 
@@ -8579,7 +8695,7 @@ Sort by urgency (most overdue first). Use natural Hinglish.`;
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
+        model: GROQ_MODEL,
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.3,
         response_format: { type: 'json_object' },
@@ -8641,7 +8757,7 @@ Output JSON: { "style_description": "2-3 sentences describing exact style", "det
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
+        model: GROQ_MODEL,
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.3,
         response_format: { type: 'json_object' },
@@ -8654,7 +8770,7 @@ Output JSON: { "style_description": "2-3 sentences describing exact style", "det
     // Auto-save the detected style to user profile
     await supabase.from('users').update({
       ai_persona: result.style_description,
-      voice_style: result.detected_style || 'casual_hinglish',
+      voice_style: result.detected_style || 'direct_english',
       updated_at: new Date(),
     }).eq('id', userId);
 
@@ -8731,7 +8847,7 @@ app.post('/api/voice/call', authMiddleware, async (req, res) => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
         body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
+          model: GROQ_MODEL,
           messages: [{ role: 'user', content: `Write a 20-word Hinglish phone call opening for collecting ₹${invoice_amount} from ${customer_name}, ${days_overdue} days overdue. Tone: ${tone}. Business: ${profile?.business_name}. ${profile?.ai_persona || ''}. Output only the script text.` }],
           temperature: 0.3,
         }),
@@ -9565,7 +9681,7 @@ Return JSON only:
     const aiRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
-      body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'user', content: prompt }], temperature: 0.2, max_tokens: 1200 })
+      body: JSON.stringify({ model: GROQ_MODEL, messages: [{ role: 'user', content: prompt }], temperature: 0.2, max_tokens: 1200 })
     });
     const aiData = await aiRes.json();
     const text = aiData.choices?.[0]?.message?.content || '{}';
@@ -9912,7 +10028,7 @@ Extract order from Hindi/Hinglish transcript. Return ONLY valid JSON, no comment
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile', temperature: 0.1, max_tokens: 500,
+        model: GROQ_MODEL, temperature: 0.1, max_tokens: 500,
         messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
       }),
     });
@@ -10238,7 +10354,7 @@ LIVE BUSINESS SNAPSHOT (right now):
 • Team: ${(workers || []).filter(w => w.is_active).map(w => w.name).join(', ') || 'no workers yet'}`;
 
     // Voice/persona context
-    const styleDesc = { casual_hinglish:'Mix of Hindi + English (Hinglish)', formal_hindi:'Formal Hindi', direct_english:'Direct English', friendly_urdu:'Friendly Urdu-influenced', regional_hindi:'Regional Hindi dialect' }[profile?.voice_style || ''] || 'Hinglish';
+    const styleDesc = { casual_hinglish:'Mix of Hindi + English (Hinglish)', formal_hindi:'Formal Hindi', direct_english:'Direct English', friendly_urdu:'Friendly Urdu-influenced', regional_hindi:'Regional Hindi dialect' }[profile?.voice_style || ''] || 'Direct English';
     const voiceCtx = profile?.owner_name ? `\nSPEAK TO OWNER AS: ${profile.owner_name} ji. Style: ${styleDesc}. ${profile?.ai_persona ? 'Their style: ' + profile.ai_persona : ''}` : '';
 
     const systemPrompt = `You are Vantro Brain — a specialized AI built exclusively for this Indian MSME business.
@@ -10412,7 +10528,7 @@ RULES:
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
         body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
+          model: GROQ_MODEL,
           messages,
           tools,
           tool_choice: 'auto',
@@ -10578,7 +10694,17 @@ app.post('/api/onboarding/business', authMiddleware, async (req, res) => {
     };
     const { error } = await supabase.from('users').update(update).eq('id', userId);
     if (error) throw error;
-    res.json({ success: true });
+    // The country sets the business's currency, number format, timezone and
+    // tax label (only the ones not already chosen). A failure here does not
+    // fail onboarding; Settings can set them later.
+    let region = null;
+    if (process.env.DATABASE_URL) {
+      region = await applyCountryDefaults(getPool(), userId, update.country).catch((e) => {
+        logRouteError(req, e);
+        return null;
+      });
+    }
+    res.json({ success: true, region });
   } catch (err) { logRouteError(req, err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
@@ -12750,6 +12876,22 @@ app.use('/api', authProvidersRouter({
 const { connectorsRouter } = require('./lib/routes/connectors');
 app.use('/api/connectors', connectorsRouter({ pool: getPool(), authMiddleware }));
 
+// Region: country, currency, number/date format, timezone and tax label for
+// the business (lib/locale/region.js). Stored as versioned definitions.
+const { regionRouter, applyCountryDefaults } = require('./lib/routes/region');
+app.use('/api/settings/region', regionRouter({ pool: getPool(), authMiddleware }));
+
+// Custom workflows: owners chain agents, conditions and actions behind a
+// trigger (lib/domain/workflows/customWorkflows.js). Needs migration 068.
+const { customWorkflowsRouter, runScheduledCustomWorkflows } = require('./lib/routes/customWorkflows');
+app.use('/api/custom-workflows', customWorkflowsRouter({ pool: getPool(), authMiddleware, isEnabled: isFeatureEnabled }));
+
+// Connect any software: incoming webhooks, any REST API, Gmail as a source
+// (lib/connectors/connections.js, gmailInbox.js). Needs migration 069.
+const { connectionsRouter, hooksRouter } = require('./lib/routes/connections');
+app.use('/api/integrations', connectionsRouter({ pool: getPool(), authMiddleware }));
+app.use('/api/hooks', hooksRouter({ pool: getPool() }));
+
 app.get('/api/ai-actions', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -13956,6 +14098,35 @@ cron.schedule('10 * * * *', async () => {
     if (!outcome.ran) { _log('info', '[WorldUSGSCron] Skipped — previous run still holds the lock'); return; }
     _log('info', '[WorldUSGSCron] Done', outcome.result.stats);
   } catch (err) { _log('error', '[WorldUSGSCron] Fatal', { error: err.message }); }
+}, { timezone: 'UTC' });
+
+// Custom workflows with a schedule trigger — checked every 15 minutes, gated by
+// FEATURE_CUSTOM_WORKFLOW_SCHEDULER_ENABLED (default OFF). Each run is claimed
+// by (workflow, schedule slot), so a firing never runs twice, and every agent
+// step still checks its kill switches.
+cron.schedule('*/15 * * * *', async () => {
+  const { isEnabled: _isFE } = require('./lib/featureFlags');
+  if (!_isFE('custom_workflow_scheduler_enabled') || !process.env.DATABASE_URL) return;
+  const { safeLog: _log } = require('./lib/observability/logger');
+  try {
+    const out = await runScheduledCustomWorkflows(getPool());
+    if (out.ran || out.failed) _log('info', '[CustomWorkflowCron] Done', out);
+  } catch (err) { _log('error', '[CustomWorkflowCron] Fatal', { error: err.message }); }
+}, { timezone: 'UTC' });
+
+// Workflows that start from a Gmail message — new inbox messages are read every
+// 5 minutes for tenants with such a workflow turned on, under the same flag
+// as scheduled workflows. Each message runs a workflow at most once.
+cron.schedule('*/5 * * * *', async () => {
+  const { isEnabled: _isFE } = require('./lib/featureFlags');
+  if (!_isFE('custom_workflow_scheduler_enabled') || !process.env.DATABASE_URL) return;
+  const { safeLog: _log } = require('./lib/observability/logger');
+  try {
+    const { pollAllInboxes } = require('./lib/connectors/gmailInbox');
+    const { dispatchEvent } = require('./lib/domain/workflows/customWorkflows');
+    const out = await pollAllInboxes(getPool(), { dispatch: dispatchEvent });
+    if (out.events || out.failed) _log('info', '[GmailWorkflowCron] Done', out);
+  } catch (err) { _log('error', '[GmailWorkflowCron] Fatal', { error: err.message }); }
 }, { timezone: 'UTC' });
 
 // Starlane decisions — hourly discovery and daily contract verification per
