@@ -48,12 +48,12 @@ async function main() {
   check('+91 and 0-prefixed forms agree', normalizePhone('+91 98765-43210') === '919876543210' && normalizePhone('098765 43210') === '919876543210');
   check('too short is empty', normalizePhone('12345') === '');
 
-  codes.issue('t:a', '111111', { userId: 'u1' }, 60000);
-  check('a wrong code fails', codes.consume('t:a', '222222') === null);
-  check('the right code works once', codes.consume('t:a', '111111')?.userId === 'u1' && codes.consume('t:a', '111111') === null);
-  codes.issue('t:b', '333333', { userId: 'u2' }, 60000);
-  codes.consume('t:b', 'x', { maxAttempts: 1 });
-  check('one wrong guess burns a single-attempt code', codes.consume('t:b', '333333', { maxAttempts: 1 }) === null);
+  await codes.issue('t:a', '111111', { userId: 'u1' }, 60000);
+  check('a wrong code fails', (await codes.consume('t:a', '222222')) === null);
+  check('the right code works once', (await codes.consume('t:a', '111111'))?.userId === 'u1' && (await codes.consume('t:a', '111111')) === null);
+  await codes.issue('t:b', '333333', { userId: 'u2' }, 60000);
+  await codes.consume('t:b', 'x', { maxAttempts: 1 });
+  check('one wrong guess burns a single-attempt code', (await codes.consume('t:b', '333333', { maxAttempts: 1 })) === null);
 
   // A database blip does not end a session that was just confirmed active.
   {
