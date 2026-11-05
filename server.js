@@ -475,6 +475,8 @@ app.use((req, res, next) => {
   if (req.path === '/api/payments/webhook') return next();
   // Incoming webhooks keep the raw body for signature checks (lib/routes/connections.js).
   if (req.path.startsWith('/api/hooks/')) return next();
+  // Meta signs the exact bytes of WhatsApp deliveries (lib/routes/connectors.js).
+  if (req.path === '/api/connectors/whatsapp_business/webhook') return next();
   return jsonParser(req, res, next);
 });
 app.use(express.urlencoded({ extended: true })); // Twilio webhooks send form-encoded
@@ -599,7 +601,8 @@ const apiLimiter = makeLimiter({
   // webhook URL, plus a wider per-IP backstop. Senders such as Stripe or
   // Zapier post for every tenant from a few shared IPs, so the anonymous
   // 120/min per-IP budget here would throttle all tenants together.
-  skip: (req) => String(req.originalUrl || '').startsWith('/api/hooks/'),
+  // Meta delivers every tenant's WhatsApp messages from shared IPs too.
+  skip: (req) => String(req.originalUrl || '').startsWith('/api/hooks/') || String(req.originalUrl || '').startsWith('/api/connectors/whatsapp_business/webhook'),
 });
 const uploadLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, max: 20 });
 const aiLimiter = makeLimiter({ windowMs: 10 * 60 * 1000, max: 40, keyGenerator: authAwareKey });
@@ -14123,6 +14126,21 @@ cron.schedule('*/5 * * * *', async () => {
     const out = await pollAllInboxes(getPool(), { dispatch: dispatchEvent });
     if (out.events || out.failed) _log('info', '[GmailWorkflowCron] Done', out);
   } catch (err) { _log('error', '[GmailWorkflowCron] Fatal', { error: err.message }); }
+}, { timezone: 'UTC' });
+
+// Live app connectors (Zoho Books, QuickBooks Online, Razorpay) — every 30
+// minutes each connected account is read again. Only connectors that are
+// Live run (their FEATURE_CONNECTOR_*_ENABLED flag on and developer
+// credentials set; lib/connectors/apps/index.js). Read-only: nothing is
+// written to those apps.
+cron.schedule('*/30 * * * *', async () => {
+  if (!process.env.DATABASE_URL) return;
+  const { safeLog: _log } = require('./lib/observability/logger');
+  try {
+    const { syncAllApps } = require('./lib/connectors/apps/sync');
+    const out = await syncAllApps(getPool());
+    if (out.accounts) _log('info', '[AppConnectorCron] Done', out);
+  } catch (err) { _log('error', '[AppConnectorCron] Fatal', { error: err.message }); }
 }, { timezone: 'UTC' });
 
 // Starlane decisions — hourly discovery and daily contract verification per
