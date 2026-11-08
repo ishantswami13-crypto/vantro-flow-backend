@@ -54,7 +54,6 @@
     "staging:migrate":     "node scripts/staging-migrate.js",
     "staging:seed":        "node scripts/staging-seed.js",
     "staging:jwt":         "node scripts/staging-jwt.js",
-
     "staging:verify-auth": "node scripts/staging-verify-auth.js",
     "staging:setup-supabase": "node scripts/setup-node-staging-supabase.js",
     "staging:create-supabase": "node scripts/create-supabase-staging.js",
@@ -70,7 +69,6 @@
     "@anthropic-ai/sdk": "^0.113.0",
     "@supabase/supabase-js": "^2.49.8",
     "bcryptjs": "^2.4.3",
-    "compression": "^1.8.2",
     "compression": "^1.8.2",
     "cors": "^2.8.5",
     "dotenv": "^16.5.0",
