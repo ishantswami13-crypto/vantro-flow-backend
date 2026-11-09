@@ -5932,7 +5932,12 @@ app.get('/api/ready', (req, res) => {
       database_configured: !!process.env.DATABASE_URL,
       database_connectivity: 'not_checked',
       authConfig: process.env.JWT_SECRET ? 'ok' : 'missing',
-      supabaseConfig: process.env.SUPABASE_URL ? 'ok' : 'missing',
+      // Supabase is optional: without it every query runs over DATABASE_URL
+      // through the pg shim, which is a complete setup, not a gap.
+      supabaseConfig: (() => {
+        const { dataLayer } = require('./lib/config/supabaseClient');
+        return dataLayer === 'supabase' ? 'ok' : dataLayer === 'pg_shim' ? 'not_needed_pg_direct' : 'missing';
+      })(),
       metrics: process.env.METRICS_TOKEN ? 'ok' : 'missing',
       // Whether a new user can receive a sign-up code, without naming the
       // sender or any key: Resend's sandbox sender only reaches the Resend
