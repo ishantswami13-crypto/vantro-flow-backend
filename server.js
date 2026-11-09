@@ -1394,6 +1394,16 @@ app.post('/api/auth/signup', async (req, res) => {
 
     const user = data[0];
 
+    // The signup code is off unless SIGNUP_OTP_REQUIRED=true: WhatsApp
+    // delivery isn't configured in production yet, so a required code would
+    // leave new accounts stuck. Without it, signup signs in the same way
+    // /api/auth/login does.
+    if (process.env.SIGNUP_OTP_REQUIRED !== 'true') {
+      const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+      const csrf_token = setSessionCookies(res, token);
+      return res.json({ success: true, token, csrf_token, user });
+    }
+
     // Generate and send OTP
     const otp = await storeOTP(user.id);
     const otpMsg = `Starlane verification code: *${otp}*\n\nYe code 10 minute mein expire ho jaayega. Kisi ke saath share mat karein.`;
