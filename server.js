@@ -12919,6 +12919,11 @@ app.use('/api/settings/region', regionRouter({ pool: getPool(), authMiddleware }
 const { entitiesRouter } = require('./lib/routes/entities');
 app.use('/api/entities', entitiesRouter({ pool: getPool(), authMiddleware }));
 
+// Team dashboard: the people who own customer accounts (migration 072).
+// Customers are assigned to a rep by name; the tenant is the JWT user.
+const { repsRouter } = require('./lib/routes/reps');
+app.use('/api/reps', repsRouter({ pool: getPool(), authMiddleware }));
+
 // Custom workflows: owners chain agents, conditions and actions behind a
 // trigger (lib/domain/workflows/customWorkflows.js). Needs migration 068.
 const { customWorkflowsRouter, runScheduledCustomWorkflows } = require('./lib/routes/customWorkflows');
