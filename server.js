@@ -12914,6 +12914,11 @@ app.use('/api/connectors', connectorsRouter({ pool: getPool(), authMiddleware })
 const { regionRouter, applyCountryDefaults } = require('./lib/routes/region');
 app.use('/api/settings/region', regionRouter({ pool: getPool(), authMiddleware }));
 
+// Spaces: several companies under one account (migration 071). Customers and
+// suppliers are assigned to a company by name; the tenant is the JWT user.
+const { entitiesRouter } = require('./lib/routes/entities');
+app.use('/api/entities', entitiesRouter({ pool: getPool(), authMiddleware }));
+
 // Custom workflows: owners chain agents, conditions and actions behind a
 // trigger (lib/domain/workflows/customWorkflows.js). Needs migration 068.
 const { customWorkflowsRouter, runScheduledCustomWorkflows } = require('./lib/routes/customWorkflows');
