@@ -242,6 +242,8 @@ test('a person gives an agent work: the instruction is stored on the run and rea
   const detail = await ca.get(`/api/os/agents/${key}/runs/${run.body.runId}`);
   assert.equal(detail.body.run.input.instruction, 'Lay out the next 8 weeks and tell me which week runs short');
   assert.equal(detail.body.run.input.horizonDays, 56);
+  const listed = (await ca.get(`/api/os/agents/${key}/runs`)).body.runs.find((x) => x.id === run.body.runId);
+  assert.equal(listed.instruction, 'Lay out the next 8 weeks and tell me which week runs short', 'the run list carries the task');
 
   assert.equal((await ca.post(`/api/os/agents/${key}/run`, { instruction: 'x'.repeat(1001) })).status, 400);
   assert.equal((await ca.post(`/api/os/agents/${key}/run`, { instruction: 42 })).status, 400);
