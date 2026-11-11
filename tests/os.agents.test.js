@@ -10,6 +10,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { dbReady, createTenant, deleteTenant, seedGolden, startServer, client, todayIso } = require('./helpers/decisionHarness');
 const { computeWorkingCapital } = require('../lib/domain/os/workingCapital');
+const { cleanInstruction, horizonFromInstruction, readInstruction } = require('../lib/domain/os/agentWork');
 
 const DAY = 86400000;
 const asOfDay = Date.UTC(2026, 10, 3);
@@ -76,6 +77,33 @@ test('money out counts unpaid purchases, overdue ones land in week one, and the 
 test('nothing open means NEEDS_DATA, not a zero forecast', () => {
   const wc = computeWorkingCapital({ asOfDay, receivables: [], purchases: [] });
   assert.equal(wc.status, 'NEEDS_DATA');
+});
+
+// ── Work instructions (no database) ─────────────────────────────────────
+
+test('an instruction is cleaned and a fixed agent only takes what it can read from it', () => {
+  assert.equal(cleanInstruction('   '), null);
+  assert.equal(cleanInstruction(undefined), null);
+  assert.equal(cleanInstruction('  next 60 days\u0000 please '), 'next 60 days please');
+  assert.throws(() => cleanInstruction('x'.repeat(1001)), /under 1000/);
+  assert.throws(() => cleanInstruction({ a: 1 }), /must be text/);
+
+  assert.equal(horizonFromInstruction('Lay out the next 60 days'), 60);
+  assert.equal(horizonFromInstruction('next 8 weeks'), 56);
+  assert.equal(horizonFromInstruction('two months ahead'), 60);
+  assert.equal(horizonFromInstruction('who should I chase?'), null);
+
+  const wc = 'starlane.working_capital';
+  const a = readInstruction(wc, 'next 6 weeks', { workingCapitalKey: wc });
+  assert.equal(a.settings.horizonDays, 42);
+  assert.match(a.understood, /42-day horizon/);
+  const clamped = readInstruction(wc, 'next 365 days', { workingCapitalKey: wc });
+  assert.equal(clamped.settings.horizonDays, 90, 'clamped to what the agent supports, and it says so');
+  assert.match(clamped.understood, /used 90/);
+  const other = readInstruction('starlane.scan', 'look at the last quarter', { workingCapitalKey: wc });
+  assert.deepEqual(other.settings, {});
+  assert.match(other.understood, /fixed code/);
+  assert.deepEqual(readInstruction(wc, null, { workingCapitalKey: wc }), { settings: {}, understood: null });
 });
 
 // ── HTTP (real database) ─────────────────────────────────────────────────
@@ -192,9 +220,48 @@ test('kill switches stop on-demand runs; agents that run in their own flow canno
   await ca.post('/api/decisions/controls', { scope: 'AGENT', scopeKey: key, stopped: false });
   assert.equal((await ca.post(`/api/os/agents/${key}/run`, {})).status, 200);
 
-  assert.equal((await ca.post('/api/os/agents/starlane.decision_engine/run', {})).status, 409);
+  assert.equal((await ca.post('/api/os/agents/starlane.collections_agent/run', {})).status, 409);
   assert.equal((await ca.get('/api/os/agents/no.such.agent/runs')).status, 404);
   const verifier = await ca.get('/api/os/agents/starlane.outcome_verifier/runs');
   assert.equal(verifier.status, 200);
   assert.equal(verifier.body.tracked, false, 'agents without a run log say so');
+});
+
+test('a person gives an agent work: the instruction is stored on the run and read where it can be', async (t) => {
+  if (!env.ok) return t.skip(`no database: ${env.reason}`);
+  const a = await tenant('wc-work');
+  const b = await tenant('wc-work-b');
+  await seedGolden(env.pool, a.id, todayIso());
+  const ca = client(server.base, a);
+  const key = 'starlane.working_capital';
+
+  const run = await ca.post(`/api/os/agents/${key}/run`, { instruction: 'Lay out the next 8 weeks and tell me which week runs short' });
+  assert.equal(run.status, 200, JSON.stringify(run.body).slice(0, 400));
+  assert.equal(run.body.horizonDays, 56, 'the horizon came from the instruction');
+  assert.match(run.body.understood, /56-day horizon/);
+  const detail = await ca.get(`/api/os/agents/${key}/runs/${run.body.runId}`);
+  assert.equal(detail.body.run.input.instruction, 'Lay out the next 8 weeks and tell me which week runs short');
+  assert.equal(detail.body.run.input.horizonDays, 56);
+
+  assert.equal((await ca.post(`/api/os/agents/${key}/run`, { instruction: 'x'.repeat(1001) })).status, 400);
+  assert.equal((await ca.post(`/api/os/agents/${key}/run`, { instruction: 42 })).status, 400);
+
+  // Another tenant cannot read the instruction.
+  assert.equal((await client(server.base, b).get(`/api/os/agents/${key}/runs/${run.body.runId}`)).status, 404);
+});
+
+test('the decision engine can be started on demand; it prepares decisions and sends nothing', async (t) => {
+  if (!env.ok) return t.skip(`no database: ${env.reason}`);
+  const a = await tenant('de-run');
+  await seedGolden(env.pool, a.id, todayIso());
+  const ca = client(server.base, a);
+  const key = 'starlane.decision_engine';
+  assert.equal((await ca.get('/api/os/agents')).body.agents.find((x) => x.key === key).runnable, true);
+  const run = await ca.post(`/api/os/agents/${key}/run`, { instruction: 'Find what needs me this week' });
+  assert.equal(run.status, 200, JSON.stringify(run.body).slice(0, 400));
+  assert.ok(run.body.runId, 'the run is recorded and its id returned');
+  const detail = await ca.get(`/api/os/agents/${key}/runs/${run.body.runId}`);
+  assert.equal(detail.body.run.input.instruction, 'Find what needs me this week');
+  const sent = await env.pool.query(`SELECT COUNT(*)::int AS n FROM outbound_messages WHERE user_id = $1`, [a.id]).catch(() => ({ rows: [{ n: 0 }] }));
+  assert.equal(sent.rows[0].n, 0, 'starting the agent sends no message');
 });
