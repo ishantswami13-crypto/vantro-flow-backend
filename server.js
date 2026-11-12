@@ -419,7 +419,7 @@ const corsOptions = {
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   // X-Access-Token: access-flow status/entitlement tokens (lib/routes/access.js).
   // X-Sync-Run-Id: connector hosts tie an import to the sync run they started.
-  allowedHeaders: ["Authorization", "Content-Type", "X-CSRF-Token", "X-Request-ID", "X-Access-Token", "X-Sync-Run-Id", "X-Starlane-Client"],
+  allowedHeaders: ["Authorization", "Content-Type", "X-CSRF-Token", "X-Request-ID", "X-Access-Token", "X-Sync-Run-Id", "X-Starlane-Client", "X-Starlane-Org", "Idempotency-Key"],
   // Lets the frontend read the X-CSRF-Token response header (set below in
   // authMiddleware) across origins — without this, a custom response header
   // is invisible to cross-origin fetch() even though the browser received
@@ -12930,6 +12930,23 @@ const { connectionsRouter, hooksRouter } = require('./lib/routes/connections');
 app.use('/api/integrations', connectionsRouter({ pool: getPool(), authMiddleware }));
 app.use('/api/hooks', hooksRouter({ pool: getPool() }));
 
+// Universal platform: organizations, apps, members, Agent Studio, the agent
+// execution engine, approvals, knowledge, connections and Command Center
+// (lib/routes/platform.js, lib/platform/*). Needs migration 072. The worker
+// runs in every instance (leases and SKIP LOCKED keep runs single) unless
+// PLATFORM_WORKER_ENABLED=false.
+const { platformRouter, platformHooksRouter } = require('./lib/routes/platform');
+let platformWorker = null;
+const wakePlatformWorker = () => { if (platformWorker) platformWorker.tick(); };
+app.use('/api/platform/hooks', platformHooksRouter({ pool: getPool(), onExecutionQueued: wakePlatformWorker }));
+app.use('/api/platform', platformRouter({ pool: getPool(), authMiddleware, router: modelRouter, onExecutionQueued: wakePlatformWorker }));
+if (process.env.DATABASE_URL && String(process.env.PLATFORM_WORKER_ENABLED || 'true').toLowerCase() !== 'false') {
+  platformWorker = require('./lib/platform/engine').startWorker(getPool(), { router: modelRouter }, {
+    intervalMs: Number(process.env.PLATFORM_WORKER_INTERVAL_MS || 2000),
+    parallel: Number(process.env.PLATFORM_WORKER_PARALLEL || 2),
+  });
+}
+
 app.get('/api/ai-actions', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -15239,6 +15256,7 @@ async function shutdown(sig) {
   await Promise.race([closed, new Promise((r) => setTimeout(r, graceMs))]);
   httpServer.closeAllConnections?.();
   if (outboundRunner) await outboundRunner.stop().catch(() => {});
+  if (platformWorker) platformWorker.stop();
   await Promise.allSettled([
     pgPool ? pgPool.end() : null,
     require('./lib/db/pg').isAvailable() ? require('./lib/db/pg').getPool().end() : null,
