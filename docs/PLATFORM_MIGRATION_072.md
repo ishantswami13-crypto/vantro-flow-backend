@@ -67,3 +67,19 @@ COMMIT;
 ```
 
 Invitation emails go out only when the admin ticks the box and `RESEND_API_KEY` is set; links point at `FRONTEND_URL`.
+
+## Migration 074: meaning search for Knowledge
+
+`migrations/074_knowledge_embeddings.sql` adds two nullable columns to `platform_knowledge_chunks` (`embedding REAL[]`, `embedding_model TEXT`), two indexes and a small SQL function `platform_dot(real[], real[])`. It needs no extension (no pgvector) and depends on 072. It is additive: until it is applied, and while the feature is off, Knowledge search keeps working by words.
+
+Meaning search stays off unless `FEATURE_KNOWLEDGE_EMBEDDINGS_ENABLED=true` and `OPENAI_API_KEY` or `GEMINI_API_KEY` is set (`KNOWLEDGE_EMBEDDINGS_PROVIDER` picks one when both are). Turning it on sends passage text and search queries to that provider to be embedded; check that this is acceptable for the organization's data before enabling it. If the provider fails, search falls back to words and says so.
+
+Roll back with:
+
+```sql
+BEGIN;
+ALTER TABLE platform_knowledge_chunks DROP COLUMN IF EXISTS embedding, DROP COLUMN IF EXISTS embedding_model;
+DROP FUNCTION IF EXISTS platform_dot(real[], real[]);
+DELETE FROM starlane_migrations WHERE filename = 'migrations/074_knowledge_embeddings.sql';
+COMMIT;
+```
