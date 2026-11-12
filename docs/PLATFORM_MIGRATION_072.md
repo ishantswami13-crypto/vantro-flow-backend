@@ -52,3 +52,18 @@ COMMIT;
 ```
 
 This loses agents, runs, approvals and knowledge created on the platform. Organization rows created by the backfill are harmless and can stay.
+
+## Migration 073: invitations
+
+`migrations/073_platform_invitations.sql` adds one table, `platform_invitations`, and depends on 072. It is additive and safe to apply right after 072 with the same `npm run db:migrate`. Until it is applied, everything else keeps working; only inviting someone without an account fails (adding an existing account does not use it).
+
+Roll back with:
+
+```sql
+BEGIN;
+DROP TABLE IF EXISTS platform_invitations;
+DELETE FROM starlane_migrations WHERE filename = 'migrations/073_platform_invitations.sql';
+COMMIT;
+```
+
+Invitation emails go out only when the admin ticks the box and `RESEND_API_KEY` is set; links point at `FRONTEND_URL`.
