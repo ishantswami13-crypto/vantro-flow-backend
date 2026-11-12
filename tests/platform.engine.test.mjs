@@ -329,7 +329,24 @@ try {
   // ── Command Center and connections are real reads ─────────────────────
   const cc = await api(dist, 'GET', '/command-center');
   check('command center counts stored executions', cc.status === 200 && cc.executions.last7d.completed >= 4 && cc.usage.modelCalls > 0, cc.executions);
-  check('cost is reported as not measured, not invented', cc.usage.cost.available === false);
+  check('cost is reported as not measured, not invented', cc.usage.cost.available === false && /No price is set for test\/scripted/.test(cc.usage.cost.reason), cc.usage.cost);
+  check('tokens are recorded per model', cc.usage.cost.byModel.some((m) => m.model === 'test/scripted' && m.calls > 0 && m.inputTokens > 0 && m.cost === null), cc.usage.cost.byModel);
+  check('member cannot set model prices', (await api(member, 'PUT', '/policies', { modelPrices: { currency: 'USD', models: { 'test/scripted': { input: 1, output: 1 } } } }, { org: distOrg })).status === 403);
+  check('a negative price is refused', (await api(dist, 'PUT', '/policies', { modelPrices: { currency: 'USD', models: { 'test/scripted': { input: -1, output: 1 } } } })).status === 400);
+  check('a malformed model name is refused', (await api(dist, 'PUT', '/policies', { modelPrices: { currency: 'USD', models: { 'no slash': { input: 1, output: 1 } } } })).status === 400);
+  const priced = await api(dist, 'PUT', '/policies', { modelPrices: { currency: 'USD', models: { 'test/scripted': { input: 3, output: 15 } } } });
+  check('admin sets a price per million tokens', priced.status === 200 && priced.policy.modelPrices.models['test/scripted'].output === 15, priced);
+  const run1 = (await api(dist, 'GET', `/executions/${t1.executionId}`)).execution;
+  const u1 = run1.usageByModel['test/scripted'];
+  const expected1 = Math.round(((u1.input * 3 + u1.output * 15) / 1e6) * 1e6) / 1e6;
+  check('a run reports tokens per model that add up to its totals', u1 && u1.input === run1.inputTokens && u1.output === run1.outputTokens, run1.usageByModel);
+  check('a run\'s cost is computed from its tokens and the price', run1.cost.available === true && run1.cost.value === expected1 && run1.cost.currency === 'USD', run1.cost);
+  check('model steps carry their own token counts', run1.steps.filter((x) => x.kind === 'model').every((x) => Number.isInteger(x.output?.inputTokens)));
+  const cc2 = await api(dist, 'GET', '/command-center');
+  check('command center cost is measured once every model has a price', cc2.usage.cost.available === true && cc2.usage.cost.value > 0, cc2.usage.cost);
+  const us = await api(dist, 'GET', '/usage');
+  check('usage shows cost per agent', us.cost.available === true && us.perAgent.some((a) => a.cost.available && a.cost.value > 0), us.perAgent);
+  check('another organization\'s prices are separate', (await api(svc, 'GET', '/policies')).policy.modelPrices.models['test/scripted'] === undefined);
   check('failures surface as alerts', cc.alerts.some((a) => a.kind === 'failures'));
   const ccSvc = await api(svc, 'GET', '/command-center');
   check('another organization sees an empty command center', ccSvc.executions.last7d.completed === 0 && ccSvc.recent.length === 0);
