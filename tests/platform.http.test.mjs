@@ -3,7 +3,12 @@
 // run that fails honestly because no model key is set in this environment,
 // the webhook trigger's credential check, and that existing finance routes
 // still answer for the same user. Needs DATABASE_URL with migration 072.
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 import { makeChecker, openPool, seedUser, deleteUsers, startServer } from './helpers/httpHarness.mjs';
+
+const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'knowledge');
 
 const { check, done } = makeChecker();
 const pool = openPool();
@@ -46,6 +51,28 @@ try {
   check('another tenant cannot read the run', (await call(b, 'GET', `/api/platform/executions/${t.executionId}`)).http === 404);
   check('bad webhook token is a 404', (await call(null, 'POST', `/api/platform/hooks/agents/${'0'.repeat(48)}`, { x: 1 })).http === 404);
   check('client cannot spoof the org through the body', (await call(b, 'GET', '/api/platform/agents')).agents.length === 0);
+
+  // Knowledge uploads: the server reads PDF and Word text; the file is not kept.
+  const col = await call(a, 'POST', '/api/platform/knowledge/collections', { name: 'Policies', scope: 'organization' });
+  const upload = async (u, colId, file, name, title) => {
+    const fd = new FormData();
+    fd.append('file', new Blob([readFileSync(path.join(fixtures, file))]), name);
+    if (title) fd.append('title', title);
+    const r = await fetch(`${srv.base}/api/platform/knowledge/collections/${colId}/documents/upload`, { method: 'POST', headers: { Authorization: `Bearer ${u.token}` }, body: fd });
+    let j = {}; try { j = await r.json(); } catch { /* empty */ }
+    return { http: r.status, ...j };
+  };
+  const up = await upload(a, col.id, 'warranty.pdf', 'Warranty terms.pdf');
+  check('PDF upload stored as a document', up.http === 201 && up.id && up.extracted?.pages === 1, up);
+  const wd = await upload(a, col.id, 'onboarding.docx', 'onboarding.docx', 'Distributor onboarding');
+  check('Word upload stored as a document', wd.http === 201 && wd.id, wd);
+  const docs = (await call(a, 'GET', `/api/platform/knowledge/collections/${col.id}/documents`)).documents || [];
+  check('titles come from the file name or the given title', docs.some((d) => d.title === 'Warranty terms') && docs.some((d) => d.title === 'Distributor onboarding'), docs.map((d) => d.title));
+  const found = await call(a, 'GET', '/api/platform/knowledge/search?q=warranty');
+  check('uploaded PDF text is searchable', found.results?.some((x) => /18 month/.test(x.snippet || x.content || '')), found);
+  check('scanned PDF refused with the reason', /no text layer/.test((await upload(a, col.id, 'scanned.pdf', 'scan.pdf')).error || ''));
+  check('legacy .doc refused', (await upload(a, col.id, 'legacy.doc', 'old.doc')).http === 400);
+  check('another tenant cannot upload into the collection', (await upload(b, col.id, 'warranty.pdf', 'x.pdf')).http === 404);
 
   // Existing finance routes still answer for the same JWT.
   const inv = await call(a, 'GET', `/api/invoices/${a.id}`);
