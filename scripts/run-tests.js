@@ -56,7 +56,10 @@ for (const file of files) {
   const started = Date.now();
   const r = spawnSync(process.execPath, [file], { cwd: ROOT, env: process.env, encoding: 'utf8', timeout: TIMEOUT_MS });
   const output = `${r.stdout || ''}${r.stderr || ''}`;
-  const skips = (output.match(/^\s*SKIP\b/gm) || []).length;
+  // "SKIP ..." (house style), "[SKIP] ..." (supply-chain DB suites) and
+  // node:test's "# SKIP" directive all count; a file that skipped its checks
+  // must never read as a clean pass.
+  const skips = (output.match(/^\s*(?:\[SKIP\]|SKIP\b)|^\s*(?:not )?ok \d+ .*# SKIP\b/gm) || []).length;
   const ms = Date.now() - started;
   if (r.status === 0) results.push({ file, status: 'PASS', note: skips ? `${skips} check(s) skipped` : '', ms });
   else {
