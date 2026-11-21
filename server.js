@@ -12935,11 +12935,23 @@ app.use('/api/hooks', hooksRouter({ pool: getPool() }));
 // (lib/routes/platform.js, lib/platform/*). Needs migration 072. The worker
 // runs in every instance (leases and SKIP LOCKED keep runs single) unless
 // PLATFORM_WORKER_ENABLED=false.
-const { platformRouter, platformHooksRouter } = require('./lib/routes/platform');
+const { platformRouter, platformHooksRouter, trustRouter } = require('./lib/routes/platform');
 let platformWorker = null;
 const wakePlatformWorker = () => { if (platformWorker) platformWorker.tick(); };
 app.use('/api/platform/hooks', platformHooksRouter({ pool: getPool(), onExecutionQueued: wakePlatformWorker }));
 app.use('/api/platform', platformRouter({ pool: getPool(), authMiddleware, router: modelRouter, onExecutionQueued: wakePlatformWorker }));
+// Public trust page data: frameworks and their honest status (no auth).
+app.use('/api/trust', trustRouter());
+// Retention (daily) and scheduled account erasures (hourly). Each only does
+// anything while its flag is on: FEATURE_RETENTION_JOB_ENABLED,
+// FEATURE_PRIVACY_ERASURE_ENABLED (lib/platform/security/*).
+cron.schedule('40 2 * * *', async () => {
+  if (!isFeatureEnabled('retention_job_enabled')) return;
+  try { console.log('[retention]', JSON.stringify(await require('./lib/platform/security/retention').runAll(getPool()))); } catch (e) { console.error('[retention]', e.message); }
+}, { timezone: 'UTC' });
+cron.schedule('5 * * * *', async () => {
+  try { const r = await require('./lib/platform/security/privacy').runDueErasures(getPool()); if (r.ran) console.log('[erasure]', JSON.stringify({ ran: r.ran })); } catch (e) { console.error('[erasure]', e.message); }
+}, { timezone: 'UTC' });
 if (process.env.DATABASE_URL && String(process.env.PLATFORM_WORKER_ENABLED || 'true').toLowerCase() !== 'false') {
   platformWorker = require('./lib/platform/engine').startWorker(getPool(), { router: modelRouter }, {
     intervalMs: Number(process.env.PLATFORM_WORKER_INTERVAL_MS || 2000),
