@@ -148,7 +148,7 @@ try {
   activeRouter = scriptedRouter;
 
   const tmpl = await api(dist, 'GET', '/templates');
-  check('six templates on one engine, unavailable integrations labelled', tmpl.templates.length === 6 && tmpl.templates.find((t) => t.key === 'sales_qualification').ready === false);
+  check('eleven templates on one engine, unavailable integrations labelled', tmpl.templates.length === 11 && tmpl.templates.find((t) => t.key === 'sales_qualification').ready === false && tmpl.templates.find((t) => t.key === 'app_data_analyst').ready === false);
   check('finance template is ready where Finance is enabled', tmpl.templates.find((t) => t.key === 'finance_analysis').ready === true);
   const tmplSvc = await api(svc, 'GET', '/templates');
   check('finance template is not ready without Finance', tmplSvc.templates.find((t) => t.key === 'finance_analysis').ready === false);

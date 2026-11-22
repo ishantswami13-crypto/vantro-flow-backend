@@ -89,6 +89,33 @@ function verifyJWT(token) {
 
 const JWT_SECRET = getSecret('JWT_SECRET');
 
+// A web session. Extra claims record how the person signed in: mfa: true after
+// an authenticator or recovery code, sso: <organization id> after that
+// organization's single sign-on. An organization's MFA rule reads them.
+async function startWebSession(res, user, claims = {}) {
+  const extra = {};
+  if (claims.mfa === true) extra.mfa = true;
+  if (typeof claims.sso === 'string') extra.sso = claims.sso;
+  // A revocable session row (lib/auth/webSessions.js); null before migration 077.
+  const req = res.req || {};
+  const wsid = await require('./lib/auth/webSessions').create(getPool(), user, {
+    method: claims.method || (claims.sso ? 'sso' : 'password'), mfa: claims.mfa === true, sso: extra.sso || null,
+    userAgent: req.headers && req.headers['user-agent'], ip: req.ip,
+  });
+  if (wsid) extra.wsid = wsid;
+  const token = jwt.sign({ userId: user.id, email: user.email, ...extra }, JWT_SECRET, { expiresIn: '30d' });
+  return { token, csrf_token: setSessionCookies(res, token) };
+}
+
+// Before any non-SSO sign-in issues a session: refuses it if the email's
+// organization requires SSO, or returns { mfaRequired, mfaToken } if the
+// account has two-step sign-in on. Null means go ahead.
+async function gateSignIn(user, method) {
+  const pool = getPool();
+  if (!pool) return null;
+  return require('./lib/routes/accountSecurity').signInGate(pool, JWT_SECRET, user, method);
+}
+
 const promClient = require('prom-client');
 const register = new promClient.Registry();
 promClient.collectDefaultMetrics({ register });
@@ -570,7 +597,7 @@ function makeLimiter({ windowMs, max, skipSuccessfulRequests = false, keyGenerat
 // Rate limiting — layered: auth + general API + heavier abuse-prone endpoints.
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 8,
+  max: Number(process.env.AUTH_FAILURE_LIMIT_PER_15M || 8),
   standardHeaders: true,
   legacyHeaders: false,
   skipSuccessfulRequests: true, // only count failed attempts
@@ -814,8 +841,11 @@ function authMiddleware(req, res, next) {
 // Web tokens have no sid and are unaffected.
 function continueIfSessionActive(req, res, next) {
   const sid = req.user && req.user.sid;
-  if (!sid) return next();
-  require('./lib/auth/sessions').isActive(getPool(), sid)
+  const check = sid
+    ? require('./lib/auth/sessions').isActive(getPool(), sid)
+    // Web tokens: their session row (wsid) or, for older tokens, the account's sign-out-everywhere cut-off.
+    : require('./lib/auth/webSessions').check(getPool(), req.user);
+  check
     .then((active) => (active ? next() : res.status(401).json({ error: 'Session ended', code: 'SESSION_INVALID' })))
     .catch((err) => {
       safeLog('error', '[auth] session check failed', { code: err && err.code, error: err && err.message });
@@ -1340,6 +1370,11 @@ app.post('/api/auth/signup', async (req, res) => {
     const { rows: existingRows } = await getPool().query('SELECT id FROM users WHERE lower(email) = $1 LIMIT 1', [email]);
     if (existingRows.length) return res.status(409).json({ error: 'Email already registered' });
 
+    // An email on a domain whose organization requires SSO signs in through SSO.
+    if (getPool() && await require('./lib/auth/sso').requiredFor(getPool(), email)) {
+      return res.status(403).json({ error: 'Your organization requires single sign-on. Use "Sign in with SSO".', code: 'SSO_REQUIRED' });
+    }
+
     // Selective rollout: when the access gate is on, only emails with an
     // approved access application may create an account.
     if (isFeatureEnabled('access_gate_enabled')) {
@@ -1399,8 +1434,7 @@ app.post('/api/auth/signup', async (req, res) => {
     // leave new accounts stuck. Without it, signup signs in the same way
     // /api/auth/login does.
     if (process.env.SIGNUP_OTP_REQUIRED !== 'true') {
-      const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
-      const csrf_token = setSessionCookies(res, token);
+      const { token, csrf_token } = await startWebSession(res, user);
       return res.json({ success: true, token, csrf_token, user });
     }
 
@@ -1486,8 +1520,7 @@ app.post('/api/auth/verify-otp', async (req, res) => {
 
     // Issue real 7-day session token
     const { data: user } = await supabase.from('users').select('id, email, phone, business_name, plan, created_at').eq('id', decoded.userId).single();
-    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
-    const csrf_token = setSessionCookies(res, token);
+    const { token, csrf_token } = await startWebSession(res, user);
 
     res.json({ success: true, token, csrf_token, user });
   } catch (err) {
@@ -1513,16 +1546,25 @@ app.post('/api/auth/login', async (req, res) => {
     if (!valid) return res.status(401).json({ error: 'Invalid email or password' });
 
     const { password_hash, ...user } = data;
-    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
-    const csrf_token = setSessionCookies(res, token);
+    // Organization SSO requirement and two-step sign-in (lib/routes/accountSecurity.js).
+    const gate = await gateSignIn(user, 'password');
+    if (gate) return res.json({ success: true, ...gate });
+    const { token, csrf_token } = await startWebSession(res, user);
     res.json({ success: true, token, csrf_token, user });
   } catch (error) {
+    if (error && error.code === 'SSO_REQUIRED') return res.status(403).json({ error: error.message, code: error.code });
     console.error('[login]', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.post('/api/auth/logout', (req, res) => {
+app.post('/api/auth/logout', async (req, res) => {
+  // Ends this browser's session row too, so a copied token stops working.
+  try {
+    const { token } = getAuthToken(req);
+    const claims = token ? verifyJWT(token) : null;
+    if (claims && claims.wsid && getPool()) await require('./lib/auth/webSessions').revoke(getPool(), claims.userId, claims.wsid);
+  } catch { /* an expired or invalid token has nothing to end */ }
   clearSessionCookies(res);
   res.json({ success: true });
 });
@@ -1672,6 +1714,9 @@ app.post('/api/auth/reset-password', async (req, res) => {
       getPool().query('UPDATE users SET password_hash = $1 WHERE lower(email) = $2', [password_hash, email]),
       supabase.from('password_reset_tokens').update({ used: true }).eq('id', token.id)
     ]);
+    // A reset ends every existing session: whoever had the old password is signed out.
+    const reset = await getPool().query('SELECT id FROM users WHERE lower(email) = $1', [email]);
+    for (const u of reset.rows) await require('./lib/auth/webSessions').revokeAll(getPool(), u.id);
 
     res.json({ success: true, message: 'Password reset successfully. Please log in.' });
   } catch (error) {
@@ -1696,7 +1741,14 @@ app.post('/api/auth/change-password', authLimiter, authMiddleware, async (req, r
     const password_hash = await bcrypt.hash(new_password, 12);
     const { error: upErr } = await supabase.from('users').update({ password_hash, updated_at: new Date() }).eq('id', req.user.userId);
     if (upErr) throw upErr;
-    res.json({ success: true, message: 'Password changed.' });
+    // Every other session ends; this browser gets a fresh one.
+    let fresh = {};
+    if (getPool()) {
+      await require('./lib/auth/webSessions').revokeAll(getPool(), req.user.userId);
+      const me = (await getPool().query('SELECT id, email, phone, business_name, plan, created_at FROM users WHERE id = $1', [req.user.userId])).rows[0];
+      fresh = { ...(await startWebSession(res, me, { mfa: req.user.mfa === true, sso: req.user.sso, method: 'password' })), user: me };
+    }
+    res.json({ success: true, message: 'Password changed. Other devices are signed out.', ...fresh });
   } catch (error) {
     logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
@@ -12895,10 +12947,8 @@ const { authProvidersRouter } = require('./lib/routes/authProviders');
 app.use('/api', authProvidersRouter({
   pool: getPool(),
   authMiddleware,
-  issueWebSession: (res, user) => {
-    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
-    return { token, csrf_token: setSessionCookies(res, token) };
-  },
+  issueWebSession: (res, user, method) => startWebSession(res, user, { method }),
+  gateSignIn,
   isAccessGateOn: () => isFeatureEnabled('access_gate_enabled'),
   hasApprovedApplication: require('./lib/access/service').hasApprovedApplication,
   track: require('./lib/observability/productEvents').track,
@@ -12906,6 +12956,15 @@ app.use('/api', authProvidersRouter({
 
 // Connector platform — manifests (lib/connectors/registry.js) + live state
 // derived only from real rows (lib/connectors/state.js). See lib/routes/connectors.js.
+const { accountSecurityRouter } = require('./lib/routes/accountSecurity');
+app.use('/api', accountSecurityRouter({
+  pool: getPool(),
+  authMiddleware,
+  jwtSecret: JWT_SECRET,
+  signSession: startWebSession,
+  apiBase: (req) => (process.env.PUBLIC_API_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, ''),
+  appBase: () => (process.env.PUBLIC_APP_URL || process.env.FRONTEND_URL || 'https://vantro-flow.vercel.app').replace(/\/+$/, ''),
+}));
 const { connectorsRouter } = require('./lib/routes/connectors');
 app.use('/api/connectors', connectorsRouter({ pool: getPool(), authMiddleware }));
 
@@ -12935,11 +12994,23 @@ app.use('/api/hooks', hooksRouter({ pool: getPool() }));
 // (lib/routes/platform.js, lib/platform/*). Needs migration 072. The worker
 // runs in every instance (leases and SKIP LOCKED keep runs single) unless
 // PLATFORM_WORKER_ENABLED=false.
-const { platformRouter, platformHooksRouter } = require('./lib/routes/platform');
+const { platformRouter, platformHooksRouter, trustRouter } = require('./lib/routes/platform');
 let platformWorker = null;
 const wakePlatformWorker = () => { if (platformWorker) platformWorker.tick(); };
 app.use('/api/platform/hooks', platformHooksRouter({ pool: getPool(), onExecutionQueued: wakePlatformWorker }));
 app.use('/api/platform', platformRouter({ pool: getPool(), authMiddleware, router: modelRouter, onExecutionQueued: wakePlatformWorker }));
+// Public trust page data: frameworks and their honest status (no auth).
+app.use('/api/trust', trustRouter());
+// Retention (daily) and scheduled account erasures (hourly). Each only does
+// anything while its flag is on: FEATURE_RETENTION_JOB_ENABLED,
+// FEATURE_PRIVACY_ERASURE_ENABLED (lib/platform/security/*).
+cron.schedule('40 2 * * *', async () => {
+  if (!isFeatureEnabled('retention_job_enabled')) return;
+  try { console.log('[retention]', JSON.stringify(await require('./lib/platform/security/retention').runAll(getPool()))); } catch (e) { console.error('[retention]', e.message); }
+}, { timezone: 'UTC' });
+cron.schedule('5 * * * *', async () => {
+  try { const r = await require('./lib/platform/security/privacy').runDueErasures(getPool()); if (r.ran) console.log('[erasure]', JSON.stringify({ ran: r.ran })); } catch (e) { console.error('[erasure]', e.message); }
+}, { timezone: 'UTC' });
 if (process.env.DATABASE_URL && String(process.env.PLATFORM_WORKER_ENABLED || 'true').toLowerCase() !== 'false') {
   platformWorker = require('./lib/platform/engine').startWorker(getPool(), { router: modelRouter }, {
     intervalMs: Number(process.env.PLATFORM_WORKER_INTERVAL_MS || 2000),

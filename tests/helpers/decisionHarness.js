@@ -75,6 +75,8 @@ function tokenFor(user) {
   return jwt.sign({ userId: user.id, email: user.email }, process.env.JWT_SECRET, { algorithm: 'HS256', expiresIn: '1h' });
 }
 
+const STARTUP_DONE = /\[migrate\] (Auto-migration|No DATABASE_URL)/;
+
 async function startServer(extraEnv = {}) {
   const port = 4100 + Math.floor(Math.random() * 800);
   const child = spawn(process.execPath, [path.join(__dirname, '..', '..', 'server.js')], {
@@ -85,15 +87,19 @@ async function startServer(extraEnv = {}) {
   child.stdout.on('data', (d) => { log += d; });
   child.stderr.on('data', (d) => { log += d; });
   const base = `http://127.0.0.1:${port}`;
-  const deadline = Date.now() + 30000;
+  const deadline = Date.now() + 60000;
+  let up = false;
   while (Date.now() < deadline) {
     if (child.exitCode != null) throw new Error(`server exited early:\n${log.slice(-2000)}`);
     try {
-      const r = await fetch(`${base}/api/health`);
-      if (r.status < 500) break;
+      if (!up) up = (await fetch(`${base}/api/health`)).status < 500;
     } catch { /* not up yet */ }
+    // The server answers before its startup schema work (runAutoMigrations)
+    // ends; seeding during that DDL can deadlock or stall. Wait for it.
+    if (up && STARTUP_DONE.test(log)) break;
     await new Promise((res) => setTimeout(res, 250));
   }
+  if (!up || !STARTUP_DONE.test(log)) { child.kill('SIGKILL'); throw new Error(`server did not finish starting:\n${log.slice(-2000)}`); }
   return {
     base,
     log: () => log,

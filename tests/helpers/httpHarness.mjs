@@ -51,6 +51,8 @@ export async function deleteUsers(pool, ids) {
   }
 }
 
+const STARTUP_DONE = /\[migrate\] (Auto-migration|No DATABASE_URL)/;
+
 export async function startServer(port, extraEnv = {}) {
   const child = spawn(process.execPath, ['server.js'], {
     cwd: process.cwd(),
@@ -62,10 +64,14 @@ export async function startServer(port, extraEnv = {}) {
   child.stderr.on('data', (d) => { logs += d; });
   const base = `http://127.0.0.1:${port}`;
   const start = Date.now();
+  let up = false;
   for (;;) {
-    try { const r = await fetch(`${base}/api/live`); if (r.status) break; } catch { /* not up yet */ }
+    try { if (!up) up = !!(await fetch(`${base}/api/live`)).status; } catch { /* not up yet */ }
+    // The server answers before its startup schema work (runAutoMigrations)
+    // ends; seeding during that DDL can deadlock or stall. Wait for it.
+    if (up && STARTUP_DONE.test(logs)) break;
     if (child.exitCode !== null) throw new Error(`server exited early:\n${logs.slice(-2000)}`);
-    if (Date.now() - start > 30000) { child.kill(); throw new Error(`server did not start:\n${logs.slice(-2000)}`); }
+    if (Date.now() - start > 60000) { child.kill(); throw new Error(`server did not finish starting:\n${logs.slice(-2000)}`); }
     await new Promise((r) => setTimeout(r, 250));
   }
   return { base, stop: () => child.kill(), logs: () => logs };
