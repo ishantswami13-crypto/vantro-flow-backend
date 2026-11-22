@@ -94,7 +94,7 @@ try {
   r = await call(pwToken, 'POST', '/api/auth/passkeys/options', {});
   opts = r.options;
   r = await call(pwToken, 'POST', '/api/auth/passkeys', { response: key.register(opts), name: 'Laptop' });
-  check('a passkey is added', r.http === 201 && r.passkey.name === 'Laptop' && !!r.token, r);
+  check('a passkey is added', r.http === 201 && r.passkey.name === 'Laptop' && !!r.token && r.user?.id === a.id, r);
   check('the session issued after adding it counts as two-step', jwt.decode(r.token).mfa === true);
   const pkToken = r.token;
   const row = (await pool.query('SELECT public_key, counter FROM user_passkeys WHERE user_id = $1', [a.id])).rows[0];

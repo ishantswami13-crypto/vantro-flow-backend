@@ -1745,7 +1745,8 @@ app.post('/api/auth/change-password', authLimiter, authMiddleware, async (req, r
     let fresh = {};
     if (getPool()) {
       await require('./lib/auth/webSessions').revokeAll(getPool(), req.user.userId);
-      fresh = await startWebSession(res, { id: req.user.userId, email: req.user.email }, { mfa: req.user.mfa === true, sso: req.user.sso, method: 'password' });
+      const me = (await getPool().query('SELECT id, email, phone, business_name, plan, created_at FROM users WHERE id = $1', [req.user.userId])).rows[0];
+      fresh = { ...(await startWebSession(res, me, { mfa: req.user.mfa === true, sso: req.user.sso, method: 'password' })), user: me };
     }
     res.json({ success: true, message: 'Password changed. Other devices are signed out.', ...fresh });
   } catch (error) {

@@ -72,7 +72,7 @@ try {
   check('an old token without a session row still works before sign-out-everywhere', r.http === 200);
   await new Promise((res) => setTimeout(res, 1100)); // the cut-off is compared in whole seconds
   r = await call(laptop.token, 'POST', '/api/auth/account-sessions/sign-out-everywhere', {});
-  check('sign out everywhere hands back a fresh session', r.http === 200 && !!r.token && jwt.decode(r.token).wsid !== jwt.decode(laptop.token).wsid, r);
+  check('sign out everywhere hands back a fresh session', r.http === 200 && !!r.token && r.user?.id === a.id && jwt.decode(r.token).wsid !== jwt.decode(laptop.token).wsid, r);
   const fresh = r.token;
   r = await call(laptop.token, 'GET', '/api/auth/me');
   check('the old session on this device is ended', r.http === 401, r);
