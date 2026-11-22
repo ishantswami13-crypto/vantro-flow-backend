@@ -50,9 +50,21 @@ async function tenant(label) {
 async function reopenApp(user) {
   await server.stop();
   server = await startServer({ FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED: 'false' });
+  await waitUntilUp(server);
   const api = client(server.base, user);
   await openApp(api);
   return api;
+}
+
+// startServer gives up quietly after 30 s; under a loaded full-suite run a
+// restarted server can take longer, so wait for it explicitly.
+async function waitUntilUp(srv) {
+  const deadline = Date.now() + 90000;
+  while (Date.now() < deadline) {
+    try { if ((await fetch(`${srv.base}/api/health`)).status < 500) return; } catch { /* not up yet */ }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  throw new Error(`server did not come up:\n${srv.log().slice(-1500)}`);
 }
 
 async function openApp(api) {
