@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/* global localStorage, document */ // used inside page.evaluate / addInitScript (browser context)
 // FILE: scripts/demo/supplier-delay-journey.js
 // `npm run demo:supplier-delay:journey`: drives the supplier-delay demo
 // through the real frontend in a headless browser and checks the database
