@@ -92,10 +92,17 @@ const JWT_SECRET = getSecret('JWT_SECRET');
 // A web session. Extra claims record how the person signed in: mfa: true after
 // an authenticator or recovery code, sso: <organization id> after that
 // organization's single sign-on. An organization's MFA rule reads them.
-function startWebSession(res, user, claims = {}) {
+async function startWebSession(res, user, claims = {}) {
   const extra = {};
   if (claims.mfa === true) extra.mfa = true;
   if (typeof claims.sso === 'string') extra.sso = claims.sso;
+  // A revocable session row (lib/auth/webSessions.js); null before migration 077.
+  const req = res.req || {};
+  const wsid = await require('./lib/auth/webSessions').create(getPool(), user, {
+    method: claims.method || (claims.sso ? 'sso' : 'password'), mfa: claims.mfa === true, sso: extra.sso || null,
+    userAgent: req.headers && req.headers['user-agent'], ip: req.ip,
+  });
+  if (wsid) extra.wsid = wsid;
   const token = jwt.sign({ userId: user.id, email: user.email, ...extra }, JWT_SECRET, { expiresIn: '30d' });
   return { token, csrf_token: setSessionCookies(res, token) };
 }
@@ -834,8 +841,11 @@ function authMiddleware(req, res, next) {
 // Web tokens have no sid and are unaffected.
 function continueIfSessionActive(req, res, next) {
   const sid = req.user && req.user.sid;
-  if (!sid) return next();
-  require('./lib/auth/sessions').isActive(getPool(), sid)
+  const check = sid
+    ? require('./lib/auth/sessions').isActive(getPool(), sid)
+    // Web tokens: their session row (wsid) or, for older tokens, the account's sign-out-everywhere cut-off.
+    : require('./lib/auth/webSessions').check(getPool(), req.user);
+  check
     .then((active) => (active ? next() : res.status(401).json({ error: 'Session ended', code: 'SESSION_INVALID' })))
     .catch((err) => {
       safeLog('error', '[auth] session check failed', { code: err && err.code, error: err && err.message });
@@ -1424,8 +1434,7 @@ app.post('/api/auth/signup', async (req, res) => {
     // leave new accounts stuck. Without it, signup signs in the same way
     // /api/auth/login does.
     if (process.env.SIGNUP_OTP_REQUIRED !== 'true') {
-      const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
-      const csrf_token = setSessionCookies(res, token);
+      const { token, csrf_token } = await startWebSession(res, user);
       return res.json({ success: true, token, csrf_token, user });
     }
 
@@ -1511,8 +1520,7 @@ app.post('/api/auth/verify-otp', async (req, res) => {
 
     // Issue real 7-day session token
     const { data: user } = await supabase.from('users').select('id, email, phone, business_name, plan, created_at').eq('id', decoded.userId).single();
-    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
-    const csrf_token = setSessionCookies(res, token);
+    const { token, csrf_token } = await startWebSession(res, user);
 
     res.json({ success: true, token, csrf_token, user });
   } catch (err) {
@@ -1541,7 +1549,7 @@ app.post('/api/auth/login', async (req, res) => {
     // Organization SSO requirement and two-step sign-in (lib/routes/accountSecurity.js).
     const gate = await gateSignIn(user, 'password');
     if (gate) return res.json({ success: true, ...gate });
-    const { token, csrf_token } = startWebSession(res, user);
+    const { token, csrf_token } = await startWebSession(res, user);
     res.json({ success: true, token, csrf_token, user });
   } catch (error) {
     if (error && error.code === 'SSO_REQUIRED') return res.status(403).json({ error: error.message, code: error.code });
@@ -1550,7 +1558,13 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-app.post('/api/auth/logout', (req, res) => {
+app.post('/api/auth/logout', async (req, res) => {
+  // Ends this browser's session row too, so a copied token stops working.
+  try {
+    const { token } = getAuthToken(req);
+    const claims = token ? verifyJWT(token) : null;
+    if (claims && claims.wsid && getPool()) await require('./lib/auth/webSessions').revoke(getPool(), claims.userId, claims.wsid);
+  } catch { /* an expired or invalid token has nothing to end */ }
   clearSessionCookies(res);
   res.json({ success: true });
 });
@@ -1700,6 +1714,9 @@ app.post('/api/auth/reset-password', async (req, res) => {
       getPool().query('UPDATE users SET password_hash = $1 WHERE lower(email) = $2', [password_hash, email]),
       supabase.from('password_reset_tokens').update({ used: true }).eq('id', token.id)
     ]);
+    // A reset ends every existing session: whoever had the old password is signed out.
+    const reset = await getPool().query('SELECT id FROM users WHERE lower(email) = $1', [email]);
+    for (const u of reset.rows) await require('./lib/auth/webSessions').revokeAll(getPool(), u.id);
 
     res.json({ success: true, message: 'Password reset successfully. Please log in.' });
   } catch (error) {
@@ -1724,7 +1741,13 @@ app.post('/api/auth/change-password', authLimiter, authMiddleware, async (req, r
     const password_hash = await bcrypt.hash(new_password, 12);
     const { error: upErr } = await supabase.from('users').update({ password_hash, updated_at: new Date() }).eq('id', req.user.userId);
     if (upErr) throw upErr;
-    res.json({ success: true, message: 'Password changed.' });
+    // Every other session ends; this browser gets a fresh one.
+    let fresh = {};
+    if (getPool()) {
+      await require('./lib/auth/webSessions').revokeAll(getPool(), req.user.userId);
+      fresh = await startWebSession(res, { id: req.user.userId, email: req.user.email }, { mfa: req.user.mfa === true, sso: req.user.sso, method: 'password' });
+    }
+    res.json({ success: true, message: 'Password changed. Other devices are signed out.', ...fresh });
   } catch (error) {
     logRouteError(req, error);
     res.status(500).json({ error: 'Internal server error' });
@@ -12923,7 +12946,7 @@ const { authProvidersRouter } = require('./lib/routes/authProviders');
 app.use('/api', authProvidersRouter({
   pool: getPool(),
   authMiddleware,
-  issueWebSession: (res, user) => startWebSession(res, user),
+  issueWebSession: (res, user, method) => startWebSession(res, user, { method }),
   gateSignIn,
   isAccessGateOn: () => isFeatureEnabled('access_gate_enabled'),
   hasApprovedApplication: require('./lib/access/service').hasApprovedApplication,

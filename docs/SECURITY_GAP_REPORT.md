@@ -1,12 +1,12 @@
 # Starlane security and compliance gap report
 
-Date: 21 November 2026. Scope: `vantro-flow-backend` with platform core (PR #86) and this change (migrations 075 and 076), and `vantro-flow-frontend`.
+Date: 22 November 2026. Scope: `vantro-flow-backend` with platform core (PR #86) and this change (migrations 075, 076 and 077), and `vantro-flow-frontend`.
 
 ## The short version
 
 Starlane holds **no** certification, attestation or authorization today: not SOC 2, not ISO 27001 / 27701 / 42001, not AIUC-1, not FedRAMP. Those are granted by outside auditors after a period of evidence, and no code change can produce one. GDPR, CCPA and India's DPDP Act are laws, not certificates; the honest claim for them is "designed to align", meaning the controls below exist in the product.
 
-The product must never show a certification badge it does not hold. The trust page and the admin Security page both read their claims from `lib/platform/security/frameworks.js`, where every status is "Not certified", "No audit report yet", "Not authorized" or "Designed to align (not independently assessed)". Change a status only with a signed report in hand.
+The public Security page may say "Designed around SOC 2 and ISO/IEC 27001 controls" and list the controls in `lib/platform/security/publicControls.js`, because each of those describes code that exists. It must never show a certification badge or logo it does not hold. The trust page and the admin Security page both read their claims from `lib/platform/security/frameworks.js`, where every status is "Not certified", "No audit report yet", "Not authorized" or "Designed to align (not independently assessed)". Change a status only with a signed report in hand.
 
 ## Technical controls: what exists now
 
@@ -29,15 +29,18 @@ Status is what `GET /api/platform/security/posture` computes on a running server
 | Prompt injection screening | In place (prompt guard on by default) | `promptGuard.service.js` |
 | Secret scanning, dependency audit, tenant-isolation check in CI | In place | `.github/workflows/security.yml` |
 | Tenant isolation | Partial: enforced in every application query; RLS is enabled on tables but the server role bypasses it and there are no policies, so the database is not a second line of defence | migration 006 not applied |
-| Multi-factor sign-in | In place (new): authenticator app (TOTP) with 10 single-use recovery codes, after password, Google, Apple or phone sign-in; codes cannot be replayed; 5 wrong codes lock for 15 minutes; an organization can require it for admins or everyone. Not built: passkeys, and the desktop and mobile app sessions do not carry the second-factor mark yet | migration 076, `lib/auth/mfa.js`, `lib/platform/security/mfaPolicy.js` |
-| Single sign-on | Partial (new): OpenID Connect per organization (Okta, Entra ID, Google Workspace, Auth0 and others), email domains proven by DNS TXT, PKCE, signed ID token checks, a test sign-in before it can be used, optional enforcement with the owner exempt, accounts created on first sign-in. **Not built: SAML 2.0 and SCIM provisioning** | migration 076, `lib/auth/sso.js` |
+| Multi-factor sign-in | In place (new): authenticator app (TOTP) with 10 single-use recovery codes, or a passkey, after password, Google, Apple or phone sign-in; codes cannot be replayed; 5 wrong codes lock for 15 minutes; an organization can require it for admins or everyone; a password-only session cannot add or remove a second factor once the account has one. Not built: the desktop and mobile app sessions do not carry the second-factor mark yet | migrations 076 and 077, `lib/auth/mfa.js`, `lib/auth/passkeys.js`, `lib/platform/security/mfaPolicy.js` |
+| Passkeys (WebAuthn) | In place (new): passwordless sign-in and second step; user verification required; single-use hashed challenges (5 minutes); origin and RP ID checked; signature counter refuses cloned keys; only public keys stored. Needs Node.js 20+ on the server (answers 503 otherwise) | migration 077, `lib/auth/passkeys.js`, `@simplewebauthn/server` 13.3.3 |
+| Single sign-on | In place (new): **SAML 2.0** and OpenID Connect per organization (Okta, Entra ID, Google Workspace, OneLogin, ADFS, Auth0 and others), email domains proven by DNS TXT, a test sign-in before it can be used, optional enforcement with the owner exempt, accounts created on first sign-in. SAML: signed assertions required, issuer/audience/recipient/InResponseTo checked, service-provider initiated only, single-use requests, SHA-1 refused, metadata import (no DOCTYPE). **Not built: SCIM provisioning**, so removing someone from the IdP does not remove their membership | migrations 076 and 077, `lib/auth/sso.js`, `lib/auth/saml.js`, `@node-saml/node-saml` 5.2.0 |
+| Session management | In place (new): each web sign-in is a session row; people can list and end sessions (web and app), sign out everywhere, and a password change or reset ends every other session; logout ends the token's session; an organization can cap session length (1 to 720 hours) for its workspace; only a /24 or /48 network prefix is stored, never a full IP | migration 077, `lib/auth/webSessions.js` |
+| Dependency vulnerabilities | In place (new): CI fails on any unreviewed high or critical advisory in production dependencies. One reviewed exception: `xlsx` (no fixed version on npm; used only for signed-in spreadsheet imports; to replace). `yaml` and `qs` were upgraded to fixed versions | `scripts/security-dependency-audit.js` |
 | Backups and restore drills | Outside the app: run by the database host; no recorded drill | `BACKUP_RESTORE_DRILL.md` is a plan |
 | Penetration test | **Not done** | — |
 
 ## What each framework still needs
 
 ### SOC 2 Type II (attestation by a CPA firm)
-1. MFA is built and an organization can require it; switch the rule on for Starlane's own staff organization and keep the evidence. Passkeys and MFA for the desktop and mobile app sessions are still to build.
+1. MFA (authenticator app or passkey) is built and an organization can require it; switch the rule on for Starlane's own staff organization and keep the evidence. The second-factor mark for desktop and mobile app sessions, and SCIM so leavers are removed automatically, are still to build.
 2. Written policies approved by management: information security, access control, change management, incident response, vendor management, business continuity, data classification, acceptable use.
 3. Evidence processes: quarterly access reviews, onboarding / offboarding records, change approvals (PR reviews already give some of this), vendor reviews of Railway, Vercel, Supabase / Neon, model providers.
 4. Backup restore drill on a schedule, with a record.
@@ -73,15 +76,20 @@ Missing: Data Processing Agreement and published subprocessor list; SCCs for EU 
 | Stolen OAuth state or code | PKCE (S256), single-use hashed state with a 10-minute expiry, client secret never leaves the server |
 | Someone points another company's emails at their own identity provider | A domain counts for SSO only after a DNS TXT record proves control, a verified domain belongs to one organization, public mail domains cannot be claimed, and the ID token email must be on a verified domain |
 | A broken identity provider locks an organization out | SSO cannot be required before a test sign-in passes; the owner keeps their other sign-in methods |
+| A forged or replayed SAML response | Assertions must be signed by the organization's IdP certificate (verified by node-saml / xml-crypto, not hand-written code); signature wrapping, tampering, wrong issuer, audience or recipient, expiry, another request's response, IdP-initiated responses and SHA-1 are refused; each request is single-use. All covered by `tests/auth.saml.test.mjs` |
+| A stolen password used to swap out the account's second factor | Adding or removing an authenticator or passkey needs a session that already passed the second step (or came from SSO) |
+| A stolen or copied session token | Web sessions can be ended individually or everywhere and stop on the next request (15-second cache); password changes end them; organizations can cap session age |
+| A cloned passkey | The signature counter must increase; a lower counter is refused |
 | The MFA challenge token used as a session | It is signed with a separate derived key, so the normal session check rejects it; it expires in 5 minutes |
 | Credential leak through logs or API | Credentials encrypted, never returned; call log stores no bodies or URLs; errors pass through `redact()` |
 | Audit tampering by someone with database access | Hash chain detects edits and gaps; keep the `head` from `/security/audit/verify` outside Starlane to detect tail truncation |
 
 ## Rollout steps (operator)
 
-1. Review and apply migrations 072 to 074 (PR #86), 075 and 076 (this change) to staging, then production. 075 is additive except two triggers on `platform_audit_events`; 076 is additive. Rollback is in each migration header.
+1. Review and apply migrations 072 to 074 (PR #86), 075, 076 and 077 (this change) to staging, then production. 075 is additive except two triggers on `platform_audit_events`; 076 and 077 are additive. Rollback is in each migration header. Until 077 is applied, web sessions behave as before (30-day tokens without a revocation list), and SAML, passkeys and session limits answer that the migration is pending.
 2. Confirm `OUTBOUND_CREDENTIALS_KEY` is set in production. MFA secrets and SSO client secrets are encrypted with it; without it neither can be turned on.
-2a. Set `PUBLIC_API_URL` and `PUBLIC_APP_URL` so the SSO redirect URL (`<PUBLIC_API_URL>/api/auth/sso/callback`) and the return to the app are right.
+2a. Set `PUBLIC_API_URL` and `PUBLIC_APP_URL` so the SSO redirect URL (`<PUBLIC_API_URL>/api/auth/sso/callback`), the SAML ACS URL (`<PUBLIC_API_URL>/api/auth/sso/saml/acs`) and entity ID (`<PUBLIC_API_URL>/api/auth/sso/saml/metadata`), and the return to the app are right. Passkeys use the app's hostname as the relying party ID; set `WEBAUTHN_RP_ID` and `WEBAUTHN_ORIGINS` if the app is served from more than one origin. Changing the RP ID later makes existing passkeys stop working.
+2b. Run the backend on Node.js 20 or newer (passkeys need it). Nixpacks reads `engines` in package.json (">=18"); set `NIXPACKS_NODE_VERSION=20` or 22 in Railway, or raise `engines`, before relying on passkeys.
 3. Leave `FEATURE_PRIVACY_ERASURE_ENABLED` off until the legal retention review is done.
 4. Turn on `FEATURE_RETENTION_JOB_ENABLED` once admins have reviewed the default periods (90 / 90 / 180 days).
 5. `FEATURE_WORKFLOW_HTTP_ACTIONS_ENABLED` (existing) also gates agents changing other software (`apps.act`); reads work without it.

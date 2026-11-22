@@ -349,7 +349,7 @@ try {
   // ── Posture and trust ────────────────────────────────────────────────
   const pos = await api(admin, 'GET', '/security/posture', undefined, as(admin));
   const ctl = (id) => pos.controls.find((c) => c.id === id);
-  check('posture reports live control status', ctl('credential_encryption').status === 'in_place' && ctl('audit_tamper_evidence').status === 'partial' && ctl('mfa').status === 'partial' && /does not require it yet/.test(ctl('mfa').detail) && ctl('sso').status === 'partial' && /SAML 2.0 and SCIM provisioning are not built/.test(ctl('sso').detail), pos.controls?.map((c) => [c.id, c.status]));
+  check('posture reports live control status', ctl('credential_encryption').status === 'in_place' && ctl('audit_tamper_evidence').status === 'partial' && ctl('mfa').status === 'partial' && /does not require it yet/.test(ctl('mfa').detail) && ctl('sso').status === 'partial' && /SCIM provisioning is not built/.test(ctl('sso').detail) && ctl('session_management').status === 'in_place', pos.controls?.map((c) => [c.id, c.status]));
   check('posture never claims a certification', pos.frameworks.every((f) => ['not_attested', 'not_certified', 'not_authorized', 'designed_to_align'].includes(f.status)));
   check('member cannot see posture', (await api(member, 'GET', '/security/posture', undefined, as(member))).status === 403);
   const trust = await (await fetch(`${ROOT}/api/trust`)).json();

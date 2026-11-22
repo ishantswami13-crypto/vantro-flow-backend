@@ -16,7 +16,8 @@ async function main() {
     const u = await seedUser(pool, 'settings'); users.push(u.id);
     await pool.query('UPDATE users SET password_hash = $2 WHERE id = $1', [u.id, await bcrypt.hash('old-password-1', 4)]);
     server = await startServer(8931, { FEATURE_EXTERNAL_MESSAGE_SENDING_ENABLED: 'false', TWILIO_WHATSAPP_NUMBER: '', RAZORPAY_KEY_ID: '', RAZORPAY_KEY_SECRET: '', FEATURE_PUSH_NOTIFICATIONS_ENABLED: 'false', STARLANE_GLOBAL_STOP: '' });
-    const call = (path, body, method = 'POST') => fetch(server.base + path, { method, headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${u.token}` }, body: body ? JSON.stringify(body) : undefined });
+    let token = u.token;
+    const call = (path, body, method = 'POST') => fetch(server.base + path, { method, headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: body ? JSON.stringify(body) : undefined });
 
     let r = await call('/api/auth/change-password', { current_password: 'wrong-one', new_password: 'new-password-2' });
     check('a wrong current password is refused', r.status === 400, r.status);
@@ -26,6 +27,11 @@ async function main() {
     check('refused attempts leave the password unchanged', await bcrypt.compare('old-password-1', hash));
     r = await call('/api/auth/change-password', { current_password: 'old-password-1', new_password: 'new-password-2' });
     check('the right current password changes it', r.status === 200, r.status);
+    const changed = await r.json();
+    check('it hands back a fresh session for this browser', typeof changed.token === 'string' && changed.token !== u.token);
+    r = await call('/api/settings/delivery-status', null, 'GET');
+    check('sessions from before the change are ended (web sessions, migration 077)', r.status === 401 || !changed.token, r.status);
+    if (changed.token) token = changed.token;
     hash = (await pool.query('SELECT password_hash FROM users WHERE id=$1', [u.id])).rows[0].password_hash;
     check('the new password is what is stored', await bcrypt.compare('new-password-2', hash));
     r = await fetch(server.base + '/api/auth/change-password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
