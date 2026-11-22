@@ -13,9 +13,12 @@
 // one. Idempotent: deletes and recreates only its own .invalid tenant.
 //
 // Usage: DATABASE_URL=postgres://...@127.0.0.1/... node scripts/demo/seed-supplier-delay.js
+// Optional DEMO_PASSWORD (8+ characters): the demo owner can then sign in on
+// the normal login page with owner@supplier-delay-demo.invalid and it.
 
 require('dotenv').config();
 const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
 const { assertTestDatabase } = require('../../lib/db/testDatabaseGuard');
 const { seedSupplierDelay, deleteSupplierDelayData } = require('../../tests/fixtures/supplierDelay');
 
@@ -24,6 +27,9 @@ const EMAIL = 'owner@supplier-delay-demo.invalid';
 async function main() {
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required (a local database).');
   assertTestDatabase(process.env.DATABASE_URL);
+  const password = process.env.DEMO_PASSWORD || '';
+  if (password && password.length < 8) throw new Error('DEMO_PASSWORD must be at least 8 characters.');
+  const passwordHash = password ? await bcrypt.hash(password, 10) : null;
   const { getPool } = require('../../lib/db/pg');
   const pool = getPool();
   const client = await pool.connect();
@@ -34,7 +40,7 @@ async function main() {
       await deleteSupplierDelayData(client, row.id);
       await client.query('DELETE FROM users WHERE id = $1', [row.id]);
     }
-    const u = await client.query(`INSERT INTO users (email, business_name, owner_name) VALUES ($1, 'Kaveri Cycle Works (synthetic)', 'Demo Owner') RETURNING id`, [EMAIL]);
+    const u = await client.query(`INSERT INTO users (email, business_name, owner_name, password_hash) VALUES ($1, 'Kaveri Cycle Works (synthetic)', 'Demo Owner', $2) RETURNING id`, [EMAIL, passwordHash]);
     const userId = u.rows[0].id;
     const today = new Date().toISOString().slice(0, 10);
     const fx = await seedSupplierDelay(client, userId, today);
@@ -47,6 +53,9 @@ async function main() {
     console.log(`  at risk because of the delay: ${fx.expected.atRisk.join(', ')} (₹${fx.expected.valueAtRisk.toLocaleString('en-IN')})`);
     console.log(`  already at risk regardless:   ${fx.expected.alreadyAtRisk.join(', ')}`);
     console.log(`  on time:                      ${fx.expected.onTime.join(', ')}`);
+    console.log(password
+      ? `\nSign in on the app's login page as ${EMAIL} with the DEMO_PASSWORD you set, then open Decisions > Inbound shipments.`
+      : '\nSet DEMO_PASSWORD (8+ characters) when seeding to sign in on the normal login page.');
     if (process.env.JWT_SECRET) {
       const token = jwt.sign({ userId, email: EMAIL }, process.env.JWT_SECRET, { algorithm: 'HS256', expiresIn: '4h' });
       console.log('\nToken (4h, local only):');
