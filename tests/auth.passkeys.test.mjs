@@ -79,6 +79,8 @@ try {
   let r = await call(null, 'POST', '/api/auth/login', { email: a.email, password });
   const pwToken = r.token;
   check('password sign-in gives a session while the account has no second factor', r.http === 200 && !!pwToken, r);
+  // The same password on another device: a session that never proves a second factor.
+  const otherDevice = (await call(null, 'POST', '/api/auth/login', { email: a.email, password })).token;
 
   r = await call(pwToken, 'GET', '/api/auth/passkeys');
   check('passkeys are available and the list starts empty', r.http === 200 && r.available === true && r.passkeys.length === 0 && r.rpID === RP_ID, r);
@@ -97,12 +99,16 @@ try {
   check('a passkey is added', r.http === 201 && r.passkey.name === 'Laptop' && !!r.token && r.user?.id === a.id, r);
   check('the session issued after adding it counts as two-step', jwt.decode(r.token).mfa === true);
   const pkToken = r.token;
+  r = await call(pwToken, 'GET', '/api/auth/me');
+  check('the new session replaces the one that added the passkey', r.http === 401, r);
+  r = await call(pkToken, 'GET', '/api/auth/account-sessions');
+  check('so this browser is listed once, as two-step', r.http === 200 && r.sessions.filter((x) => x.current).length === 1 && r.sessions.find((x) => x.current).twoStep === true && r.sessions.length === 2, r.sessions);
   const row = (await pool.query('SELECT public_key, counter FROM user_passkeys WHERE user_id = $1', [a.id])).rows[0];
   check('only the public key is stored', row && Buffer.isBuffer(row.public_key) && row.public_key.length < 200);
 
-  r = await call(pwToken, 'POST', '/api/auth/passkeys/options', {});
+  r = await call(otherDevice, 'POST', '/api/auth/passkeys/options', {});
   check('a password-only session cannot add another second factor once one exists', r.http === 403 && r.code === 'REAUTH_REQUIRED', r);
-  r = await call(pwToken, 'POST', '/api/auth/mfa/setup', {});
+  r = await call(otherDevice, 'POST', '/api/auth/mfa/setup', {});
   check('nor start an authenticator app setup', r.http === 403 && r.code === 'REAUTH_REQUIRED', r);
 
   // Password sign-in now needs a second step, and offers the passkey.
@@ -124,6 +130,7 @@ try {
   r = await call(bToken, 'POST', '/api/auth/passkeys/options', {});
   r = await call(bToken, 'POST', '/api/auth/passkeys', { response: keyB.register(r.options), name: 'B key' });
   check('a second account adds its own passkey', r.http === 201, r);
+  const bSession = r.token;
   r = await call(null, 'POST', '/api/auth/login', { email: a.email, password });
   const t2 = r.mfaToken;
   r = await call(null, 'POST', '/api/auth/mfa/passkey/options', { mfaToken: t2 });
@@ -159,9 +166,9 @@ try {
   check('the list shows the passkey with its last use', r.passkeys.length === 1 && !!pk.lastUsedAt, r.passkeys);
   r = await call(pkToken, 'PATCH', `/api/auth/passkeys/${pk.id}`, { name: 'Work laptop' });
   check('a passkey can be renamed', r.http === 200);
-  r = await call(bToken, 'DELETE', `/api/auth/passkeys/${pk.id}`);
+  r = await call(bSession, 'DELETE', `/api/auth/passkeys/${pk.id}`);
   check("another account cannot remove this account's passkey", r.http === 403 || r.http === 404, r);
-  r = await call(pwToken, 'DELETE', `/api/auth/passkeys/${pk.id}`);
+  r = await call(otherDevice, 'DELETE', `/api/auth/passkeys/${pk.id}`);
   check('a password-only session cannot remove it', r.http === 403 && r.code === 'REAUTH_REQUIRED', r);
   r = await call(pkToken, 'DELETE', `/api/auth/passkeys/${pk.id}`);
   check('a two-step session can remove it', r.http === 200, r);
