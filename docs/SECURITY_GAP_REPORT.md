@@ -1,6 +1,6 @@
 # Starlane security and compliance gap report
 
-Date: 21 November 2026. Scope: `vantro-flow-backend` with platform core (PR #86) and this change (migration 075), and `vantro-flow-frontend`.
+Date: 21 November 2026. Scope: `vantro-flow-backend` with platform core (PR #86) and this change (migrations 075 and 076), and `vantro-flow-frontend`.
 
 ## The short version
 
@@ -29,15 +29,15 @@ Status is what `GET /api/platform/security/posture` computes on a running server
 | Prompt injection screening | In place (prompt guard on by default) | `promptGuard.service.js` |
 | Secret scanning, dependency audit, tenant-isolation check in CI | In place | `.github/workflows/security.yml` |
 | Tenant isolation | Partial: enforced in every application query; RLS is enabled on tables but the server role bypasses it and there are no policies, so the database is not a second line of defence | migration 006 not applied |
-| Multi-factor sign-in | **Not built**: sign-up verifies email with a code; sign-in is password only | — |
-| SSO (SAML / OIDC) and SCIM | **Not built**: Google sign-in exists for individuals only | — |
+| Multi-factor sign-in | In place (new): authenticator app (TOTP) with 10 single-use recovery codes, after password, Google, Apple or phone sign-in; codes cannot be replayed; 5 wrong codes lock for 15 minutes; an organization can require it for admins or everyone. Not built: passkeys, and the desktop and mobile app sessions do not carry the second-factor mark yet | migration 076, `lib/auth/mfa.js`, `lib/platform/security/mfaPolicy.js` |
+| Single sign-on | Partial (new): OpenID Connect per organization (Okta, Entra ID, Google Workspace, Auth0 and others), email domains proven by DNS TXT, PKCE, signed ID token checks, a test sign-in before it can be used, optional enforcement with the owner exempt, accounts created on first sign-in. **Not built: SAML 2.0 and SCIM provisioning** | migration 076, `lib/auth/sso.js` |
 | Backups and restore drills | Outside the app: run by the database host; no recorded drill | `BACKUP_RESTORE_DRILL.md` is a plan |
 | Penetration test | **Not done** | — |
 
 ## What each framework still needs
 
 ### SOC 2 Type II (attestation by a CPA firm)
-1. MFA for every user, enforced for admins (engineering, about 1 week).
+1. MFA is built and an organization can require it; switch the rule on for Starlane's own staff organization and keep the evidence. Passkeys and MFA for the desktop and mobile app sessions are still to build.
 2. Written policies approved by management: information security, access control, change management, incident response, vendor management, business continuity, data classification, acceptable use.
 3. Evidence processes: quarterly access reviews, onboarding / offboarding records, change approvals (PR reviews already give some of this), vendor reviews of Railway, Vercel, Supabase / Neon, model providers.
 4. Backup restore drill on a schedule, with a record.
@@ -71,13 +71,17 @@ Missing: Data Processing Agreement and published subprocessor list; SCCs for EU 
 | A connected app's response carries a prompt injection that makes an agent act | Every write to another app and every MCP tool call waits for a person to approve the exact request; test runs never execute writes |
 | A third-party MCP server mislabels a destructive tool as read-only | MCP tools are always treated as external; `readOnlyHint` is displayed, never trusted |
 | Stolen OAuth state or code | PKCE (S256), single-use hashed state with a 10-minute expiry, client secret never leaves the server |
+| Someone points another company's emails at their own identity provider | A domain counts for SSO only after a DNS TXT record proves control, a verified domain belongs to one organization, public mail domains cannot be claimed, and the ID token email must be on a verified domain |
+| A broken identity provider locks an organization out | SSO cannot be required before a test sign-in passes; the owner keeps their other sign-in methods |
+| The MFA challenge token used as a session | It is signed with a separate derived key, so the normal session check rejects it; it expires in 5 minutes |
 | Credential leak through logs or API | Credentials encrypted, never returned; call log stores no bodies or URLs; errors pass through `redact()` |
 | Audit tampering by someone with database access | Hash chain detects edits and gaps; keep the `head` from `/security/audit/verify` outside Starlane to detect tail truncation |
 
 ## Rollout steps (operator)
 
-1. Review and apply migrations 072 to 074 (PR #86) and 075 (this change) to staging, then production. 075 is additive except two triggers on `platform_audit_events`; rollback is in the migration header.
-2. Confirm `OUTBOUND_CREDENTIALS_KEY` is set in production.
+1. Review and apply migrations 072 to 074 (PR #86), 075 and 076 (this change) to staging, then production. 075 is additive except two triggers on `platform_audit_events`; 076 is additive. Rollback is in each migration header.
+2. Confirm `OUTBOUND_CREDENTIALS_KEY` is set in production. MFA secrets and SSO client secrets are encrypted with it; without it neither can be turned on.
+2a. Set `PUBLIC_API_URL` and `PUBLIC_APP_URL` so the SSO redirect URL (`<PUBLIC_API_URL>/api/auth/sso/callback`) and the return to the app are right.
 3. Leave `FEATURE_PRIVACY_ERASURE_ENABLED` off until the legal retention review is done.
 4. Turn on `FEATURE_RETENTION_JOB_ENABLED` once admins have reviewed the default periods (90 / 90 / 180 days).
 5. `FEATURE_WORKFLOW_HTTP_ACTIONS_ENABLED` (existing) also gates agents changing other software (`apps.act`); reads work without it.
