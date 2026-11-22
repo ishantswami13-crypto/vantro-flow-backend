@@ -358,6 +358,7 @@ function warmBusinessCache(userId) {
 // Initialize Supabase
 const { supabase } = require('./lib/config/supabaseClient');
 const { fetchAllRows } = require('./lib/db/fetchAllRows');
+const stockLedger = require('./lib/domain/inventory/stockLedger');
 const { getBusinessContext } = require('./lib/businessContext');
 const salesService = require('./lib/services/SalesService');
 const purchaseService = require('./lib/services/PurchaseService');
@@ -2865,6 +2866,13 @@ app.post('/api/products', authMiddleware, async (req, res) => {
       .select();
 
     if (error) throw error;
+    // The opening stock goes into the ledger too, so the reconcile recount
+    // and later movements start from it instead of from 0.
+    const opening = stockLedger.planOpeningMovements(userId, data || [], []);
+    if (opening.length) {
+      const { error: movErr } = await supabase.from('stock_movements').insert(opening);
+      if (movErr) console.warn('[products] opening stock movement not recorded:', movErr.message);
+    }
     await createActivityLog(userId, 'product_created', {
       entityType: 'product',
       entityId: data[0]?.id,
@@ -2941,6 +2949,18 @@ app.post('/api/stock/move', authMiddleware, async (req, res) => {
     if (!product) return res.status(404).json({ error: 'Product not found' });
 
     const newStock = Math.max(0, (product.current_stock || 0) + delta);
+
+    // Stock that predates the ledger (no movement yet) is recorded as the
+    // opening balance before this movement, or the next recount would rebuild
+    // the level from this movement alone.
+    if (Number(product.current_stock || 0) !== 0) {
+      const { data: anyMove } = await supabase.from('stock_movements').select('id').eq('user_id', userId).eq('product_id', product_id).limit(1);
+      if (!anyMove?.length) {
+        const opening = stockLedger.planOpeningMovements(userId, [{ id: product_id, current_stock: product.current_stock }], []);
+        const { error: openErr } = await supabase.from('stock_movements').insert(opening);
+        if (openErr) throw openErr;
+      }
+    }
 
     const [{ data: movement, error: movErr }, { error: updateErr }] = await Promise.all([
       supabase.from('stock_movements').insert([{
@@ -3250,11 +3270,15 @@ async function reconcileBusinessData(userId) {
     // chunks instead of one round trip per row, and the stock recount reads
     // every movement once and only writes products whose stock changed.
     const lc = (v) => String(v || '').trim().toLowerCase();
-    const [purchases, sales, pMovements, existingProducts] = await Promise.all([
+    const [purchases, sales, pMovements, existingProducts, purchaseLines, movedProducts] = await Promise.all([
       fetchAllRows(() => supabase.from('purchases').select('*').eq('user_id', userId)),
       fetchAllRows(() => supabase.from('sales').select('*').eq('user_id', userId)),
-      fetchAllRows(() => supabase.from('stock_movements').select('id, reference').eq('user_id', userId).not('reference', 'is', null)),
+      fetchAllRows(() => supabase.from('stock_movements').select('id, reference, product_id, movement_type, quantity').eq('user_id', userId).not('reference', 'is', null)),
       fetchAllRows(() => supabase.from('products').select('id, name, current_stock').eq('user_id', userId)),
+      // Tracked purchase lines decide what a purchase has delivered. A schema
+      // without the table (older installs) means every purchase is legacy.
+      fetchAllRows(() => supabase.from('purchase_line_items').select('id, purchase_id, product_id, unit_price, received_quantity').eq('user_id', userId)).catch(() => []),
+      fetchAllRows(() => supabase.from('stock_movements').select('id, product_id').eq('user_id', userId)),
     ]);
     const movementRefs = new Set(pMovements.map(m => m.reference));
     const productByName = new Map();
@@ -3268,8 +3292,16 @@ async function reconcileBusinessData(userId) {
     }
 
     // 1. BACKFILL PURCHASES
-    const newMovements = [];
-    for (const p of purchases) {
+    // A purchase with tracked lines books only what those lines received (an
+    // open purchase order books nothing). Only purchases without lines fall
+    // back to reading the bill's items as goods received.
+    const receipts = stockLedger.planPurchaseReceipts(userId, purchases, purchaseLines, pMovements);
+    // A product holding stock with no movement at all has an opening balance
+    // nobody recorded. Record it before anything else moves the product, so
+    // the recount below starts from it instead of from 0.
+    const openings = stockLedger.planOpeningMovements(userId, existingProducts, movedProducts);
+    const newMovements = [...openings, ...receipts.receiptMovements];
+    for (const p of receipts.legacy) {
       const ref = p.bill_number || String(p.id);
       if (movementRefs.has(ref)) continue;
       const items = getPurchaseItems(p);
@@ -3366,16 +3398,8 @@ async function reconcileBusinessData(userId) {
     // Scoped by owner: with RLS bypassed the user_id filter is what keeps
     // another tenant's movements out of the recount.
     const movements = await fetchAllRows(() => supabase.from('stock_movements').select('id, product_id, movement_type, quantity').eq('user_id', userId));
-    const stockByProduct = new Map();
-    for (const m of movements) {
-      const k = String(m.product_id);
-      const delta = m.movement_type === 'in' ? toMoney(m.quantity) : -toMoney(m.quantity);
-      stockByProduct.set(k, (stockByProduct.get(k) || 0) + delta);
-    }
-    for (const prod of existingProducts) {
-      const stock = stockByProduct.get(String(prod.id)) || 0;
-      if (Math.abs(stock - toMoney(prod.current_stock)) < 1e-9) continue;
-      await supabase.from('products').update({ current_stock: stock, updated_at: new Date() }).eq('id', prod.id).eq('user_id', userId);
+    for (const u of stockLedger.planStockUpdates(existingProducts, movements)) {
+      await supabase.from('products').update({ current_stock: u.stock, updated_at: new Date() }).eq('id', u.id).eq('user_id', userId);
     }
     console.log(`[Auto-Reconcile] Completed for user ${maskId(userId)}.`);
   } catch (err) {
@@ -9333,12 +9357,35 @@ app.post('/api/reconcile/backfill', requireAdmin, async (req, res) => {
       isDryRun
     };
 
+    // 0. Stock with no movement behind it is an opening balance: record it
+    //    before the backfill moves the product, so the recount keeps it.
+    {
+      const { data: products } = await supabase.from('products').select('id, current_stock').eq('user_id', userId);
+      const { data: allMoves } = await supabase.from('stock_movements').select('product_id').eq('user_id', userId);
+      const openings = stockLedger.planOpeningMovements(userId, products || [], allMoves || []);
+      report.openingBalancesRecorded = openings.length;
+      if (!isDryRun && openings.length) {
+        const { error: oErr } = await supabase.from('stock_movements').insert(openings);
+        if (oErr) throw oErr;
+      }
+    }
+
     // 1. BACKFILL PURCHASES -> INVENTORY
     const { data: purchases } = await supabase.from('purchases').select('*').eq('user_id', userId);
-    const { data: pMovements } = await supabase.from('stock_movements').select('reference').eq('user_id', userId).not('reference', 'is', null);
+    const { data: pMovements } = await supabase.from('stock_movements').select('reference, product_id, movement_type, quantity').eq('user_id', userId).not('reference', 'is', null);
     const movementRefs = new Set((pMovements || []).map(m => m.reference));
+    // Purchases tracked line by line book only received quantities (see
+    // lib/domain/inventory/stockLedger.js); open purchase orders book nothing.
+    const { data: purchaseLines } = await supabase.from('purchase_line_items').select('id, purchase_id, product_id, unit_price, received_quantity').eq('user_id', userId);
+    const receipts = stockLedger.planPurchaseReceipts(userId, purchases || [], purchaseLines || [], pMovements || []);
+    if (!isDryRun && receipts.receiptMovements.length) {
+      const { error: rErr } = await supabase.from('stock_movements').insert(receipts.receiptMovements);
+      if (rErr) throw rErr;
+    }
+    for (const m of receipts.receiptMovements) report.purchasesBackfilled.push({ ref: m.reference, received: m.quantity });
+    report.openPurchaseOrdersSkipped = receipts.tracked.length;
 
-    for (const p of (purchases || [])) {
+    for (const p of receipts.legacy) {
       const ref = p.bill_number || String(p.id);
       if (movementRefs.has(ref)) {
         report.skippedDuplicates++;
