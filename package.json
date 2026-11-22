@@ -51,6 +51,7 @@
     "demo:dataset":        "node scripts/demo/make-demo-dataset.js",
     "demo:readiness":      "node scripts/demo-readiness.js",
     "demo:supplier-delay": "node scripts/demo/seed-supplier-delay.js",
+    "demo:supplier-delay:journey": "node scripts/demo/supplier-delay-journey.js",
     "test:outbound":       "node --test --test-concurrency=1 tests/outbound.unit.test.js tests/outbound.engine.test.js tests/outbound.http.test.js",
     "outreach:preflight":  "node scripts/outreach-preflight.js",
     "staging:migrate":     "node scripts/staging-migrate.js",
