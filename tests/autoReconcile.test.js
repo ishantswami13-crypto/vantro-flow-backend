@@ -42,7 +42,8 @@ test('a data page reconciles stock and bank matches once, scoped to the tenant',
 
   // Tenant B has a product with the same name; it must not be touched.
   const other = await q(`INSERT INTO products (user_id, name, current_stock) VALUES ($1,'Steel Rod',99) RETURNING id`, [b.id]);
-  // Tenant A: an existing product (different case), stale stock.
+  // Tenant A: an existing product (different case) holding 5 with no
+  // movement behind it: an opening balance the recount must keep.
   await q(`INSERT INTO products (user_id, name, current_stock) VALUES ($1,'steel rod',5)`, [a.id]);
   await q(
     `INSERT INTO purchases (user_id, supplier_name, amount, paid_amount, status, bill_number, items) VALUES
@@ -65,10 +66,10 @@ test('a data page reconciles stock and bank matches once, scoped to the tenant',
   assert.ok(r.status < 500, `invoices page loads (${r.status})`);
 
   const products = (await q(`SELECT name, current_stock::numeric AS s FROM products WHERE user_id = $1 ORDER BY name`, [a.id])).rows;
-  assert.deepEqual(products.map((p) => [p.name, Number(p.s)]), [['Blue Paint', 4], ['steel rod', 7]], 'in 10 + 4, out 3; existing product matched case-insensitively');
+  assert.deepEqual(products.map((p) => [p.name, Number(p.s)]), [['Blue Paint', 4], ['steel rod', 12]], 'opening 5, in 10 + 4, out 3; existing product matched case-insensitively');
 
   const moves = (await q(`SELECT movement_type, quantity::numeric AS q, reference FROM stock_movements WHERE user_id = $1 ORDER BY reference, movement_type`, [a.id])).rows;
-  assert.deepEqual(moves.map((m) => [m.reference, m.movement_type, Number(m.q)]), [['B-1', 'in', 10], ['B-2', 'in', 4], ['S-1', 'out', 3]]);
+  assert.deepEqual(moves.map((m) => [m.reference.startsWith('OPENING-') ? 'OPENING' : m.reference, m.movement_type, Number(m.q)]), [['B-1', 'in', 10], ['B-2', 'in', 4], ['OPENING', 'in', 5], ['S-1', 'out', 3]]);
 
   const txns = (await q(`SELECT matched_type, type, amount::numeric AS a FROM bank_transactions WHERE user_id = $1 ORDER BY matched_type`, [a.id])).rows;
   assert.deepEqual(txns.map((x) => [x.matched_type, x.type, Number(x.a)]), [['invoice', 'credit', 300], ['purchase', 'debit', 1000], ['sale', 'credit', 300]], 'only paid records are matched');
@@ -78,6 +79,6 @@ test('a data page reconciles stock and bank matches once, scoped to the tenant',
 
   // Concurrent callers share the same run; nothing is duplicated.
   await Promise.all([ca.get(`/api/invoices/${a.id}`), ca.get(`/api/invoices/${a.id}`)]);
-  assert.equal((await q(`SELECT COUNT(*)::int AS n FROM stock_movements WHERE user_id = $1`, [a.id])).rows[0].n, 3);
+  assert.equal((await q(`SELECT COUNT(*)::int AS n FROM stock_movements WHERE user_id = $1`, [a.id])).rows[0].n, 4, 'opening + 3 backfilled, nothing twice');
   assert.equal((await q(`SELECT COUNT(*)::int AS n FROM bank_transactions WHERE user_id = $1`, [a.id])).rows[0].n, 3);
 });

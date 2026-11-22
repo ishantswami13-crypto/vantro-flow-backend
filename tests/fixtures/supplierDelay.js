@@ -17,10 +17,9 @@
 const crypto = require('crypto');
 
 const BIKE_PRICE = 18500;
-// The legacy auto-reconcile treats every `purchases` row with an amount (or
-// items) as goods already received and books them into stock. These are open
-// purchase orders whose lines are still inbound, so the billed amount is 0 (nothing billed yet)
-// and the lines live only in purchase_line_items. See the findings report.
+// Open purchase orders: the supplier has billed them, and every line is still
+// inbound (purchase_line_items with no received_quantity). Opening the app
+// must not book them into stock (lib/domain/inventory/stockLedger.js).
 const OPEN_PO_NOTE = 'Open purchase order; goods not yet received (synthetic fixture)';
 const LOCK_PRICE = 900;
 
@@ -42,13 +41,8 @@ async function seedSupplierDelay(db, userId, asOfDay) {
       `INSERT INTO products (id, user_id, name, sku, unit_price, unit, current_stock, category) VALUES ($1,$2,$3,$4,$5,'pcs',$6,$7)`,
       [pid, userId, name, sku, price, stock, category]
     );
-    // current_stock is derived: the app's auto-reconcile (server.js
-    // reconcileBusinessData, run from /api/auth/me) recomputes it from
-    // stock_movements and would zero a stock level that has no movement.
-    await db.query(
-      `INSERT INTO stock_movements (user_id, product_id, movement_type, quantity, reference, notes) VALUES ($1,$2,'in',$3,$4,'Opening stock (synthetic fixture)')`,
-      [userId, pid, stock, `OPENING-${sku}`]
-    );
+    // Deliberately no stock_movements: stock typed into the product record is
+    // how most owners start, and the reconcile must keep it.
   }
   await db.query(
     `INSERT INTO product_components (user_id, finished_product_id, component_product_id, quantity_per_unit) VALUES ($1,$2,$3,1), ($1,$2,$4,2)`,
@@ -61,11 +55,11 @@ async function seedSupplierDelay(db, userId, asOfDay) {
     [userId, P.frame, sup.rows[0].id, P.wheel, sup2.rows[0].id]);
 
   const pu1 = await db.query(
-    `INSERT INTO purchases (user_id, supplier_name, amount, status, purchase_date, bill_number, currency, notes) VALUES ($1,'Shenzhen Frame Co',0,'ordered',$2,'PO-7781','INR',$3) RETURNING id`,
+    `INSERT INTO purchases (user_id, supplier_name, amount, status, purchase_date, bill_number, currency, notes) VALUES ($1,'Shenzhen Frame Co',165000,'unpaid',$2,'PO-7781','INR',$3) RETURNING id`,
     [userId, plus(asOfDay, -20), OPEN_PO_NOTE]
   );
   const pu2 = await db.query(
-    `INSERT INTO purchases (user_id, supplier_name, amount, status, purchase_date, bill_number, currency, notes) VALUES ($1,'Pune Wheel Works',0,'ordered',$2,'PO-7790','INR',$3) RETURNING id`,
+    `INSERT INTO purchases (user_id, supplier_name, amount, status, purchase_date, bill_number, currency, notes) VALUES ($1,'Pune Wheel Works',60000,'unpaid',$2,'PO-7790','INR',$3) RETURNING id`,
     [userId, plus(asOfDay, -10), OPEN_PO_NOTE]
   );
   const frameLine = await db.query(
