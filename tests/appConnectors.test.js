@@ -42,6 +42,9 @@ const LIVE_ENV = {
   FEATURE_CONNECTOR_QUICKBOOKS_ENABLED: 'true', QUICKBOOKS_CLIENT_ID: 'qbo-client', QUICKBOOKS_CLIENT_SECRET: 'qbo-secret',
   FEATURE_CONNECTOR_RAZORPAY_ENABLED: 'true',
   FEATURE_CONNECTOR_WHATSAPP_BUSINESS_ENABLED: 'true', META_APP_SECRET: 'meta-app-secret', WHATSAPP_WEBHOOK_VERIFY_TOKEN: 'verify-me',
+  // Feed apps (lib/connectors/feeds): Shopify, WooCommerce, Zoho Inventory.
+  FEATURE_CONNECTOR_SHOPIFY_ENABLED: 'true', FEATURE_CONNECTOR_WOOCOMMERCE_ENABLED: 'true', FEATURE_CONNECTOR_ZOHO_INVENTORY_ENABLED: 'true',
+  FEATURE_CONNECTOR_XERO_ENABLED: 'true', XERO_CLIENT_ID: 'xero-client', XERO_CLIENT_SECRET: 'xero-secret',
   PUBLIC_API_URL: 'https://api.starlane.test', FRONTEND_URL: 'https://app.starlane.test',
 };
 
@@ -154,8 +157,8 @@ test('every app connector stays Coming soon, with no connect action, until its f
     assert.ok(m.connect && m.access.length, id);
     assert.deepEqual(registry.validateManifest(m), [], id);
   }
-  // The catalog count is unchanged: these were already listed as planned.
-  assert.equal(registry.listManifests(off).length, 45);
+  // Shopify, WooCommerce and Xero moved from planned to built; Zoho Inventory is new.
+  assert.equal(registry.listManifests(off).length, 46);
 });
 
 test('app health is derived from the account and its sync runs only', () => {

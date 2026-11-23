@@ -479,6 +479,8 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/api/hooks/')) return next();
   // Meta signs the exact bytes of WhatsApp deliveries (lib/routes/connectors.js).
   if (req.path === '/api/connectors/whatsapp_business/webhook') return next();
+  // Data feed pushes may be CSV or Excel, not only JSON (lib/routes/feeds.js).
+  if (req.path === '/api/feeds/in' || req.path.startsWith('/api/feeds/in/')) return next();
   return jsonParser(req, res, next);
 });
 app.use(express.urlencoded({ extended: true })); // Twilio webhooks send form-encoded
@@ -604,7 +606,9 @@ const apiLimiter = makeLimiter({
   // Zapier post for every tenant from a few shared IPs, so the anonymous
   // 120/min per-IP budget here would throttle all tenants together.
   // Meta delivers every tenant's WhatsApp messages from shared IPs too.
-  skip: (req) => String(req.originalUrl || '').startsWith('/api/hooks/') || String(req.originalUrl || '').startsWith('/api/connectors/whatsapp_business/webhook'),
+  // Data feed pushes have their own per-key and per-IP limits (lib/routes/feeds.js).
+  skip: (req) => String(req.originalUrl || '').startsWith('/api/hooks/') || String(req.originalUrl || '').startsWith('/api/connectors/whatsapp_business/webhook')
+    || String(req.originalUrl || '').startsWith('/api/feeds/in'),
 });
 const uploadLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, max: 20 });
 const aiLimiter = makeLimiter({ windowMs: 10 * 60 * 1000, max: 40, keyGenerator: authAwareKey });
@@ -12970,6 +12974,12 @@ app.use('/api', authProvidersRouter({
 const { connectorsRouter } = require('./lib/routes/connectors');
 app.use('/api/connectors', connectorsRouter({ pool: getPool(), authMiddleware }));
 
+// Data feeds — products, bills of materials, customer orders and purchase
+// orders flowing in from a Google Sheet, any file address, a connected app or
+// rows other software pushes, all through the operational import's checks.
+const { feedsRouter, discoverFor: feedDiscoverFor } = require('./lib/routes/feeds');
+app.use('/api/feeds', feedsRouter({ pool: getPool(), authMiddleware }));
+
 // Region: country, currency, number/date format, timezone and tax label for
 // the business (lib/locale/region.js). Stored as versioned definitions.
 const { regionRouter, applyCountryDefaults } = require('./lib/routes/region');
@@ -14241,6 +14251,21 @@ cron.schedule('*/30 * * * *', async () => {
     const out = await syncAllApps(getPool());
     if (out.accounts) _log('info', '[AppConnectorCron] Done', out);
   } catch (err) { _log('error', '[AppConnectorCron] Fatal', { error: err.message }); }
+}, { timezone: 'UTC' });
+
+// Data feeds on a schedule — every 15 minutes, the feeds that are due run
+// once (claimed with SKIP LOCKED, so one replica runs each). Gated by
+// FEATURE_DATA_FEEDS_SCHEDULER_ENABLED (default OFF). Read-only towards the
+// sources; writes only through the operational import.
+cron.schedule('*/15 * * * *', async () => {
+  const { isEnabled: _isFE } = require('./lib/featureFlags');
+  if (!_isFE('data_feeds_scheduler_enabled') || !process.env.DATABASE_URL) return;
+  const { safeLog: _log } = require('./lib/observability/logger');
+  try {
+    const { runDueFeeds } = require('./lib/connectors/feeds/feeds');
+    const out = await runDueFeeds(getPool(), { discover: feedDiscoverFor(getPool()) });
+    if (out.feeds) _log('info', '[DataFeedsCron] Done', out);
+  } catch (err) { _log('error', '[DataFeedsCron] Fatal', { error: err.message }); }
 }, { timezone: 'UTC' });
 
 // Starlane decisions — hourly discovery and daily contract verification per
