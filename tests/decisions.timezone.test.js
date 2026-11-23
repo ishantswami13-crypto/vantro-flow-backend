@@ -7,8 +7,8 @@
 // the dates quoted in customer drafts, and could flip an order between on
 // time and late.
 //
-// This file (1) checks the DATE helper directly and (2) re-runs the two
-// end-to-end supplier-delay suites with the process (test runner + spawned
+// This file (1) checks the DATE helper directly and (2) re-runs the three
+// end-to-end supplier-delay suites (including decision reconciliation) with the process (test runner + spawned
 // server) in timezones east and west of UTC. Needs DATABASE_URL; the runner
 // reports it SKIPPED without one.
 
@@ -33,7 +33,7 @@ test('pgDateDay reads a node-pg DATE as its calendar day in any timezone', () =>
 
 for (const tz of ['Asia/Kolkata', 'Pacific/Kiritimati', 'America/Los_Angeles']) {
   test(`supplier-delay suites pass with the server in ${tz}`, { skip: !process.env.DATABASE_URL && 'needs DATABASE_URL' }, () => {
-    const r = spawnSync(process.execPath, ['--test', '--test-concurrency=1', 'tests/decisions.supplierDelay.test.js', 'tests/operations.realData.test.js'], {
+    const r = spawnSync(process.execPath, ['--test', '--test-concurrency=1', 'tests/decisions.supplierDelay.test.js', 'tests/operations.realData.test.js', 'tests/decisions.delayReconcile.test.js'], {
       cwd: ROOT,
       env: { ...process.env, TZ: tz },
       encoding: 'utf8',
