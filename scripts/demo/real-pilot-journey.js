@@ -304,7 +304,12 @@ async function main() {
     const agentEvents = (await pool.query(`SELECT COALESCE(model, '') AS model FROM decision_events WHERE user_id = $1 AND actor_type = 'agent'`, [userId])).rows;
     check(agentEvents.length > 0 && agentEvents.every((e) => /no LLM/.test(e.model)), 'every engine event is recorded as deterministic (no LLM)');
     s = await sent();
-    check(s.sends === 0 && s.jobs === 0 && s.drafts_moved === 0, 'at the end: the one draft still waits for approval; nothing was sent', JSON.stringify(s));
+    // Everything arrived, so no order is late: the run decision resolves and
+    // its unsent draft is withdrawn (kept, with a reason), never left sendable.
+    const left = (await pool.query(`SELECT status, block_reason FROM ai_actions WHERE user_id = $1`, [userId])).rows;
+    check(s.sends === 0 && s.jobs === 0 && left.length === 1 && left[0].status === 'expired' && /received in full/.test(left[0].block_reason || ''), 'at the end: the draft is withdrawn because the goods arrived; nothing was sent', JSON.stringify({ ...s, left }));
+    const dstat = (await pool.query(`SELECT status FROM decisions WHERE user_id = $1 AND kind = 'SUPPLIER_DELAY'`, [userId])).rows.map((r) => r.status);
+    check(dstat.length === 1 && dstat[0] === 'RESOLVED', 'the run decision is resolved, not left current', dstat.join(','));
     check(errors.length === 0, 'no page errors', errors.join(' | '));
   } catch (err) {
     await shot('FAILED').catch(() => {});
