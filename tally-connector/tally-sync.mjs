@@ -8,6 +8,10 @@
  * idempotently in invoices / purchases / bank_transactions / products /
  * stock_movements. Safe to re-run — nothing is ever imported twice.
  *
+ * When the owner has added Tally data feeds in Starlane (Data feeds › Tally),
+ * each sync also sends open sales orders, purchase orders and stock items for
+ * those feeds (POST /api/import/tally/feeds).
+ *
  * Zero dependencies — plain Node.js (v18+).
  *
  * Usage:
@@ -196,6 +200,54 @@ function debtorContactsRequestXML(company) {
   <STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>${companyTag}</STATICVARIABLES>
   <TDL><TDLMESSAGE>
    <COLLECTION NAME="StarlaneDebtorContacts" ISMODIFY="No"><TYPE>Ledger</TYPE><CHILDOF>$$GroupSundryDebtors</CHILDOF><BELONGSTO>Yes</BELONGSTO><FETCH>NAME, LEDGERMOBILE, LEDGERPHONE</FETCH></COLLECTION>
+  </TDLMESSAGE></TDL>
+ </DESC></BODY>
+</ENVELOPE>`;
+}
+
+/**
+ * Stock items with their group, base unit and closing balance — for a
+ * "Products and stock" data feed. Names and quantities only; no values.
+ */
+function stockItemsRequestXML(company) {
+  const companyTag = company ? `<SVCURRENTCOMPANY>${escapeXml(company)}</SVCURRENTCOMPANY>` : '';
+  return `<ENVELOPE>
+ <HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>StarlaneStockItems</ID></HEADER>
+ <BODY><DESC>
+  <STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>${companyTag}</STATICVARIABLES>
+  <TDL><TDLMESSAGE>
+   <COLLECTION NAME="StarlaneStockItems" ISMODIFY="No"><TYPE>StockItem</TYPE><FETCH>NAME, PARENT, BASEUNITS, CLOSINGBALANCE</FETCH></COLLECTION>
+  </TDLMESSAGE></TDL>
+ </DESC></BODY>
+</ENVELOPE>`;
+}
+
+/**
+ * Sales Orders and Purchase Orders in a date range, with the vouchers that
+ * fulfil them (Delivery Notes, Receipt Notes, Sales and Purchase invoices),
+ * for "Customer orders" and "Purchase orders" data feeds. STARLANEPARENT is
+ * each voucher's base type, so renamed voucher types are still recognised.
+ * Starlane works out what is still outstanding from the order numbers.
+ */
+function orderVouchersRequestXML(fromDate, toDate, company) {
+  const companyTag = company ? `<SVCURRENTCOMPANY>${escapeXml(company)}</SVCURRENTCOMPANY>` : '';
+  return `<ENVELOPE>
+ <HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>StarlaneOrderVouchers</ID></HEADER>
+ <BODY><DESC>
+  <STATICVARIABLES>
+   <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+   <SVFROMDATE TYPE="Date">${fromDate}</SVFROMDATE>
+   <SVTODATE TYPE="Date">${toDate}</SVTODATE>
+   ${companyTag}
+  </STATICVARIABLES>
+  <TDL><TDLMESSAGE>
+   <COLLECTION NAME="StarlaneOrderVouchers" ISMODIFY="No">
+    <TYPE>Voucher</TYPE>
+    <FETCH>DATE, VOUCHERTYPENAME, VOUCHERNUMBER, PARTYLEDGERNAME, ISCANCELLED, ISOPTIONAL, ALLINVENTORYENTRIES.*, INVENTORYENTRIES.*</FETCH>
+    <COMPUTE>STARLANEPARENT : $Parent:VoucherType:$VoucherTypeName</COMPUTE>
+    <FILTER>StarlaneOrderFlow</FILTER>
+   </COLLECTION>
+   <SYSTEM TYPE="Formulae" NAME="StarlaneOrderFlow">$$IsSalesOrder:$VoucherTypeName OR $$IsPurcOrder:$VoucherTypeName OR $$IsDelNote:$VoucherTypeName OR $$IsRcptNote:$VoucherTypeName OR $$IsSales:$VoucherTypeName OR $$IsPurchase:$VoucherTypeName</SYSTEM>
   </TDLMESSAGE></TDL>
  </DESC></BODY>
 </ENVELOPE>`;
@@ -577,7 +629,11 @@ const CHUNK = 1000;
 
 async function runOnce(cfg) {
   const { rows, contacts, identities } = await collectRows(cfg);
-  if (rows.length === 0) { console.log('ℹ️  No vouchers found in this date range. Nothing to send.'); return; }
+  if (rows.length === 0) {
+    console.log('ℹ️  No vouchers found in this date range. Nothing to send.');
+    if (MODE === 'once' || MODE === 'watch') await syncFeeds(cfg, await getAuthHeader(cfg));
+    return;
+  }
 
   if (MODE === 'test' || MODE === 'dry-run') {
     console.log(`\n📋 ${rows.length} vouchers that WOULD be sent to Starlane:\n`);
@@ -606,9 +662,66 @@ async function runOnce(cfg) {
   }).catch((e) => ({ status: 0, body: { error: e.message } }));
   if (recon.status === 200) console.log(`${recon.body.held ? '⚠️ ' : '🧾'} ${recon.body.message}`);
   else console.log(`⚠️  Could not check for vouchers deleted in Tally (${recon.status}): ${recon.body?.error || 'unknown error'}`);
+  await syncFeeds(cfg, authHeader);
   const imported = {};
   for (const res of results) for (const [k, v] of Object.entries(res.imported || {})) imported[k] = (imported[k] || 0) + (Number(v) || 0);
   try { writeFileSync(join(HERE, 'state.json'), JSON.stringify({ lastSync: new Date().toISOString(), result: imported }, null, 2)); } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// Data feeds: orders, purchase orders and stock, only for the feeds the owner
+// added in Starlane (Data feeds › Tally). Tally's XML is sent as it came;
+// Starlane parses it and runs it through the same checks as a file upload.
+// ---------------------------------------------------------------------------
+const FEED_XML_LIMIT = 9 * 1024 * 1024;   // Starlane takes requests up to 10 MB
+
+function addDays(yyyymmdd, days) {
+  const d = new Date(`${tallyDateToISO(yyyymmdd)}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10).replace(/-/g, '');
+}
+
+async function syncFeeds(cfg, authHeader) {
+  const wanted = await apiRequest(cfg.starlane.apiBase, '/api/connectors/device/feeds', { authHeader }).catch((e) => ({ status: 0, body: { error: e.message } }));
+  if (wanted.status === 404) return; // an older Starlane without data feeds
+  if (wanted.status !== 200) { console.log(`⚠️  Could not ask Starlane which data feeds to send (${wanted.status}): ${wanted.body?.error || 'unknown error'}`); return; }
+  const kinds = wanted.body?.kinds || [];
+  if (!kinds.length) return;
+  const to = today();
+  for (const company of cfg.companies.length ? cfg.companies : ['']) {
+    const label = company || '(current company)';
+    const send = async (kind, xml) => {
+      const r = await apiRequest(cfg.starlane.apiBase, '/api/import/tally/feeds', { method: 'POST', authHeader, json: { kind, xml, company } });
+      if (r.status !== 200) { console.log(`⚠️  ${label}: ${kind} feed was not accepted (${r.status}): ${r.body?.error || 'unknown error'}`); return; }
+      for (const x of r.body.results || []) console.log(`   ${label}: ${kind} feed — ${x.status}${x.error ? ` (${x.error})` : ''}`);
+    };
+    try {
+      if (kinds.includes('products')) {
+        process.stdout.write(`📦 Reading stock items from Tally for ${label} ... `);
+        const xml = await tallyPost(cfg, stockItemsRequestXML(company));
+        console.log('done.');
+        if (xml.length > FEED_XML_LIMIT) console.log(`⚠️  ${label}: the stock item list is too large to send in one go.`);
+        else await send('products', xml);
+      }
+      const orderKinds = kinds.filter((k) => k === 'orders' || k === 'purchase_lines');
+      if (orderKinds.length) {
+        // Start with Starlane's look-back; if the export is too large, read a shorter range.
+        let xml = null;
+        for (const days of [null, 90, 30]) {
+          const from = days ? addDays(to, -days) : (wanted.body.ordersFromDate || addDays(to, -180));
+          process.stdout.write(`🧾 Reading orders from ${tallyDateToISO(from)} for ${label} ... `);
+          const got = await tallyPost(cfg, orderVouchersRequestXML(from, to, company));
+          console.log('done.');
+          if (got.length <= FEED_XML_LIMIT) { xml = got; break; }
+          console.log(`   That export is larger than Starlane takes; trying a shorter range.`);
+        }
+        if (!xml) console.log(`⚠️  ${label}: even 30 days of orders is too large to send.`);
+        else for (const kind of orderKinds) await send(kind, xml);
+      }
+    } catch (e) {
+      console.log(`⚠️  ${label}: data feeds skipped (${e.message}).`);
+    }
+  }
 }
 
 async function enroll(cfg) {
