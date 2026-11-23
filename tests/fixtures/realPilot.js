@@ -39,6 +39,38 @@ async function seedProductMaster(db, userId) {
   return P;
 }
 
+const toCsv = (rows) => Buffer.from(rows.map((r) => r.map((c) => (/[,"]/.test(String(c)) ? `"${String(c).replace(/"/g, '""')}"` : String(c))).join(',')).join('\r\n') + '\r\n');
+
+// The same product master as seedProductMaster, the way a customer would
+// export it, with three rows the import must refuse: a second product on an
+// existing SKU, a new product with no stock stated, and a negative stock.
+function productsCsv() {
+  return toCsv([
+    ['SKU', 'Item Name', 'Unit', 'Category', 'Stock On Hand', 'Selling Price'],
+    ['MTR-1HP', 'Motor 1HP', 'pcs', 'component', '4', ''],
+    ['IMP-SS', 'Impeller SS', 'pcs', 'component', '30', ''],
+    ['PMP-A1', 'Pump A1', 'pcs', 'finished', '0', '9,000.00'],
+    ['VLV-25', 'Valve 25mm', 'pcs', 'resale', '40', '400'],
+    ['SEAL-K', 'Seal kit', 'pcs', 'resale', '0', '150'],
+    ['GSK-1', 'Gasket Red', 'pcs', 'resale', '0', '20'],
+    ['GSK-1', 'Gasket Black', 'pcs', 'resale', '0', '20'],
+    ['CPL-9', 'Coupling 2in', 'pcs', 'resale', '', '120'],
+    ['BRK-3', 'Bracket', 'pcs', 'component', '-5', ''],
+  ]);
+}
+const PRODUCT_MAPPING = { sku: 'SKU', product_name: 'Item Name', unit: 'Unit', category: 'Category', on_hand: 'Stock On Hand', unit_price: 'Selling Price' };
+
+// Pump A1 = 1 motor + 1 impeller. The nut is not in the product master.
+function componentsCsv() {
+  return toCsv([
+    ['Finished SKU', 'Finished Product', 'Component SKU', 'Component', 'Qty Per Unit'],
+    ['PMP-A1', 'Pump A1', 'MTR-1HP', 'Motor 1HP', '1'],
+    ['PMP-A1', 'Pump A1', 'IMP-SS', 'Impeller SS', '1'],
+    ['PMP-A1', 'Pump A1', 'NUT-8', 'Nut M8', '4'],
+  ]);
+}
+const COMPONENT_MAPPING = { finished_sku: 'Finished SKU', finished_name: 'Finished Product', component_sku: 'Component SKU', component_name: 'Component', quantity_per_unit: 'Qty Per Unit' };
+
 function purchaseCsv(asOfDay, overrides = {}) {
   const d = (n) => plus(asOfDay, n);
   const rows = [
@@ -112,4 +144,4 @@ const EXPECTED = {
   afterPartialReceipt: { atRisk: ['Bharat Irrigation'], valueAtRisk: 135000 },
 };
 
-module.exports = { plus, seedProductMaster, purchaseCsv, ordersXlsx, PURCHASE_MAPPING, ORDER_MAPPING, EXPECTED };
+module.exports = { plus, seedProductMaster, productsCsv, componentsCsv, purchaseCsv, ordersXlsx, PRODUCT_MAPPING, COMPONENT_MAPPING, PURCHASE_MAPPING, ORDER_MAPPING, EXPECTED };

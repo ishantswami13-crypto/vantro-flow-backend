@@ -65,3 +65,4 @@ cortex-lab/.env.test
 # Demo files are dated the day they are made: npm run demo:dataset
 /demo/
 real-pilot-journey/
+pilot-demo-files/

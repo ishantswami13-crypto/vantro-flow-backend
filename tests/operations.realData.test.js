@@ -20,7 +20,7 @@ const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { dbReady, createTenant, deleteTenant, startServer, client, todayIso } = require('./helpers/decisionHarness');
 const { testDatabaseProblem } = require('../lib/db/testDatabaseGuard');
-const { plus, seedProductMaster, purchaseCsv, ordersXlsx, PURCHASE_MAPPING, ORDER_MAPPING, EXPECTED } = require('./fixtures/realPilot');
+const { plus, seedProductMaster, productsCsv, componentsCsv, purchaseCsv, ordersXlsx, PRODUCT_MAPPING, COMPONENT_MAPPING, PURCHASE_MAPPING, ORDER_MAPPING, EXPECTED } = require('./fixtures/realPilot');
 const { commitOperationalImport } = require('../lib/domain/operations/operationalImport');
 
 let env;
@@ -455,6 +455,107 @@ test('order import edge cases: currency, invalid values, changed source records'
   assert.equal(cl.status, 200, JSON.stringify(cl.body));
   const o = (await env.pool.query(`SELECT o.status, oli.line_status FROM order_line_items oli JOIN orders o ON o.id = oli.order_id WHERE oli.user_id = $1 AND oli.external_ref = 'SO-15'`, [a.user.id])).rows[0];
   assert.deepEqual(o, { status: 'delivered', line_status: 'delivered' });
+});
+
+test('from an empty account: products, stock and components come only from files; stock is physical; the delay result is the same as hand-worked', async (t) => {
+  if (!env.ok) return t.skip(`no database: ${env.reason}`);
+  const user = await createTenant(env.pool, 'ops-empty');
+  tenants.push(user);
+  const a = { user, api: withUpload(client(server.base, user), user) };
+  const count = async (tbl) => (await env.pool.query(`SELECT COUNT(*)::int AS n FROM ${tbl} WHERE user_id = $1`, [user.id])).rows[0].n;
+  assert.equal(await count('products'), 0);
+
+  // Products: preview proposes the mapping, writes nothing, shows the three bad rows.
+  const pbuf = productsCsv();
+  const pv = await a.api.upload('/operations/import/preview', pbuf, 'item-master.csv', { kind: 'products' });
+  assert.equal(pv.status, 200, JSON.stringify(pv.body));
+  assert.equal(pv.body.proposal.fields.on_hand.header, 'Stock On Hand');
+  assert.equal(pv.body.proposal.fields.sku.header, 'SKU');
+  assert.ok(pv.body.mappingErrors.some((e) => /system this file came from/.test(e)));
+  const popts = { mapping: PRODUCT_MAPPING, dateOrders: {}, sourceSystem: 'Tally item master', reviewChoices: {} };
+  const pv2 = await a.api.upload('/operations/import/preview', pbuf, 'item-master.csv', { kind: 'products', options: popts });
+  const ps = pv2.body.summary;
+  assert.equal(ps.counts.new, 6, JSON.stringify(ps.counts));
+  assert.equal(ps.counts.rejected, 3);
+  const reasons = ps.rejectedByReason.map((r) => r.example).join(' | ');
+  assert.match(reasons, /SKU GSK-1 appears again with different values/);
+  assert.match(reasons, /"Coupling 2in" is a new product with no stock on hand stated/);
+  assert.match(reasons, /stock on hand "-5" is negative/);
+  assert.equal(await count('products'), 0, 'preview writes nothing');
+
+  const pc = await a.api.upload('/operations/import/commit', pbuf, 'item-master.csv', { kind: 'products', options: popts });
+  assert.equal(pc.status, 200, JSON.stringify(pc.body));
+  assert.equal(pc.body.summary.entities.productsCreated, 6);
+  assert.equal(pc.body.summary.entities.openingStockRecorded, 3, 'motor 4, impeller 30, valve 40');
+  const prods = Object.fromEntries((await env.pool.query(`SELECT sku, id, current_stock::text AS s, unit_price::text AS price FROM products WHERE user_id = $1`, [user.id])).rows.map((r) => [r.sku, r]));
+  assert.deepEqual(Object.keys(prods).sort(), ['GSK-1', 'IMP-SS', 'MTR-1HP', 'PMP-A1', 'SEAL-K', 'VLV-25']);
+  assert.equal(Number(prods['MTR-1HP'].s), 4);
+  assert.equal(prods['MTR-1HP'].price, null, 'no selling price stays unknown, not 0');
+  assert.equal(Number(prods['PMP-A1'].price), 9000);
+  const ledger = (await env.pool.query(`SELECT reference, quantity::float AS q FROM stock_movements WHERE user_id = $1 ORDER BY quantity`, [user.id])).rows;
+  assert.deepEqual(ledger.map((m) => [m.reference.split('-')[0], m.q]), [['OPENING', 4], ['OPENING', 30], ['OPENING', 40]]);
+
+  // Same file again: one import. Changed choices: a new batch, nothing duplicated.
+  const again = await a.api.upload('/operations/import/commit', pbuf, 'item-master.csv', { kind: 'products', options: popts });
+  assert.equal(again.body.import.alreadyImported, true);
+  const renamed = await a.api.upload('/operations/import/commit', pbuf, 'item-master.csv', { kind: 'products', options: { ...popts, sourceSystem: 'Tally items' } });
+  assert.equal(renamed.status, 200);
+  assert.equal(renamed.body.summary.counts.unchanged, 6);
+  assert.equal(await count('products'), 6);
+
+  // Components.
+  const cbuf = componentsCsv();
+  const copts = { mapping: COMPONENT_MAPPING, dateOrders: {}, sourceSystem: 'Tally BOM', reviewChoices: {} };
+  const cc = await a.api.upload('/operations/import/commit', cbuf, 'bom.csv', { kind: 'components', options: copts });
+  assert.equal(cc.status, 200, JSON.stringify(cc.body));
+  assert.equal(cc.body.summary.counts.new, 2);
+  assert.match(cc.body.summary.rejectedByReason[0].example, /component: no product with SKU NUT-8 or named "Nut M8"; import products first/);
+  assert.equal(await count('product_components'), 2);
+
+  // Then the purchase and order exports; the rest of the loop must match the hand-worked plan.
+  const pbuf2 = purchaseCsv(today);
+  const prev = await a.api.upload('/operations/import/preview', pbuf2, 'zoho-open-pos.csv', { kind: 'purchase_lines', options: { mapping: PURCHASE_MAPPING, dateOrders: {}, sourceSystem: 'Zoho Inventory', stockFollows: 'STARLANE', reviewChoices: {} } });
+  const review = prev.body.summary.review;
+  assert.deepEqual(review.map((r) => r.label), ['UNK-9 · Unknown part'], 'GSK-1 now names exactly one product, so only the unknown part is asked');
+  await importPurchases(a, { reviewChoices: { [review[0].key]: 'SKIP' } });
+  await importOrders(a);
+  const pli = (await env.pool.query(`SELECT external_ref, received_quantity::text AS r FROM purchase_line_items WHERE user_id = $1 ORDER BY external_ref`, [user.id])).rows;
+  assert.deepEqual(pli.map((x) => x.external_ref), ['PO-777/1', 'PO-901/1', 'PO-901/2', 'PO-905/1', 'PO-906/1']);
+  assert.equal(Number(prods['MTR-1HP'] && (await env.pool.query('SELECT current_stock FROM products WHERE id = $1', [prods['MTR-1HP'].id])).rows[0].current_stock), 4, 'open purchase quantities never become stock');
+
+  const motor = await motorLine(user.id);
+  const rep = await a.api.post('/api/decisions/report-supplier-delay', { purchaseLineItemId: motor.id, newExpectedAt: plus(today, 12), reason: 'Copper shortage' });
+  assert.equal(rep.status, 200, JSON.stringify(rep.body));
+  const d = (await a.api.get(`/api/decisions/${rep.body.decision.id}`)).body.decision;
+  assert.deepEqual(d.analysis.supplierDelay.atRisk.map((l) => l.customerName).sort(), EXPECTED.afterDelay.atRisk);
+  // PO-777 (5 motors at +9) is also imported on this account, since no typed-in
+  // bill conflicts with it; the at-risk orders and value are unchanged by it.
+  assert.equal(d.materiality.revenueExposure, EXPECTED.afterDelay.valueAtRisk);
+
+  // A later product file never overwrites stock Starlane now tracks through movements.
+  const r1 = await a.api.post(`/api/decisions/purchase-lines/${motor.id}/receipts`, { quantity: '20', receivedOn: today, idempotencyKey: key() });
+  assert.equal(r1.status, 201);
+  const recount = Buffer.from('SKU,Item Name,Stock On Hand\r\nMTR-1HP,Motor 1HP,50\r\nVLV-25,Valve 25mm,35\r\n');
+  const rc = await a.api.upload('/operations/import/commit', recount, 'recount.csv', { kind: 'products', options: { mapping: { sku: 'SKU', product_name: 'Item Name', on_hand: 'Stock On Hand' }, dateOrders: {}, sourceSystem: 'Tally item master', reviewChoices: {} } });
+  assert.equal(rc.status, 200, JSON.stringify(rc.body));
+  assert.equal(rc.body.summary.counts.conflicts, 2);
+  assert.match(rc.body.summary.conflicts[0].details[0], /already tracks stock of Motor 1HP .*24 now.*was not applied/);
+  assert.equal(Number((await env.pool.query('SELECT current_stock FROM products WHERE id = $1', [prods['MTR-1HP'].id])).rows[0].current_stock), 24);
+  const audit = (await env.pool.query(`SELECT payload->>'kind' AS kind FROM decision_events WHERE user_id = $1 AND event_type = 'OPERATIONS_IMPORTED' ORDER BY created_at`, [user.id])).rows.map((r) => r.kind);
+  assert.deepEqual(audit, ['products', 'products', 'components', 'purchase_lines', 'orders', 'products']);
+});
+
+test('import limits: oversize and malformed files are refused before anything is read into the database', async (t) => {
+  if (!env.ok) return t.skip(`no database: ${env.reason}`);
+  const a = await tenant('limits');
+  const big = Buffer.alloc(16 * 1024 * 1024, 'a');
+  const r = await a.api.upload('/operations/import/preview', big, 'huge.csv', { kind: 'products' });
+  assert.equal(r.status, 413, JSON.stringify(r.body).slice(0, 200));
+  const wrong = await a.api.upload('/operations/import/preview', Buffer.from('%PDF-1.4'), 'scan.pdf', { kind: 'products' });
+  assert.equal(wrong.status, 400);
+  const badKind = await a.api.upload('/operations/import/preview', productsCsv(), 'x.csv', { kind: 'invoices' });
+  assert.equal(badKind.status, 400);
+  assert.match(badKind.body.error, /kind must be/);
 });
 
 test('a failed import rolls back every row of the file', async (t) => {

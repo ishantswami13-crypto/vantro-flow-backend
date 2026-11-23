@@ -54,6 +54,7 @@
     "demo:supplier-delay": "node scripts/demo/seed-supplier-delay.js",
     "demo:supplier-delay:journey": "node scripts/demo/supplier-delay-journey.js",
     "demo:real-pilot:journey":     "node scripts/demo/real-pilot-journey.js",
+    "demo:real-pilot:files":       "node scripts/demo/real-pilot-files.js",
     "test:outbound":       "node --test --test-concurrency=1 tests/outbound.unit.test.js tests/outbound.engine.test.js tests/outbound.http.test.js",
     "outreach:preflight":  "node scripts/outreach-preflight.js",
     "staging:migrate":     "node scripts/staging-migrate.js",
