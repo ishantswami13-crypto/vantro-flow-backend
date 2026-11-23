@@ -322,12 +322,24 @@ test('end to end: Tally bridge, Xero, an SFTP folder and an emailed report feed 
   assert.deepEqual(r.body.kinds, ['orders', 'purchase_lines', 'products']);
   assert.match(r.body.ordersFromDate, /^\d{8}$/);
 
-  r = await call(null, 'POST', '/api/import/tally/feeds', { kind: 'products', xml: SAMPLE_STOCK, company: '' }, device);
+  // Orders first, before Starlane knows the products: the lines are held, not invented.
+  r = await call(null, 'POST', '/api/import/tally/feeds', { kind: 'orders', xml: SAMPLE_ORDERS }, device);
   assert.equal(r.status, 200, JSON.stringify(r.body));
   assert.equal(r.body.results[0].status, 'imported', JSON.stringify(r.body));
+  assert.equal(r.body.results[0].summary.counts.reviewRequired, 3);
+  assert.equal(await count(`SELECT count(*) n FROM order_line_items WHERE user_id = $1`, [a.id]), 0);
+  // Held lines are looked at once more against the products as they are now, then settle.
+  r = await call(null, 'POST', '/api/import/tally/feeds', { kind: 'orders', xml: SAMPLE_ORDERS }, device);
+  assert.equal(r.body.results[0].summary?.counts.reviewRequired, 3, JSON.stringify(r.body));
+  r = await call(null, 'POST', '/api/import/tally/feeds', { kind: 'orders', xml: SAMPLE_ORDERS }, device);
+  assert.equal(r.body.results[0].status, 'unchanged', 'products did not change, so nothing is checked again');
+  r = await call(null, 'POST', '/api/import/tally/feeds', { kind: 'products', xml: SAMPLE_STOCK, company: '' }, device);
+  assert.equal(r.body.results[0].status, 'imported', JSON.stringify(r.body));
   assert.equal(await count(`SELECT count(*) n FROM products WHERE user_id = $1`, [a.id]), 3);
+  // The same orders export again: the products now exist, so the held lines come in.
   r = await call(null, 'POST', '/api/import/tally/feeds', { kind: 'orders', xml: SAMPLE_ORDERS }, device);
   assert.equal(r.body.results[0].status, 'imported', JSON.stringify(r.body));
+  assert.equal(r.body.results[0].summary.counts.reviewRequired, 0);
   r = await call(null, 'POST', '/api/import/tally/feeds', { kind: 'purchase_lines', xml: SAMPLE_ORDERS }, device);
   assert.equal(r.body.results[0].status, 'imported', JSON.stringify(r.body));
   const steel = async () => (await pool.query(`SELECT l.quantity::text q, l.outstanding_quantity::text o FROM order_line_items l JOIN orders o ON o.id = l.order_id
@@ -416,6 +428,10 @@ test('end to end: Tally bridge, Xero, an SFTP folder and an emailed report feed 
   assert.equal(feedRow.source_state.lastFile, 'stock-2026-11-02.csv');
   assert.equal(String(feedRow.secret_enc).includes('erp-pass'), false);
   assert.equal((await call(a, 'POST', `/api/feeds/${sf.body.feed.id}/run`)).body.run.status, 'unchanged');
+  r = await call(a, 'POST', `/api/feeds/${sf.body.feed.id}/preview`);
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.deepEqual(r.body.preview.file.columns, ['Item Code', 'Item Name', 'Closing Stock'], 'a saved feed is read again with its stored password, to reconfirm columns');
+  assert.equal((await call(b, 'POST', `/api/feeds/${sf.body.feed.id}/preview`)).status, 404);
   assert.ok(srv.logins.every((l) => !l.refused && !l.refusedOpen), `read only: ${JSON.stringify(srv.logins)}`);
   assert.ok(srv.logins.some((l) => l.method === 'password' && l.username === 'erp'));
   // The server comes back with a different host key: refused until the owner acts.
