@@ -359,6 +359,7 @@ function warmBusinessCache(userId) {
 const { supabase } = require('./lib/config/supabaseClient');
 const { fetchAllRows } = require('./lib/db/fetchAllRows');
 const stockLedger = require('./lib/domain/inventory/stockLedger');
+const goodsReceipt = require('./lib/domain/inventory/goodsReceipt');
 const { getBusinessContext } = require('./lib/businessContext');
 const salesService = require('./lib/services/SalesService');
 const purchaseService = require('./lib/services/PurchaseService');
@@ -3277,7 +3278,14 @@ async function reconcileBusinessData(userId) {
       fetchAllRows(() => supabase.from('products').select('id, name, current_stock').eq('user_id', userId)),
       // Tracked purchase lines decide what a purchase has delivered. A schema
       // without the table (older installs) means every purchase is legacy.
-      fetchAllRows(() => supabase.from('purchase_line_items').select('id, purchase_id, product_id, unit_price, received_quantity').eq('user_id', userId)).catch(() => []),
+      // '*' so the read works before and after migration 078 (received_before_tracking,
+      // stock_follows). Only a missing table means "no tracked lines"; any other
+      // failure aborts the reconcile, because treating tracked purchases as legacy
+      // would book open purchase orders into stock.
+      fetchAllRows(() => supabase.from('purchase_line_items').select('*').eq('user_id', userId)).catch((err) => {
+        if (/purchase_line_items.*does not exist|relation .*purchase_line_items/i.test(String(err?.message || ''))) return [];
+        throw err;
+      }),
       fetchAllRows(() => supabase.from('stock_movements').select('id, product_id').eq('user_id', userId)),
     ]);
     const movementRefs = new Set(pMovements.map(m => m.reference));
@@ -3300,7 +3308,13 @@ async function reconcileBusinessData(userId) {
     // nobody recorded. Record it before anything else moves the product, so
     // the recount below starts from it instead of from 0.
     const openings = stockLedger.planOpeningMovements(userId, existingProducts, movedProducts);
-    const newMovements = [...openings, ...receipts.receiptMovements];
+    const newMovements = [...openings];
+    // Received units with no movement behind them are booked line by line
+    // under the line's row lock (the lock goods receipts take), so a receipt
+    // being recorded at this moment is never booked a second time.
+    if (receipts.receiptMovements.length) {
+      await goodsReceipt.bookUnpostedLineReceipts(getPool(), userId, receipts.receiptMovements.map((m) => String(m.reference).replace(/^PLI-/, '')));
+    }
     for (const p of receipts.legacy) {
       const ref = p.bill_number || String(p.id);
       if (movementRefs.has(ref)) continue;
@@ -9376,11 +9390,11 @@ app.post('/api/reconcile/backfill', requireAdmin, async (req, res) => {
     const movementRefs = new Set((pMovements || []).map(m => m.reference));
     // Purchases tracked line by line book only received quantities (see
     // lib/domain/inventory/stockLedger.js); open purchase orders book nothing.
-    const { data: purchaseLines } = await supabase.from('purchase_line_items').select('id, purchase_id, product_id, unit_price, received_quantity').eq('user_id', userId);
+    const { data: purchaseLines, error: plErr } = await supabase.from('purchase_line_items').select('*').eq('user_id', userId);
+    if (plErr) throw plErr;
     const receipts = stockLedger.planPurchaseReceipts(userId, purchases || [], purchaseLines || [], pMovements || []);
     if (!isDryRun && receipts.receiptMovements.length) {
-      const { error: rErr } = await supabase.from('stock_movements').insert(receipts.receiptMovements);
-      if (rErr) throw rErr;
+      await goodsReceipt.bookUnpostedLineReceipts(getPool(), userId, receipts.receiptMovements.map((m) => String(m.reference).replace(/^PLI-/, '')));
     }
     for (const m of receipts.receiptMovements) report.purchasesBackfilled.push({ ref: m.reference, received: m.quantity });
     report.openPurchaseOrdersSkipped = receipts.tracked.length;
