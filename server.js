@@ -12218,6 +12218,13 @@ async function executeApprovedAction(action, { source }) {
     });
     return { ok: true, paused: true, message: 'Approved and recorded. Carrying out actions is paused by Starlane for now, so nothing was sent, called or paid.' };
   }
+  // A customer delay update is only approved here, never sent: sending is a
+  // separate step behind the external-send flag. It stays 'approved' so
+  // nothing reads it as delivered.
+  if (action.action_type === 'COMMITMENT_DELAY_NOTICE') {
+    await createActivityLog(action.user_id, 'ai_action_approved', { entityType: 'ai_action', entityId: action.id, source, actionType: action.action_type });
+    return { ok: true, approvedOnly: true, message: 'Approved. Not sent: sending a customer update is a separate step, and external sending is off.' };
+  }
   let result;
   try {
     if (action.action_type === 'INVENTORY_PO_READY') result = await executeInventoryPO(action.user_id, action);
@@ -12268,6 +12275,13 @@ app.post('/api/actions/:id/approve', approvalLinkLimiter, async (req, res) => {
       return res.status(403).send(approvalResultPage('Link expired or invalid', 'This approval link is no longer valid. Please check your Action Center for the latest status.', false));
     }
 
+    {
+      const owner = await getPool().query('SELECT user_id FROM ai_actions WHERE id = $1', [actionId]).catch(() => ({ rows: [] }));
+      if (owner.rows[0]) {
+        const fresh = await require('./lib/domain/decisions/noticeFreshness').checkDelayNoticeCurrent(getPool(), owner.rows[0].user_id, actionId, { stage: 'approval_link' });
+        if (!fresh.ok) return res.status(fresh.status).send(approvalResultPage('Not approved', fresh.error, false));
+      }
+    }
     const claim = await claimPendingAction(actionId, 'approved');
     if (claim.ok) require('./lib/observability/productEvents').track('approval.completed', { userId: claim.action.user_id, actionId, props: { decision: 'approved', via: 'approval_link' } });
     if (!claim.ok) {
@@ -13083,6 +13097,10 @@ app.patch('/api/ai-actions/:id', authMiddleware, async (req, res) => {
     if (decidedStatuses.includes(status)) {
       const { getPool } = require('./lib/db/pg');
       const pool = getPool();
+      if (status === 'approved') {
+        const fresh = await require('./lib/domain/decisions/noticeFreshness').checkDelayNoticeCurrent(pool, userId, id, { stage: 'approve' });
+        if (!fresh.ok) return res.status(fresh.status).json({ error: fresh.error, code: fresh.code, newerDecisionId: fresh.newerDecisionId || null });
+      }
       const approvedBy = status === 'approved' ? userId : null;
       const approvedAt = status === 'approved' ? new Date().toISOString() : null;
       const casRes = await pool.query(
@@ -13190,6 +13208,8 @@ app.post('/api/intelligence/actions/:id/approve-and-execute', authMiddleware, as
     const { getPool } = require('./lib/db/pg');
     const { executeSupplyChainAction, resolveExecutionMode } = require('./lib/domain/automation/supplyChainExecutionAdapter');
     const pool = getPool();
+    const fresh = await require('./lib/domain/decisions/noticeFreshness').checkDelayNoticeCurrent(pool, userId, req.params.id, { stage: 'approve_and_execute' });
+    if (!fresh.ok) return res.status(fresh.status).json({ error: fresh.error, code: fresh.code, newerDecisionId: fresh.newerDecisionId || null });
 
     // Close the Loop mission: atomic compare-and-swap, not SELECT-then-UPDATE.
     // The old SELECT-then-UPDATE had a real double-click/concurrent-request
@@ -13707,6 +13727,8 @@ app.post('/api/ai-actions/:id/send-whatsapp', authMiddleware, async (req, res) =
       const msg = error || 'Internal server error';
       if (errorCode === 'NOT_FOUND')     return res.status(404).json({ error: 'Action not found' });
       if (errorCode === 'NOT_APPROVED')  return res.status(409).json({ error: msg, status: (errorMeta && errorMeta.status) || null });
+      if (errorCode === 'NOTICE_STALE')  return res.status(409).json({ error: msg, code: 'NOTICE_STALE', newerDecisionId: (errorMeta && errorMeta.detail) || null });
+      if (errorCode === 'NOTICE_CHECK_FAILED') return res.status(503).json({ error: msg, code: 'NOTICE_CHECK_FAILED' });
       if (errorCode === 'NO_PHONE')      return res.status(422).json({ error: msg });
       if (errorCode === 'NO_MESSAGE')    return res.status(422).json({ error: msg });
       if (errorCode === 'NOT_CONFIGURED') return res.status(503).json({ error: msg });
