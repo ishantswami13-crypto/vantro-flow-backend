@@ -9,7 +9,7 @@ record; everything else is derived from it and can be rebuilt.
 | L0 System of record | Ledgers, orders, POs, shipments, decisions | Live. RLS on the `pg` path planned (PR 6) |
 | L1 Cache | Hot reads shared across replicas | **Added:** `lib/data/cache` (memory or Postgres backend) |
 | L2 Event log | Outbox written in the business transaction, `LISTEN/NOTIFY` delivery | **Added:** `lib/data/events`, migration 091 |
-| L3 Read models | Precomputed Home, Decisions, exposure | PR 3 |
+| L3 Read models | Receivables by tenant and customer with ageing, served at `/api/data` | **Added:** `lib/data/readModels`, migration 092 |
 | L4 Analytics | Star schema: daily facts by customer, product, supplier, date, currency | PR 4 |
 | L5 Search | `pg_trgm` fuzzy entity names; `pgvector` for Vault when needed | PR 5 |
 
@@ -98,8 +98,48 @@ await withTenant(req.user.id, async (db) => {
 - **Delivery.** Polling every 2 s by default. Set `EVENT_LISTEN_DATABASE_URL` to
   a session-mode or direct connection for instant `LISTEN/NOTIFY` wake-ups;
   Supabase's transaction pooler (port 6543) does not support `LISTEN`.
-- **Not started yet.** No dispatcher runs in `server.js`; the read models (PR 3)
-  are the first consumers and will start it behind a flag.
+- **Started by** `lib/data/boot.js` when `STARLANE_DATA_LAYER_ENABLED=true` (see below).
+
+## Read models (`lib/data/readModels`)
+
+`rm_receivables_tenant` and `rm_receivables_customer` hold open and overdue
+receivables per tenant, currency and customer, with ageing buckets (current,
+1-30, 31-60, 61-90, 90+ days past due), oldest due date and last payment date.
+Currencies are never added together; `''` / `null` is the base currency.
+
+- **Never stale.** Every read compares a fingerprint of the tenant's invoice
+  rows (row count plus an order-independent sum of `md5(id, xmin)`, which
+  changes on any insert, update or delete, even ones that skip `updated_at`)
+  and the as-of day with what the model was built from. If they differ it
+  rebuilds that tenant first. The background work below only makes that
+  rebuild happen ahead of the request.
+- **Kept current in the background** by a durable consumer on `invoice.*`,
+  `payment.*`, `receivable.*` and `customer.*` events, and by a sweep every
+  5 minutes (`READ_MODEL_SWEEP_MS`) for writes that do not emit events yet.
+- **Rebuild any time:** `npm run data:rebuild` (stale tenants) or
+  `npm run data:rebuild -- --all`. The tables are derived data only.
+- **As-of day** is the UTC date. Dates go out as `YYYY-MM-DD` text, never via a
+  JS `Date`, so servers east of UTC do not shift them.
+
+### Endpoints (404 unless `STARLANE_DATA_LAYER_ENABLED=true`)
+
+| Endpoint | Returns |
+| --- | --- |
+| `GET /api/data/receivables` | Summary by currency + the 10 most overdue customers |
+| `GET /api/data/receivables/customers?currency=&sort=overdue\|open\|age\|name&limit=&offset=` | Paged customer exposure |
+| `GET /api/data/status` | Whether this server runs the dispatcher, consumer and cache stats |
+
+### Turning it on
+
+1. Apply migrations 090-092 (`npm run db:migrate`), staging first.
+2. Set `STARLANE_DATA_LAYER_ENABLED=true`. Optional: `EVENT_LISTEN_DATABASE_URL`
+   (session-mode connection) for instant wake-ups, `STARLANE_CACHE_BACKEND=postgres`
+   for a cache shared across replicas.
+3. Rollback: unset the flag. Nothing else reads these tables.
+
+Scale note: the fingerprint and the sweep scan a tenant's invoices (a few ms
+per 10,000 rows). Past roughly a million invoices per tenant, switch to a
+per-tenant version counter maintained by a statement-level trigger.
 
 ### Tests
 
@@ -111,3 +151,7 @@ await withTenant(req.user.id, async (db) => {
 - `tests/dataEvents.db.test.mjs` — outbox rollback, idempotency, tenant reads,
   failure and retry, exactly-once projection with two racing servers, commit
   order with an open transaction, broadcast invalidation and `LISTEN` wake-ups.
+- `tests/dataReadModels.db.test.mjs` — hand-worked receivables (part payments,
+  cancelled, undated, merged name variants, USD kept apart), freshness after
+  writes with no event and no `updated_at`, deletes, day rollover, event
+  consumer, sweep, and the HTTP endpoints with tenant isolation and the flag.

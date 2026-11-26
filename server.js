@@ -12930,6 +12930,11 @@ const { connectionsRouter, hooksRouter } = require('./lib/routes/connections');
 app.use('/api/integrations', connectionsRouter({ pool: getPool(), authMiddleware }));
 app.use('/api/hooks', hooksRouter({ pool: getPool() }));
 
+// Layered data backend: read models served at /api/data (lib/data, migrations
+// 090-092). 404 unless STARLANE_DATA_LAYER_ENABLED=true.
+const { dataLayerRouter } = require('./lib/routes/dataLayer');
+app.use('/api/data', dataLayerRouter({ authMiddleware }));
+
 app.get('/api/ai-actions', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -15204,6 +15209,9 @@ const httpServer = app.listen(PORT, () => {
   }
   runAutoMigrations();
   if (process.env.DATABASE_URL) require('./lib/safety/externalSend').startGlobalStopWatcher(getPool());
+  require('./lib/data/boot').startFromEnv({ log: safeLog })
+    .then((r) => console.log(`🧱 Data layer: ${r ? 'STARTED' : 'OFF (STARLANE_DATA_LAYER_ENABLED is not true)'}`))
+    .catch((err) => console.error('[data] data layer failed to start:', err.message));
   if (outboundRunner) {
     outboundRunner.start();
     console.log(`📮 Outbound engine runner: STARTED (${outboundRunner.concurrency} worker slot(s); sends only for tenants that pressed START)`);
