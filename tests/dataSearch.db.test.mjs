@@ -48,12 +48,23 @@ async function main() {
     check('a one-character query is refused', !!(await rejects(search(a.id, 'x', { pool }))));
     check('an unknown type is refused', !!(await rejects(search(a.id, 'abc', { types: 'users', pool }))));
 
+    // Two different customers with the same name: inserted higher id first, so
+    // without an id tie-break the order would follow the physical row order.
+    await pool.query(`INSERT INTO customers (id, user_id, name, phone) VALUES
+      ('00000000-0000-4000-8000-0000000000f2', $1, 'Patel Brothers', '911'),
+      ('00000000-0000-4000-8000-0000000000f1', $1, 'Patel Brothers', '922')`, [a.id]);
+    const twins = (await search(a.id, 'patel brothers', { pool })).map((r) => r.id);
+    check('two customers with the same name are both listed, never merged, lower id first',
+      twins.join() === '00000000-0000-4000-8000-0000000000f1,00000000-0000-4000-8000-0000000000f2', twins);
+
     console.log('\nduplicates');
     const dups = await duplicates(a.id, { type: 'customer', pool });
     const pair = (x, y) => dups.find((d) => [d.a.name, d.b.name].sort().join('|') === [x, y].sort().join('|'));
     check('"M/s Sharma and Sons" (invoice) pairs with "Sharma & Sons Pvt Ltd" (customer)', !!pair('M/s Sharma and Sons', 'Sharma & Sons Pvt Ltd'), dups);
     check('"Gupta Electrical" pairs with "Gupta Electricals"', !!pair('Gupta Electrical', 'Gupta Electricals'), dups);
     check('unrelated names are not paired', !dups.some((d) => [d.a.name, d.b.name].includes('Kiran Hardware Stores')));
+    const twinPair = dups.find((d) => d.a.name === 'Patel Brothers' && d.b.name === 'Patel Brothers');
+    check('the same-name pair is listed once with a fixed a/b order', twinPair && twinPair.a.id < twinPair.b.id && dups.filter((d) => d.a.name === 'Patel Brothers').length === 1, dups);
 
     console.log('\nfreshness');
     await pool.query("UPDATE customers SET name = 'Kiran Hardware Mart' WHERE user_id = $1 AND name = 'Kiran Hardware Stores'", [a.id]);
