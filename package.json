@@ -10,6 +10,7 @@
     "test": "node scripts/run-tests.js",
     "db:migrate": "node scripts/migrate.js",
     "db:migrate:status": "node scripts/migrate.js --status",
+    "data:rebuild": "node scripts/data-rebuild.js",
     "db:preflight": "node scripts/db-preflight.js",
     "env:check": "node scripts/check-production-env.js",
     "db:baseline": "node scripts/db-baseline.js",
