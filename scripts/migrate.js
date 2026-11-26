@@ -98,6 +98,9 @@ async function connect() {
   const cfg = buildSanitizedPgConfig(process.env.DATABASE_URL);
   if (!cfg) throw new Error('DATABASE_URL is not set');
   const client = new Client(cfg);
+  // Surface RAISE WARNING from migrations (e.g. 095 when a role cannot be
+  // granted); notices below WARNING stay quiet.
+  client.on('notice', (n) => { if (n.severity === 'WARNING') console.warn(`  warning: ${n.message}`); });
   await client.connect();
   return client;
 }

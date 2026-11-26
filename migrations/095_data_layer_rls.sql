@@ -24,8 +24,21 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'starlane_app') THEN
     CREATE ROLE starlane_app NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
   END IF;
-  -- The connecting (migrating) user may switch to it with SET ROLE.
-  EXECUTE format('GRANT starlane_app TO %I', current_user);
+  -- The connecting (migrating) user may switch to it with SET ROLE. A
+  -- non-superuser migrator can only grant a role it administers: on Postgres
+  -- 16 that is a role it created itself, so a starlane_app made earlier by
+  -- another user (a second database on the same cluster, a dashboard user)
+  -- cannot be granted from here. That must not stop the migration run: the
+  -- role is only used when STARLANE_DB_TENANT_ROLE is set, and withTenant then
+  -- fails closed ("permission denied to set role") until an admin runs
+  --   GRANT starlane_app TO <app user>;
+  IF NOT pg_has_role(current_user, 'starlane_app', 'MEMBER') THEN
+    BEGIN
+      EXECUTE format('GRANT starlane_app TO %I', current_user);
+    EXCEPTION WHEN insufficient_privilege THEN
+      RAISE WARNING 'starlane_app exists but % cannot be granted it. Leave STARLANE_DB_TENANT_ROLE unset until an admin runs: GRANT starlane_app TO %;', current_user, current_user;
+    END;
+  END IF;
 END $$;
 
 GRANT USAGE ON SCHEMA public TO starlane_app;
