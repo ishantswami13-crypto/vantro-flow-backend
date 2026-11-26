@@ -10,7 +10,7 @@ record; everything else is derived from it and can be rebuilt.
 | L1 Cache | Hot reads shared across replicas | **Added:** `lib/data/cache` (memory or Postgres backend) |
 | L2 Event log | Outbox written in the business transaction, `LISTEN/NOTIFY` delivery | **Added:** `lib/data/events`, migration 091 |
 | L3 Read models | Receivables by tenant and customer with ageing, served at `/api/data` | **Added:** `lib/data/readModels`, migration 092 |
-| L4 Analytics | Star schema: daily facts by customer, product, supplier, date, currency | PR 4 |
+| L4 Analytics | Fact tables sliced by time, customer, currency and status through a cube API | **Added:** `lib/data/analytics`, migration 093 |
 | L5 Search | `pg_trgm` fuzzy entity names; `pgvector` for Vault when needed | PR 5 |
 
 Redis, ClickHouse, Kafka and a graph database are deliberately not added yet.
@@ -141,6 +141,40 @@ Scale note: the fingerprint and the sweep scan a tenant's invoices (a few ms
 per 10,000 rows). Past roughly a million invoices per tenant, switch to a
 per-tenant version counter maintained by a statement-level trigger.
 
+## Analytics cube (`lib/data/analytics`)
+
+Two fact tables, loaded by the same freshness rule as the read models:
+
+| Fact | Grain | Measures |
+| --- | --- | --- |
+| `fact_invoices` | one row per invoice | `count`, `invoiced`, `collected`, `outstanding`, `avg_days_to_pay`, `avg_days_late`, `on_time_rate` |
+| `fact_receivables_daily` | tenant x customer x currency x day, partitioned by month | `open_amount`, `overdue_amount`, `current`, `d1_30`, `d31_60`, `d61_90`, `d90_plus`, `customers`, `overdue_customers` |
+
+Dimensions: `customer`, `currency`, `status` (invoices), and one time grain
+(`day`, `week`, `month`, `quarter`, `year`) over a chosen date (`invoice`,
+`due` or `paid` for invoices; `snapshot` for daily receivables).
+
+```
+GET /api/data/cube?fact=invoices&measures=invoiced,collected&by=month,customer&from=2026-04-01&to=2027-03-31
+GET /api/data/cube?fact=receivables_daily&measures=open_amount,overdue_amount&by=week&currency=USD
+GET /api/data/cube/schema
+```
+
+Rules the cube enforces:
+
+- Only names from its whitelist reach SQL; every value is bound.
+- Money is never added across currencies: a money measure always groups by
+  currency (`currencyAdded: true` in the answer says it did).
+- Daily receivables are balances, not flows: grouped by week or month, each
+  period shows its last snapshot day, never a sum of days. Days with nothing
+  open read as zero (no row), using `fact_snapshot_days`.
+- New monthly partitions get row-level security and lose API-role grants as
+  they are created, like every other data-layer table.
+
+History: `fact_receivables_daily` records how things stood each day, so it
+only has days from when the data layer was turned on. The sweep takes the
+snapshot every day even if nobody opens the app.
+
 ### Tests
 
 - `tests/dataLayer.unit.test.mjs` — no database.
@@ -155,3 +189,7 @@ per-tenant version counter maintained by a statement-level trigger.
   cancelled, undated, merged name variants, USD kept apart), freshness after
   writes with no event and no `updated_at`, deletes, day rollover, event
   consumer, sweep, and the HTTP endpoints with tenant isolation and the flag.
+- `tests/dataAnalytics.db.test.mjs` — hand-worked invoice measures, days to
+  pay and lateness, currency separation, daily snapshots across a month
+  boundary with partitions, last-day-per-period, paid-off customers, spec
+  validation and the HTTP cube.
