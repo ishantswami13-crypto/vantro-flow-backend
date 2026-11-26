@@ -7,8 +7,8 @@ record; everything else is derived from it and can be rebuilt.
 | Layer | Purpose | Status |
 | --- | --- | --- |
 | L0 System of record | Ledgers, orders, POs, shipments, decisions | Live. RLS on the `pg` path planned (PR 6) |
-| L1 Cache | Hot reads shared across replicas | **This PR:** `lib/data/cache` (memory or Postgres backend) |
-| L2 Event log | Outbox written in the business transaction, `LISTEN/NOTIFY` delivery | PR 2 |
+| L1 Cache | Hot reads shared across replicas | **Added:** `lib/data/cache` (memory or Postgres backend) |
+| L2 Event log | Outbox written in the business transaction, `LISTEN/NOTIFY` delivery | **Added:** `lib/data/events`, migration 091 |
 | L3 Read models | Precomputed Home, Decisions, exposure | PR 3 |
 | L4 Analytics | Star schema: daily facts by customer, product, supplier, date, currency | PR 4 |
 | L5 Search | `pg_trgm` fuzzy entity names; `pgvector` for Vault when needed | PR 5 |
@@ -64,6 +64,43 @@ so every replica sees the same values and invalidations. Expired rows are
 purged every 10 minutes by the process that uses the cache. Rollback: unset the
 variable (back to memory); the table can be dropped with no data loss.
 
+## Event log (`lib/data/events`)
+
+```js
+const { withTenant, events } = require('./lib/data');
+
+await withTenant(req.user.id, async (db) => {
+  await db.query('UPDATE purchase_orders SET expected_date = $2 WHERE user_id = $1 AND id = $3', [db.userId, newDate, poId]);
+  await events.appendEvent(db, {
+    stream: `purchase_order:${poId}`,
+    type: 'purchase_order.delayed',
+    payload: { poId, from: oldDate, to: newDate },
+    idempotencyKey: req.get('Idempotency-Key') || undefined,
+  });
+});
+```
+
+- **Outbox.** `event_log` is written in the same transaction as the change, so
+  an event exists exactly when its change committed.
+- **Idempotent appends.** The same `idempotencyKey` for the same tenant returns
+  the first event and writes nothing.
+- **Commit order.** Each row stores its transaction id; consumers only read rows
+  whose transaction is older than every open one, so a slow transaction's event
+  is never skipped (a plain `id > cursor` reader would skip it).
+- **Durable consumers** keep one cursor in `event_consumers`. A run locks the
+  consumer row with `SKIP LOCKED` (one server at a time) and runs the handler in
+  the same transaction as the cursor move, each event under a savepoint. A
+  projection written by the handler is therefore applied exactly once. A failing
+  handler stops at that event, records `last_error`, and retries next run.
+- **Broadcast consumers** keep an in-memory cursor per process starting at
+  "now"; `cacheInvalidationConsumer(cache)` clears a tenant's cache on every
+  server when one of its events commits.
+- **Delivery.** Polling every 2 s by default. Set `EVENT_LISTEN_DATABASE_URL` to
+  a session-mode or direct connection for instant `LISTEN/NOTIFY` wake-ups;
+  Supabase's transaction pooler (port 6543) does not support `LISTEN`.
+- **Not started yet.** No dispatcher runs in `server.js`; the read models (PR 3)
+  are the first consumers and will start it behind a flag.
+
 ### Tests
 
 - `tests/dataLayer.unit.test.mjs` — no database.
@@ -71,3 +108,6 @@ variable (back to memory); the table can be dropped with no data loss.
   after commit or rollback, Postgres enforces the timeout and read-only mode,
   two tenants cannot read, change or delete each other's rows, and the shared
   cache is visible across two cache instances.
+- `tests/dataEvents.db.test.mjs` — outbox rollback, idempotency, tenant reads,
+  failure and retry, exactly-once projection with two racing servers, commit
+  order with an open transaction, broadcast invalidation and `LISTEN` wake-ups.
