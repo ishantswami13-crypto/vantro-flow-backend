@@ -6,7 +6,7 @@ record; everything else is derived from it and can be rebuilt.
 
 | Layer | Purpose | Status |
 | --- | --- | --- |
-| L0 System of record | Ledgers, orders, POs, shipments, decisions | Live. RLS on the `pg` path planned (PR 6) |
+| L0 System of record | Ledgers, orders, POs, shipments, decisions | Live. RLS enforced on the data-layer path (migration 095, opt-in) |
 | L1 Cache | Hot reads shared across replicas | **Added:** `lib/data/cache` (memory or Postgres backend) |
 | L2 Event log | Outbox written in the business transaction, `LISTEN/NOTIFY` delivery | **Added:** `lib/data/events`, migration 091 |
 | L3 Read models | Receivables by tenant and customer with ageing, served at `/api/data` | **Added:** `lib/data/readModels`, migration 092 |
@@ -198,6 +198,31 @@ GET /api/data/search/duplicates?type=customer&minScore=0.6
   changes (same fingerprint rule), so results are never stale. The source
   tables get no new indexes or triggers.
 
+## Row-level security on the data-layer path (migration 095)
+
+The backend connects as the table owner, and owners bypass RLS, so a policy
+alone protects nothing on that path. With `STARLANE_DB_TENANT_ROLE=starlane_app`,
+`withTenant` also runs `SET LOCAL ROLE starlane_app` (transaction-local, like
+`app.user_id`). That role has no `BYPASSRLS`, and every data-layer table has a
+`tenant_isolation` policy on `app.user_id`, so Postgres itself:
+
+- hides other tenants' rows from a query that forgets its tenant filter,
+- refuses to insert, or move, a row into another tenant,
+- shows nothing at all when no tenant is set.
+
+The role may read the source tables (invoices, customers, suppliers,
+products) through a policy of its own that matches only `app.user_id`; it
+cannot write them. Policies for other roles, such as the existing `auth.uid()`
+ones on customers, are untouched. Partition creation runs through an
+owner-run (`SECURITY DEFINER`) function that the API roles cannot call.
+
+Turn on in staging first: apply 095, set the variable, run
+`node tests/dataRls.db.test.mjs` and the other `tests/data*.db.test.mjs`
+files with it set. Rollback: unset the variable.
+
+Legacy tables keep their current RLS state; the wider rollout is still
+migration 006's job.
+
 ### Tests
 
 - `tests/dataLayer.unit.test.mjs` — no database.
@@ -219,3 +244,7 @@ GET /api/data/search/duplicates?type=customer&minScore=0.6
 - `tests/dataSearch.db.test.mjs` — normalisation, typos, GSTIN and SKU
   prefixes, invoice-only names, duplicates, renames and deletes, tenant
   isolation and the HTTP endpoints.
+- `tests/dataRls.db.test.mjs` — the role cannot bypass RLS and does not leak
+  past its transaction; unfiltered reads, forged inserts, moves and deletes
+  across tenants are all stopped by Postgres. Every other `data*.db` file also
+  passes with `STARLANE_DB_TENANT_ROLE=starlane_app` set.

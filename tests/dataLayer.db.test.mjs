@@ -43,17 +43,20 @@ async function main() {
     console.log('\nrepositories');
     await pool.query(`CREATE TABLE ${table} (id serial PRIMARY KEY, user_id uuid NOT NULL, name text, qty numeric)`);
     const repo = defineRepository({ table, columns: ['name', 'qty'] });
-    const rowA = await withTenant(a, (db) => repo.insert(db, { name: 'cable', qty: '250.25' }), { pool });
-    await withTenant(b, (db) => repo.insert(db, { name: 'pump', qty: 3 }), { pool });
+    // This scratch table is not one the tenant role may use; the role path is
+    // covered by dataRls.db.test.mjs.
+    const asOwner = { pool, role: null };
+    const rowA = await withTenant(a, (db) => repo.insert(db, { name: 'cable', qty: '250.25' }), asOwner);
+    await withTenant(b, (db) => repo.insert(db, { name: 'pump', qty: 3 }), asOwner);
     check('insert stores the tenant from the handle', rowA.user_id === a && rowA.qty === '250.25', rowA);
-    const seenByB = await withTenant(b, (db) => repo.findMany(db), { pool });
+    const seenByB = await withTenant(b, (db) => repo.findMany(db), asOwner);
     check("a tenant lists only its own rows", seenByB.length === 1 && seenByB[0].name === 'pump', seenByB);
-    check("findById of another tenant's row returns nothing", (await withTenant(b, (db) => repo.findById(db, rowA.id), { pool })) === null);
-    check("update of another tenant's row changes nothing", (await withTenant(b, (db) => repo.update(db, rowA.id, { name: 'stolen' }), { pool })) === null);
-    check("remove of another tenant's row removes nothing", (await withTenant(b, (db) => repo.remove(db, rowA.id), { pool })) === false);
-    const still = await withTenant(a, (db) => repo.findById(db, rowA.id), { pool });
+    check("findById of another tenant's row returns nothing", (await withTenant(b, (db) => repo.findById(db, rowA.id), asOwner)) === null);
+    check("update of another tenant's row changes nothing", (await withTenant(b, (db) => repo.update(db, rowA.id, { name: 'stolen' }), asOwner)) === null);
+    check("remove of another tenant's row removes nothing", (await withTenant(b, (db) => repo.remove(db, rowA.id), asOwner)) === false);
+    const still = await withTenant(a, (db) => repo.findById(db, rowA.id), asOwner);
     check('the owner still sees the row unchanged', still && still.name === 'cable');
-    check('count is per tenant', (await withTenant(a, (db) => repo.count(db), { pool })) === 1);
+    check('count is per tenant', (await withTenant(a, (db) => repo.count(db), asOwner)) === 1);
 
     console.log('\nshared Postgres cache');
     const reg = await pool.query("SELECT relpersistence FROM pg_class WHERE relname = 'starlane_cache'");
