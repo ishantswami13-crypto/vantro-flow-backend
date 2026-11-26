@@ -11,7 +11,7 @@ record; everything else is derived from it and can be rebuilt.
 | L2 Event log | Outbox written in the business transaction, `LISTEN/NOTIFY` delivery | **Added:** `lib/data/events`, migration 091 |
 | L3 Read models | Receivables by tenant and customer with ageing, served at `/api/data` | **Added:** `lib/data/readModels`, migration 092 |
 | L4 Analytics | Fact tables sliced by time, customer, currency and status through a cube API | **Added:** `lib/data/analytics`, migration 093 |
-| L5 Search | `pg_trgm` fuzzy entity names; `pgvector` for Vault when needed | PR 5 |
+| L5 Search | Typo-tolerant names (`pg_trgm`) and duplicate detection; `pgvector` for Vault later | **Added:** `lib/data/search`, migration 094 |
 
 Redis, ClickHouse, Kafka and a graph database are deliberately not added yet.
 Each layer has an interface so one can be swapped in when volume calls for it.
@@ -175,6 +175,29 @@ History: `fact_receivables_daily` records how things stood each day, so it
 only has days from when the data layer was turned on. The sweep takes the
 snapshot every day even if nobody opens the app.
 
+## Search (`lib/data/search`)
+
+`search_entities` indexes customer, supplier and product names (plus names
+that only exist on invoices) with a trigram GIN index. Names are normalised
+first: lower case, `&` to `and`, punctuation dropped, the `M/s` prefix and
+legal forms (Pvt, Ltd, LLP, Inc, Co, ...) removed, so
+`M/s. Sharma & Sons Pvt. Ltd.` and `sharma and sons` are the same text.
+
+```
+GET /api/data/search?q=sharma%20snos&types=customer,supplier,product
+GET /api/data/search/duplicates?type=customer&minScore=0.6
+```
+
+- Typo-tolerant (`word_similarity`), and a GSTIN, phone or SKU prefix matches
+  its record with score 1. `%` and `_` in a query are literal.
+- On a tie a real customer record ranks above the same name seen only on
+  invoices; invoice-only names use the read models' `name:<lower name>` key.
+- Duplicates lists likely-same pairs (`similarity >= minScore`) for review. It
+  never merges anything.
+- Rebuilt per tenant when any of customers, suppliers, products or invoices
+  changes (same fingerprint rule), so results are never stale. The source
+  tables get no new indexes or triggers.
+
 ### Tests
 
 - `tests/dataLayer.unit.test.mjs` — no database.
@@ -193,3 +216,6 @@ snapshot every day even if nobody opens the app.
   pay and lateness, currency separation, daily snapshots across a month
   boundary with partitions, last-day-per-period, paid-off customers, spec
   validation and the HTTP cube.
+- `tests/dataSearch.db.test.mjs` — normalisation, typos, GSTIN and SKU
+  prefixes, invoice-only names, duplicates, renames and deletes, tenant
+  isolation and the HTTP endpoints.
