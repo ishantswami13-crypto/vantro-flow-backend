@@ -154,6 +154,25 @@ async function main() {
     check('a failing backend fails open: the fetcher still answers', v === 'fresh' && fetched === 1 && c.stats().errors >= 2, c.stats());
   }
 
+  {
+    const { businessToday, asOfDay } = require('../lib/data/readModels/receivables');
+    // 2026-11-26 20:00 UTC is 01:30 on 27 Nov in India: the owner's day has turned.
+    const late = new Date('2026-11-26T20:00:00Z');
+    check('the default as-of day is the business day in Asia/Kolkata, not UTC', businessToday(late) === '2026-11-27', businessToday(late));
+    check('BUSINESS_TIMEZONE is honoured', businessToday(late, 'Europe/London') === '2026-11-26');
+    check('an invalid timezone falls back to UTC instead of throwing', businessToday(late, 'Not/AZone') === '2026-11-26');
+    check('an explicit asOf is used as given', asOfDay('2026-01-31') === '2026-01-31');
+  }
+  {
+    const { parseSpec } = require('../lib/data/analytics');
+    const refused = (spec) => { try { parseSpec(spec); return null; } catch (e) { return e; } };
+    for (const d of ['2026-13-01', '2026-02-30', '2026-11-31']) {
+      const e = refused({ measures: 'invoiced', from: d });
+      check(`cube refuses impossible date ${d} as a 400 (RangeError), not a SQL error`, e instanceof RangeError, e && e.message);
+    }
+    check('cube accepts 2028-02-29', refused({ measures: 'invoiced', to: '2028-02-29' }) === null);
+  }
+
   done();
 }
 
